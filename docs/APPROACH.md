@@ -69,7 +69,7 @@ So a client can keep **armed sessions** ready: setup, handshake, KU0, π_C1 and 
 
 ## Running it
 
-Prototype (unchanged from the verified build): `crypto/PROGRESS.md` has exact commands. Integration branches: see each repo's `README-CONFIDENTIAL.md`.
+Prototype (unchanged from the verified build): `crypto/PROGRESS.md` has exact commands. Integration branches: `docs/confidential-upstream.md` in routstr-core and routstrd, `client/confidential/README.md` in routstr-sdk; the PRs are listed in `README.md`.
 
 ## Status / evidence
 

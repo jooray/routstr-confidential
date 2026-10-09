@@ -121,7 +121,7 @@ cd $P/crypto/client && CU_PROVER=../zkbench/target/release/cu-prover node --expe
 ```
 
 For routstrd, use a scratch `ROUTSTRD_DIR` and add a `confidentialUpstream`
-block (`routstrd/README-CONFIDENTIAL.md`). Run it with Bun ≥ 1.4 and send
+block (`routstrd/docs/confidential-upstream.md`). Run it with Bun ≥ 1.4 and send
 `x-routstr-verify: confidential`.
 
 **Checks.**

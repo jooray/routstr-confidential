@@ -32,7 +32,7 @@ crypto/
   tools/cu_cashu.py mint/redeem helper (uv ephemeral env)
 routstr-core/       routstr/confidential.py, routstr/confidential_ws.py, settings,
                     main.py wiring, payment/models.py field, tests/unit/test_confidential.py,
-                    README-CONFIDENTIAL.md
+                    docs/confidential-upstream.md
 ```
 
 ## Exact reproduction commands
