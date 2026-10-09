@@ -1,0 +1,22 @@
+{
+  "name": "cu-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Confidential-upstream client: vendored @reclaimprotocol/tls fork + session driver",
+  "scripts": {
+    "e2e": "node --experimental-strip-types src/driver.ts",
+    "baseline": "node --experimental-strip-types src/baseline.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^1.3.0",
+    "@noble/curves": "^1.9.6",
+    "@noble/hashes": "^1.8.0",
+    "@peculiar/asn1-cms": "^2.3.14",
+    "@peculiar/asn1-ecc": "^2.3.14",
+    "@peculiar/asn1-rsa": "^2.3.14",
+    "@peculiar/asn1-schema": "^2.3.13",
+    "@peculiar/x509": "^1.12.3",
+    "micro-rsa-dsa-dh": "^0.1.0"
+  }
+}

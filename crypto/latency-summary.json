@@ -1,0 +1,16 @@
+{
+  "e2e_runs": 7,
+  "e2e": {
+    "ttft_ms": 1083,
+    "total_ms": 1574
+  },
+  "baseline": {
+    "runs": 10,
+    "ttft_ms": 598,
+    "total_ms": 678.5
+  },
+  "added": {
+    "ttft_ms": 485,
+    "total_ms": 895.5
+  }
+}

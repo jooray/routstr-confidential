@@ -1,0 +1,4 @@
+# Reuse the pre-compiled mpz2 dependency artifacts that shipped in
+# zkbench/target so the pinned (rev 8f89783) VOLE deps are not rebuilt.
+[build]
+target-dir = "zkbench/target"

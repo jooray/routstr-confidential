@@ -1,0 +1,461 @@
+//! Reusable ZK gadgets: linear (XOR/rewiring) circuits plus an in-circuit
+//! HMAC-SHA256 built from `mpz-hash`'s SHA-256 and the AES-128 circuit.
+//!
+//! Linear circuits (XOR, select, splice, pad) add no AND gates, so they are
+//! effectively free in the VOLE protocol; all the cost is SHA-256 and AES.
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
+use mpz_circuits::{Circuit, CircuitBuilder};
+use mpz_vm_core::{
+    Call, CallableExt, Vm, VmError,
+    memory::{
+        Array, MemoryExt, Slice, ToRaw, Vector, ViewExt,
+        binary::{Binary, U8},
+    },
+};
+use mpz_hash::sha256::Sha256;
+
+use crate::Role;
+
+/// Which side of the protocol we are building circuits for.
+// Kept in this module so the gadgets can branch on it without a cycle.
+
+fn cache<F>(key: u64, build: F) -> Arc<Circuit>
+where
+    F: FnOnce() -> Circuit,
+{
+    static CACHE: LazyLock<Mutex<HashMap<u64, Arc<Circuit>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = guard.get(&key) {
+        return c.clone();
+    }
+    let c = Arc::new(build());
+    guard.insert(key, c.clone());
+    c
+}
+
+/// A constant bit as a *real* gate output (never a raw const node, which the
+/// circuit builder cannot renumber).
+fn cbit(b: &mut CircuitBuilder, node: mpz_circuits::Node<mpz_circuits::Feed>, bit: bool) -> mpz_circuits::Node<mpz_circuits::Feed> {
+    if bit {
+        let inv = b.add_inv_gate(node);
+        b.add_xor_gate(node, inv)
+    } else {
+        b.add_xor_gate(node, node)
+    }
+}
+
+/// `n`-bit XOR of two `n`-bit inputs.
+pub fn xor_circuit(n_bits: usize) -> Arc<Circuit> {
+    cache(
+        0xA1_0000_0000 ^ n_bits as u64,
+        || {
+            let mut b = CircuitBuilder::new();
+            let a: Vec<_> = (0..n_bits).map(|_| b.add_input()).collect();
+            let c: Vec<_> = (0..n_bits).map(|_| b.add_input()).collect();
+            for i in 0..n_bits {
+                let out = b.add_xor_gate(a[i], c[i]);
+                b.add_output(out);
+            }
+            b.build().unwrap()
+        },
+    )
+}
+
+/// Key padding for HMAC: 32-byte key -> 64-byte block (`key || 0^32`).
+pub fn pad_key_circuit() -> Arc<Circuit> {
+    cache(0xB2, || {
+        let mut b = CircuitBuilder::new();
+        let key: Vec<_> = (0..256).map(|_| b.add_input()).collect();
+        for bit in &key {
+            let out = b.add_id_gate(*bit);
+            b.add_output(out);
+        }
+        for _ in 0..256 {
+            let z = cbit(&mut b, key[0], false);
+            b.add_output(z);
+        }
+        b.build().unwrap()
+    })
+}
+
+/// Extract `len` bytes starting at byte `start` from an `in_len`-byte input.
+pub fn select_circuit(in_len: usize, start: usize, len: usize) -> Arc<Circuit> {
+    cache(0xC3_0000_0000 ^ ((in_len as u64) << 32) ^ ((start as u64) << 8) ^ len as u64, || {
+        let mut b = CircuitBuilder::new();
+        let inp: Vec<_> = (0..in_len * 8).map(|_| b.add_input()).collect();
+        for bit in &inp[start * 8..(start + len) * 8] {
+            let out = b.add_id_gate(*bit);
+            b.add_output(out);
+        }
+        b.build().unwrap()
+    })
+}
+
+/// Concatenate several byte vectors into one contiguous output (pure rewiring).
+pub fn concat_circuit(sizes: &[usize]) -> Arc<Circuit> {
+    let key = {
+        let mut k = 0xD4u64;
+        for s in sizes {
+            k = k.wrapping_mul(1099511628211) ^ (*s as u64);
+        }
+        k
+    };
+    cache(key, || {
+        let mut b = CircuitBuilder::new();
+        let inputs: Vec<_> = (0..sizes.iter().sum::<usize>() * 8)
+            .map(|_| b.add_input())
+            .collect();
+        for bit in &inputs {
+            let out = b.add_id_gate(*bit);
+            b.add_output(out);
+        }
+        b.build().unwrap()
+    })
+}
+
+/// Build the head plaintext `P` from a public template and a private key.
+///
+/// Inputs: template (`head_len` bytes) then key (`L` bytes). Outputs:
+/// `head_len` bytes where each `{KEY}` position takes the next key byte.
+pub fn splice_circuit(head_len: usize, key_offsets: &[usize]) -> Arc<Circuit> {
+    let key = {
+        let mut k = 0xE5u64 ^ head_len as u64;
+        for o in key_offsets {
+            k = k.wrapping_mul(2654435761) ^ (*o as u64);
+        }
+        k
+    };
+    let l = key_offsets.len();
+    cache(key, || {
+        let mut b = CircuitBuilder::new();
+        let template: Vec<_> = (0..head_len * 8).map(|_| b.add_input()).collect();
+        let keybits: Vec<_> = (0..l * 8).map(|_| b.add_input()).collect();
+        for i in 0..head_len {
+            let source = match key_offsets.iter().position(|&o| o == i) {
+                Some(j) => &keybits[j * 8..j * 8 + 8],
+                None => &template[i * 8..i * 8 + 8],
+            };
+            for bit in source {
+                let out = b.add_id_gate(*bit);
+                b.add_output(out);
+            }
+        }
+        b.build().unwrap()
+    })
+}
+
+/// GCM counter block: `out = (iv XOR seq) || counter`, where `iv` is 96 bits,
+/// `seq` 64 bits and `counter` a public 32-bit input.
+pub fn ctr_block_circuit() -> Arc<Circuit> {
+    cache(0xF6, || {
+        let mut b = CircuitBuilder::new();
+        let iv: Vec<_> = (0..96).map(|_| b.add_input()).collect();
+        let seq: Vec<_> = (0..64).map(|_| b.add_input()).collect();
+        let counter: Vec<_> = (0..32).map(|_| b.add_input()).collect();
+        // iv[0..32] unchanged
+        for bit in &iv[0..32] {
+            let out = b.add_id_gate(*bit);
+            b.add_output(out);
+        }
+        // iv[32..96] XOR seq[0..64]
+        for i in 0..64 {
+            let out = b.add_xor_gate(iv[32 + i], seq[i]);
+            b.add_output(out);
+        }
+        // counter (big-endian bytes were fed in)
+        for bit in &counter {
+            let out = b.add_id_gate(*bit);
+            b.add_output(out);
+        }
+        b.build().unwrap()
+    })
+}
+
+/// Membership of every byte in `[A-Za-z0-9_-]`, AND-reduced to one bit.
+pub fn alphabet_circuit(len: usize) -> Arc<Circuit> {
+    cache(0x17_0000_0000 ^ len as u64, || {
+        const CHARS: &[u8] = b"-_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut b = CircuitBuilder::new();
+        let data: Vec<_> = (0..len * 8).map(|_| b.add_input()).collect();
+        let mut byte_ok = Vec::with_capacity(len);
+        for byte_idx in 0..len {
+            let bits = &data[byte_idx * 8..byte_idx * 8 + 8];
+            let mut terms = Vec::with_capacity(CHARS.len());
+            for &c in CHARS {
+                // equality = AND over bits of NOT(bit XOR const_bit)
+                let mut eq_bits = Vec::with_capacity(8);
+                for i in 0..8 {
+                    let cbit = (c >> i) & 1 == 1;
+                    let x = b.add_xor_gate(bits[i], if cbit { b.get_const_one() } else { b.get_const_zero() });
+                    eq_bits.push(b.add_inv_gate(x));
+                }
+                let mut acc = eq_bits[0];
+                for bit in &eq_bits[1..] {
+                    acc = b.add_and_gate(acc, *bit);
+                }
+                terms.push(acc);
+            }
+            // OR-reduce the terms
+            let mut acc = terms[0];
+            for t in &terms[1..] {
+                let a_xor_b = b.add_xor_gate(acc, *t);
+                let a_and_b = b.add_and_gate(acc, *t);
+                acc = b.add_xor_gate(a_xor_b, a_and_b);
+            }
+            byte_ok.push(acc);
+        }
+        let mut all = byte_ok[0];
+        for t in &byte_ok[1..] {
+            all = b.add_and_gate(all, *t);
+        }
+        // Emit a whole byte so the output is a `Vector<U8>` (1 == all allowed).
+        b.add_output(all);
+        for _ in 0..7 {
+            let z = cbit(&mut b, all, false);
+            b.add_output(z);
+        }
+        b.build().unwrap()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// VM-level helpers
+// ---------------------------------------------------------------------------
+
+/// Allocate a public vector of bytes (both sides assign it).
+pub fn public_bytes<VM: Vm<Binary>>(vm: &mut VM, data: &[u8]) -> anyhow::Result<Vector<U8>> {
+    let v: Vector<U8> = vm.alloc_vec(data.len())?;
+    vm.mark_public(v)?;
+    vm.assign(v, data.to_vec())?;
+    vm.commit(v)?;
+    Ok(v)
+}
+
+/// Allocate a private (prover) / blind (verifier) vector of bytes.
+pub fn secret_bytes<VM: Vm<Binary>>(
+    vm: &mut VM,
+    role: Role,
+    len: usize,
+    data: Option<&[u8]>,
+) -> anyhow::Result<Vector<U8>> {
+    let v: Vector<U8> = vm.alloc_vec(len)?;
+    match role {
+        Role::Prover => {
+            vm.mark_private(v)?;
+            vm.assign(v, data.expect("prover must supply the witness").to_vec())?;
+            vm.commit(v)?;
+        }
+        Role::Verifier => {
+            vm.mark_blind(v)?;
+            vm.commit(v)?;
+        }
+    }
+    Ok(v)
+}
+
+/// XOR two equal-length byte vectors (linear, free).
+pub fn xor_bytes<VM: Vm<Binary>>(
+    vm: &mut VM,
+    a: &Vector<U8>,
+    b: &Vector<U8>,
+) -> anyhow::Result<Vector<U8>> {
+    assert_eq!(a.len(), b.len());
+    let circ = xor_circuit(a.len() * 8);
+    let call = Call::builder(circ)
+        .arg(a.to_raw())
+        .arg(b.to_raw())
+        .build()
+        .expect("xor input length");
+    Ok(vm.call(call)?)
+}
+
+/// XOR a vector with a constant byte string.
+pub fn xor_const<VM: Vm<Binary>>(
+    vm: &mut VM,
+    a: &Vector<U8>,
+    constant: &[u8],
+) -> anyhow::Result<Vector<U8>> {
+    let c = public_bytes(vm, constant)?;
+    xor_bytes(vm, a, &c)
+}
+
+/// Extract `len` bytes from `a` starting at byte `start`.
+pub fn select<VM: Vm<Binary>>(
+    vm: &mut VM,
+    a: &Vector<U8>,
+    start: usize,
+    len: usize,
+) -> anyhow::Result<Vector<U8>> {
+    let circ = select_circuit(a.len(), start, len);
+    let call = Call::builder(circ).arg(a.to_raw()).build().unwrap();
+    Ok(vm.call(call)?)
+}
+
+/// Concatenate byte vectors into one contiguous vector.
+pub fn concat<VM: Vm<Binary>>(vm: &mut VM, parts: &[Vector<U8>]) -> anyhow::Result<Vector<U8>> {
+    let sizes: Vec<usize> = parts.iter().map(|p| p.len()).collect();
+    let circ = concat_circuit(&sizes);
+    let mut builder = Call::builder(circ);
+    for p in parts {
+        builder = builder.arg(p.to_raw());
+    }
+    Ok(vm.call(builder.build().unwrap())?)
+}
+
+/// In-circuit AES-128 block encryption.
+pub fn aes_block<VM: Vm<Binary>>(
+    vm: &mut VM,
+    key: &Array<U8, 16>,
+    msg: &Array<U8, 16>,
+) -> anyhow::Result<Array<U8, 16>> {
+    let call = Call::builder(mpz_circuits::AES128.clone())
+        .arg(key.to_raw())
+        .arg(msg.to_raw())
+        .build()
+        .unwrap();
+    Ok(vm.call(call)?)
+}
+
+/// In-circuit HMAC-SHA256 with a 32-byte key and a public message.
+pub fn hmac_sha256<VM: Vm<Binary>>(
+    vm: &mut VM,
+    key: &Vector<U8>,
+    msg: &Vector<U8>,
+) -> anyhow::Result<Array<U8, 32>> {
+    assert_eq!(key.len(), 32);
+    let pad = Call::builder(pad_key_circuit()).arg(key.to_raw()).build().unwrap();
+    let key64: Vector<U8> = vm.call(pad)?;
+
+    let ipad = public_bytes(vm, &[0x36u8; 64])?;
+    let opad = public_bytes(vm, &[0x5cu8; 64])?;
+    let ipad_x = xor_bytes(vm, &key64, &ipad)?;
+    let opad_x = xor_bytes(vm, &key64, &opad)?;
+
+    let mut inner = Sha256::new();
+    inner.update(&ipad_x);
+    inner.update(msg);
+    let inner_digest: Array<U8, 32> = inner.finalize(vm)?;
+
+    let mut outer = Sha256::new();
+    outer.update(&opad_x);
+    outer.update(&inner_digest.into());
+    Ok(outer.finalize(vm)?)
+}
+
+/// `HKDF-Expand-Label(secret, label, context, len)` computed in-circuit.
+/// The full Expand-Label info is public; only `secret` is hidden.
+pub fn expand_label<VM: Vm<Binary>>(
+    vm: &mut VM,
+    secret: &Vector<U8>,
+    label: &str,
+    context: &[u8],
+    len: usize,
+) -> anyhow::Result<Vector<U8>> {
+    let mut info = cu_crypto::hkdf::hkdf_label(label, context, len as u16);
+    info.push(0x01); // T(1)
+    let msg = public_bytes(vm, &info)?;
+    let full = hmac_sha256(vm, secret, &msg)?;
+    if len == 32 {
+        Ok(full.into())
+    } else {
+        select(vm, &full.into(), 0, len)
+    }
+}
+
+/// Derive `(K, IV)` from a traffic secret in-circuit.
+pub fn record_keys<VM: Vm<Binary>>(
+    vm: &mut VM,
+    secret: &Vector<U8>,
+) -> anyhow::Result<(Array<U8, 16>, Array<U8, 12>)> {
+    let k = expand_label(vm, secret, "key", &[], 16)?;
+    let iv = expand_label(vm, secret, "iv", &[], 12)?;
+    Ok((
+        k.try_into().expect("16-byte AES key"),
+        iv.try_into().expect("12-byte IV"),
+    ))
+}
+
+/// Build the GCM counter block for `counter` from a 12-byte IV and 8-byte seq.
+pub fn ctr_block<VM: Vm<Binary>>(
+    vm: &mut VM,
+    iv: &Array<U8, 12>,
+    seq: u64,
+    counter: u32,
+) -> anyhow::Result<Array<U8, 16>> {
+    let seq_bytes = public_bytes(vm, &seq.to_be_bytes())?;
+    let ctr_bytes = public_bytes(vm, &counter.to_be_bytes())?;
+    let circ = ctr_block_circuit();
+    let call = Call::builder(circ)
+        .arg(iv.to_raw())
+        .arg(seq_bytes.to_raw())
+        .arg(ctr_bytes.to_raw())
+        .build()
+        .unwrap();
+    let out: Vector<U8> = vm.call(call)?;
+    Ok(out.try_into().expect("16-byte counter block"))
+}
+
+/// Decrypt `w` bytes of a record starting at inner-plaintext offset `off`,
+/// producing exactly the bytes at `[sel_start, sel_start+sel_len)`.
+///
+/// `ct_window` is the public ciphertext window `ct[off .. off+w]`.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_window<VM: Vm<Binary>>(
+    vm: &mut VM,
+    key: &Array<U8, 16>,
+    iv: &Array<U8, 12>,
+    seq: u64,
+    ct_window: &Vector<U8>,
+    off: usize,
+    w: usize,
+    sel_start: usize,
+    sel_len: usize,
+) -> anyhow::Result<Vector<U8>> {
+    assert_eq!(ct_window.len(), w);
+    let block_start = off / 16;
+    let prefix = off % 16;
+    let nblocks = (prefix + w).div_ceil(16);
+
+    let mut ks_blocks: Vec<Vector<U8>> = Vec::with_capacity(nblocks);
+    for j in 1..=nblocks {
+        // J0 has counter field 1; keystream block `j` has counter `block_start + j + 1`.
+        let ctr = ctr_block(vm, iv, seq, (block_start + j + 1) as u32)?;
+        let ks = aes_block(vm, key, &ctr)?;
+        ks_blocks.push(ks.into());
+    }
+    let ks_all = concat(vm, &ks_blocks)?;
+    let ks_used = select(vm, &ks_all, prefix, w)?;
+    let pt = xor_bytes(vm, ct_window, &ks_used)?;
+    select(vm, &pt, sel_start, sel_len)
+}
+
+/// Decrypt a whole record from inner-plaintext offset 0 and return its content
+/// (the inner plaintext minus the trailing content-type byte).
+pub fn decrypt_record_content<VM: Vm<Binary>>(
+    vm: &mut VM,
+    key: &Array<U8, 16>,
+    iv: &Array<U8, 12>,
+    seq: u64,
+    ct: &Vector<U8>,
+) -> anyhow::Result<Vector<U8>> {
+    let nblocks = ct.len().div_ceil(16);
+    let mut ks_blocks: Vec<Vector<U8>> = Vec::with_capacity(nblocks);
+    for j in 1..=nblocks {
+        // keystream block `j` has counter field `j + 1`.
+        let ctr = ctr_block(vm, iv, seq, (j + 1) as u32)?;
+        ks_blocks.push(aes_block(vm, key, &ctr)?.into());
+    }
+    let ks_all = concat(vm, &ks_blocks)?;
+    let ks_used = select(vm, &ks_all, 0, ct.len())?;
+    let pt = xor_bytes(vm, ct, &ks_used)?;
+    select(vm, &pt, 0, ct.len() - 1)
+}
+
+/// Slice a `Vector<U8>` into a raw `Slice` view (helper for callers).
+pub fn raw(v: &Vector<U8>) -> Slice {
+    v.to_raw()
+}

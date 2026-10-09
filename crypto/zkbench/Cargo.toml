@@ -1,0 +1,34 @@
+[package]
+name = "zkbench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cu-crypto = { path = "../cu-crypto" }
+mpz-circuits = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141", features = ["aes"] }
+mpz-common = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-core = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-memory-core = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-vm-core = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-ot = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141", features = ["ideal"] }
+mpz-zk = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-hash = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141", default-features = false, features = ["sha256"] }
+futures = "0.3"
+tokio = { version = "1.38", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+rand = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+aes = "0.8"
+hex = "0.4"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+itybity = "0.2"
+
+[features]
+rayon = ["mpz-zk/rayon"]
+
+[profile.release]
+debug = false

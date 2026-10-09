@@ -1,0 +1,16 @@
+# The three routstr repos are checked out here for development; they are
+# published as their own branches/PRs (see README.md).
+/routstr-core/
+/routstr-sdk/
+/routstrd/
+
+# Original research notes and third-party reports: kept local.
+/docs/original/
+
+# Paper build leftovers
+/paper/build.log
+/paper/*.bak.md
+/paper/p6-06.png
+/paper/p7-07.png
+
+.DS_Store
