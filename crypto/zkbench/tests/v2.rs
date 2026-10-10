@@ -123,7 +123,8 @@ async fn suffix_mismatch_gives_zero_bit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c2s_verifier_moved_window_reveals_no_plaintext() {
-    let (params, witness) = fixtures::pi_c2s();
+    // 400 private 'x' bytes before the suffix; the verifier moves onto them.
+    let (params, witness) = fixtures::pi_c2s_after(400);
     let Params::PiC2S(mut p) = params else { unreachable!() };
     p.sel_start = 0;
     let res = run_pair_ideal(&Params::PiC2S(p), &witness).await;

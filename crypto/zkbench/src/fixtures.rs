@@ -60,6 +60,10 @@ pub fn pi_c1() -> (Params, Witness) {
     )
 }
 
+/// The pinned suffix in production shape (the sidecar's `canonical_suffix`
+/// for this model and max_tokens = 12): the statement size of π_C2/π_C2S.
+pub const SUFFIX: &[u8] = b",\"model\":\"mistral-small-3-2-24b-instruct\",\"max_tokens\":12,\"max_completion_tokens\":12,\"n\":1,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"venice_parameters\":{\"include_venice_system_prompt\":false,\"enable_web_search\":\"off\"}}";
+
 fn window_params(key: [u8; 16], iv: [u8; 12], seq: u64, inner: &[u8], target: &[u8]) -> PiC2 {
     let stream = aesgcm::ctr_keystream(&key, &iv, seq, inner.len());
     let ct = xor(inner, &stream);
@@ -80,13 +84,19 @@ fn window_params(key: [u8; 16], iv: [u8; 12], seq: u64, inner: &[u8], target: &[
     }
 }
 
-/// π_C2: the pinned suffix on the last epoch-2 record.
+/// π_C2: the pinned suffix as the last epoch-2 record (the client sends it as
+/// a record of its own).
 pub fn pi_c2() -> (Params, Witness) {
+    pi_c2_after(0)
+}
+
+/// π_C2 on a record that carries `prefix` private bytes ('x') before the suffix.
+pub fn pi_c2_after(prefix: usize) -> (Params, Witness) {
     let ks = ks();
     let k2 = ks.c_ap_2.key();
     let iv2 = ks.c_ap_2.iv();
-    let suffix = b",\"model\":\"mistral-small-3-2-24b-instruct\",\"max_tokens\":12,\"n\":1,\"stream\":true}".to_vec();
-    let mut inner = vec![b'x'; 400];
+    let suffix = SUFFIX.to_vec();
+    let mut inner = vec![b'x'; prefix];
     inner.extend_from_slice(&suffix);
     inner.push(0x17);
     let p = window_params(k2, iv2, 7, &inner, &suffix);
@@ -209,12 +219,18 @@ pub fn v2_secrets() -> V2Secrets {
     }
 }
 
-/// π_C2S: the pinned suffix on the final epoch-1 body record (seq 3).
+/// π_C2S: the pinned suffix as the final epoch-1 body record (seq 3; the
+/// client sends it as a record of its own).
 pub fn pi_c2s() -> (Params, Witness) {
+    pi_c2s_after(0)
+}
+
+/// π_C2S on a record that carries `prefix` private bytes ('x') before the suffix.
+pub fn pi_c2s_after(prefix: usize) -> (Params, Witness) {
     let v = v2_secrets();
     let secret = cu_crypto::keyschedule::Secret::new(v.c_ap_1);
-    let suffix = b",\"model\":\"mistral-small-3-2-24b-instruct\",\"max_tokens\":12,\"n\":1,\"stream\":true}".to_vec();
-    let mut inner = vec![b'x'; 400];
+    let suffix = SUFFIX.to_vec();
+    let mut inner = vec![b'x'; prefix];
     inner.extend_from_slice(&suffix);
     inner.push(0x17);
     let w = window_params(secret.key(), secret.iv(), 3, &inner, &suffix);

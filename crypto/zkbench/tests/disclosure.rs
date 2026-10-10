@@ -24,7 +24,7 @@ async fn honest_suffix_and_usage_prove_with_one_bit() {
 async fn verifier_chosen_window_reveals_no_plaintext() {
     // The record is 400 × 'x' then the suffix. A malicious verifier moves the
     // window onto the private 'x' bytes while keeping the expected suffix.
-    let (params, witness) = fixtures::pi_c2();
+    let (params, witness) = fixtures::pi_c2_after(400);
     let Params::PiC2(mut p) = params else { unreachable!() };
     p.sel_start = 0;
     let res = run_pair_ideal(&Params::PiC2(p), &witness).await;
