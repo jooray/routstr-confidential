@@ -1,15 +1,6 @@
 {
   "upstream_host": "api.venice.ai",
-  "price_list": {
-    "qwen3-235b-a22b-thinking-2507": { "in": 0.0, "cached_in": 0.0, "out": 0.0 },
-    "hermes-3-llama-3.1-405b": { "in": 0.0, "cached_in": 0.0, "out": 0.0 },
-    "deepseek-v4-pro": { "in": 0.0, "cached_in": 0.0, "out": 0.0 },
-    "deepseek-v4-flash": { "in": 0.0, "cached_in": 0.0, "out": 0.0 },
-    "deepseek-v4-flash-0731": { "in": 0.0, "cached_in": 0.0, "out": 0.0 },
-    "deepseek-v3.2": { "in": 0.0, "cached_in": 0.0, "out": 0.0 },
-    "deepseek-v4-pro-0813": { "in": 0.0, "cached_in": 0.0, "out": 0.0 },
-    "mercury-2": { "in": 0.0, "cached_in": 0.0, "out": 0.0 }
-  },
+  "price_list": {},
   "head_template": "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
   "key_alphabet": "[A-Za-z0-9_-]",
   "key_length": 42,
@@ -24,14 +15,5 @@
   ],
   "max_tokens_cap": 4096,
   "notary_pubkey": "",
-  "text_only_ok": {
-    "qwen3-235b-a22b-thinking-2507": true,
-    "hermes-3-llama-3.1-405b": true,
-    "deepseek-v4-pro": true,
-    "deepseek-v4-flash": true,
-    "deepseek-v4-flash-0731": true,
-    "deepseek-v3.2": true,
-    "deepseek-v4-pro-0813": true,
-    "mercury-2": true
-  }
+  "text_only_ok": {}
 }

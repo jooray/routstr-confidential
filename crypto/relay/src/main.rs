@@ -66,7 +66,8 @@ struct Offer {
     max_tokens_cap: u64,
     #[serde(default)]
     notary_pubkey: String,
-    /// Per-model modality gate (GAP-3). Escrow prices the prompt as
+    /// Optional model allowlist (empty = every model the node prices). It
+    /// was the modality gate (GAP-3) when escrow priced the prompt as
     /// `prompt_tokens <= LEN` (SPEC §5.1), which an accepted `image_url` part
     /// breaks: the attacker picks the image, so its token cost is not bounded
     /// by body bytes (probe: one ~50-byte URL cost 554 → 2050 tokens on a
@@ -74,7 +75,9 @@ struct Offer {
     /// multimodal parts; `text_only_ok[model] == true` marks such a model.
     /// When the map is non-empty the sidecar refuses any setup for a model not
     /// explicitly marked true, so the confidential path cannot be priced this
-    /// way even if the node's own model list is broader.
+    /// way even if the node's own model list is broader. The node now reserves
+    /// a full-context prompt, which bounds image parts too, so the shipped
+    /// offer leaves the map empty.
     #[serde(default)]
     text_only_ok: HashMap<String, bool>,
 }

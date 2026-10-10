@@ -148,11 +148,14 @@ Check yours before offering it:
 
 ```sh
 crypto/tools/provider-profile-check.py --help    # run it against your provider; it must pass every item
-crypto/tools/regression-modality.py --help       # models must reject image inputs
 ```
 
-The sidecar ships with an offer for Venice (`crypto/relay/offer.venice.json`: host, request-head template and
-the models offered confidentially); adapt it for another OpenAI-compatible provider.
+The sidecar ships with an offer for Venice (`crypto/relay/offer.venice.json`: host, request-head template,
+pinned suffix keys); adapt it for another OpenAI-compatible provider. **Models and prices come from the
+node:** every model the node serves through the sidecar's provider host is offered confidentially, at the
+node's normal rates (plus any surcharge). The node reserves a full-context prompt, so image inputs need no
+separate gate. To restrict the list, put model ids in the offer's `text_only_ok` map (`{"id": true, …}`):
+a non-empty map is an allowlist, enforced by the sidecar and the node.
 
 **1. The sidecar** (container build, from the `twopc-v2` checkout):
 

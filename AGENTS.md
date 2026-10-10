@@ -138,7 +138,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun ≥ 1.4 and se
 **Checks.**
 - `crypto/tools/provider-profile-check.py`: the provider assumptions A1–A11,
   live (11/11); `--self-test` proves the negative controls.
-- `crypto/tools/regression-modality.py`: image/data-URI rejection per model.
+- `crypto/tools/regression-modality.py`: image/data-URI rejection per model (only needed for an allowlist in `text_only_ok`; the shipped offer leaves it empty, since the node reserves a full-context prompt).
 - `crypto/tools/adversarial-model-swap.sh` (with `AUTH=… CU_NODE=…
   NODE_LOG=routstr-core/logs/app_<date>.log` on a dedicated node): the
   model/cap swap attacks plus an honest control, as a gate (exit ≠ 0 on any
