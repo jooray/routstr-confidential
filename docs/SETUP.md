@@ -1,0 +1,156 @@
+# Trying confidential mode
+
+Confidential mode lets a Routstr node serve your LLM request without seeing the prompt or the answer, and
+(protocol v2) without you ever being able to recover the node's provider API key. How it works:
+[`paper/paper.pdf`](../paper/paper.pdf); trade-offs between v1 and v2: [`V1-V2-ONE-PAGER.pdf`](V1-V2-ONE-PAGER.pdf).
+
+This is **experimental**: the code lives on branches, not in Routstr releases yet, and the two-party
+computation is not externally reviewed. Use small amounts.
+
+| Repo | Branch | What |
+|---|---|---|
+| [jooray/routstr-confidential](https://github.com/jooray/routstr-confidential/tree/twopc-v2) | `twopc-v2` | provers (`cu-prover`, `cu-2pc`), the node's sidecar (`cu-sidecar`), paper |
+| [jooray/routstr-sdk](https://github.com/jooray/routstr-sdk/tree/confidential-2pc) | `confidential-2pc` | the client transport |
+| [jooray/routstrd](https://github.com/jooray/routstrd/tree/confidential-upstream) | `confidential-upstream` | the daemon (opt-in header, config) |
+| [jooray/routstr-core](https://github.com/jooray/routstr-core/tree/confidential-2pc) | `confidential-2pc` | the node |
+
+You need: git, Rust (stable), Bun ≥ 1.4, Node.js/npm (to build the SDK).
+
+## 1. Client only (use an existing node)
+
+If you only want to try it as a user, you need routstrd and the two prover binaries. You then need a node
+that runs confidential mode; for example **https://routstr.cypherpunk.today** runs protocol v2 with Venice as
+the provider (it is announced on Nostr, so routstrd finds it).
+
+**Build the provers.**
+
+```sh
+git clone -b twopc-v2 https://github.com/jooray/routstr-confidential
+cd routstr-confidential/crypto
+cargo build --release -p zkbench --bin cu-prover -p twopc --bin cu-2pc
+# binaries: crypto/zkbench/target/release/{cu-prover,cu-2pc} (keep them in one directory)
+cd ../..
+```
+
+**Build the SDK branch and routstrd against it.**
+
+```sh
+git clone -b confidential-2pc https://github.com/jooray/routstr-sdk
+(cd routstr-sdk && npm install && npm run build)
+
+git clone -b confidential-upstream https://github.com/jooray/routstrd
+cd routstrd
+bun install
+# use the SDK branch instead of the npm release
+rm -rf node_modules/@routstr/sdk && ln -s "$PWD/../routstr-sdk" node_modules/@routstr/sdk
+bun link            # puts `routstrd` on your PATH
+```
+
+**Configure.** Set up and fund routstrd as usual (`routstrd onboard`, then `routstrd receive <cashu token>`
+or `routstrd receive <sats>` for Lightning). Then add to `~/.routstrd/config.json`:
+
+```json
+{
+  "confidentialUpstream": {
+    "enabled": true,
+    "trusted_hosts": ["api.venice.ai"],
+    "node_pubkeys": ["<the node's Nostr pubkey, hex or npub>"],
+    "prover_path": "/absolute/path/to/crypto/zkbench/target/release/cu-prover"
+  }
+}
+```
+
+- `trusted_hosts`: the provider hostnames whose TLS certificate you accept. This is what you trust instead of
+  an enclave: your client checks the provider's certificate itself.
+- `node_pubkeys`: nodes whose signed offers you accept (for routstr.cypherpunk.today:
+  `2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7`).
+- `cu-2pc` is found next to `cu-prover` (or set `CU_2PC`).
+
+**Use it.** Start the daemon (`routstrd start`, optionally `--provider https://<node>` to pin one node) and
+send chat completions with the opt-in header:
+
+```sh
+curl http://127.0.0.1:8008/v1/chat/completions \
+  -H 'content-type: application/json' -H 'x-routstr-verify: confidential' \
+  -d '{"model":"deepseek-v4-flash","max_tokens":200,"stream":true,
+       "messages":[{"role":"user","content":"Say hi in three words."}]}'
+```
+
+Any OpenAI-compatible client works if it can add that header (OpenAI Python:
+`default_headers={"x-routstr-verify": "confidential"}`). With the header, a request is either confidential or
+refused: it is never silently sent in the clear. Only `POST /v1/chat/completions` is supported, `max_tokens`
+is required (it is pinned and reserved for), and only models the node lists in its confidential offer are
+used (`GET https://<node>/v1/confidential/offer`).
+
+What to expect: each request first runs a two-party computation with the node (about 21 MB in each
+direction, under a second on a fast connection, several seconds on a slow uplink), then the TLS session and
+proofs. The answer streams as usual. The node's signed receipt is checked against the usage the provider
+reported; a failed check fails the request.
+
+## 2. Running a node
+
+A confidential node is a normal Routstr node plus `cu-sidecar`, a small Rust service that relays the TLS
+connection to the provider, writes the one record carrying the API key, and verifies the proofs. Billing uses
+the node's normal reservation and settlement.
+
+**Provider requirements.** Confidential mode needs a provider whose API behaves predictably (it waits for the
+full request body, applies the last duplicate JSON key, enforces token caps, reports usage in the stream).
+Check yours before offering it:
+
+```sh
+crypto/tools/provider-profile-check.py --help    # run it against your provider; it must pass every item
+crypto/tools/regression-modality.py --help       # models must reject image inputs
+```
+
+The sidecar ships with an offer for Venice (`crypto/relay/offer.venice.json`: host, request-head template and
+the models offered confidentially); adapt it for another OpenAI-compatible provider.
+
+**1. The sidecar** (container build, from the `twopc-v2` checkout):
+
+```sh
+podman build -f crypto/Containerfile.sidecar -t cu-sidecar crypto   # or docker
+```
+
+Run it in the same container network as the node, with no published port. It needs the provider API key
+(the same one the node uses):
+
+```sh
+podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=... cu-sidecar \
+  --listen 0.0.0.0:7444 --upstream api.venice.ai:443 --key-env UPSTREAM_API_KEY \
+  --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
+```
+
+`--protocol 2` selects the two-party handshake (`1` is the single-party variant). Limits: `--max-sessions`
+(32) and `--max-body` (8 MiB); sessions time out after 600 s.
+
+**2. The node**: build routstr-core from the `confidential-2pc` branch (its `Dockerfile` is the upstream one)
+and set
+
+```sh
+CONFIDENTIAL_SIDECAR_URL=http://cu-sidecar:7444
+```
+
+routstr-core persists settings in its database: if the node has run before, set it once through
+`PATCH /admin/api/settings` as well. The node then serves `GET /v1/confidential/offer` (signed with its Nostr
+key) and marks the offered models in `/v1/models` with `confidential_upstream`. Its reverse proxy must pass
+WebSockets for `/v1/confidential/ws` and `/v1/confidential/zk` (`Upgrade`/`Connection` headers, read timeout
+of a few minutes).
+
+**3. Check it.**
+
+```sh
+curl -s https://<node>/v1/confidential/offer | jq '{v, upstream_host, models: (.price_list|keys)}'
+```
+
+`v` must be `2`. Then run one request through routstrd as in section 1. On the node, each session logs the
+2PC, `credential record + KeyUpdate written to upstream (epoch 0)`, the three proofs and the settlement.
+
+**Bandwidth.** Each confidential request costs the node about 23 MB of upload (the two-party computation's
+garbled circuits cannot be reused), so budget roughly 0.3 Gbit/s at 100 requests per minute. Normal
+(non-confidential) requests are unaffected.
+
+## Reference client
+
+`crypto/client/src/driver.ts` is a self-contained client that runs one session against a node and prints every
+check (`node --experimental-strip-types src/driver.ts --node https://<node> --model <m> --max-tokens 40
+--auth <sk-… or cashu…>`); see `AGENTS.md` for running the whole stack locally.
