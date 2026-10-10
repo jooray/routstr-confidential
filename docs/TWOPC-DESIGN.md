@@ -19,8 +19,8 @@ C and N run the handshake key schedule jointly so that:
 | s_ap_0 (server→client, the response) | yes | **never** (P2) |
 | c_ap_1 (client body epoch) | yes | **never** (P2) |
 | K_0, IV_0 (c_ap_0's AES key/IV) | **never** (P1) | yes |
-| h1 = SHA256(c_ap_1), h2 = SHA256(s_ap_0) | yes | yes (public anchors for π_C2/π_C3) |
-| hk = SHA256(K_0 ‖ IV_0) | yes | yes (public anchor for π_N) |
+| h1 = SHA256(c_ap_1), h2 = SHA256(s_ap_0) | yes | yes (public anchors for π_C2S/π_C3S) |
+| hk = SHA256(K_0 ‖ IV_0) | yes | yes (public anchor for π_NK) |
 
 All of c_hs, s_hs, s_ap_0, c_ap_1, K_0, IV_0 are one-way HKDF-Expand-Label outputs (RFC 8446 §7.1), so knowing
 any subset above never yields a secret in the other party's column.
@@ -31,7 +31,7 @@ any subset above never yields a secret in the other party's column.
 |---|---|---|---|
 | Handshake | c_hs / s_hs | C | ClientHello, client Finished (computed by C from c_hs) |
 | 0 | c_ap_0 (K_0, IV_0) | **N** | seq 0: the credential record (head with `Authorization`); seq 1: `KeyUpdate(update_not_requested)` |
-| 1 | c_ap_1 | C | the JSON body; its final record is the suffix, held by N until π_C2 |
+| 1 | c_ap_1 | C | the JSON body; its final record is the suffix, held by N until π_C2S |
 | Response | s_ap_0 | U | streamed response |
 
 C sends nothing in epoch 0. There is no π_C1 and no KU0/KU1 from C.
@@ -63,14 +63,19 @@ C sends nothing in epoch 0. There is no π_C1 and no KU0/KU1 from C.
 8. **Phase B (N garbles, C evaluates).** Inputs MS shares, th_SF. Computes c_ap_0, s_ap_0, c_ap_1, K_0, IV_0,
    h1, h2, hk. Outputs to C: s_ap_0, c_ap_1 (masked with C's mask); to N: K_0, IV_0 (masked with N's mask);
    public: h1, h2, hk. Same check and report as phase A.
-9. **π_N (N→C):** knowledge of K_0, IV_0 with SHA256(K_0‖IV_0) = hk, and the head record's ciphertext
-   CTR-decrypts (seq 0) to the published template with key positions in the alphabet. N then writes the
-   credential record (seq 0) and the KeyUpdate (seq 1) under K_0 after C's Finished.
-10. **Body** under c_ap_1 from seq 0; final record = suffix, held until **π_C2**: witness c_ap_1,
+9. **π_NK (N→C):** knowledge of K_0, IV_0 with SHA256(K_0‖IV_0) = hk, and the head record's ciphertext
+   CTR-decrypts (seq 0) to the published template with key positions in the alphabet. N holds C's records
+   after the client Finished until C has verified π_NK and sent `release_head`; N then writes the
+   credential record (seq 0) and the KeyUpdate (seq 1) under K_0 in one write.
+10. **Body** under c_ap_1 from seq 0; final record = suffix, held until **π_C2S**: witness c_ap_1,
     public h1; derive K_1, IV_1; decrypt the window; one-bit equality with the suffix.
-11. **Response** under s_ap_0; **π_C3**: witness s_ap_0, public h2; otherwise as v1 (records from the end,
-    `skip`, one-bit equality).
-12. Settlement, receipt: unchanged.
+11. **Response** under s_ap_0; **π_C3S**: witness s_ap_0, public h2; otherwise as v1's π_C3 (records from
+    the end, `skip`, one-bit equality).
+12. Attestation, settlement and receipt as in v1. When U closes the connection, N's relay signs (with a
+    per-process Ed25519 key) an attestation binding the sid, the certificate-chain hash, both handshake
+    transcript hashes, the record count and the SHA-256 of all bytes in each direction, `c_commit` (a
+    hash of the credential record as written) and the time; the node re-signs it with its Nostr key, and
+    C checks that signature and that the sid and transcript hashes are its own.
 
 ## Security model of the 2PC
 

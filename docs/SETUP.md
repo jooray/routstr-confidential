@@ -14,7 +14,7 @@ computation is not externally reviewed. Use small amounts.
 | [jooray/routstrd](https://github.com/jooray/routstrd/tree/confidential-upstream) | `confidential-upstream` | the daemon (opt-in header, config) |
 | [jooray/routstr-core](https://github.com/jooray/routstr-core/tree/confidential-2pc) | `confidential-2pc` | the node |
 
-You need: git, Rust (stable), Bun ≥ 1.4, Node.js/npm (to build the SDK).
+You need: git, Rust (stable), Bun (≥ 1.4 only for protocol v1 sessions, whose handshake uses WebCrypto X25519), Node.js/npm (to build the SDK).
 
 ## 1. Client only (use an existing node)
 
@@ -97,8 +97,10 @@ usage the provider reported; a failed check fails the request.
 **Pre-warming** is on by default and driven by your traffic. After a confidential request for a node,
 model and `max_tokens`, routstrd arms a session in the background (setup, reservation, the two-party
 preprocessing; no connection to the provider yet), so the next matching request skips the preprocessing.
-It keeps one armed session while requests keep coming, two on bursts or overlapping requests, and closes
-them a few minutes after the last request: an idle routstrd keeps nothing open and nothing reserved. Each
+It keeps one armed session while requests keep coming, two once a key has seen 3 requests in 5 minutes, and
+at least as many as its requests have overlapped (at most 6 per key and 6 in total). It retires an armed
+session 480 s after its setup and closes a key's sessions once it has had no request for 10 minutes: an idle
+routstrd keeps nothing open and nothing reserved. Each
 armed session reserves funds on your node credential until it is used or closed (released, no charge unless the node has an abandon fee, below),
 and costs about 22 MB of download and 1.2 MB of upload to prepare. Tune or disable it in `config.json`:
 
@@ -177,7 +179,8 @@ podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=...
 
 **Denial-of-service limit.** The node refuses a new confidential session (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
-unused sessions: set up but with no credential record written yet. Pre-warmed sessions count. The limit is
+unused sessions. A session counts as unused from the moment the node accepts its WebSocket, before the setup
+frame arrives, until the credential record is written (or the session ends). Pre-warmed sessions count. The limit is
 only as good as the node's idea of the client address, which depends on how the node is reached:
 
 | Deployment | What to set | Result |
@@ -215,7 +218,9 @@ node; the session fee and the surcharge price the work of a request that is used
 `routstr-core/docs/confidential-upstream.md` for the exact rules.
 
 `--protocol 2` selects the two-party handshake (`1` is the single-party variant). Limits: `--max-sessions`
-(32) and `--max-body` (8 MiB); sessions time out after 600 s. Client bytes held before the credential
+(32) and `--max-body` (8 MiB). The sidecar gives an armed session 600 s from its setup to send the
+ClientHello and then a fresh 600 s; the node ends every session 600 s after accepting its WebSocket, so in
+practice the node's limit is the one that applies. Client bytes held before the credential
 record is written are capped at about the declared body length, and a client cannot raise the proof
 channel's preallocation above the sidecar's own.
 

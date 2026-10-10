@@ -443,8 +443,11 @@ per-1k rates of the frozen offer and $m$ the node's minimum charge. For the case
 
 U's response streams under $s_{ap,0}$; C decrypts it and verifies every GCM tag natively (P3 for the
 response) and streams tokens to the application live. At close, N signs a **session attestation**
-binding the session id, the certificate chain hash, the handshake transcript hash, directional
-ciphertext hashes, record boundaries and time.
+binding the session id, the certificate chain hash, the two handshake transcript hashes (through
+ServerHello and through the server Finished), the record counts in each direction, the SHA-256 of all bytes sent to U and of all bytes received
+from it, the commitment to the credential record ($c_{commit}$) and the time. N's relay signs it with a
+per-process Ed25519 key and N signs it again with its Nostr key; C checks N's signature and that the
+session id and both transcript hashes are its own.
 
 C then discloses R: the plaintext from the boundary of the last usage-bearing data event through the
 stream terminator, with its chunk framing, anchored at the end of the transcript N relayed.
@@ -468,7 +471,8 @@ Confidential sessions use the node's ordinary billing; nothing about money is sp
 
 1. **Setup.** C authenticates with the credential it already uses for normal requests, either an API
    key or a one-off e-cash token that the node turns into one, and names the offer it verified by its
-   signature. N keeps the offers it signed in the last ten minutes and freezes that offer's per-model
+   signature. N keeps an offer it signed for ten minutes after it last served it (at most 512 offers)
+   and freezes that offer's per-model
    rates for the session; an unknown or expired offer is refused (HTTP 409) and C refetches it. N
    reserves on the credential (section 4.6) before any connection to U is opened.
 2. **Charge.** N's relay parses R (dechunk, take the usage event and the terminal marker) and requires
@@ -621,12 +625,14 @@ salt are fresh per session.
    exposure; compared with "ciphertext only", it is more than volume and timing. The prompt side can
    be padded inside the JSON body; the response side needs provider-side padding or batching.
 6. *DoS and limits.* The node and its relay validate the setup and reserve before opening any connection
-   to U, bound concurrent sessions (32), the time to setup (15 s), the session lifetime (600 s), the 2PC
+   to U, bound concurrent sessions (32), the time to setup (15 s), the session lifetime (600 s from the
+   node's WebSocket accept), the 2PC
    (180 s) and the body (8 MiB); before the credential record is written the relay buffers no more of
    C's bytes than the declared body needs, and C cannot make N preallocate more proof-channel
    correlations than N asks for itself. The 2PC's preprocessing makes a session expensive for N (about 22 MB of
    upload and 0.5 s of CPU each), which a reservation per session limits, but per-client limits must also
-   bound it; the node refuses new sessions from a client address with twelve unused ones.
+   bound it; the node refuses new sessions from a client address with twelve unused ones (connected but
+   with no credential record written yet).
 7. *Error metadata.* On an upstream error N learns the status line, the response headers and the body
    length, but not the body.
 8. *Endpoint hygiene.* Keys live in C's process; N holds the API key in memory. C's certificate
@@ -753,10 +759,12 @@ $\pi_{NK}$, the credential record and KeyUpdate, the body and $\pi_{C2S}$. An ar
 reservation until it is claimed or discarded (released at no charge), and its body length is fixed at
 arming: the client pads a shorter body with JSON whitespace between the private part and the suffix,
 choosing the length from recent bodies (power-of-two buckets). The client daemon arms only while it sees
-traffic: after a confidential request for a given node, model and token cap it keeps one armed session
-(two on bursts or overlapping requests, at most three per key and four in total), retires sessions
-before the node's session limit, and closes them a few minutes after the last request, so an idle client
-holds nothing. (The reference client's `--arm` mode, used for the local benchmarks, arms further,
+traffic: after a confidential request for a given node, model and token cap it keeps one armed session,
+two once that key has seen three requests in five minutes, and at least as many as the largest number of
+its requests that overlapped (at most six per key and six in total, and six in total for nodes that
+charge an abandon fee). It retires an armed session 480 s after its setup, before the node's session
+limit, and closes a key's sessions once it has had no request for ten minutes, so an idle client holds
+nothing. (The reference client's `--arm` mode, used for the local benchmarks, arms further,
 through the handshake and $\pi_{NK}$.)
 
 The proofs' own setup is pre-warmed too. Each proof needs OT/VOLE correlations (Chou-Orlandi base OT,
@@ -982,10 +990,12 @@ being used. We therefore layer several limits, from free and always on to priced
    it contacts the relay; the relay validates the setup before it starts the 2PC. A client without funds
    gets no garbled circuit.
 3. **Global and per-address caps.** N serves at most a fixed number of concurrent sessions (32 by
-   default), each limited to 600 s, with 15 s to send its setup. It also refuses a new session from a
-   client address that already holds a set number of unused sessions, that is, set up but with no
-   credential record written yet (12 by default; HTTP 429). The address is the TCP peer, or, only for
-   peers configured as trusted reverse proxies, the rightmost `X-Forwarded-For` entry; a client cannot
+   default), each limited to 600 s from the node's WebSocket accept, with 15 s to send its setup. (The
+   relay has its own 600 s limits, one for an armed session to send its ClientHello and a fresh one
+   after it, so in practice the node's limit is the one that ends a session.) N also refuses a new session
+   from a client address that already holds a set number of unused sessions, counted from the WebSocket
+   accept, before the setup arrives, until the credential record is written (12 by default; HTTP 429).
+   The address is the TCP peer, or, only for peers configured as trusted reverse proxies, the rightmost `X-Forwarded-For` entry; a client cannot
    name its own address. Clients behind one address, such as all Tor users of an onion service, share
    the limit.
 4. **Fees in the signed offer (section 4.8).** A session fee $f_s$ on completed requests, an abandon fee
@@ -997,7 +1007,8 @@ being used. We therefore layer several limits, from free and always on to priced
 5. **Client-side restraint.** The client daemon arms sessions only while it sees confidential traffic,
    keeps a bounded number of armed sessions for a node that charges an abandon fee (six by default, sized
    for parallel coding agents), arms only if that fee is
-   below a configured limit (5 sats by default), and closes armed sessions after a few idle minutes; it
+   below a configured limit (5 sats by default), retires an armed session 480 s after its setup, and
+   closes a key's armed sessions once it has had no request for ten minutes; it
    logs every abandon fee it pays.
 
 **How the deployed node is set up.** The case-study node charges no session fee and no surcharge, and an

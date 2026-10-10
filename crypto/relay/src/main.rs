@@ -3,9 +3,19 @@
 //! One WebSocket per session carries the control channel and the relayed TLS
 //! records; a second WebSocket per proof carries the mpz VOLE protocol.
 //!
-//! Security-critical ordering (SPEC §5, PLAN §3):
+//! Security-critical ordering, protocol v1 (`--protocol 1`; SPEC §5, PLAN §3):
 //!   HANDSHAKE → KU0 → HS_VERIFIED → PI_C1_VERIFIED → C_COMMIT → PI_N_VERIFIED
 //!   → [credential record ‖ KU1] (atomic) → BODY → CLOSE_NOTIFY → ATTESTED → SETTLED.
+//!
+//! Protocol v2 (`--protocol 2`; docs/TWOPC-DESIGN.md):
+//!   SETUP → 2PC preprocessing → joint key share (armed; no provider
+//!   connection, up to 600 s) → ClientHello (exactly the joint P-256 share;
+//!   the upstream is dialed now; fresh 600 s deadline) → 2PC handshake and
+//!   application phases → AWAIT_HEAD (client records held) → HS_VERIFIED →
+//!   credential record assembled under K_0, π_NK params → π_NK verified by
+//!   the client → RELEASE_HEAD → [credential record ‖ KeyUpdate] (atomic,
+//!   epoch 0) → BODY (final suffix record held until π_C2S verifies)
+//!   → CLOSE → ATTESTED → π_C3S → SETTLED.
 //!
 //! The API key lives only in memory, is never logged (only its length), and
 //! appears only inside the single credential record written to the upstream.

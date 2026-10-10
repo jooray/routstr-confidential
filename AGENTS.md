@@ -65,34 +65,52 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
                                                          Venice (api.venice.ai)
 ```
 
-**One session.**
+**One session (protocol v2, the deployed default).**
 1. *Setup.* The client sends its ordinary node credential (`sk-` key or Cashu
    token) in `setup.auth` and the signature of the offer it verified in
    `setup.offer_sig`. The node validates the setup and the credential
    (`validate_bearer_key`), freezes that offer's rates, reserves a full-context
    prompt plus the pinned `max_tokens` (`pay_for_request`), and only then
-   dials the sidecar and forwards the setup *without* the credential. The
-   sidecar opens no provider connection before a valid setup.
-2. *Handshake.* The client does the TLS handshake with Venice through the relay
-   and discloses only the handshake traffic secrets. The sidecar verifies the
-   certificate chain, hostname, CertificateVerify and both Finished messages.
-3. *Credential record.* KeyUpdate. π_C1 proves the one-shot record material.
-   The sidecar writes the head record with the API key; π_N proves to the
-   client that it matches the published template. Then KU1.
-4. *Body.* The client sends the body, with the pinned JSON suffix (model, caps,
-   …) as its own final record. **The sidecar holds that record until π_C2
-   proves it is the canonical suffix**, so Venice cannot start on anything
-   else.
-5. *Response.* It streams back; the client decrypts and verifies it.
-6. *Settlement.* π_C3 proves the disclosed usage event (or, for an upstream
+   dials the sidecar and forwards the setup *without* the credential.
+2. *Preprocessing and key share.* The node garbles the key-schedule circuits
+   and streams them to the client (`cu-2pc`); both run the joint P-256 key
+   share. A pre-warmed ("armed") session stops here and waits for a request.
+   The sidecar has no provider connection yet.
+3. *Handshake.* The client's ClientHello must carry exactly the joint share;
+   the sidecar dials Venice only now. The two parties run the key schedule
+   jointly: the client gets the handshake secrets, `s_ap_0` and `c_ap_1`, the
+   node gets only `K_0, IV_0`. The sidecar verifies the certificate chain,
+   hostname, CertificateVerify and both Finished messages.
+4. *Credential record.* The sidecar builds the head record with the API key
+   under `K_0`; π_NK proves to the client that it matches the published
+   template. On the client's `release_head` the sidecar writes it and a
+   KeyUpdate (epoch 0) in one write.
+5. *Body.* The client sends the body under `c_ap_1`, with the pinned JSON
+   suffix (model, caps, …) as its own final record. **The sidecar holds that
+   record until π_C2S proves it is the canonical suffix**, so Venice cannot
+   start on anything else.
+6. *Response.* It streams back; the client decrypts and verifies it. When
+   Venice closes the connection the sidecar signs an attestation (sid,
+   certificate-chain hash, both handshake transcript hashes, record counts
+   and SHA-256 of all bytes in each direction, `c_commit`, time) with its
+   per-process Ed25519 key; the node re-signs it with its Nostr key, and the
+   client checks that signature and that the sid and transcript hashes are
+   its own.
+7. *Settlement.* π_C3S proves the disclosed usage event (or, for an upstream
    HTTP error, only the response head; the body stays private). The node
    charges the usage at the frozen offer rates (EHBP's
    `finalize_ehbp_actual_cost_payment`), or releases the reservation for a
    4xx/503, and returns a signed receipt bound to the sid and attestation.
-   π_C2/π_C3 compare inside the circuit (the node learns one bit), and the
+   π_C2S/π_C3S compare inside the circuit (the node learns one bit), and the
    client checks every proof parameter against its own records (`params.ts`).
-7. *Abort.* Before the record is released: release. After it, with no
-   disclosure: charge the reservation.
+8. *Abort.* Before the final body record is released: release (less any
+   abandon fee). After it, with no disclosure: charge the reservation.
+
+**v1 variant** (`--protocol 1`; branch `v1-poc` here, `confidential-upstream` in routstr-core and routstr-sdk): the client does the TLS
+handshake alone (X25519) and discloses only the handshake traffic secrets.
+After KeyUpdate, π_C1 proves the one-shot record material, the sidecar writes
+the head record, π_N proves it against the template, then KU1. The body and
+response steps use π_C2 and π_C3, anchored on the handshake values.
 
 **Where the code is.**
 
@@ -132,7 +150,7 @@ cd $P/crypto/client && CU_PROVER=../zkbench/target/release/cu-prover node --expe
 ```
 
 For routstrd, use a scratch `ROUTSTRD_DIR` and add a `confidentialUpstream`
-block (`routstrd/docs/confidential-upstream.md`). Run it with Bun ≥ 1.4 and send
+block (`routstrd/docs/confidential-upstream.md`). Run it with Bun (≥ 1.4 for v1 nodes) and send
 `x-routstr-verify: confidential`.
 
 **Checks.**
@@ -201,7 +219,8 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
 - **Each SDK entrypoint is its own bundle.** The confidential transport is
   registered on a `globalThis` symbol by the Bun/Node entrypoints; the
   browser-safe bundle never imports it.
-- **Bun < 1.4 lacks WebCrypto X25519.** The session fails fast with a clear
+- **Bun < 1.4 lacks WebCrypto X25519.** This matters only for v1 sessions
+  (v2 uses P-256, and the SDK probes X25519 only for v1). A v1 session fails fast with a clear
   error.
 - **routstrd needs Nostr discovery to fetch a node's models.** It only fetches
   models for discovered nodes, so a private, unannounced node must be in its
