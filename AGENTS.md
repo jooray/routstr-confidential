@@ -197,6 +197,10 @@ settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
     session (`/zk?proof=zkchan`, `cu-prover --channel`,
     `zkbench/src/channel.rs`) holding the OT/VOLE correlations for π_NK,
     π_C2S and π_C3S; per-proof `/zk?proof=pi_*` is the fallback.
+  - Node-only garbling PoC (`crypto/twopc-ag`, not integrated): the client
+    uploads ~0.06–1.2 MB instead of 21 MB per session (cold 2PC on a
+    2 Mbit/s uplink 9.6 s vs 85 s); same leakage class as dual execution;
+    report and integration plan in `crypto/twopc-ag/REPORT.md`, needs review.
   - The SDK release (version bump) and routstrd's `@routstr/sdk` bump are
     the maintainers' step.
   - The sidecar and prover are not yet in any upstream repo.

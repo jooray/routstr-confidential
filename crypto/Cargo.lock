@@ -2352,6 +2352,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "twopc-ag"
+version = "0.1.0"
+dependencies = [
+ "cu-crypto",
+ "futures",
+ "getrandom 0.3.4",
+ "mpz-circuits",
+ "mpz-common",
+ "mpz-core",
+ "mpz-fields",
+ "mpz-ole",
+ "mpz-ot",
+ "mpz-ot-core",
+ "mpz-share-conversion",
+ "p256",
+ "rand 0.10.3",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "twopc",
+ "zeroize",
+ "zkbench",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
