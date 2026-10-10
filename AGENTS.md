@@ -178,6 +178,15 @@ the tag `v2-symmetric` in this repo, routstr-core and routstr-sdk. Note:
 routstr-core persists
 settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
 
+## Browser client (separate repos)
+
+`~/projects/routstr-confidential-web` (github jooray/routstr-confidential-web): the browser library
+(`crates/client-wasm` = the client side of `twopc` + proof channel compiled to wasm, vendored copies of
+`cu-crypto`/`twopc`/`zkbench` plus a wasm patch in `patches/`; TS package at the root).
+`~/projects/routstr-confidential-pwa` (github jooray/routstr-confidential-pwa): the demo PWA, deployed by
+GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the library by commit:
+`node scripts/pin-lib.mjs <sha>`). Changes to `crypto/twopc` or `zkbench` here must be re-vendored there.
+
 ## Gotchas
 
 - **Never log or commit `VENICE_API_KEY`**, node nsecs or Cashu tokens. Scan

@@ -41,6 +41,13 @@ user testing. To try it: [`docs/SETUP.md`](docs/SETUP.md).
 
 This repo's default branch is `twopc-v2` (protocol v2); the v1 proof of concept is the `v1-poc` branch.
 
+## In the browser
+
+A browser version runs the same client (2PC and proofs in WebAssembly) inside a static web page:
+library [jooray/routstr-confidential-web](https://github.com/jooray/routstr-confidential-web), demo PWA
+[jooray/routstr-confidential-pwa](https://github.com/jooray/routstr-confidential-pwa), live at
+<https://jooray.github.io/routstr-confidential-pwa/>.
+
 ## Build
 
 ```bash

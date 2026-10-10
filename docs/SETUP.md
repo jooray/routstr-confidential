@@ -131,6 +131,11 @@ under a second; most of a warm request is the provider's own latency, and a sess
 handshake reached it in about 1 s). Arming runs in the background and takes about as long as the cold
 two-party computation.
 
+**In a browser.** The demo app <https://jooray.github.io/routstr-confidential-pwa/> does the same in a web
+page: fund it with Lightning or a Cashu token, chat, and see the provider's certificate chain, the proofs
+and the signed receipt. The library behind it, for your own web app:
+[jooray/routstr-confidential-web](https://github.com/jooray/routstr-confidential-web).
+
 ## 2. Running a node
 
 A confidential node is a normal Routstr node plus `cu-sidecar`, a small Rust service that relays the TLS
