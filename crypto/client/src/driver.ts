@@ -39,6 +39,7 @@ import { concat, epoch1Material, fromHex, hex, sha256 } from './advice.ts'
 import { runZk } from './zkbridge.ts'
 import { checkPiC1Params, checkPiC2Params, checkPiC2SParams, checkPiC3Params, checkPiC3SParams } from './params.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
+import { ZkChan } from './zkchan.ts'
 
 setCryptoImplementation(webcryptoCrypto)
 
@@ -76,6 +77,10 @@ const ARM = argv.includes('--arm')
 // starting π_C3; `--parallel-proofs` lets them overlap, for the stall study.
 const SERIAL_PROOFS = !argv.includes('--parallel-proofs')
 const POOL = Number(arg('--pool', '0'))
+// v2: run π_NK/π_C2S/π_C3S over the session's pre-warmed proof channel
+// (`zkchan`, OT/VOLE set up while arming). `--no-zkchan` forces the per-proof
+// path (fresh OT per proof), e.g. for before/after measurements.
+const ZKCHAN = !argv.includes('--no-zkchan')
 // The node bearer(s): an sk- key or Cashu token(s), comma-separated for --pool.
 // (--escrow-token is accepted as an alias.)
 const ESCROW_TOKENS = (arg('--auth') ?? arg('--escrow-token') ?? '')
@@ -331,6 +336,7 @@ class Session {
     else this.outbox.push(b)
   }
   close() {
+    this.zkchan?.close()
     try {
       this.ws.close()
     } catch {
@@ -411,6 +417,11 @@ class Session {
     if (this.ready.v !== 2) throw new Error('node did not start a v2 session')
     this.twopc = new TwoPc()
     this.twopc.start(this.zkUrl('twopc', this.sid))
+    if (ZKCHAN) {
+      // The proof channel's OT/VOLE setup runs alongside the 2PC preprocessing.
+      this.zkchan = new ZkChan()
+      this.zkchan.start(this.zkUrl('zkchan', this.sid))
+    }
     const t2pc = Date.now()
     let keyShare = await this.twopc.keyShare()
     if (ADV_OWN_SHARE) {
@@ -447,7 +458,29 @@ class Session {
   }
 
   twopc: TwoPc | undefined
+  zkchan: ZkChan | undefined
+  zkTimes: Record<string, any> = {}
   ap: ApOut | undefined
+
+  /**
+   * v2: one proof, over the pre-warmed channel when it is usable, else the
+   * per-proof path. Fallback only while no proof has started on the channel:
+   * once one has, a channel failure ends the session (the node aborts it).
+   */
+  async proofV2(proof: string, cmd: 'prove' | 'verify', params: unknown, witness?: unknown): Promise<void> {
+    const t = Date.now()
+    const ch = this.zkchan
+    if (ch && (ch.used || (await ch.ready(120_000)))) {
+      const m = await ch.run(cmd, proof, params, witness)
+      this.zkTimes[proof] = { via: 'zkchan', ms: Date.now() - t, inner_ms: m.ms, bytes_sent: m.bytes_sent, bytes_recv: m.bytes_recv }
+      trace(`zk ${proof}`, `zkchan ${Date.now() - t}ms`)
+      return
+    }
+    if (ch) this.log({ ev: 'zkchan_fallback', proof, err: String(ch.failure) })
+    const prof = await runZk(this.zkUrl(proof, this.sid), { proof, role: cmd === 'prove' ? 'prover' : 'verifier', params, witness })
+    this.zkTimes[proof] = { via: 'per-proof', ms: Date.now() - t, ...prof }
+    trace(`zk ${proof}`, `per-proof ${Date.now() - t}ms`)
+  }
   tKeyShare = 0
   tPhaseA = 0
   tPhaseB = 0
@@ -483,7 +516,7 @@ class Session {
       this.tC1Sent = Date.now()
       const commit = await this.waitT('c_commit', 60000)
       checkPiNKParams(commit.params, OFFER, this.ap!, body.length)
-      await runZk(this.zkUrl('pi_nk', this.sid), { proof: 'pi_nk', role: 'verifier', params: commit.params })
+      await this.proofV2('pi_nk', 'verify', commit.params)
       this.log({ ev: 'pi_nk_ok' })
       this.tProofsReady = Date.now()
       this.prepared = true
@@ -607,12 +640,14 @@ class Session {
       }
     }
     const c2Name = PROTO === 2 ? 'pi_c2s' : 'pi_c2'
-    const c2Promise = runZk(this.zkUrl(c2Name, this.sid), {
-      proof: c2Name,
-      role: 'prover',
-      params: c2params.params,
-      witness: PROTO === 2 ? { Secret: Array.from(this.ap!.clientAp1) } : { Hs: Array.from(this.hs) },
-    })
+    const c2Promise = (PROTO === 2
+      ? this.proofV2(c2Name, 'prove', c2params.params, { Secret: Array.from(this.ap!.clientAp1) })
+      : runZk(this.zkUrl(c2Name, this.sid), {
+          proof: c2Name,
+          role: 'prover',
+          params: c2params.params,
+          witness: { Hs: Array.from(this.hs) },
+        }))
       .then(() => this.log({ ev: 'pi_c2_ok' }))
       .catch((e) => this.log({ ev: 'pi_c2_fail', err: String(e) }))
 
@@ -675,13 +710,18 @@ class Session {
       checkPiC3Params(c3.params, { session: this.sessionValues(), serverRecords: this.serverRecords, r, skip })
     }
     const c3Name = PROTO === 2 ? 'pi_c3s' : 'pi_c3'
-    await runZk(this.zkUrl(c3Name, this.sid), {
-      proof: c3Name,
-      role: 'prover',
-      params: c3.params,
-      witness: PROTO === 2 ? { Secret: Array.from(this.ap!.serverAp0) } : { Hs: Array.from(this.hs) },
-    })
+    if (PROTO === 2) {
+      await this.proofV2(c3Name, 'prove', c3.params, { Secret: Array.from(this.ap!.serverAp0) })
+    } else {
+      await runZk(this.zkUrl(c3Name, this.sid), {
+        proof: c3Name,
+        role: 'prover',
+        params: c3.params,
+        witness: { Hs: Array.from(this.hs) },
+      })
+    }
     this.twopc?.close()
+    this.zkchan?.close()
     this.log({ ev: 'pi_c3_ok' })
 
     const terminal = await Promise.race([
@@ -773,6 +813,13 @@ class Session {
         ? { twopc_key_share_ms: this.tKeyShare - this.tReady, twopc_phase_a_ms: this.tPhaseA, twopc_phase_b_ms: this.tPhaseB, twopc: this.twopc?.timings }
         : {}),
       record_ku1_ms: this.tHeadWritten - this.tRecordStart,
+      ...(PROTO === 2
+        ? {
+            zk: this.zkTimes,
+            zkchan_ready_ms: this.zkchan?.tReady ? this.zkchan.tReady - this.zkchan.tStart : undefined,
+            zkchan_setup: this.zkchan?.readyInfo?.timings,
+          }
+        : {}),
       claim_to_body_ms: tBodyWrite - tClaim,
       upstream_ttft_ms: ttftAbs - tBodyWrite,
     }

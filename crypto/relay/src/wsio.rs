@@ -41,6 +41,11 @@ pub fn ws_duplex(ws: WebSocket) -> (Compat<tokio::io::DuplexStream>, WsBridge) {
                 _ => {}
             }
         }
+        // Signal EOF to the protocol side: dropping this half alone does not
+        // (the read half lives on in the outbound pump), and a long-lived
+        // reader (the proof channel waiting for its next request) would
+        // otherwise wait for the session time limit.
+        let _ = bw.shutdown().await;
     });
 
     let out = tokio::spawn(async move {

@@ -18,7 +18,20 @@ export interface ZkJob {
 }
 
 /** Run one proof end-to-end: spawn cu-prover and pipe it to the ZK websocket. */
-export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Promise<void> {
+export interface ZkProfile {
+  /** WebSocket open, from the call. */
+  ws_open_ms: number
+  /** First proof byte from the peer, from the call. */
+  first_byte_ms: number
+  /** cu-prover exit, from the call. */
+  total_ms: number
+  bytes_sent: number
+  bytes_recv: number
+}
+
+export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Promise<ZkProfile> {
+  const t0 = Date.now()
+  const prof: ZkProfile = { ws_open_ms: 0, first_byte_ms: 0, total_ms: 0, bytes_sent: 0, bytes_recv: 0 }
   const ws = new WebSocket(zkUrl)
   ws.binaryType = 'arraybuffer'
 
@@ -36,6 +49,7 @@ export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Prom
   const pending: Buffer[] = []
   let wsOpen = false
   child.stdout.on('data', (chunk: Buffer) => {
+    prof.bytes_sent += chunk.length
     if (wsOpen && ws.readyState === WebSocket.OPEN) ws.send(chunk)
     else pending.push(chunk)
   })
@@ -48,11 +62,14 @@ export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Prom
         timeoutMs,
       )
       ws.onopen = () => {
+        prof.ws_open_ms = Date.now() - t0
         wsOpen = true
         for (const chunk of pending) ws.send(chunk)
         pending.length = 0
         ws.onmessage = (ev) => {
           const data = ev.data
+          if (!prof.first_byte_ms) prof.first_byte_ms = Date.now() - t0
+          prof.bytes_recv += (data as ArrayBuffer).byteLength ?? 0
           if (data instanceof ArrayBuffer) child.stdin.write(Buffer.from(data))
           else if (ArrayBuffer.isView(data)) child.stdin.write(Buffer.from(data.buffer))
         }
@@ -68,6 +85,7 @@ export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Prom
           // 'close' (not 'exit') so all stdout data has been delivered before we
           // resolve and the caller closes the websocket: resolving on 'exit' can
           // drop the prover's final flush bytes and stall the peer's verifier.
+          prof.total_ms = Date.now() - t0
           if (code === 0) resolve()
           else reject(new Error(`cu-prover exited ${code} for ${job.proof}`))
         })
@@ -87,4 +105,5 @@ export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Prom
       /* ignore */
     }
   }
+  return prof
 }

@@ -5,7 +5,9 @@
 //! π_C2 (body suffix) and π_C3 (usage disclosure). Native advice lives in
 //! `cu-crypto`; the circuits here mirror it exactly.
 
+pub mod channel;
 pub mod fixtures;
+pub mod mux;
 pub mod gadgets;
 pub mod proofs;
 pub mod statements;

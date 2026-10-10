@@ -19,7 +19,7 @@ use crate::Role;
 use crate::statements::{Check, Params, Witness, build};
 use crate::transport::Counters;
 
-fn ferret_config() -> ferret::FerretConfig {
+pub(crate) fn ferret_config() -> ferret::FerretConfig {
     ferret::FerretConfig::builder()
         .lpn_type(ferret::LpnType::Regular)
         .build()
@@ -102,53 +102,77 @@ where
             let base_send = co::Sender::default();
             let kos_recv = kos::Receiver::new(kos::ReceiverConfig::default(), base_send);
             let ferret_recv = ferret::Receiver::new(ferret_config(), ferret_seed, kos_recv);
-            let mut prover = Prover::new(ProverConfig::default(), ferret_recv);
-
-            let checks = build(&mut prover, Role::Prover, params, witness)?;
-            // The prover must decode exactly the outputs the verifier decodes:
-            // mpz stages a "prove" flush entry for these ranges on both sides.
-            let mut futs = Vec::with_capacity(checks.len());
-            for c in &checks {
-                futs.push(prover.decode(c.value)?);
-            }
-            prover
-                .execute_all(&mut ctx)
-                .await
-                .map_err(|e| anyhow!("prover execute: {e}"))?;
-            for f in futs {
-                let _ = f.await.map_err(|e| anyhow!("prover decode: {e}"))?;
-            }
+            prove_with(ferret_recv, &mut ctx, params, witness).await?;
             Ok(Vec::new())
         }
         Role::Verifier => {
             let base_recv = co::Receiver::default();
             let kos_send = kos::Sender::new(kos::SenderConfig::default(), delta.into_inner(), base_recv);
             let ferret_send = ferret::Sender::new(ferret_config(), base_seed, kos_send);
-            let mut verifier = Verifier::new(VerifierConfig::default(), delta, ferret_send);
-
-            let checks = build(&mut verifier, Role::Verifier, params, witness)?;
-            let mut futs = Vec::with_capacity(checks.len());
-            for c in &checks {
-                futs.push(verifier.decode(c.value)?);
-            }
-            verifier
-                .execute_all(&mut ctx)
-                .await
-                .map_err(|e| anyhow!("verifier execute: {e}"))?;
-            let mut got = Vec::with_capacity(futs.len());
-            for f in futs {
-                got.push(
-                    f.await
-                        .map_err(|e| anyhow!("verifier decode: {e}"))?,
-                );
-            }
-            let results = check_results(&checks, &got);
-            if !all_ok(&results) {
-                bail!("proof checks failed: {results:?}");
-            }
-            Ok(results)
+            verify_with(ferret_send, delta, &mut ctx, params).await
         }
     }
+}
+
+/// The prover side of one proof over `ctx`, with correlations from `ot`
+/// (generated on demand by the VM's flush, or already preprocessed).
+pub(crate) async fn prove_with<OT>(
+    ot: OT,
+    ctx: &mut Context,
+    params: &Params,
+    witness: Option<&Witness>,
+) -> Result<()>
+where
+    OT: RCOTReceiver<bool, Block> + mpz_common::Flush + Send + 'static,
+{
+    let mut prover = Prover::new(ProverConfig::default(), ot);
+    let checks = build(&mut prover, Role::Prover, params, witness)?;
+    // The prover must decode exactly the outputs the verifier decodes:
+    // mpz stages a "prove" flush entry for these ranges on both sides.
+    let mut futs = Vec::with_capacity(checks.len());
+    for c in &checks {
+        futs.push(prover.decode(c.value)?);
+    }
+    prover
+        .execute_all(ctx)
+        .await
+        .map_err(|e| anyhow!("prover execute: {e}"))?;
+    for f in futs {
+        let _ = f.await.map_err(|e| anyhow!("prover decode: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The verifier side of one proof over `ctx`; `delta` must be `ot`'s global
+/// correlation. Fails unless every check holds.
+pub(crate) async fn verify_with<OT>(
+    ot: OT,
+    delta: Delta,
+    ctx: &mut Context,
+    params: &Params,
+) -> Result<Vec<CheckResult>>
+where
+    OT: RCOTSender<Block> + mpz_common::Flush + Send + 'static,
+{
+    let mut verifier = Verifier::new(VerifierConfig::default(), delta, ot);
+    let checks = build(&mut verifier, Role::Verifier, params, None)?;
+    let mut futs = Vec::with_capacity(checks.len());
+    for c in &checks {
+        futs.push(verifier.decode(c.value)?);
+    }
+    verifier
+        .execute_all(ctx)
+        .await
+        .map_err(|e| anyhow!("verifier execute: {e}"))?;
+    let mut got = Vec::with_capacity(futs.len());
+    for f in futs {
+        got.push(f.await.map_err(|e| anyhow!("verifier decode: {e}"))?);
+    }
+    let results = check_results(&checks, &got);
+    if !all_ok(&results) {
+        bail!("proof checks failed: {results:?}");
+    }
+    Ok(results)
 }
 
 /// Run prover and verifier against each other in one process with ideal OT,

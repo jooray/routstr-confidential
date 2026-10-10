@@ -2554,6 +2554,7 @@ version = "0.1.0"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
+ "async-trait",
  "cu-crypto",
  "futures",
  "hex",
@@ -2571,6 +2572,7 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "serde_json",
+ "serio",
  "sha2",
  "tokio",
  "tokio-util",

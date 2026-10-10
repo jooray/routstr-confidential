@@ -223,6 +223,8 @@ struct SessionShared {
     /// contend). Proofs are per-session independent, so serializing inside a
     /// session costs nothing on the critical path and removes the contention.
     zk_lock: tokio::sync::Mutex<()>,
+    /// v2: the session's proof channel (`/zk?proof=zkchan`) was opened.
+    zkchan_taken: std::sync::atomic::AtomicBool,
 }
 
 /// Recorded relay state needed for the proofs.
@@ -498,6 +500,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         evt: evt_tx.clone(),
         insecure: app.insecure,
         zk_lock: tokio::sync::Mutex::new(()),
+        zkchan_taken: std::sync::atomic::AtomicBool::new(false),
     });
 
     let send_task = tokio::spawn(async move {
@@ -1596,6 +1599,12 @@ async fn zk_handler(socket: WebSocket, q: HashMap<String, String>, app: Arc<AppS
     let sid = q.get("sid").cloned().unwrap_or_default();
     if let Err(e) = zk_inner(socket, &proof, &sid, &app).await {
         warn!(proof, error = %e, "zk session failed");
+        // A proof channel that fails outside a proof (setup, idle, transport)
+        // reports nothing: the session goes on and the client falls back to
+        // the per-proof path. A failed proof on it reported its own ZkDone.
+        if proof == "zkchan" {
+            return;
+        }
         if let Some(s) = app.sessions.lock().unwrap().get(&sid).cloned() {
             let _ = s.evt.send(Ev::ZkDone { proof, ok: false, err: Some(e.to_string()), params: None });
         }
@@ -1619,17 +1628,23 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
         }
         return result;
     }
-    let params = shared.params.lock().unwrap().get(proof).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
-    let (role, witness) = match proof {
-        "pi_n" => (Role::Prover, Some(Witness::Key(shared.key.to_vec()))),
-        "pi_nk" => {
-            let kiv = shared.k0_iv0.lock().unwrap().clone().ok_or_else(|| anyhow!("no K_0 yet"))?;
-            let k0: [u8; 16] = kiv[..16].try_into()?;
-            let iv0: [u8; 12] = kiv[16..28].try_into()?;
-            (Role::Prover, Some(Witness::NodeKey { k0, iv0, key: shared.key.to_vec() }))
+    if proof == "zkchan" {
+        if app.offer.v != 2 {
+            bail!("the proof channel is a protocol v2 feature");
         }
-        _ => (Role::Verifier, None),
-    };
+        if shared.zkchan_taken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            bail!("proof channel already open for this session");
+        }
+        let (io, bridge) = ws_duplex(socket);
+        let result = tokio::time::timeout(SESSION_TIMEOUT, run_zkchan(io, &shared))
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("proof channel reached the session time limit")));
+        bridge.finish().await;
+        info!(elapsed_ms = started.elapsed().as_millis() as u64, ok = result.is_ok(), "zkchan end");
+        return result;
+    }
+    let params = shared.params.lock().unwrap().get(proof).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
+    let (role, witness) = node_side(proof, &shared)?;
     let (io, bridge) = ws_duplex(socket);
     // One proof at a time per session (see SessionShared::zk_lock).
     let _guard = shared.zk_lock.lock().await;
@@ -1656,6 +1671,86 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
     };
     let _ = shared.evt.send(Ev::ZkDone { proof: proof.to_string(), ok, err, params: Some(params) });
     result.map(|_| ())
+}
+
+/// The node's role and witness for `proof`.
+fn node_side(proof: &str, shared: &SessionShared) -> Result<(Role, Option<Witness>)> {
+    Ok(match proof {
+        "pi_n" => (Role::Prover, Some(Witness::Key(shared.key.to_vec()))),
+        "pi_nk" => {
+            let kiv = shared.k0_iv0.lock().unwrap().clone().ok_or_else(|| anyhow!("no K_0 yet"))?;
+            let k0: [u8; 16] = kiv[..16].try_into()?;
+            let iv0: [u8; 12] = kiv[16..28].try_into()?;
+            (Role::Prover, Some(Witness::NodeKey { k0, iv0, key: shared.key.to_vec() }))
+        }
+        _ => (Role::Verifier, None),
+    })
+}
+
+/// v2: the session's long-lived proof channel (`zkbench::channel`). The
+/// correlations for π_NK (node proves) and π_C2S/π_C3S (client proves) are
+/// generated while the session is armed; at claim time the client requests
+/// each proof by name and the node runs it against *its own* parameters for
+/// that name (exactly like the per-proof path), reporting `Ev::ZkDone`.
+///
+/// Failure semantics: setup or transport failure outside a proof reports
+/// nothing (the client may fall back to `/zk?proof=pi_*`); a proof that fails
+/// or times out on the channel reports `ZkDone { ok: false }` and the session
+/// aborts, as with the per-proof path. The channel never runs a second proof
+/// after a failure, and each proof at most once.
+async fn run_zkchan<Io>(io: Io, shared: &Arc<SessionShared>) -> Result<()>
+where
+    Io: futures::AsyncRead + futures::AsyncWrite + Send + Unpin + 'static,
+{
+    use zkbench::channel::{Party, Prealloc, ZkChannel};
+    let mut ch = tokio::time::timeout(TWOPC_TIMEOUT, ZkChannel::open(io, Party::Node, Prealloc::default()))
+        .await
+        .map_err(|_| anyhow!("proof channel preprocessing timed out"))??;
+    let steps: Vec<String> = ch.take_timings().iter().map(|t| format!("{}={:.0}ms/{}B", t.step, t.ms, t.bytes_sent + t.bytes_recv)).collect();
+    info!(steps = %steps.join(" "), "zkchan ready");
+    loop {
+        // The session may end while the channel idles (its task drops the
+        // event receiver): stop serving then.
+        let req = tokio::select! {
+            r = ch.next_request() => r?,
+            _ = shared.evt.closed() => None,
+        };
+        let Some(req) = req else { break };
+        let proof = req.proof;
+        let t = std::time::Instant::now();
+        let run = async {
+            if !matches!(proof.as_str(), "pi_nk" | "pi_c2s" | "pi_c3s") {
+                bail!("{proof} is not served on the proof channel");
+            }
+            let params = shared.params.lock().unwrap().get(proof.as_str()).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
+            let (_, witness) = node_side(&proof, shared)?;
+            let _guard = shared.zk_lock.lock().await;
+            let r = match tokio::time::timeout(std::time::Duration::from_secs(30), ch.serve(&proof, &params, witness.as_ref())).await {
+                Ok(r) => r,
+                Err(_) => {
+                    ch.poison();
+                    Err(anyhow!("zk proof timed out after 30s"))
+                }
+            };
+            Ok((params, r))
+        }
+        .await;
+        let (params, result) = match run {
+            Ok((p, r)) => (Some(p), r),
+            Err(e) => (None, Err(e)),
+        };
+        let (ok, err) = match &result {
+            Ok(checks) => (checks.iter().all(|c| c.ok), None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        info!(proof, ok, elapsed_ms = t.elapsed().as_millis() as u64, "zkchan proof");
+        let _ = shared.evt.send(Ev::ZkDone { proof: proof.clone(), ok, err, params });
+        if !ok {
+            break;
+        }
+    }
+    ch.close().await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
