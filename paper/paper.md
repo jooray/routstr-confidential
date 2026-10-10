@@ -9,18 +9,20 @@ abstract: |
   designs ask every user to verify an attestation of the node's software after every update. Our
   protocol rests instead on the provider's TLS certificate and on cryptography. The client is the TLS 1.3
   client of the provider and the node relays the records. Client and node run the TLS key schedule as a
-  two-party computation (share conversion over P-256, then a dual-execution garbled circuit): the node
-  alone gets the key of the first application epoch, in which it writes its `Authorization` record and a
-  KeyUpdate, and the client alone gets the keys for the body and the streamed response. Nobody holds the
-  ECDHE or master secret, so the client cannot recover the API key even if it records the node's
-  traffic. Zero-knowledge proofs anchored on hashes the computation outputs show the client that the
-  node's record matches a published template, and show the node that the request ends in a public
-  suffix pinning the model and token cap and that the billed usage is the provider's own report. Against
-  a live provider on one host, a cold request reaches the provider after 0.89 s and a pre-warmed one 5 ms
-  after it is claimed, followed by a 0.10 s suffix proof. The price is about 21 MB of garbled tables in
-  each direction per request, which pre-warming moves off the request path. We also describe a
-  single-party variant that needs a tenth of the bandwidth but protects the key only while no observer
-  of the node's egress colludes with the client.
+  two-party computation (share conversion over P-256, then a garbled circuit that only the node garbles
+  and the client checks gate by gate with information-theoretic MACs): the node alone gets the key of
+  the first application epoch, in which it writes its `Authorization` record and a KeyUpdate, and the
+  client alone gets the keys for the body and the streamed response. Nobody holds the ECDHE or master
+  secret, so the client cannot recover the API key even if it records the node's traffic. Zero-knowledge
+  proofs anchored on hashes the computation outputs show the client that the node's record matches a
+  published template, and show the node that the request ends in a public suffix pinning the model and
+  token cap and that the billed usage is the provider's own report. Against a live provider on one host,
+  a cold request reaches the provider after about 1.2 s and a pre-warmed one 5 ms after it is claimed,
+  followed by a 0.10 s suffix proof. The price is about 22 MB from the node to the client and 1.2 MB back
+  per request; on a home link with a 2 Mbit/s uplink the cold two-party computation takes about 7 s, and
+  pre-warming moves it off the request path. We also describe a single-party variant that needs under a
+  quarter of the bandwidth but protects the key only while no observer of the node's egress colludes
+  with the client.
 ---
 
 # 1. Introduction
@@ -63,8 +65,10 @@ covers only the key schedule, a fixed workload of 31 SHA-256 compressions, never
 1. A TLS 1.3 protocol (section 4) in which the first application epoch belongs to the relay node, which
    writes its credential record and a KeyUpdate under a key only it holds, while the body and the
    response run under keys only the client holds. The handshake key schedule runs as a two-party
-   computation with security against a malicious peer and at most one bit of leakage per session
-   (section 4.4).
+   computation secure against a malicious peer, in which only the node garbles and the client checks
+   every gate against masks the node has authenticated to it. Neither party ever reveals its inputs;
+   a cheating node can learn at most $\log_2 5 \approx 2.3$ bits per session about values used only in
+   that session, and the client uploads 1.2 MB (section 4.4).
 2. A request-integrity construction: the client proves that its request body ends in an agreed public
    JSON suffix that pins every cost-relevant parameter, and the provider sees the complete request only
    after the proof verifies (section 4.6). The node proves that its hidden record matches a published
@@ -76,8 +80,9 @@ covers only the key schedule, a fixed workload of 31 SHA-256 compressions, never
 4. A **provider profile** (section 3.1) that separates what any upstream must satisfy from
    provider-specific details.
 5. A working implementation verified end to end against a live provider, with measurements of every
-   component and of the whole path, cold and pre-warmed (section 6), and a comparison with a simpler
-   single-party variant that trades the credential guarantee for bandwidth (section 7).
+   component and of the whole path, cold and pre-warmed (section 6), a comparison with an earlier
+   dual-execution version of the 2PC (section 6.6), and a comparison with a simpler single-party
+   variant that trades the credential guarantee for bandwidth (section 7).
 
 # 2. Model
 
@@ -111,9 +116,10 @@ anyone but N. A receipt is N's signed statement, not a proof to outsiders.
 
 Adversaries: either C or N may deviate arbitrarily from the protocol (they are malicious towards each
 other); U follows TLS and its own API, and is trusted with the prompt and the API key as it is today.
-Assumptions: the standard hardness of ECDH over P-256, SHA-256, HMAC and AES-GCM; security of the
-garbling scheme, of oblivious transfer and of VOLE-based zero knowledge; the WebPKI. No trusted
-hardware.
+Assumptions: the standard hardness of ECDH over P-256, SHA-256, HMAC and AES-GCM; fixed-key AES as a
+correlation-robust hash (the usual assumption of free-XOR garbling); security of oblivious transfer and
+correlated-OT extension (KOS, Ferret) against a malicious party, and of VOLE-based zero knowledge; the
+WebPKI. No trusted hardware.
 
 # 3. Preliminaries and the provider profile
 
@@ -179,12 +185,29 @@ SHA-256 (as a compression-function circuit) and AES-128 are available as gadgets
 online during the session, so interactivity costs only round trips. Every plaintext comparison in our
 statements is done inside the circuit and only a single equality bit is decoded.
 
-**Garbled circuits and dual execution.** A garbler encodes a Boolean circuit so that an evaluator who
-holds one label per input wire learns the output and nothing else. Half-gates garbling costs 32 bytes
-per AND gate (XOR is free). Plain garbling is secure only against a semi-honest garbler. *Dual
-execution* (Mohassel and Franklin 2006; Huang, Katz and Evans 2012) runs the circuit twice with the roles
-swapped and checks that both runs produced the same output, which gives security against a malicious
-party at the cost of at most one bit of leakage: the result of the check.
+**Garbled circuits.** A garbler encodes a Boolean circuit so that an evaluator who holds one label per
+input wire learns the output and nothing else. With free XOR, the two labels of every wire differ by a
+global offset $\Delta$ that only the garbler knows, and XOR gates cost nothing. With point-and-permute,
+the last bit of the label the evaluator holds is a pointer bit $\Lambda_w = z_w \oplus \lambda_w$: the
+wire's true value $z_w$ hidden by a mask $\lambda_w$ that the garbler chose. Half-gates garbling (Zahur,
+Rosulek and Evans 2015) sends 256 bits per AND gate; three-halves garbling (Rosulek and Roy 2021) splits
+labels into halves and sends $1.5\kappa + 5 = 197$ bits per AND gate. Plain garbling protects the
+garbler's inputs from the evaluator, but nothing stops a malicious garbler from garbling a different
+circuit.
+
+**IT-MACs and authenticated garbling.** An information-theoretic MAC on a bit $x$ held by one party
+gives that party $x$ and $M = K \oplus x \Delta_B$ over $GF(2^{128})$, and gives the other party the key
+$K$ and a global key $\Delta_B$. The holder can open $x$ only to its true value unless it guesses
+$\Delta_B$, and MACs are linear, so XORs of authenticated bits are authenticated for free. Random
+correlated oblivious transfer (KOS, or Ferret on top of it) produces such MACs cheaply, and a
+QuickSilver-style check verifies a whole batch of products $t = x_i x_j$ at the cost of two field
+elements. *Authenticated garbling* (Wang, Ranellucci and Katz 2017, and its successors) uses IT-MACs on
+the wire masks to make a single garbled circuit secure against a malicious garbler. In the full
+constructions the masks are secret-shared between the two parties, which removes all leakage but needs
+authenticated AND triples whose generation costs more bandwidth than garbling twice. We use a
+garbler-only form (section 4.4): the garbler keeps the masks, authenticates them to the evaluator, and
+the evaluator checks every AND gate with one batched check. The price is a few bits of selective-failure
+leakage per session.
 
 **Share conversion (ECtF).** Two parties holding ECDH contributions can convert the two halves of a
 point sum into additive shares of its x-coordinate with a few multiplicative-to-additive (M2A) and
@@ -231,12 +254,12 @@ offer it verified, the model, the token cap and the body length. N validates the
 offer's rates, reserves funds for the request (section 4.6) and only then dials its relay process. N
 opens no connection to U before a valid setup.
 
-**Preprocessing.** Before any TLS byte is sent, both parties garble both phases of the key-schedule
-circuit (section 4.4) with their own global offsets and send each other the tables, and run the
-oblivious-transfer setup for every evaluator input bit and the random OLEs for the share conversion.
-This step is independent of all inputs. It moves about 21 MB in each direction, because the garbled
-tables cannot be reused: a garbled circuit is single-use, and each session needs one handshake and one
-credential record. Section 6 discusses how pre-warming moves it off the request path.
+**Preprocessing.** Before any TLS byte is sent, N garbles both phases of the key-schedule circuit
+(section 4.4) and streams the tables to C, the parties authenticate N's wire masks to C and run the
+checks on them, and they run the oblivious-transfer setup for C's input bits and the random OLEs for
+the share conversion. This step is independent of all inputs. It moves about 22 MB from N to C and
+1.2 MB from C to N, and it cannot be reused: a garbled circuit is single-use, and each session needs one
+handshake and one credential record. Section 6 discusses how pre-warming moves it off the request path.
 
 **Joint key share.** C draws a scalar $a_C$, sends a commitment $\mathrm{SHA256}(P_C \Vert \rho)$ to
 $P_C = a_C G$, receives $P_N = a_N G$ from N and opens. Both compute $P = P_C + P_N$. Committing first
@@ -261,7 +284,7 @@ random masks. It adds the shares modulo $p$ (about 770 AND gates), computes HS, 
 $c_{hs}$, $s_{hs}$, the "derived" secret and MS. It outputs $c_{hs}$ and $s_{hs}$ in the clear and MS only
 as $MS \oplus r_C \oplus r_N$, so that afterwards C's share of MS is $r_C$ and N's is $MS \oplus r_C$.
 Neither share says anything about MS. Phase A must finish before U gives up waiting for the client
-Finished; locally it takes 23 ms.
+Finished; locally it takes about 33 ms, check included.
 
 **Handshake verification.** With $s_{hs}$, C decrypts U's encrypted handshake messages in its own TLS
 stack and verifies the certificate chain to the WebPKI roots, the hostname, CertificateVerify and the
@@ -279,29 +302,62 @@ Every HKDF-Expand-Label in the schedule fits one inner block, and keyed HMAC sta
 per secret and reused, so phase A costs 14 SHA-256 compressions (298,088 AND gates) and phase B 17
 (358,091 AND gates).
 
-**Dual execution.** Each phase is garbled twice: in run 1 N garbles and C evaluates, in run 2 C garbles
-and N evaluates. Both runs execute at once. Every output wire is decoded by both evaluators, which is why
-private outputs are masked inside the circuit with a mask only their owner inputs: the other party
-decodes a one-time-padded value. Each party also inputs its own view of the transcript hash, so a
-disagreement about the transcript changes the output and fails the check below.
+**Garbling and authenticated masks.** Only N garbles. In preprocessing, N garbles each phase once
+with three-halves garbling under its global offset $\Delta_A$, so a session garbles 656,179 AND gates.
+The mask $\lambda_w$ of every wire is the pointer bit of N's label for the value 0, and C only ever sees
+the pointer bits $\Lambda_w = z_w \oplus \lambda_w$. C draws a global MAC key $\Delta_B$ (128 bits, 127 of
+them random). Using random correlated OT in which C is the sender (Ferret, bootstrapped by KOS), N
+authenticates to C the mask of every circuit input and every AND output (the *base* wires) and, for every
+AND gate $k$ with inputs $i, j$, the product $t_k = \lambda_i \lambda_j$: about 1.3 million IT-MACs. The
+masks of all other wires follow by linearity. N sends its tables and these commitments first; only then
+does C send a 32-byte seed, from which both derive a challenge $\chi$ and a per-session salt. N then
+proves all products $t_k$ with one QuickSilver-style check, opens the masks of C's input wires, of the
+transcript-hash wires and of every output wire (the bits and one hash of their MACs), and sends one
+check row per base wire and a value $Y_N$.
 
-**Equality check.** Before either party uses any output, they compare the two runs through labels. C
-hashes, for every output bit $i$, the label it obtained in N's circuit for the value $v_i$ it decoded,
-together with its own run-2 label for that same value; N does the same with the value it decoded in run 2.
-The hashes are exchanged commit-then-open. A party can produce the other's hash only if both runs decoded
-the same vector: for a differing bit it would need an inactive label of the peer's circuit, which
-half-gates garbling hides. On a mismatch the session aborts. **No output is sent to U, used to encrypt,
-or revealed before the check passes.**
+**Evaluation and the consistency check.** Online, C obtains the labels of its inputs by oblivious
+transfer, and N sends the labels of its own inputs and of the transcript hash. C checks the pointer bits
+of its own inputs and of the transcript hash against the opened masks, so N can neither substitute C's
+inputs nor feed in a different transcript. C evaluates and then checks all AND gates at once. Gate
+$k = (i, j \to o)$ was evaluated consistently with the committed masks if and only if
+$$e_k = \lambda_o \oplus t_k \oplus \Lambda_i \lambda_j \oplus \Lambda_j \lambda_i \oplus \Lambda_o \oplus \Lambda_i \Lambda_j = 0.$$
+Under the MACs, $\sum_k \chi^k e_k = 0$ becomes a linear equation between $Y_N$ and the check rows on one
+side and, on the other, a value C computes from its MAC keys and its active labels. N does not know the
+pointer bits, so each row is padded with hashes of the wire's two labels and only the label C actually
+holds opens it. C accepts if and only if the two sides agree. The rows and $Y_N$ are sent truncated to
+64 bits, while all arithmetic stays in $GF(2^{128})$. The hash in each row is tweaked by the per-session
+salt, which N learns only after it has committed its tables, its offset and its keys (section 5 explains
+why this matters).
 
-**What a cheating party gains.** A corrupt garbler (wrong circuit, wrong decoding bits, inputs that
-differ between the two runs) and selective failure on the oblivious transfer can only make the honest
-party's decoded output a wrong function of the honest inputs. The adversary learns whether the check
-passed, one predicate on those inputs, and the session aborts. The honest inputs are the ECDHE share, the
-masks and the MS share, all fresh in each session. The API key is never an input to the 2PC, so leakage
-cannot accumulate on it across sessions. A party that feeds different MS shares or masks to phase B than
-phase A gave it only obtains keys nobody knows, which U rejects. ECtF uses semi-honest conversions; a
-deviation there only shifts Z, which the server Finished check catches, or causes a selective failure
-that again surfaces as one success-or-abort bit.
+**Output.** C decodes its outputs with the authenticated masks. Only then does it send N the output
+pointer bits and a hash of its output labels. N recomputes those labels from its own keys, checks the
+hash and decodes its outputs. Private outputs are masked inside the circuit with a mask only their owner
+inputs, so each party decodes only a one-time-padded value of the other's output. C cannot change N's
+outputs, because that needs an inactive output label, and inactive labels need $\Delta_A$. On any failure
+both parties abort. **No output is sent to U, used to encrypt, or revealed before these checks pass.**
+Online, each phase takes about 1.5 round trips and 35 to 45 ms of computation.
+
+**What a cheating party gains.** A cheating N can garble a different circuit, lie about a mask, a
+product or an opened bit, corrupt check rows, or run the oblivious transfer for C's inputs with a wrong
+correlation. Each of these either fails the product check, the openings, the pointer checks or the
+consistency check, or leaves C's outputs correct (section 5). What N can still do is make an abort depend
+on C's private values (selective failure). In each phase it observes one of three outcomes (C aborted,
+C's output labels were rejected, success), and the session ends at the first failure, so there are at
+most five outcomes per session: N learns at most $\log_2 5 \approx 2.3$ bits. A cheating C, the
+evaluator, sees the tables, its active labels, uniformly random pointer bits, the opened masks of values
+it already knows or decodes (its inputs, the public transcript hash, its outputs), check rows padded by
+hashes of labels it does not hold, and $Y_N$, which it can compute itself. It learns nothing beyond its
+outputs and can only choose its own inputs, as in any 2PC. A party that feeds different MS shares or
+masks to phase B than phase A gave it only obtains keys nobody knows, which U rejects. ECtF uses
+semi-honest conversions; a deviation there only shifts Z, which the server Finished check catches, or
+causes a selective failure that is already counted above.
+
+**Why the leakage cannot accumulate.** The bits N can learn are about C's inputs to that session: its
+ECDHE scalar share, its MS share and its masks. The protocol keeps one invariant: **no 2PC input and no
+garbling key is ever reused across sessions.** Scalars, shares, masks, labels, $\Delta_A$, $\Delta_B$,
+the MAC keys and the salt are all drawn fresh for each session and used once, and an aborted session is
+discarded. Bits leaked in different sessions are therefore about independent values and never add up to
+any secret. The API key is never an input to the 2PC: it exists only in N's epoch-0 record.
 
 **Inputs are never opened.** Every private input enters only as a garbled input or an OLE input, and
 nothing is revealed after the session. This distinguishes the construction from 2PC-TLS designs in which
@@ -456,8 +512,8 @@ MS, $c_{ap,0}$): the 2PC outputs these to nobody or to N alone, masked under N's
 opened afterwards. The secrets C does receive ($c_{hs}$, $s_{hs}$, $s_{ap,0}$, $c_{ap,1}$) are one-way
 HKDF outputs that are not ancestors of $K_0$, and $h_k$ is a hash of a 28-byte uniformly random value.
 So a C that records every byte N sends to U, alone or with an observer on N's network path, holds AES-GCM
-ciphertext under a key it does not know. A cheating C can learn at most one bit about its session's
-fresh shares (section 4.4), and the API key is not a 2PC input at all. C cannot cut N out of the key
+ciphertext under a key it does not know. A cheating C learns nothing from the 2PC beyond its own
+outputs (section 4.4), and the API key is not a 2PC input at all. C cannot cut N out of the key
 exchange: N relays only a ClientHello whose single key share is the joint point. The commitment to
 $C_1$ that N sends is also safe: without $K_0$ it does not allow testing guesses of the key.
 
@@ -467,11 +523,36 @@ U are not compromised.
 **P2 (content).** The body runs under $c_{ap,1}$ and the response under $s_{ap,0}$, which the 2PC outputs
 only to C, masked with C's mask. N's outputs ($c_{hs}$, $s_{hs}$, $K_0$, $IV_0$, the anchors) are not
 ancestors of either. A cheating N that garbles a wrong circuit, for example one that outputs C's keys in
-a form N can read, is caught by the equality check before C uses any key, and learns at most one bit
-about C's fresh inputs. The proofs that decrypt under C's keys ($\pi_{C2S}$, $\pi_{C3S}$) output one
+a form N can read, is caught by C's consistency check before C uses any key, except with probability
+about $2^{-62}$ per session (below), and learns at most $\log_2 5 \approx 2.3$ bits about C's fresh,
+single-use inputs. The proofs that decrypt under C's keys ($\pi_{C2S}$, $\pi_{C3S}$) output one
 equality bit, on parameters C has checked against its own records, so N cannot use them as a decryption
 oracle. What N learns in plaintext is public by design: the suffix, the usage event, or on an error the
 response head.
+
+**Soundness of the 2PC against a cheating N.** N fixes every base mask and every product $t_k$ under
+$\Delta_B$ before it sees $\chi$, and learns nothing about $\Delta_B$ (security of the correlated OT).
+The product check fails for a wrong $t_k$ except with probability $2n/2^{128}$ for $n$ gates. If some AND
+gate was evaluated inconsistently, then $E = \sum_k \chi^k e_k \neq 0$ except with probability
+$n/2^{128}$ over $\chi$, and C then accepts only if the 64-bit projection of $\Delta_B E$ equals a value N
+fixed without any information about $\Delta_B$. For $E \neq 0$ the map $\Delta \mapsto \pi(\Delta E)$
+is onto $GF(2)^{64}$, so with 127 uniform bits in $\Delta_B$ this happens with probability at most
+$2^{-63}$ per phase, about $2^{-62}$ per session. N cannot grind: it learns nothing about $\Delta_B$, and
+the first failure ends the session. Once every gate is consistent, C's outputs are the correct function
+of its own inputs, N's effective inputs and the real transcript, because C's inputs and the transcript
+hash are pinned by the pointer checks and C decodes with authenticated masks.
+
+*The salt.* Truncating the rows to 64 bits needs one more step. With $E = 0$, a label that is not N's
+honest label but has the right pointer bit changes no output; it only changes the check sum by the
+difference of two truncated hashes. Without a salt, a node that reused its labels across sessions could
+precompute once, with about $2^{64}$ work, a table deviation whose 64-bit hash difference is zero. That
+deviation would pass the check and, through C's output-label hash, tell N which of two evaluation paths C
+took: leakage without an abort. Because the row hash is keyed by a salt from C's seed, and everything
+that fixes such a label (tables, $\Delta_A$, N's keys) is committed before the salt is known, the hash
+difference is a fresh 64-bit value and the check fails except with probability $2^{-64}$. Labels N
+chooses online (its own inputs, the transcript hash, the corrections for C's inputs) shift by amounts N
+already knows, so they carry no information about C. An honest node never reuses labels; the salt keeps
+the check sound against one that does.
 
 **P3 (integrity).** C's body records are authenticated under a key only C has. N holds $K_0$ and can
 write any epoch-0 records (below), but none of them carries C's data. The suffix is proven to be the
@@ -479,8 +560,8 @@ body's tail, so the effective parameters are exactly the agreed ones; response t
 
 **P4 (accounting).** The billed usage is a substring of the authenticated response, proven under the
 session's server secret and anchored to the end of the transcript. The anchors $h_1$, $h_2$ are outputs
-of the same 2PC that produced the keys, agreed by both runs, so C cannot prove against a secret of its
-choosing without a SHA-256 preimage. N computes the suffix from the setup values, accepts only that
+of the same 2PC that produced the keys, and N accepts them only through C's authenticated output report,
+so C cannot prove against a secret of its choosing without a SHA-256 preimage. N computes the suffix from the setup values, accepts only that
 suffix, and lets U see the complete request only after $\pi_{C2S}$ has verified, so U runs exactly the
 reserved model and cap. The receipt binds the result to the session id and the reservation.
 
@@ -488,7 +569,8 @@ reserved model and cap. The receipt binds the result to the session id and the r
 Finished messages: C in its TLS stack, N from the handshake secrets that the 2PC gives it in the clear.
 
 **P6 (freshness).** The session id is a hash of fresh nonces and the node's one-time reservation id; the
-TLS randoms, the ECDHE scalars, the masks and all garbled circuits are fresh per session.
+TLS randoms, the ECDHE scalars, the masks, the garbled tables, both global offsets, the MAC keys and the
+salt are fresh per session.
 
 **Residual risks.**
 
@@ -499,12 +581,20 @@ TLS randoms, the ECDHE scalars, the masks and all garbled circuits are fresh per
    own records stay authenticated under $c_{ap,1}$, the response is readable only by C, and a broken
    request shows up as a failed response. A node could always choose to misuse its own account; what
    the protocol guarantees is that it cannot read or alter C's content.
-2. *The 2PC is new code.* The ECtF, the dual-execution garbling and the equality check are our own
-   composition of `mpz2` components and have not been independently reviewed. The single-party variant
-   (section 7) avoids this code.
-3. *Selective failure.* Each 2PC session can leak one bit about the honest party's fresh shares through
-   the abort decision. The bits do not accumulate on any long-term secret. A party that aborts sessions
-   on purpose is visible to the other side.
+2. *The 2PC is a new, unpublished variant.* The garbler-only authenticated garbling, its consistency
+   check with garbler-held masks, the 64-bit projection and the salt are argued in section 4.4 and above,
+   but this variant has no published proof, and the construction as a whole needs external review. The
+   three-halves garbler is our own implementation: it was rebuilt from the scheme's structure, with the
+   evaluator's matrices taken from a public reimplementation, and it is checked exhaustively for
+   correctness. Correctness does not depend on those matrices but the privacy argument does, so they
+   must be checked against Rosulek and Roy's paper. The MAC layer assumes that `mpz2`'s Ferret and KOS
+   are secure against a malicious receiver (here N). ECtF is semi-honest, as in TLSNotary. The
+   dual-execution version (section 6.6) rests on a simpler, better-studied construction, and the
+   single-party variant (section 7) avoids the 2PC altogether.
+3. *Selective failure.* Each 2PC session can leak at most $\log_2 5 \approx 2.3$ bits about the client's
+   ECDHE share, MS share and masks through the abort pattern. No 2PC input or garbling key is reused
+   across sessions, so the bits never accumulate on any secret, and the API key is not a 2PC input. A node
+   that aborts sessions on purpose is visible to its clients.
 4. *P-256.* The key exchange uses P-256, as most TLS clients still offer; X25519 cannot be used with an
    additive joint share.
 5. *Traffic analysis.* N sees the size of every record. The body length is visible, and so is the
@@ -515,9 +605,9 @@ TLS randoms, the ECDHE scalars, the masks and all garbled circuits are fresh per
    be padded inside the JSON body; the response side needs provider-side padding or batching.
 6. *DoS and limits.* The node and its relay validate the setup and reserve before opening any connection
    to U, bound concurrent sessions (32), the time to setup (15 s), the session lifetime (600 s), the 2PC
-   (180 s) and the body (8 MiB). The 2PC's preprocessing makes a session expensive for N in bandwidth
-   (about 21 MB of upload each), which a reservation per session limits but per-client rate limits must
-   also bound.
+   (180 s) and the body (8 MiB). The 2PC's preprocessing makes a session expensive for N (about 22 MB of
+   upload and 0.5 s of CPU each), which a reservation per session limits, but per-client limits must also
+   bound it; the node refuses new sessions from a client address with three unused ones.
 7. *Error metadata.* On an upstream error N learns the status line, the response headers and the body
    length, but not the body.
 8. *Endpoint hygiene.* Keys live in C's process; N holds the API key in memory. C's certificate
@@ -541,9 +631,9 @@ TLS randoms, the ECDHE scalars, the masks and all garbled circuits are fresh per
 The implementation consists of:
 
 - `cu-crypto`: native TLS 1.3 key schedule and GCM, tested against RFC 8448 and NIST vectors.
-- `twopc`: the two-party key schedule (ECtF over P-256, the phase A and B circuits, dual execution over
-  `mpz2`'s half-gates garbler with KOS oblivious transfer, the label equality check), with a client-side
-  binary.
+- `twopc`: the two-party key schedule (ECtF over P-256, the phase A and B circuits, a three-halves
+  garbler and evaluator, IT-MACs on N's masks from `mpz2`'s Ferret and KOS correlated OT, the product
+  and consistency checks), with a client-side binary.
 - `zkbench`: the VOLE-ZK statements $\pi_{NK}$, $\pi_{C2S}$, $\pi_{C3S}$ (and those of the single-party
   variant) with tests that the circuits agree with native code, mutation tests, and one-bit disclosure
   tests; the client's prover binary reads its job and witness on stdin, so no secret touches the disk.
@@ -562,7 +652,7 @@ group it offered, validates certificate paths per RFC 5280 and hostnames per RFC
 ## 6.2 Component costs
 
 All component figures are from an Apple M2 Max, release builds, both parties in one process. "Local"
-has no delay; "50 ms RTT" adds 25 ms one way and limits each direction to the stated bandwidth.
+has no delay. Network figures use an emulated link with a rate per direction and a fixed one-way delay.
 
 **Two-party key schedule.**
 
@@ -571,23 +661,27 @@ has no delay; "50 ms RTT" adds 25 ms one way and limits each direction to the st
 | Phase A | 298,088 | 1,421,372 | 14 | 768 |
 | Phase B | 358,091 | 1,705,600 | 17 | 1,504 |
 
-Each circuit is garbled twice, so a session garbles 1.31 M AND gates, half by each party. Only 8 of
-phase A's compressions are on the path to $c_{hs}$ and $s_{hs}$.
+N garbles each circuit once, 656,179 AND gates per session. Only 8 of phase A's compressions are on the
+path to $c_{hs}$ and $s_{hs}$.
 
-| Step (local) | Time | Data |
+| Step (local, C's view) | Time | C sends / receives |
 |---|---|---|
-| Preprocess (garbled tables, OT setup, OLEs) | ≈0.49 s in the live client (126 ms in-process) | ≈21 MB each way |
-| Joint key share | 3 ms | ≈115 B |
-| ECtF | 2 ms | ≈0.3 kB |
-| Phase A / its check | 23 ms / 4 ms | ≈21 kB each way |
-| Phase B / its check | 26 ms / 7 ms | ≈24 kB each way |
+| Preprocess (tables, MACs, checks, OT setup, OLEs) | 0.55 s in-process; 0.70-0.84 s in the live client | 1.21 MB / 22.07 MB |
+| Joint key share | 2 ms | 41 B / 74 B |
+| ECtF | 5 ms | 0.2 kB / 12 kB |
+| Phase A (evaluation and check) | 33 ms (32-47 ms live) | 73 B / 8 kB |
+| Phase B (evaluation and check) | 40 ms (38-40 ms live) | 238 B / 24 kB |
 
-Online, the whole 2PC moves about 45 kB in each direction. Preprocessing is bandwidth-bound: at 50 ms
-RTT it takes 1.8 s at 100 Mbit/s and 8.6 s at 20 Mbit/s. Measured against a deployed node from a home
-connection, it took 24.6 s; the rest of that session (online 2PC about 0.5 s, proofs about 3 s) was small by
-comparison, so on consumer uplinks pre-warming is what makes v2 usable. The online steps take about 0.45 s at 50 ms RTT
-(3.5 round trips plus about 30 ms of computation after the ServerHello, 2 round trips after the server
-Finished).
+Of the 22 MB C downloads, 16.2 MB are the three-halves tables and 5.3 MB the 64-bit check rows; the rest
+is the mask commitments and the correlated OT. Of the 1.21 MB it uploads, 1.15 MB is its part of Ferret,
+in which C is the sender. Ferret is the only backend: KOS alone would upload almost nothing but would
+make N send 16 bytes per MAC, 42.7 MB in all, and with N scheduling its tables around C's upload Ferret
+was faster on every link we measured. N spends about 0.5 s of CPU per session (six hash calls per AND
+gate, Ferret, the check material) and C about 0.4 s; each online phase takes 35 to 45 ms.
+
+Across a network the online steps take about 0.5 s at 80 ms RTT: the key share 84 ms, ECtF 170 ms,
+phase A about 121 ms and phase B about 126 ms, each phase about 1.5 round trips. Preprocessing is
+bandwidth-bound and dominates a cold session (section 6.4).
 
 **Proofs.** The anchors remove the key schedule from the client's proofs, and $\pi_{NK}$ replaces the
 single-party variant's pair $\pi_{C1}$ + $\pi_N$ (section 7):
@@ -612,19 +706,24 @@ medians of 5 sessions each. The single-party variant (v1, section 7) is measured
 
 | | v1 (single-party) | v2 (this protocol) |
 |---|---|---|
-| Cold: request start → body sent | 0.73 s | 0.89 s (2PC 0.55 s, of which tables 0.49 s; $\pi_{NK}$ 0.17 s) |
+| Cold: request start → body sent | 0.73 s | 1.2 s (2PC preprocessing 0.76 s; $\pi_{NK}$ 0.06 s); one run |
 | Cold: suffix proof held before U starts | 0.45 s ($\pi_{C2}$) | 0.10 s ($\pi_{C2S}$) |
-| Cold: time to first token | 1.90 s | 2.43 s |
-| Pre-warmed: arming time per session | 0.71 s | 0.88 s |
+| Cold: time to first token | 1.90 s | 2.43 s † |
+| Pre-warmed: arming time per session | 0.71 s | 0.88 s † |
 | Pre-warmed: claim → body sent | 3 ms | 5 ms |
-| Pre-warmed: time to first token | 1.41 s | 0.90 s |
+| Pre-warmed: time to first token | 1.41 s | 0.90 s † |
 
-The protocol's own path to U starting work is 1.18 s for v1 and 0.99 s for v2 cold, and 0.45 s against
-0.10 s pre-warmed. The time-to-first-token figures are dominated by the provider's own latency, which
-varied by several hundred milliseconds during the runs: the cold v2 median is higher although its
-protocol path is shorter. An earlier interleaved comparison of the single-party variant with a direct
-HTTPS call (60 tokens, n = 8) measured +1.07 s to first token cold and about +0.25 s pre-warmed.
-$\pi_{C3S}$ and settlement run after the client's stream has ended and add no latency.
+† Measured with the dual-execution 2PC (section 6.6). Its local preprocessing took 0.49 s against
+0.70-0.84 s now, so arming and the cold time to first token are now a few hundred milliseconds
+longer; its online phases took 27 and 33 ms with their checks, against 33 and 40 ms now, so the
+pre-warmed path is essentially unchanged.
+
+On one host the protocol's own path to U starting work is 1.18 s for v1 and about 1.3 s for v2 cold, and
+0.45 s against 0.10 s pre-warmed. The time-to-first-token figures are dominated by the provider's own
+latency, which varied by several hundred milliseconds during the runs. An earlier interleaved
+comparison of the single-party variant with a direct HTTPS call (60 tokens, n = 8) measured +1.07 s to
+first token cold and about +0.25 s pre-warmed. $\pi_{C3S}$ and settlement run after the client's stream
+has ended and add no latency.
 
 **Pre-warming.** Because the garbled tables are single-use and N may write only in epoch 0, the
 preprocessing cannot be shared between requests; pre-warming is how the protocol hides it. A client arms
@@ -649,30 +748,77 @@ for both directions (N proves $\pi_{NK}$, C proves $\pi_{C2S}$ and $\pi_{C3S}$),
 per session; each correlation is used once, a failed proof closes the channel, and a session without a
 channel falls back to one connection per proof.
 
-Measured against a deployed node from a home connection (about 2-7 Mbit/s up): a cold request reached its
-first token after about 35 s, almost all of it the client uploading its half of the 2PC preprocessing.
-With an armed session, $\pi_{NK}$ took 0.21-0.25 s, $\pi_{C2S}$ 0.04 s and $\pi_{C3S}$ 0.06 s over the
-channel, claim to body took about 1.0 s (handshake and both online 2PC phases), and the first token came
-after 2.0-3.2 s, most of it the provider's own latency. Arming took about 55 s on that uplink, in the
-background.
+**Against a deployed node.** We measured against a deployed node in a datacenter, which serves at more
+than 90 Mbit/s within it. Over an earlier home connection (about 2-7 Mbit/s up), with the proof channel
+pre-warmed, $\pi_{NK}$ took 0.21-0.25 s, $\pi_{C2S}$ 0.04 s and $\pi_{C3S}$ 0.06 s, against 5.4 s and 3.0 s
+for the first two with per-proof setup. With the dual-execution 2PC, a cold request from that
+connection reached its first token after about 35 s, almost all of it the client uploading its half of
+the preprocessing, and a session armed up to the key share gave a first token after 2.0-3.2 s, most of it
+the provider's own latency.
+
+A second set of runs used a poor, download-limited link: a laptop on congested 2.4 GHz Wi-Fi (up to
+about 900 ms to the local router) behind a satellite connection, with only about 2-5 Mbit/s from the
+node. Node-only and dual-execution builds were run back to back in the same hour:
+
+| Same link, cold | Node-only (v2) | Dual execution |
+|---|---|---|
+| 2PC preprocessing | 42.5-62.6 s (4 runs) | 57.8-62.2 s |
+| Time to first token | 45-68 s | 66-69 s |
+| Client sends / receives | 1.21 / 22.1 MB | about 21 / 21 MB |
+
+On such a link both versions are bound by the 21-22 MB the client must receive, so they perform alike.
+Node-only garbling helps where the client's upload is the bottleneck, as on typical asymmetric home links
+(7.4 s against 85 s at 2/50 Mbit/s in section 6.4), and is about a second slower on fast symmetric
+links. The online phases on this link took 0.21-0.39 s (phase A) and 0.18-1.6 s (phase B), following the
+link's variable latency. With a fully armed node-only session (through the handshake and $\pi_{NK}$),
+claim to body took 58 ms and the first token came after 0.94 s, of which 0.89 s was the provider's own
+latency; arming took 42.8 s in the background. A cold request thus waits about a minute on this link,
+while a pre-warmed one waits about 1 s when fully armed, or 2-3 s with the SDK's pre-warming, which arms
+only up to the key share.
 
 ## 6.4 Over a network and bandwidth
 
-With client and node 50 ms apart, the component figures give the following critical-path work before U
-starts (sums of the component benchmarks, without the relayed handshake round trips that both versions
-share):
+A cold 2PC session (preprocessing, key share, ECtF and both phases, until both parties finish) on an
+emulated link, median of 3 runs, for the earlier dual-execution version (section 6.6), for the first
+node-only implementation (half-gates tables, 128-bit check rows) and for the current one:
 
-| | v1 | v2 at 100 Mbit/s | v2 at 20 Mbit/s |
+| Link (one-way delay; up / down for the client) | Dual execution | Node-only, first version | Node-only (v2) |
 |---|---|---|---|
-| Cold | 3.8 s ($\pi_{C1}$ + $\pi_N$ + $\pi_{C2}$) | 4.2 s (tables 1.8, online 2PC 0.45, $\pi_{NK}$ 1.17, $\pi_{C2S}$ 0.79) | 11.0 s (tables 8.6; the rest as at 100 Mbit/s) |
-| Pre-warmed | 1.5 s ($\pi_{C2}$) | 0.8 s ($\pi_{C2S}$) | 0.8 s plus the slower link |
+| local | 0.17 s | 0.67 s | 0.63 s |
+| 40 ms; 2 / 50 Mbit/s | 85.2 s | 11.6 s | 7.38 s |
+| 40 ms; 7 / 50 Mbit/s | 24.9 s | 8.27 s | 5.41 s |
+| 25 ms; 100 Mbit/s symmetric | 2.27 s | 4.07 s | 3.05 s |
+| 40 ms; 2 / 10 Mbit/s | 85.2 s | 32.2 s | 20.0 s |
+| Client sends / receives | 21.1 / 21.1 MB | 1.21 / 32.2 MB | 1.21 / 22.1 MB |
 
-Cold, v2 roughly matches v1 on a fast link and is several seconds slower on a slow one. Pre-warmed, v2
-is faster, because only its cheaper suffix proof is on the path.
+Dual execution on the 2 and 7 Mbit/s uplinks is a single run. Node-only garbling turns the client's
+21 MB upload into a 1.2 MB upload and a 22 MB download, which suits asymmetric home links: on a
+2 Mbit/s uplink the cold 2PC drops from 85 s to 7.4 s. The floor there is C's Ferret upload, about
+4.9 s; N holds its tables back until C's upload is under way, so that they do not delay the small
+messages that Ferret's round trips wait for. On a fast symmetric link node-only garbling is slower than
+dual execution (3.05 s against 2.27 s), because 22 MB travel one way instead of 21 MB each way in
+parallel and the checks add sequential steps. With a 10 Mbit/s downlink the download dominates (20 s).
+The online phases are faster than with dual execution, because there is no separate equality-check
+round trip: at 40 ms one way, phase A takes about 121 ms against 207 ms and phase B about 126 ms against
+287 ms.
 
-Data per request: v1 moves about 5.9 MB of proofs; v2 about 42 MB of 2PC traffic and 3.9 MB of proofs,
-46 MB in all. N uploads about 23 MB per v2 request (100 requests per minute is about 0.3 Gbit/s), against
-about 3 MB for v1. The 2PC cost is constant in the size of the prompt and the response.
+The critical-path work before U starts, with client and node 50 ms apart at 100 Mbit/s (sums of the
+component benchmarks with per-proof setup, without the relayed handshake round trips that both
+versions share):
+
+| | v1 | v2 |
+|---|---|---|
+| Cold | 3.8 s ($\pi_{C1}$ + $\pi_N$ + $\pi_{C2}$) | about 5.0 s (2PC 3.05, $\pi_{NK}$ 1.17, $\pi_{C2S}$ 0.79) |
+| Pre-warmed | 1.5 s ($\pi_{C2}$) | 0.8 s ($\pi_{C2S}$); 0.04 s over a pre-warmed proof channel |
+
+Cold, v2 is somewhat slower than v1 on a fast link and several seconds slower on a slow uplink (the 2PC
+alone takes 7.4 s at 2 Mbit/s). Pre-warmed, v2 is faster, because only its cheaper suffix proof is on
+the path.
+
+Data per request: v1 moves about 5.9 MB of proofs; v2 about 23.3 MB of 2PC traffic (22.1 MB to the
+client, 1.2 MB from it) and 3.9 MB of proofs, about 27 MB in all. N uploads about 24 MB per v2 request
+(100 requests per minute is about 0.3 Gbit/s), against about 3 MB for v1, and spends about 0.5 s of CPU
+on the 2PC. The 2PC cost is constant in the size of the prompt and the response.
 
 ## 6.5 Live verification
 
@@ -697,6 +843,27 @@ every attack was refused with the reservation released:
 
 A client that puts its own P-256 key share in the ClientHello instead of the joint one is refused
 before anything reaches the provider. The unit and integration suites of all components pass.
+
+## 6.6 The dual-execution version
+
+The first implementation of v2 used dual execution (Mohassel and Franklin 2006; Huang, Katz and Evans
+2012) instead of node-only garbling. Each phase was garbled twice with `mpz2`'s half-gates garbler: N
+garbled and C evaluated, and C garbled and N evaluated, both runs at once. Every output was decoded by
+both evaluators, and before using any output the parties compared the two runs through a
+commit-then-open hash of output labels, which a party can produce for a differing bit only with an
+inactive label of the other's circuit. Nothing was ever opened. Per phase the adversary learned the
+outcome of the comparison, $\log_2 3 \approx 1.6$ bits per session about fresh values, under the same
+invariant as now.
+
+It worked and was deployed, but each party had to garble 656,179 AND gates and send the other about
+21 MB of tables. The client's upload made a cold session take 25 s on a 7 Mbit/s uplink and 85 s on a
+2 Mbit/s one (section 6.4), about 35 s to the first token from a home connection, and a minute of
+background upload for every pre-warmed session. Node-only garbling removes that upload. Dual execution
+remains a sound alternative: it is simpler, it rests on better-studied constructions (half-gates
+garbling and the dual-execution equality check), it leaks less (about 1.6 bits per session against
+about 2.3), it is faster on fast symmetric links, and it needs no Ferret. It is kept as the tag
+`v2-symmetric` in the three repositories (routstr-confidential `0876b5e`, routstr-core `dd9e51a5`,
+routstr-sdk `b5d16f0`).
 
 # 7. v1: the single-party variant
 
@@ -730,13 +897,13 @@ record of fixed length.
 | Client can recover the API key | yes, if it sees N's egress ciphertext | no |
 | New cryptography in the trust base | ZK proofs | ZK proofs and a 2PC |
 | Key exchange | X25519 | P-256 |
-| Data per request | ≈5.9 MB | ≈46 MB |
-| Node upload per request | ≈3 MB | ≈23 MB |
-| Cold critical-path work at 50 ms RTT | ≈3.8 s (100 Mbit/s) | ≈4.2 s (100 Mbit/s), ≈11 s (20 Mbit/s) |
+| Data per request | ≈5.9 MB | ≈27 MB (22 MB of it to the client) |
+| Node upload per request | ≈3 MB | ≈24 MB |
+| Cold critical-path work | ≈3.8 s (50 ms RTT, 100 Mbit/s) | ≈5.0 s (50 ms RTT, 100 Mbit/s); 2PC alone ≈7.4 s on a 2/50 Mbit/s link |
 | Pre-warmed suffix proof | 0.45 s local, 1.5 s at 50 ms RTT | 0.10 s local, 0.8 s at 50 ms RTT |
 
-v1 suits nodes whose upstream path is under their own control, clients on slow or metered links, and
-clients that cannot pre-warm. v2 suits nodes on shared or untrusted infrastructure and nodes with
+v1 suits nodes whose upstream path is under their own control, clients on slow or metered links
+(above all slow downlinks), and clients that cannot pre-warm. v2 suits nodes on shared or untrusted infrastructure and nodes with
 valuable keys, and is faster when sessions are pre-warmed.
 
 # 8. Deployment pattern
@@ -776,7 +943,7 @@ encryption and decryption runs inside the MPC. With the roles arranged so that t
 it gives prompt confidentiality and lets the API key be the node's private input, and it works with TLS
 1.2. The cost scales with the payload and there is no streaming: we measured about 5.8 s and 41.5 MB for
 a 2 KB request, 34 s and 377 MB for 32 KB, and 129 s and 1.44 GB for 128 KB (100 Mbit/s, 50 ms). Our 2PC
-moves a similar amount of data as the 2 KB case, but it covers only the key schedule, so its cost is
+moves about half the data of the 2 KB case, and it covers only the key schedule, so its cost is
 constant, can be precomputed, and the payload then streams at native speed. TLSNotary's key-exchange
 conversion is the basis of our ECtF.
 
@@ -785,13 +952,24 @@ Garble-then-Prove (Xie et al., USENIX Security 2024) obtain malicious security c
 party open its inputs, or its key shares, after the session, so that the other can check the garbling
 and later prove statements about the transcript. That fits a notary whose shares are worthless after the
 session. It does not fit our setting: N's share would reveal the master secret, hence $K_0$, hence the
-API key, which is a long-term secret. We use full dual execution, with an equality check on output
-labels (Huang, Katz and Evans 2012), in which nothing is ever opened, at the price of garbling every
-circuit twice and accepting one bit of leakage.
+API key, which is a long-term secret. We need a 2PC in which nothing is ever opened. Our first version
+used full dual execution with an equality check on output labels (Huang, Katz and Evans 2012; section
+6.6); the current one uses garbler-only authenticated garbling.
 
-**DiStefano** (Celi et al., 2023) runs the TLS 1.3 handshake as a 2PC with authenticated garbling, which
-is maliciously secure without leakage but needs heavier preprocessing. It could replace our dual
-execution where the leakage bit matters more than bandwidth.
+**Authenticated garbling** (Wang, Ranellucci and Katz 2017; Katz, Ranellucci, Rosulek and Wang 2018;
+Dittmer, Ishai, Lu and Ostrovsky 2022; Cui, Wang, Yang and Yu 2023) makes one garbled circuit secure
+against a malicious garbler. The wire masks are secret-shared between the parties and the AND gates are
+backed by authenticated triples, so nothing leaks. KRRW-style triple generation costs more bandwidth, in
+both directions, than garbling twice, and the compressed preprocessing of DILO and CWYY needs primitives
+(block correlated OT or subfield VOLE with many keys) that `mpz2` does not provide. We keep the masks
+with the garbler and authenticate them to the evaluator. That needs only correlated OT and a
+QuickSilver-style product check, and its batched per-wire check follows CWYY's, but it accepts a
+selective-failure leakage of at most 2.3 bits per session. Its soundness argument is our own (section
+5). Three-halves garbling (Rosulek and Roy 2021) cuts N's tables by about a quarter against half-gates.
+
+**DiStefano** (Celi et al., 2023) runs the TLS 1.3 handshake as a 2PC with fully authenticated garbling,
+which is maliciously secure without leakage but needs heavier preprocessing. It could replace our 2PC
+where the remaining bits of leakage matter more than bandwidth.
 
 **DECO** (Zhang et al., ACM CCS 2020) introduced the three-party handshake, in which prover and verifier
 secret-share the session keys so that the verifier is convinced of data the prover received. Its goal is
@@ -822,7 +1000,7 @@ provider, without having to review the node's software.
 | Trusted hardware or attested software | no | no | no | no | yes |
 | Streaming, native-speed payload | yes | yes | no | yes | yes |
 | Added latency, pre-warmed (local) | 0.10 s proof | 0.45 s proof | 5.8-129 s | ≈10 s | ≈0 |
-| Data per request | ≈46 MB, constant | ≈5.9 MB | 41 MB-1.4 GB | transcript size | ≈0 |
+| Data per request | ≈27 MB, constant | ≈5.9 MB | 41 MB-1.4 GB | transcript size | ≈0 |
 | Third-party-verifiable transcript | no | no | yes | yes | attestation only |
 | Provider requirement | TLS 1.3 profile with P-256 | TLS 1.3 profile | TLS 1.2+ | TLS 1.2/1.3 | any |
 
@@ -839,9 +1017,13 @@ payload. Its trust rests on the provider's TLS certificate and on cryptography, 
 software. The mechanisms are a two-party TLS key schedule that gives the node the first application
 epoch and the client every other one, a proven public suffix for parameter pinning, and a proven usage
 disclosure for settlement. A complete implementation, verified against a live provider, reaches the
-provider 5 ms after a pre-warmed request is claimed, plus a 0.10 s suffix proof; its cost is about 21 MB
-of precomputable garbled tables in each direction per request. The single-party variant needs a tenth
-of the bandwidth where the node can keep its egress private.
+provider 5 ms after a pre-warmed request is claimed, plus a 0.10 s suffix proof. Its cost is about 22 MB
+of precomputable tables and check data sent to the client and 1.2 MB sent back per request, because
+only the node garbles and the client checks the garbling instead of garbling a second copy; a cold
+two-party computation takes about 7 s on a home link with a 2 Mbit/s uplink. The price of that
+asymmetry is a selective-failure leakage of at most 2.3 bits per session about values that are never
+reused. The single-party variant needs under a quarter of the bandwidth where the node can keep its
+egress private.
 
 ---
 
@@ -891,19 +1073,31 @@ the existing integrity-only path. Per-provider assessments are in the project's 
 
 - S. Celi, A. Davidson, H. Haddadi, G. Pestana, J. Rowell. *DiStefano: Decentralized infrastructure for sharing
   trusted encrypted facts and nothing more.* NDSS 2025 (ePrint 2023/1063).
+- H. Cui, X. Wang, K. Yang, Y. Yu. *Actively secure half-gates with minimum overhead under duplex
+  networks.* EUROCRYPT 2023.
+- S. Dittmer, Y. Ishai, S. Lu, R. Ostrovsky. *Authenticated garbling from simple correlations.* CRYPTO
+  2022.
 - Y. Huang, J. Katz, D. Evans. *Quid-Pro-Quo-tocols: Strengthening semi-honest protocols with dual
   execution.* IEEE S&P 2012.
+- J. Katz, S. Ranellucci, M. Rosulek, X. Wang. *Optimizing authenticated garbling for faster secure
+  two-party computation.* CRYPTO 2018.
 - M. Keller, E. Orsini, P. Scholl. *Actively secure OT extension with optimal overhead* (KOS). CRYPTO
   2015.
 - P. Mohassel, M. Franklin. *Efficiency tradeoffs for malicious two-party computation.* PKC 2006.
 - E. Rescorla. *The Transport Layer Security (TLS) Protocol Version 1.3.* RFC 8446, 2018; test vectors
   RFC 8448.
+- M. Rosulek, L. Roy. *Three halves make a whole? Beating the half-gates lower bound for garbled
+  circuits.* CRYPTO 2021.
 - TLSNotary project. *mpz* and *mpz2* (garbling, oblivious transfer, VOLE-based ZK) and the MPC-TLS
   protocol documentation.
+- X. Wang, S. Ranellucci, J. Katz. *Authenticated garbling and efficient maliciously secure two-party
+  computation.* ACM CCS 2017.
 - R. Weiss, D. Ayzenshteyn, G. Amit, Y. Mirsky. *What was your prompt? A remote keylogging attack on AI
   assistants.* USENIX Security 2024.
 - X. Xie, K. Yang, X. Wang, Y. Yu. *Lightweight authentication of web data via garble-then-prove.*
   USENIX Security 2024.
+- K. Yang, C. Weng, X. Lan, J. Zhang, X. Wang. *Ferret: Fast extension for correlated OT with small
+  communication.* ACM CCS 2020.
 - K. Yang, P. Sarkar, C. Weng, X. Wang. *QuickSilver: Efficient and affordable zero-knowledge proofs for
   circuits and polynomials over any field.* ACM CCS 2021.
 - S. Zahur, M. Rosulek, D. Evans. *Two halves make a whole* (half-gates). EUROCRYPT 2015.

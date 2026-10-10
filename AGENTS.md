@@ -39,6 +39,9 @@ them.
 | `docs/APPROACH.md` | engineering overview: properties, components, negotiation, pre-warm |
 | `docs/ADVERSARIAL-QA.md` | model binding, provider transferability (OpenRouter, Groq…), what the node learns, cost bounds (starts with a current-state box) |
 | `docs/REVIEW-2026-10-09.md` | every bug found and fixed (numbered findings), measurements, the plug-in refactor (§8) |
+| `docs/TWOPC-DESIGN.md` | protocol v2: the two-party handshake, epochs, session flow, the 2PC security model |
+| `docs/TWOPC-NODE-GARBLING.md` | the node-only authenticated garbling: construction, security argument, the download cuts (64-bit salted rows, three-halves; why h1/h2/hk stay SHA-256) |
+| `docs/V1-V2-ONE-PAGER.md` / `.pdf` | v1 vs v2 trade-offs (data, speed, security) |
 | `docs/original/*` | **local only, not published** (git-ignored). The rows below describe what is in it |
 | `docs/original/SPEC-confidential-upstream.md` | the original protocol spec (frames, epochs, proofs); the code has since moved on (see REVIEW) |
 | `docs/original/PLAN-…`, `WIRE-UP-…` | original implementation plan and routstr wiring spec |
@@ -154,8 +157,13 @@ v2 closes P1: client and node run the TLS 1.3 key schedule as a two-party
 computation, so the client never holds the key of the credential record
 (`docs/TWOPC-DESIGN.md`, trade-offs in `docs/V1-V2-ONE-PAGER.md`). Branches:
 `twopc-v2` here, `confidential-2pc` in routstr-core and routstr-sdk (routstrd
-needs no change). Pieces: `crypto/twopc` (ECtF + dual-execution garbled
-key schedule, `cu-2pc` binary for the client), `zkbench` v2 statements
+needs no change). Pieces: `crypto/twopc` (ECtF + the key schedule as
+node-only authenticated garbling: N garbles with three-halves tables, its
+wire masks are authenticated to C by IT-MACs from Ferret COTs, C runs a
+salted 64-bit consistency check of every AND gate before using any output;
+`cu-2pc` binary for the client; construction, security argument and cuts in
+`docs/TWOPC-NODE-GARBLING.md`, measurements in `crypto/twopc/BENCH.md`),
+`zkbench` v2 statements
 (`pi_nk`, `pi_c2s`, `pi_c3s`), sidecar `--protocol 2` (`relay/src/tls_v2.rs`
 checks the ClientHello carries exactly the joint P-256 share), the TLS fork's
 `external` hooks, and the v2 paths in `driver.ts` / the SDK `session.ts`.
@@ -164,7 +172,10 @@ needs `cu-2pc` next to `cu-prover` (or `CU_2PC`). The sidecar dials the provider
 only when the ClientHello arrives, so pre-warmed (armed) sessions hold no
 provider connection. The node's uvicorn needs `--ws-ping-timeout 300`
 (docs/SETUP.md). This branch (`twopc-v2`) is the repo's default branch; the
-v1 proof of concept is the `v1-poc` branch. Note: routstr-core persists
+v1 proof of concept is the `v1-poc` branch. The earlier dual-execution 2PC
+(both parties garble, label equality check; ~21 MB upload per session) is
+the tag `v2-symmetric` in this repo, routstr-core and routstr-sdk. Note:
+routstr-core persists
 settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
 
 ## Gotchas
@@ -189,18 +200,17 @@ settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
 - **`crypto/` builds into `zkbench/target`** (see `crypto/.cargo/config.toml`).
 - **Open items.**
   - v1's P1 rests on the client never seeing the N→U ciphertext; v2 removes
-    that assumption. v2's cost is ~21 MB each way per request (client upload
-    dominates on home links); node-only garbling would turn it into a download.
+    that assumption. v2's 2PC costs ~22 MB node→client and ~1.2 MB
+    client→node per request (cold ~7.4 s on a 2/50 Mbit/s link), and a
+    cheating node can learn ≤ log2 5 ≈ 2.3 bits per session about fresh,
+    single-use values. The garbler-only variant has no published proof and
+    needs external review (`docs/TWOPC-DESIGN.md`, "Security model").
   - Pre-warming (SDK `client/confidential/prewarm.ts`, routstrd
     `confidentialUpstream.prewarm`) arms v2 sessions up to the joint key share
     only while there is traffic, plus one pre-warmed proof channel per
     session (`/zk?proof=zkchan`, `cu-prover --channel`,
     `zkbench/src/channel.rs`) holding the OT/VOLE correlations for π_NK,
     π_C2S and π_C3S; per-proof `/zk?proof=pi_*` is the fallback.
-  - Node-only garbling PoC (`crypto/twopc-ag`, not integrated): the client
-    uploads ~0.06–1.2 MB instead of 21 MB per session (cold 2PC on a
-    2 Mbit/s uplink 9.6 s vs 85 s); same leakage class as dual execution;
-    report and integration plan in `crypto/twopc-ag/REPORT.md`, needs review.
   - The SDK release (version bump) and routstrd's `@routstr/sdk` bump are
     the maintainers' step.
   - The sidecar and prover are not yet in any upstream repo.

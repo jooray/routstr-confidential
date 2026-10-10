@@ -29,14 +29,15 @@ the request exists.
 
 | | v1 | v2 |
 |---|---|---|
-| Cold: request start → body sent | 0.73 s | 1.2 s (2PC preprocessing 0.76 s; π_NK 0.06 s); node-only garbling, one run on 2026-10-10 (dual execution was 0.89 s) |
+| Cold: request start → body sent | 0.73 s | 1.2 s (2PC preprocessing 0.76 s; π_NK 0.06 s; one run) |
 | Pre-warmed: claim → body sent | 3 ms | 5 ms |
 | Suffix proof π_C2 (before the provider may start) | 0.45 s | **0.10 s** |
-| Pre-warm (arm) time per session | 0.71 s | 0.88 s |
+| Pre-warm (arm) time per session | 0.71 s | about 1.1 s (estimate) |
 
 Across a network link (from the component benchmarks, 2026-10 node-only garbling): the cold 2PC takes **3.1 s on
 a 100 Mbit/s symmetric link, 5.4 s on a 7/50 Mbit/s home link and 7.4 s on 2/50 Mbit/s** (80 ms RTT); its
-online part is about 0.45 s. In exchange π_C1 (1.5 s) disappears and π_C2 drops from 1.5 s to 0.8 s. Cold, v2 roughly matches v1 on a fast link and is several seconds slower on a slow uplink. **Pre-warmed,
+online part is about 0.5 s. In exchange π_C1 (1.5 s) disappears and π_C2 drops from 1.5 s to 0.8 s. Cold, v2 is
+about a second slower than v1 on a fast link and several seconds slower on a slow uplink. **Pre-warmed,
 v2 is faster** (only the suffix proof is on the path, and it is half the cost), so v2 wants pre-warm: the tables
 cannot be reused, one set per request, but they are input-independent and can be built and sent ahead.
 

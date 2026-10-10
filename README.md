@@ -20,7 +20,7 @@ The client is the TLS 1.3 client of the provider *through* the node. Client and 
 | Path | What |
 |---|---|
 | `crypto/relay` | **cu-sidecar**: the node-side Rust process that relays TLS, verifies the handshake, holds the request's final record until the suffix proof verifies, writes the credential record, and verifies the client's proofs |
-| `crypto/twopc` | the two-party TLS key schedule (P-256 share conversion, dual-execution garbled circuits) and the client-side `cu-2pc` binary |
+| `crypto/twopc` | the two-party TLS key schedule (P-256 share conversion, then node-only authenticated garbling: the node garbles with three-halves tables, the client checks every gate against IT-MACs on the node's wire masks) and the client-side `cu-2pc` binary. Design: [`docs/TWOPC-DESIGN.md`](docs/TWOPC-DESIGN.md), [`docs/TWOPC-NODE-GARBLING.md`](docs/TWOPC-NODE-GARBLING.md); the earlier dual-execution version is the tag `v2-symmetric` |
 | `crypto/zkbench` | VOLE-ZK circuits (mpz2) for π_NK, π_C2S, π_C3S (and v1's π_C1, π_N, π_C2, π_C3) and the **`cu-prover`** binary used by clients |
 | `crypto/cu-crypto` | TLS 1.3 key schedule and AES-GCM record math (RFC 8448 / NIST vectors) |
 | `crypto/client` | reference TypeScript client (`driver.ts`) |

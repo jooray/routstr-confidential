@@ -82,13 +82,15 @@ refused: it is never silently sent in the clear. Only `POST /v1/chat/completions
 is required (it is pinned and reserved for), and only models the node lists in its confidential offer are
 used (`GET https://<node>/v1/confidential/offer`).
 
-What to expect: each request first runs a two-party computation with the node, which moves about 21 MB in
-each direction. That takes about 2 s on a fast symmetric link, but it is bound by your upload speed: from a
-typical home connection it took about 25 s, so a cold request currently waits roughly half a minute for its
-first token. The TLS session and proofs then add a few seconds. routstrd therefore **pre-warms**: once you
-send confidential requests, it prepares the expensive part for the next one in the background (see below).
-The answer streams as usual. The node's signed receipt is checked against the usage the provider
-reported; a failed check fails the request.
+What to expect: each request first runs a two-party computation with the node, in which the client
+receives about 22 MB and sends about 1.2 MB. A cold request's waiting time is dominated by receiving those
+22 MB: seconds on a fast connection (about 3 s on a 100 Mbit/s link, about 7 s on a home connection with
+a 2 Mbit/s uplink and a 50 Mbit/s downlink), but about a minute on a slow or congested one (45-70 s to the
+first token, measured from a laptop on poor Wi-Fi behind a satellite link that got only 2-5 Mbit/s from
+the node). The TLS session and the proofs then add a few seconds. routstrd therefore **pre-warms**: once
+you send confidential requests, it prepares the expensive part for the next one in the background (see
+below), which hides it. The answer streams as usual. The node's signed receipt is checked against the
+usage the provider reported; a failed check fails the request.
 
 **Pre-warming** is on by default and driven by your traffic. After a confidential request for a node,
 model and `max_tokens`, routstrd arms a session in the background (setup, reservation, the two-party
@@ -96,7 +98,7 @@ preprocessing; no connection to the provider yet), so the next matching request 
 It keeps one armed session while requests keep coming, two on bursts or overlapping requests, and closes
 them a few minutes after the last request: an idle routstrd keeps nothing open and nothing reserved. Each
 armed session reserves funds on your node credential until it is used or closed (released, no charge),
-and costs about 21 MB each way to prepare. Tune or disable it in `config.json`:
+and costs about 22 MB of download and 1.2 MB of upload to prepare. Tune or disable it in `config.json`:
 
 ```json
 "confidentialUpstream": {
@@ -108,10 +110,11 @@ Nodes refuse more than 3 unused sessions per client address by default (see sect
 `maxTotal` at 2 or lower; a client behind a shared address (NAT, Tor) shares that limit with others.
 A request uses an armed session only if its model and `max_tokens` match exactly (they are pinned at
 setup) and its body fits the armed length; otherwise it runs cold. Responses carry
-`x-routstr-confidential-prewarmed: 1` when they used one. Measured from a home connection: about 35 s to
-the first token cold, about 2-3 s warm (the armed session also pre-generates the setup of the
-zero-knowledge proofs, so they take well under a second; most of a warm request is the provider's own
-latency). Arming itself takes about a minute on a slow uplink, in the background.
+`x-routstr-confidential-prewarmed: 1` when they used one. A pre-warmed request reaches its first token in
+about 2-3 s (the armed session also pre-generates the setup of the zero-knowledge proofs, so they take well
+under a second; most of a warm request is the provider's own latency, and a session armed through the
+handshake reached it in about 1 s). Arming runs in the background and takes about as long as the cold
+two-party computation.
 
 ## 2. Running a node
 
@@ -180,9 +183,9 @@ key) and marks the offered models in `/v1/models` with `confidential_upstream`. 
 WebSockets for `/v1/confidential/ws` and `/v1/confidential/zk` (`Upgrade`/`Connection` headers, read timeout
 of a few minutes). Run the node's server with a long WebSocket ping timeout, e.g.
 `uvicorn routstr:fastapi_app --host 0.0.0.0 --port 8000 --proxy-headers --ws-ping-interval 20
---ws-ping-timeout 300` instead of the image's default `fastapi run routstr`: while a client uploads its
-~21 MB of 2PC data, its keepalive reply waits behind it, and the default 20 s timeout drops the session on any
-slower uplink.
+--ws-ping-timeout 300` instead of the image's default `fastapi run routstr`: while ~22 MB of 2PC data is on
+its way to a client on a slow link, the keepalive waits behind it, and the default 20 s timeout drops the
+session.
 
 **3. Check it.**
 
@@ -193,8 +196,9 @@ curl -s https://<node>/v1/confidential/offer | jq '{v, upstream_host, models: (.
 `v` must be `2`. Then run one request through routstrd as in section 1. On the node, each session logs the
 2PC, `credential record + KeyUpdate written to upstream (epoch 0)`, the three proofs and the settlement.
 
-**Bandwidth.** Each confidential request costs the node about 23 MB of upload (the two-party computation's
-garbled circuits cannot be reused), so budget roughly 0.3 Gbit/s at 100 requests per minute. Normal
+**Bandwidth and CPU.** Each confidential request costs the node about 24 MB of upload (the two-party
+computation's garbled circuits cannot be reused) and about 0.5 s of CPU to garble and prepare the checks,
+so budget roughly 0.3 Gbit/s at 100 requests per minute. Normal
 (non-confidential) requests are unaffected.
 
 ## Reference client
