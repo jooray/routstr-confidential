@@ -1,11 +1,12 @@
 import { crypto } from "../crypto/index.js";
 import { getHash, getPrfHashAlgorithm, hkdfExtractAndExpandLabel } from "../utils/decryption-utils.js";
 import { SUPPORTED_CIPHER_SUITE_MAP, SUPPORTED_RECORD_TYPE_MAP } from "./constants.js";
-import { areUint8ArraysEqual, asciiToUint8Array, concatenateUint8Arrays } from "./generics.js";
+import { areUint8ArraysEqualConstantTime, asciiToUint8Array, concatenateUint8Arrays } from "./generics.js";
 import { packWith3ByteLength, packWithLength } from "./packets.js";
 export async function verifyFinishMessage(verifyData, opts) {
     const computedData = await computeFinishMessageHash(opts);
-    if (!areUint8ArraysEqual(computedData, verifyData)) {
+    // FORK PATCH (TLS-06): constant-time Finished comparison.
+    if (!areUint8ArraysEqualConstantTime(computedData, verifyData)) {
         throw new Error('Invalid finish message');
     }
 }

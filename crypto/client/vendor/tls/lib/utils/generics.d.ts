@@ -7,6 +7,12 @@ export declare function toHexStringWithWhitespace(buff: Uint8Array, whitespace?:
 export declare function xor(a: Uint8Array, b: Uint8Array): Uint8Array<ArrayBuffer>;
 export declare function concatenateUint8Arrays(arrays: Uint8Array[]): Uint8Array;
 export declare function areUint8ArraysEqual(a: Uint8Array, b: Uint8Array): boolean;
+/** FORK PATCH (TLS-06) */
+export declare function areUint8ArraysEqualConstantTime(a: Uint8Array, b: Uint8Array): boolean;
+/** FORK PATCH (TLS-05) */
+export declare const MAX_RECORD_SEQUENCE_NUMBER: number;
+export declare function assertValidRecordSequence(recordNumber: number): void;
+export declare function packRecordSequence(recordNumber: number): Uint8Array<ArrayBuffer>;
 export declare function uint8ArrayToDataView(arr: Uint8Array): DataView<ArrayBufferLike>;
 export declare function asciiToUint8Array(str: string): Uint8Array<ArrayBufferLike>;
 /**

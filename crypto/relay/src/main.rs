@@ -144,7 +144,16 @@ struct AppState {
     /// Nostr key) price, refund and sign the receipt.
     node_settles: bool,
     sessions: StdMutex<HashMap<String, Arc<SessionShared>>>,
+    /// Concurrent sessions; a session holds a slot from setup to close.
+    slots: Arc<tokio::sync::Semaphore>,
+    /// Largest request body (`setup.len`) a session may declare.
+    max_body: usize,
 }
+
+/// A session must send its `setup` this soon after connecting.
+const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Hard limit on one session's lifetime (handshake to settlement).
+const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Debug)]
 enum Ev {
@@ -210,6 +219,8 @@ async fn main() -> Result<()> {
     let insecure = args.iter().any(|a| a == "--insecure-no-proofs");
     let node_settles = args.iter().any(|a| a == "--node-settles");
     let host = arg("--host").unwrap_or_else(|| host_of(&upstream));
+    let max_sessions: usize = arg("--max-sessions").map(|v| v.parse()).transpose()?.unwrap_or(32);
+    let max_body: usize = arg("--max-body").map(|v| v.parse()).transpose()?.unwrap_or(8 << 20);
     let runs_dir = arg("--runs-dir")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -298,6 +309,8 @@ async fn main() -> Result<()> {
         runs_dir,
         node_settles,
         sessions: StdMutex::new(HashMap::new()),
+        slots: Arc::new(tokio::sync::Semaphore::new(max_sessions)),
+        max_body,
     });
 
     let app = Router::new()
@@ -368,9 +381,14 @@ enum ClientMsg {
     },
     Disclose {
         r: String,
-        /// Ciphertext lengths of the trailing content records that cover R,
-        /// ordered from the end (used to locate them unambiguously).
+        /// Ciphertext lengths of the trailing content records that cover R
+        /// (and `skip`), ordered from the end (to locate them unambiguously).
         tail_lens: Vec<usize>,
+        /// Content bytes between the end of R and the end of the response:
+        /// 0 for a usage event; for an upstream error R is only the response
+        /// head and `skip` is the undisclosed body length after it.
+        #[serde(default)]
+        skip: usize,
     },
     Ku1 {
         record: String,
@@ -404,12 +422,6 @@ async fn session_handler(socket: WebSocket, app: Arc<AppState>) {
 async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (to_client, mut from_client) = mpsc::unbounded_channel::<Message>();
-
-    let tcp = TcpStream::connect(&app.upstream)
-        .await
-        .with_context(|| format!("connecting to {}", app.upstream))?;
-    let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
-
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<Ev>();
     let shared = Arc::new(SessionShared {
         params: StdMutex::new(HashMap::new()),
@@ -427,6 +439,31 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         }
     });
 
+    let mut st = Session::default();
+    let mut log = RelayLog::default();
+    let mut client_pending: Vec<u8> = Vec::new();
+    let mut server_pending: Vec<u8> = Vec::new();
+
+    let result: Result<()> = async {
+    // Nothing reaches the upstream before a valid setup: an idle or malformed
+    // connection costs no provider socket.
+    let first = match tokio::time::timeout(SETUP_TIMEOUT, ws_rx.next()).await {
+        Ok(Some(Ok(Message::Text(t)))) => t,
+        Ok(_) => bail!("expected a setup frame"),
+        Err(_) => bail!("no setup within {}s", SETUP_TIMEOUT.as_secs()),
+    };
+    let setup: ClientMsg = serde_json::from_str(&first).map_err(|e| anyhow!("bad setup: {e}"))?;
+    let _slot = app
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("sidecar at capacity; retry later"))?;
+    handle_setup(setup, &app, &shared, &to_client, &mut st)?;
+
+    let tcp = TcpStream::connect(&app.upstream)
+        .await
+        .with_context(|| format!("connecting to {}", app.upstream))?;
+    let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
     {
         let evt = evt_tx.clone();
         tokio::spawn(async move {
@@ -445,14 +482,11 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         });
     }
 
-    let mut st = Session::default();
-    let mut log = RelayLog::default();
-    let mut client_pending: Vec<u8> = Vec::new();
-    let mut server_pending: Vec<u8> = Vec::new();
-
-    let result: Result<()> = async {
+    let deadline = tokio::time::sleep(SESSION_TIMEOUT);
+    tokio::pin!(deadline);
         loop {
             tokio::select! {
+                _ = &mut deadline => bail!("session time limit ({}s) reached", SESSION_TIMEOUT.as_secs()),
                 msg = ws_rx.next() => {
                     let Some(Ok(msg)) = msg else { break };
                     match msg {
@@ -713,6 +747,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     if let Some(dir) = &st.run_dir {
         let _ = std::fs::write(dir.join("sidecar.jsonl"), st.side_log.join("\n") + "\n");
     }
+    // The session is over: its proofs can no longer run.
+    if let Some(sid) = &st.sid {
+        app.sessions.lock().unwrap().remove(sid);
+    }
     // Close the outbound queue so the sender task drains and flushes any last
     // frame (e.g. the explicit {type:"error"} abort) before the socket goes.
     drop(to_client);
@@ -774,6 +812,83 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
+/// The session's first frame. Validated and bound to a sid before the
+/// sidecar opens any connection to the upstream.
+fn handle_setup(
+    msg: ClientMsg,
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+) -> Result<()> {
+    let send = |v: serde_json::Value| {
+        let _ = to_client.send(Message::Text(v.to_string().into()));
+    };
+    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed } = msg else {
+        bail!("expected a setup frame");
+    };
+    if st.sid.is_some() || st.state != SessionState::Handshake {
+        bail!("duplicate setup");
+    }
+    if model.is_empty() || max_tokens == 0 {
+        bail!("setup needs a model and max_tokens >= 1");
+    }
+    if len == 0 || len > app.max_body {
+        bail!("declared body length {len} outside 1..={}", app.max_body);
+    }
+    if hex::decode(&nonce_c).map(|n| n.len()).unwrap_or(0) != 32 {
+        bail!("nonce_c must be 32 bytes of hex");
+    }
+    if max_tokens > app.offer.max_tokens_cap {
+        bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
+    }
+    // GAP-3: only models verified to reject multimodal parts may be
+    // priced by the LEN bound. The gate is active only when the offer
+    // carries a non-empty text_only_ok map (backwards compatible).
+    if !app.offer.text_only_ok.is_empty()
+        && app.offer.text_only_ok.get(&model) != Some(&true)
+    {
+        bail!(
+            "model {model:?} is not marked text_only_ok; refusing (an accepted image part can exceed the LEN-priced escrow)"
+        );
+    }
+    let nonce_n = os_random_32();
+    let mut h = Vec::new();
+    h.extend_from_slice(&hex::decode(&nonce_c)?);
+    h.extend_from_slice(&nonce_n);
+    // SPEC §5.1: sid = SHA256(nonce_C ‖ nonce_N ‖ SHA256(cashu_token)).
+    // Without a token (prototype / armed session before claim) the
+    // placeholder preserves the same shape.
+    match &escrow {
+        Some(token) => h.extend_from_slice(&cu_crypto::transcript::hash(token.as_bytes())),
+        None => {
+            let mut esc = b"stub-cashu".to_vec();
+            esc.extend_from_slice(&escrow_e.to_be_bytes());
+            h.extend_from_slice(&cu_crypto::transcript::hash(&esc));
+        }
+    }
+    let sid = hex::encode(cu_crypto::transcript::hash(&h));
+    st.sid = Some(sid.clone());
+    st.body_len = len;
+    st.model = model.clone();
+    st.max_tokens = max_tokens;
+    let (head, _) = placeholder_head(&app.offer.head_template, app.key.len(), len)?;
+    st.head_len = head.len();
+    st.run_dir = Some(init_run_dir(app, &sid)?);
+    app.sessions.lock().unwrap().insert(sid.clone(), shared.clone());
+    side(
+        st,
+        format!("setup sid={} model={} len={} max_tokens={} armed={} node_settles={}", sid, model, len, max_tokens, armed, app.node_settles),
+    );
+    send(serde_json::json!({
+        "type":"ready","nonce_n":hex::encode(nonce_n),"sid":sid,
+        "pubkey":app.offer.notary_pubkey,"head_len":head.len(),
+        "suffix": canonical_suffix(&model, max_tokens),
+        "armed": armed,
+    }));
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_control(
     msg: ClientMsg,
@@ -789,58 +904,8 @@ async fn handle_control(
     };
 
     match msg {
-        ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed } => {
-            if st.sid.is_some() || st.state != SessionState::Handshake {
-                bail!("duplicate setup");
-            }
-            if max_tokens > app.offer.max_tokens_cap {
-                bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
-            }
-            // GAP-3: only models verified to reject multimodal parts may be
-            // priced by the LEN bound. The gate is active only when the offer
-            // carries a non-empty text_only_ok map (backwards compatible).
-            if !app.offer.text_only_ok.is_empty()
-                && app.offer.text_only_ok.get(&model) != Some(&true)
-            {
-                bail!(
-                    "model {model:?} is not marked text_only_ok; refusing (an accepted image part can exceed the LEN-priced escrow)"
-                );
-            }
-            let nonce_n = os_random_32();
-            let mut h = Vec::new();
-            h.extend_from_slice(&hex::decode(&nonce_c)?);
-            h.extend_from_slice(&nonce_n);
-            // SPEC §5.1: sid = SHA256(nonce_C ‖ nonce_N ‖ SHA256(cashu_token)).
-            // Without a token (prototype / armed session before claim) the
-            // placeholder preserves the same shape.
-            match &escrow {
-                Some(token) => h.extend_from_slice(&cu_crypto::transcript::hash(token.as_bytes())),
-                None => {
-                    let mut esc = b"stub-cashu".to_vec();
-                    esc.extend_from_slice(&escrow_e.to_be_bytes());
-                    h.extend_from_slice(&cu_crypto::transcript::hash(&esc));
-                }
-            }
-            let sid = hex::encode(cu_crypto::transcript::hash(&h));
-            st.sid = Some(sid.clone());
-            st.body_len = len;
-            st.model = model.clone();
-            st.max_tokens = max_tokens;
-            let (head, _) = placeholder_head(&app.offer.head_template, app.key.len(), len)?;
-            st.head_len = head.len();
-            st.run_dir = Some(init_run_dir(app, &sid)?);
-            app.sessions.lock().unwrap().insert(sid.clone(), shared.clone());
-            side(
-                st,
-                format!("setup sid={} model={} len={} max_tokens={} armed={} node_settles={}", sid, model, len, max_tokens, armed, app.node_settles),
-            );
-            send(serde_json::json!({
-                "type":"ready","nonce_n":hex::encode(nonce_n),"sid":sid,
-                "pubkey":app.offer.notary_pubkey,"head_len":head.len(),"offer":&*app.offer,
-                "suffix": canonical_suffix(&model, max_tokens),
-                "armed": armed,
-            }));
-        }
+        // Handled once, before the upstream connection exists (handle_setup).
+        ClientMsg::Setup { .. } => bail!("duplicate setup"),
         ClientMsg::HsSecrets { hs, client_hs, server_hs } => {
             if st.sid.is_none() || st.handshake.is_some() {
                 bail!("hs_secrets out of order");
@@ -977,7 +1042,7 @@ async fn handle_control(
             shared.params.lock().unwrap().insert("pi_c2".into(), params.clone());
             send(serde_json::json!({"type":"zk_params","proof":"pi_c2","params":params}));
         }
-        ClientMsg::Disclose { r, tail_lens } => {
+        ClientMsg::Disclose { r, tail_lens, skip } => {
             // Only once, and only after the upstream closed: the anchor is the
             // end of the final transcript.
             if st.state != SessionState::Attested || st.disclosed {
@@ -985,12 +1050,16 @@ async fn handle_control(
             }
             st.disclosed = true;
             let r = hex::decode(&r)?;
-            // Either the terminal usage event of a successful stream, or (for
-            // an upstream error the provider does not bill) the complete HTTP
-            // error response. Both are anchored at the end of the transcript.
+            // Either the terminal usage event of a successful stream (anchored
+            // at the end of the transcript), or, for an upstream error, only the
+            // response head: its status decides the charge, the body stays
+            // private (it sits in the `skip` bytes after the head).
             let usage = if r.starts_with(b"HTTP/1.") {
-                validate_error_response(&r)?
+                validate_error_head(&r)?
             } else {
+                if skip != 0 {
+                    bail!("a usage disclosure must end the transcript (skip = {skip})");
+                }
                 let usage = validate_r(&r)?;
                 let umodel = usage.get("model").and_then(|m| m.as_str()).unwrap_or("");
                 if umodel != st.model {
@@ -1007,12 +1076,12 @@ async fn handle_control(
                 .collect();
             let first_response = info.server_handshake_records;
             // The covered records are the final contiguous application records.
-            // Only trailing records of alert size (2 + 1 + 16 = 19 bytes, i.e. a
-            // close_notify) may be skipped; nothing in the middle.
+            // Only one trailing record of alert size (2 + 1 + 16 = 19 bytes, i.e.
+            // a close_notify) may be skipped; nothing in the middle.
             let mut chosen_rev: Vec<(usize, &Record)> = Vec::new();
             let mut j: isize = response.len() as isize - 1;
             if let Some(first_want) = tail_lens.first() {
-                while j >= first_response as isize
+                if j >= first_response as isize
                     && response[j as usize].payload.len() == 19
                     && response[j as usize].payload.len().saturating_sub(16) != *first_want
                 {
@@ -1037,8 +1106,9 @@ async fn handle_control(
                 .iter()
                 .map(|(_, rec)| rec.payload.len().saturating_sub(16 + 1))
                 .sum();
-            if total < r.len() {
-                bail!("disclosed range ({total}) does not cover R ({})", r.len());
+            let need = r.len().checked_add(skip).ok_or_else(|| anyhow!("skip overflow"))?;
+            if total < need {
+                bail!("disclosed records ({total}) do not cover R + skip ({need})");
             }
             let records: Vec<zkbench::statements::TailRecord> = chosen
                 .iter()
@@ -1057,6 +1127,7 @@ async fn handle_control(
                 session: session_of(st)?,
                 records,
                 expected: r,
+                skip,
             });
             shared.params.lock().unwrap().insert("pi_c3".into(), params.clone());
             send(serde_json::json!({"type":"zk_params","proof":"pi_c3","params":params}));
@@ -1227,19 +1298,24 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
 // R validation (§5) and settlement
 // ---------------------------------------------------------------------------
 
-/// A disclosed *complete* upstream HTTP error response (status >= 400).
+/// A disclosed upstream HTTP error response *head* (status >= 400).
 ///
-/// Sound for the same reason as the usage disclosure: the raw status line and
-/// CRLF-delimited header block cannot be produced by model output (JSON
-/// strings carry no raw CR/LF), and the disclosure must end exactly at the end
-/// of the relayed transcript with the body framing complete. Returns a usage
-/// value with `error_status`, which the node settles at zero cost.
-fn validate_error_response(r: &[u8]) -> Result<serde_json::Value> {
-    let he = r
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| anyhow!("error R: no header terminator"))?;
-    let head = std::str::from_utf8(&r[..he]).context("error R: head not utf8")?;
+/// R is exactly the status line and the header block, ending in the blank
+/// line; π_C3 proves it sits `skip` bytes before the end of the response, so
+/// the body stays private. Sound because a strict status line followed by
+/// well-formed `Name: value` header lines cannot be produced by anything but
+/// the provider's own response head: model output travels in JSON strings
+/// (no raw CR/LF) and chunk framing lines are bare hex sizes, not headers. The
+/// session carries a single response (`Connection: close`). Returns a usage
+/// value with `error_status`, which the node settles from the status alone.
+fn validate_error_head(r: &[u8]) -> Result<serde_json::Value> {
+    if !r.ends_with(b"\r\n\r\n") {
+        bail!("error R: must be exactly the response head");
+    }
+    let head = std::str::from_utf8(&r[..r.len() - 4]).context("error R: head not utf8")?;
+    if head.contains("\r\n\r\n") {
+        bail!("error R: more than one header block");
+    }
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let mut parts = status_line.splitn(3, ' ');
@@ -1248,48 +1324,20 @@ fn validate_error_response(r: &[u8]) -> Result<serde_json::Value> {
         bail!("error R: malformed status line");
     }
     let status: u16 = code.parse().context("error R: status not numeric")?;
-    if status < 400 {
+    if !(400..600).contains(&status) {
         bail!("error R: status {status} is not an error");
     }
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
+    let is_tchar = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    let mut headers = 0usize;
     for l in lines {
         let (k, v) = l.split_once(':').ok_or_else(|| anyhow!("error R: malformed header"))?;
-        match k.trim().to_ascii_lowercase().as_str() {
-            "content-length" => content_length = Some(v.trim().parse().context("error R: bad content-length")?),
-            "transfer-encoding" => chunked = v.to_ascii_lowercase().contains("chunked"),
-            _ => {}
+        if k.is_empty() || !k.chars().all(is_tchar) || v.contains('\r') || v.contains('\n') {
+            bail!("error R: malformed header");
         }
+        headers += 1;
     }
-    let body = &r[he + 4..];
-    if chunked {
-        // Reuse the chunk walker: it requires the terminal chunk to end R.
-        let mut off = 0usize;
-        loop {
-            let nl = body[off..]
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .ok_or_else(|| anyhow!("error R: missing chunk-size CRLF"))?;
-            let line = std::str::from_utf8(&body[off..off + nl]).context("error R: chunk size")?;
-            let len = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
-                .context("error R: bad chunk size")?;
-            off += nl + 2;
-            if len == 0 {
-                if body.len() != off + 2 || &body[off..] != b"\r\n" {
-                    bail!("error R: terminal chunk not at the end");
-                }
-                break;
-            }
-            if body.len() < off + len + 2 || &body[off + len..off + len + 2] != b"\r\n" {
-                bail!("error R: chunk overruns the disclosure");
-            }
-            off += len + 2;
-        }
-    } else {
-        let cl = content_length.ok_or_else(|| anyhow!("error R: no body framing"))?;
-        if body.len() != cl {
-            bail!("error R: body length {} != content-length {cl}", body.len());
-        }
+    if headers == 0 {
+        bail!("error R: no headers");
     }
     Ok(serde_json::json!({ "error_status": status, "choices": [] }))
 }
@@ -1359,7 +1407,7 @@ fn settle(app: &Arc<AppState>, st: &Session) -> Option<serde_json::Value> {
     let model = usage
         .get("model")
         .and_then(|m| m.as_str())
-        .unwrap_or("mistral-small-3-2-24b-instruct")
+        .unwrap_or(&st.model)
         .to_string();
     let receipt = serde_json::json!({
         "sid": sid,

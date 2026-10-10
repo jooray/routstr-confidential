@@ -109,6 +109,7 @@ pub fn pi_c3() -> (Params, Witness) {
             session: session(),
             records: vec![TailRecord { seq: 0, ct }],
             expected: r,
+            skip: 0,
         }),
         Witness::Hs(arr32(HS)),
     )

@@ -184,7 +184,9 @@ pub fn verify_handshake(
                 .ok_or_else(|| anyhow!("server handshake record {server_seq}: bad GCM tag"))?;
             server_seq += 1;
             // strip the inner content type byte
-            let inner = &pt[..pt.len() - 1];
+            let Some((_, inner)) = pt.split_last() else {
+                bail!("empty encrypted handshake record");
+            };
             plaintext_stream.extend_from_slice(inner);
         }
     }
@@ -288,7 +290,9 @@ pub fn verify_handshake(
             let pt = aesgcm::gcm_open(&ck, &civ, client_seq, &r.header, &r.payload)
                 .ok_or_else(|| anyhow!("client handshake record {client_seq}: bad GCM tag"))?;
             client_seq += 1;
-            let inner = &pt[..pt.len() - 1];
+            let Some((_, inner)) = pt.split_last() else {
+                bail!("empty encrypted handshake record");
+            };
             client_handshake_plain.extend_from_slice(inner);
         }
     }

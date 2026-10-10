@@ -54,11 +54,11 @@ MINT_DATABASE=/tmp/cu-mint/data/mint MINT_INPUT_FEE_PPK=0 \
 curl -s http://127.0.0.1:3338/v1/info
 ```
 
-### 2. Sidecar (node-settles, config-file offer, rayon)
+### 2. Sidecar (node-settles, config-file offer)
 
 ```bash
 cd crypto
-cargo build --release -p cu-sidecar            # rayon is on by default
+cargo build --release -p cu-sidecar            # rayon is opt-in (--features rayon), off by default
 RUST_LOG=cu_sidecar=info ./zkbench/target/release/cu-sidecar \
   --listen 127.0.0.1:7443 --upstream api.venice.ai:443 --key-env VENICE_API_KEY \
   --offer relay/offer.venice.json --node-settles
@@ -129,10 +129,10 @@ CU_PROVER=../zkbench/target/release/cu-prover \
 
 ```bash
 cd crypto/client && ./bench-warm.sh 5          # cold / warm / baseline, medians
-cd crypto && ./zkbench/target/release/cu-prover --bench --json /tmp/bench-rayon.json
-# rayon off:
-cargo build --release -p zkbench --bin cu-prover --no-default-features
-./zkbench/target/release/cu-prover --bench --json /tmp/bench-no-rayon.json
+cd crypto && ./zkbench/target/release/cu-prover --bench --json /tmp/bench-no-rayon.json   # default build: rayon off
+# rayon on (opt-in feature):
+cargo build --release -p zkbench --bin cu-prover --features rayon
+./zkbench/target/release/cu-prover --bench --json /tmp/bench-rayon.json
 ```
 
 ### 7. Tests
@@ -362,10 +362,12 @@ complete request, so they are refunded and cost the node nothing.
 
 ## GAP-2 re-check (no change made)
 
-`relay/src/main.rs` `validate_r` now requires the usage event's `model` and the
-`Disclose` handler rejects it if it differs from the pinned setup model
-(`main.rs` ~899), so a missing/mismatched model is a settlement failure rather
-than a default. The hardcoded `"mistral-small-3-2-24b-instruct"` fallback still
+`relay/src/main.rs` `validate_r` requires the usage event's `model` field, and
+the `ClientMsg::Disclose` handler (not `validate_r`, and not the `c1_material`
+handler the earlier line reference pointed at) rejects the disclosure if it
+differs from the pinned setup model; the node checks it again in
+`confidential_ws.py` `_apply_settlement`. A missing or mismatched model is a
+settlement failure rather than a default. GAP-2 is closed. The hardcoded `"mistral-small-3-2-24b-instruct"` fallback still
 present in the stub `settle()` is unreachable on that path (it is only reached
 after `validate_r` passed, and only in the direct `--node-settles`-absent
 deployment). No change required for this pass; noted for the prototype stub's
@@ -420,7 +422,34 @@ confidential tests; no `routstr-core` file was modified in this pass.
 | (f) body ends with `claude-opus-5`, client claims the canonical suffix | π_C2 fails on `suffix`; record never released; reservation released |
 
 Provider assumptions are re-checked live by `crypto/tools/provider-profile-check.py`
-(10/10 for Venice).
+(A1–A11, 11/11 for Venice on 2026-10-10).
+
+## Validation gates (`crypto/tools/`)
+
+Each gate exits 0 only if every case passes; any deviation, crash, timeout or
+inconclusive outcome exits non-zero. Each script documents its interface at
+the top.
+
+```bash
+# provider profile A1–A11 (live, fractions of a cent). 429/5xx/timeouts are
+# retried, then INCONCLUSIVE (exit 2), never PASS. A9/A11 use openssl s_client
+# (OpenSSL >= 1.1.1; CU_OPENSSL to pick one) to offer only TLS_AES_128_GCM_SHA256.
+routstr-core/.venv/bin/python -I crypto/tools/provider-profile-check.py
+routstr-core/.venv/bin/python -I crypto/tools/provider-profile-check.py --self-test   # offline
+# every offered model rejects image_url AND data-URI parts (live)
+routstr-core/.venv/bin/python -I crypto/tools/regression-modality.py [--json out.json]
+routstr-core/.venv/bin/python -I crypto/tools/regression-modality.py --self-test      # offline
+# attack cases + honest control (node + sidecar up; dedicated node). NODE_LOG
+# (the node's JSON log, routstr-core/logs/app_<date>.log) adds the money
+# assertion: released for every refused/withheld case, settled for control/b.
+AUTH=sk-... CU_NODE=http://127.0.0.1:8010 NODE_LOG=$PWD/routstr-core/logs/app_$(date +%F).log \
+  crypto/tools/adversarial-model-swap.sh          # table + crypto/runs/adversarial/summary.tsv
+# proof-stall regression: N cold sessions, fails below --min-success (default 100)
+AUTH=sk-... CU_NODE=http://127.0.0.1:8010 crypto/tools/stall-repro.sh [--min-success 95] 20 label
+```
+
+Both shell gates accept `CU_DRIVER=<command>` in place of the reference
+client, which is how their verdict logic is tested against a stub.
 
 ## #18 / #19
 
@@ -466,7 +495,52 @@ RUST_LOG=cu_sidecar=info ./zkbench/target/release/cu-sidecar \
   --listen 127.0.0.1:7443 --upstream api.venice.ai:443 --key-env VENICE_API_KEY \
   --offer relay/offer.venice.json --node-settles
 # adversarial suite (mint :3338 + node :8000 must be up)
-./tools/adversarial-model-swap.sh
+AUTH=sk-... ./tools/adversarial-model-swap.sh   # see "Validation gates"
 # cold / warm benchmark
 cd client && ./bench-warm.sh 5
 ```
+
+# Security hardening (2026-10-10)
+
+Billing in this section supersedes the
+"Node billing" bullets of the GAP-4 section above.
+
+- **Proofs.** π_C2/π_C3 compare in-circuit (`gadgets.rs` `eq_bytes`); the
+  verifier decodes one bit. Both clients validate every node-supplied proof
+  parameter (`routstr-sdk/client/confidential/params.ts`,
+  `crypto/client/src/params.ts`). π_C3 takes a `skip` of undisclosed bytes.
+- **Upstream errors.** Only the response head is disclosed
+  (`validate_error_head`); 4xx/503 release, other 5xx charge.
+- **Billing.** `reserve` reserves `max(min_request_msat,
+  ⌈(prompt_limit·in + max_tokens·out)/1000⌉)` at the rates frozen by
+  `offer_sig` (409 `offer_expired` for an unknown offer); `settle` charges the
+  frozen-rate cost of the verified usage through
+  `finalize_ehbp_actual_cost_payment`. Receipts carry `v, sid, model, usage,
+  cost_msats, reserved_msats, balance_msats, rates, notary_pubkey,
+  attestation_hash, time`, signed; the SDK requires the signature and checks
+  `sid` and `attestation_hash`.
+- **Limits.** Node and sidecar validate setup before any provider connection;
+  32 sessions each, 15 s to setup, 600 s per session, 8 MiB body.
+- **Client.** routstrd answers 400 for `x-routstr-verify: confidential` when
+  the mode is off or the endpoint is not `POST /v1/chat/completions`; the SDK
+  surfaces post-response check failures, re-verifies cached offers per call,
+  and passes the prover's witness on stdin. The vendored TLS fork (both trees)
+  does RFC 5280 path validation and the other TLS-01…10 fixes.
+
+**Results (2026-10-10, live Venice).**
+
+- Reference client, honest session (`deepseek-v4-flash`, 40 tokens):
+  reserved 2,282 msats, cost 63 msats, every receipt check true.
+- Upstream 400 (unknown field, whose error body quotes the field name): head
+  only disclosed, cost 0, signed receipt; the field name appears in neither the
+  node's nor the sidecar's log.
+- routstrd with the OpenAI Python client, streaming and non-streaming: both
+  confidential (node log: 0 plain chat requests); unsupported endpoints → 400.
+- Five idle `/ws` connections: 0 provider connections, closed at the setup
+  timeout.
+- Gates: `provider-profile-check.py` 11/11, `regression-modality.py` 8/8,
+  `adversarial-model-swap.sh` 6/6 (see "Validation gates").
+- Tests: routstr-core 2466 passed (61 confidential); SDK 744 passed and
+  `tsc --noEmit` clean (the Bun-only file fails under vitest, as on `main`);
+  routstrd 477 pass, 0 fail; `cargo test` for zkbench (incl. 4 one-bit
+  disclosure tests), cu-crypto and cu-sidecar pass.

@@ -23,7 +23,7 @@ The client is the TLS 1.3 client of the provider *through* the node. The node re
 | `crypto/zkbench` | VOLE-ZK circuits (mpz2) for π_C1, π_N, π_C2, π_C3 and the **`cu-prover`** binary used by clients |
 | `crypto/cu-crypto` | TLS 1.3 key schedule and AES-GCM record math (RFC 8448 / NIST vectors) |
 | `crypto/client` | reference TypeScript client (`driver.ts`) |
-| `crypto/tools` | `provider-profile-check.py` (live provider assumptions), `adversarial-model-swap.sh`, mint helper |
+| `crypto/tools` | validation gates, each exits non-zero on any deviation: `provider-profile-check.py` (live provider-profile gate A1–A11, incl. the pinned TLS suite and a mid-request KeyUpdate), `regression-modality.py` (every offered model rejects image URL and data-URI parts), `adversarial-model-swap.sh` (malicious-client attack cases plus an honest control), `stall-repro.sh` (N cold sessions, success-rate threshold). Also `probe-modality.py` (exploratory modality/token-amplification probe) and `cu_cashu.py` (test-mint helper: mint, balance, redeem) |
 | `paper/` | the paper (`paper.md` → `build.sh`) |
 | `docs/` | `APPROACH.md` (engineering overview), `ADVERSARIAL-QA.md`, `REVIEW-2026-10-09.md` (findings and fixes), `ONE-PAGER.md` |
 

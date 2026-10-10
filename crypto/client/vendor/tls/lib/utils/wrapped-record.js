@@ -1,6 +1,6 @@
 import { crypto } from "../crypto/index.js";
 import { AUTH_TAG_BYTE_LENGTH, SUPPORTED_CIPHER_SUITE_MAP } from "./constants.js";
-import { areUint8ArraysEqual, concatenateUint8Arrays, generateIV, isSymmetricCipher, padTls, toHexStringWithWhitespace, uint8ArrayToDataView, unpadTls } from "./generics.js";
+import { areUint8ArraysEqualConstantTime, concatenateUint8Arrays, generateIV, isSymmetricCipher, packRecordSequence, padTls, toHexStringWithWhitespace, uint8ArrayToDataView, unpadTls } from "./generics.js";
 import { packPacketHeader } from "./packets.js";
 const AUTH_CIPHER_LENGTH = 12;
 export async function decryptWrappedRecord(encryptedData, opts) {
@@ -25,7 +25,8 @@ export async function decryptWrappedRecord(encryptedData, opts) {
         const mac = plaintextAndMac.slice(-hashLength);
         const plaintext = plaintextAndMac.slice(0, -hashLength);
         const macComputed = await computeMacTls12(plaintext, opts);
-        if (!areUint8ArraysEqual(mac, macComputed)) {
+        // FORK PATCH (TLS-06): constant-time MAC comparison.
+        if (!areUint8ArraysEqualConstantTime(mac, macComputed)) {
             throw new Error(`MAC mismatch: expected ${toHexStringWithWhitespace(macComputed)}, got ${toHexStringWithWhitespace(mac)}`);
         }
         return { plaintext, iv };
@@ -81,9 +82,10 @@ export async function encryptWrappedRecord(plaintext, opts) {
         let recordIv;
         let completeIv = iv;
         if (recordIvLength && typeof recordNumber !== 'undefined') {
+            // FORK PATCH (TLS-05): full 64-bit sequence number.
+            const seq = packRecordSequence(recordNumber);
             recordIv = new Uint8Array(recordIvLength);
-            const seqNumberView = uint8ArrayToDataView(recordIv);
-            seqNumberView.setUint32(recordIvLength - 4, recordNumber);
+            recordIv.set(seq.slice(Math.max(0, 8 - recordIvLength)), Math.max(0, recordIvLength - 8));
             completeIv = concatenateUint8Arrays([
                 iv,
                 recordIv
@@ -162,9 +164,8 @@ function getTls12Header(plaintextLength, opts) {
     const recordHeader = 'recordHeaderOpts' in opts
         ? packPacketHeader(plaintextLength, opts.recordHeaderOpts)
         : replaceRecordHeaderLen(opts.recordHeader, plaintextLength);
-    const seqNumberBytes = new Uint8Array(8);
-    const seqNumberView = uint8ArrayToDataView(seqNumberBytes);
-    seqNumberView.setUint32(4, recordNumber || 0);
+    // FORK PATCH (TLS-05): full 64-bit sequence number.
+    const seqNumberBytes = packRecordSequence(recordNumber || 0);
     return concatenateUint8Arrays([
         seqNumberBytes,
         recordHeader,

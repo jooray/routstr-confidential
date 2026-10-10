@@ -29,4 +29,33 @@ export type X509Certificate<T = any> = {
      * */
     verifyIssued(otherCert: X509Certificate<T>): boolean | Promise<boolean>;
     serialiseToPem(): string;
+    /** FORK PATCH (TLS-02): accessors used by RFC 5280 path validation */
+    getAlternativeNames(): {
+        type: string;
+        value: string;
+    }[];
+    hasSubjectEmailAddress(): boolean;
+    getBasicConstraints(): {
+        ca: boolean;
+        pathLength?: number;
+    } | undefined;
+    getKeyUsages(): string[] | undefined;
+    getExtendedKeyUsages(): string[] | undefined;
+    getNameConstraints(): {
+        permitted: X509NameConstraintSubtree[];
+        excluded: X509NameConstraintSubtree[];
+    } | undefined;
+    getUnhandledCriticalExtensions(): string[];
+    getSubjectRdns(): string[];
+    isSelfIssued(): boolean;
+};
+export type X509NameConstraintSubtree = {
+    type: 'dns';
+    value: string;
+} | {
+    type: 'dn';
+    value: string[];
+} | {
+    type: 'ip' | 'email' | 'url' | 'id' | 'other' | 'unknown';
+    value?: undefined;
 };

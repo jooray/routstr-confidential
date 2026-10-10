@@ -37,6 +37,7 @@ import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
 
 import { concat, epoch1Material, fromHex, hex, sha256 } from './advice.ts'
 import { runZk } from './zkbridge.ts'
+import { checkPiC1Params, checkPiC2Params, checkPiC3Params } from './params.ts'
 
 setCryptoImplementation(webcryptoCrypto)
 
@@ -82,6 +83,8 @@ const NODE_PUBKEY = arg('--node-pubkey')
 let OFFER_PUBKEY: string | undefined
 // Escrow (sats) the node requires for this body: MODEL at MAX_TOKENS.
 let OFFER: any = null
+// The signature of the offer we verified: the node settles at its rates.
+let OFFER_SIG: string | undefined
 
 // ---------------------------------------------------------------------------
 // Minimal message bus
@@ -126,6 +129,10 @@ const suffix =
   `"venice_parameters":{"include_venice_system_prompt":false,"enable_web_search":"off"}}`
 let priv = `{"messages":[{"role":"user","content":${JSON.stringify(PROMPT)}}]`
 if (DECOY) priv += `,"model":${JSON.stringify(DECOY)}`
+// Test hook: extra private JSON members (e.g. a field the provider rejects, to
+// exercise the upstream-error path).
+const PRIVATE_EXTRA = arg('--private-extra')
+if (PRIVATE_EXTRA) priv += `,${PRIVATE_EXTRA}`
 const bodyText = priv + suffix
 const body = new TextEncoder().encode(bodyText)
 const suffixBytes = new TextEncoder().encode(suffix)
@@ -186,6 +193,26 @@ class Session {
   responseChunks: Uint8Array[] = []
   responseBytes = new Uint8Array(0)
   responseRecordCount = 0
+  serverRecords: Uint8Array[] = []
+  serverPending: Uint8Array = new Uint8Array(0)
+  epoch2 = false
+  bodyRecords: Uint8Array[] = []
+  attJson: string | undefined
+
+  sessionValues() {
+    return { clientHs: this.clientHs, serverHs: this.serverHs, thSH: this.thSH, thSF: this.thSF }
+  }
+
+  trackServerRecords(bytes: Uint8Array): void {
+    let buf = concat(this.serverPending, bytes)
+    while (buf.length >= 5) {
+      const len = (buf[3]! << 8) | buf[4]!
+      if (buf.length < 5 + len) break
+      if (buf[0] === 0x17) this.serverRecords.push(buf.slice(5, 5 + len))
+      buf = buf.subarray(5 + len)
+    }
+    this.serverPending = buf.slice()
+  }
   ttft = 0
   sid = ''
   ready: any = null
@@ -246,6 +273,7 @@ class Session {
         return
       }
       const bytes = new Uint8Array(d as ArrayBuffer)
+      this.trackServerRecords(bytes)
       this.flushChain = this.flushChain
         .then(() => this.tls.handleReceivedBytes(bytes))
         .catch((e) => console.error(`[client ${this.label}] handleReceivedBytes:`, e))
@@ -258,7 +286,9 @@ class Session {
       namedCurves: ['X25519'],
       applicationLayerProtocols: ['http/1.1'],
       write: (packet: { header: Uint8Array; content: Uint8Array }) => {
-        this.sendBytes(concat(packet.header, packet.content))
+        const record = concat(packet.header, packet.content)
+        if (this.epoch2) this.bodyRecords.push(record)
+        this.sendBytes(record)
       },
       onRead: () => {},
       onApplicationData: (rec: Uint8Array) => {
@@ -309,6 +339,7 @@ class Session {
         armed: ARM,
       }
       setup.auth = this.token ?? ''
+      if (OFFER_SIG) setup.offer_sig = OFFER_SIG
       this.sendText(setup)
     } else {
       this.sendText({
@@ -404,6 +435,13 @@ class Session {
       if (!commit.c_commit) throw new Error('insecure: no c_commit')
     } else {
       const ack = await this.waitT('zk_ack', 30000)
+      checkPiC1Params(ack.params, {
+        session: this.sessionValues(),
+        headLen: this.ready.head_len + 1,
+        s: mat.s,
+        h1: mat.h1,
+        t0: mat.t0,
+      })
       await runZk(this.zkUrl('pi_c1', this.sid), {
         proof: 'pi_c1',
         role: 'prover',
@@ -412,7 +450,8 @@ class Session {
       })
       this.log({ ev: 'pi_c1_ok' })
       commit = await this.waitT('c_commit', 60000)
-      checkPiNParams(commit.params, this.ready, mat.s, body.length)
+      // Rebuilt from the offer we fetched, never from the relayed ready frame.
+      checkPiNParams(commit.params, { offer: OFFER }, mat.s, body.length)
       await runZk(this.zkUrl('pi_n', this.sid), {
         proof: 'pi_n',
         role: 'verifier',
@@ -441,6 +480,7 @@ class Session {
     const tBodyWrite = Date.now()
     this.tBodyWrite = tBodyWrite
     // The pinned suffix in its own final record (held by the node until π_C2).
+    this.epoch2 = true
     await this.tls.write(body.subarray(0, body.length - suffixBytes.length))
     await this.tls.write(suffixBytes)
     this.log({ ev: 'body_sent', len: body.length })
@@ -476,6 +516,14 @@ class Session {
     const claimed = ADV_CLAIM_CANONICAL ? new TextEncoder().encode(this.ready.suffix) : suffixBytes
     this.sendText({ type: 'body_suffix', suffix: hex(claimed) })
     const c2params = await this.waitT('zk_params', 30000)
+    if (!ADV_SUFFIX_MODEL && !ADV_CLAIM_CANONICAL) {
+      checkPiC2Params(c2params.params, {
+        session: this.sessionValues(),
+        seq: this.bodyRecords.length - 1,
+        record: this.bodyRecords[this.bodyRecords.length - 1] ?? new Uint8Array(0),
+        suffix: suffixBytes,
+      })
+    }
     const c2Promise = runZk(this.zkUrl('pi_c2', this.sid), {
       proof: 'pi_c2',
       role: 'prover',
@@ -491,6 +539,7 @@ class Session {
       timeout(60000, 'attestation'),
     ])
     const attJson: string = attMsg.a_json ?? JSON.stringify(attMsg.a)
+    this.attJson = attMsg.a_json
     if (OFFER_PUBKEY && this.ready.pubkey !== OFFER_PUBKEY) {
       throw new Error('session pubkey differs from the signed offer key')
     }
@@ -509,24 +558,35 @@ class Session {
       }
     }
 
-    // An upstream HTTP error carries no usage event: disclose the complete
-    // error response instead (the node settles 4xx/503 at zero cost).
+    // An upstream HTTP error carries no usage event: disclose only its head
+    // (status line + headers); π_C3 proves where it sits and the body stays
+    // private (the node settles 4xx/503 at zero cost).
     const statusLine = Buffer.from(this.responseBytes.subarray(0, 64)).toString('latin1')
     const upstreamStatus = Number(/^HTTP\/1\.\d (\d{3})/.exec(statusLine)?.[1] ?? 0)
     if (upstreamStatus >= 400) {
       console.log(`[client ${this.label}] upstream error ${upstreamStatus}: ${Buffer.from(this.responseBytes).toString('utf8').split('\r\n\r\n')[1]?.slice(0, 200)}`)
     }
-    const r = upstreamStatus >= 400 ? this.responseBytes : extractR(this.responseBytes)
+    let r: Uint8Array | null
+    let skip = 0
+    if (upstreamStatus >= 400) {
+      const headEnd = Buffer.from(this.responseBytes).indexOf('\r\n\r\n')
+      if (headEnd < 0) throw new Error('upstream error response has no head')
+      r = this.responseBytes.slice(0, headEnd + 4)
+      skip = this.responseBytes.length - r.length
+    } else {
+      r = extractR(this.responseBytes)
+    }
     if (!r) throw new Error('could not extract a valid usage disclosure R')
     const tailLens: number[] = []
     let acc = 0
-    for (let i = this.responseChunks.length - 1; i >= 0 && acc < r.length; i--) {
+    for (let i = this.responseChunks.length - 1; i >= 0 && acc < r.length + skip; i--) {
       tailLens.push(this.responseChunks[i]!.length + 1)
       acc += this.responseChunks[i]!.length
     }
-    this.sendText({ type: 'disclose', r: hex(r), tail_lens: tailLens })
+    this.sendText({ type: 'disclose', r: hex(r), tail_lens: tailLens, skip })
 
     const c3 = await this.waitT('zk_params', 30000)
+    checkPiC3Params(c3.params, { session: this.sessionValues(), serverRecords: this.serverRecords, r, skip })
     await runZk(this.zkUrl('pi_c3', this.sid), {
       proof: 'pi_c3',
       role: 'prover',
@@ -546,8 +606,9 @@ class Session {
     let sigHex: string | undefined
     let scheme: string | undefined
     if (terminal.kind === 'receipt') {
-      receipt = terminal.m.receipt
-      receiptJson = terminal.m.receipt_json ?? JSON.stringify(receipt)
+      // The signed bytes are the receipt; the envelope beside them is ignored.
+      receiptJson = terminal.m.receipt_json ?? JSON.stringify(terminal.m.receipt)
+      receipt = JSON.parse(receiptJson)
       sigHex = terminal.m.sig
       scheme = terminal.m.sig_scheme
     } else {
@@ -558,6 +619,13 @@ class Session {
       sigHex = undefined
     }
     const okSig = verifySig(receiptJson, sigHex, this.ready.pubkey, scheme)
+    if (terminal.kind === 'receipt') {
+      if (!okSig) throw new Error('receipt signature invalid')
+      if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${receipt.sid}, not ${this.sid}`)
+      if (this.attJson !== undefined && receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))) {
+        throw new Error("receipt is not bound to this session's attestation")
+      }
+    }
 
     if (upstreamStatus >= 400) {
       const unbilled = upstreamStatus === 503 || upstreamStatus < 500
@@ -779,9 +847,15 @@ function checkPiNParams(params: any, ready: any, s: Uint8Array, bodyLen: number)
 
 async function verifyOffer(): Promise<void> {
   if (!VERIFY_OFFER) {
-    if (!NODE) return // direct sidecar mode: the sidecar's /offer has no price list
     try {
-      OFFER = await (await fetch(`${NODE!.replace(/\/$/, '')}/v1/confidential/offer`)).json()
+      if (!NODE) {
+        // Direct sidecar mode: the sidecar's /offer (template, no price list).
+        OFFER = await (await fetch(`${SIDECAR.replace(/\/$/, '')}/offer`)).json()
+        return
+      }
+      const raw = await (await fetch(`${NODE!.replace(/\/$/, '')}/v1/confidential/offer`)).json()
+      OFFER = raw.sig_payload ? JSON.parse(raw.sig_payload) : raw
+      OFFER_SIG = raw.sig
     } catch (e) {
       console.error('[client] could not fetch the offer:', e)
     }
@@ -804,6 +878,7 @@ async function verifyOffer(): Promise<void> {
     }
     OFFER_PUBKEY = parsed.notary_pubkey
     OFFER = parsed
+    OFFER_SIG = offer.sig
   } catch (e) {
     console.error('[client] offer verification failed:', e)
     process.exit(4)

@@ -36,6 +36,18 @@ export function areUint8ArraysEqual(a, b) {
     }
     return true;
 }
+// FORK PATCH (TLS-06): comparison without an early exit, for
+// Finished and MAC values. Only the lengths (public) short-circuit.
+export function areUint8ArraysEqualConstantTime(a, b) {
+    if (a.length !== b.length) {
+        return false;
+    }
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) {
+        diff |= a[i] ^ b[i];
+    }
+    return diff === 0;
+}
 export function uint8ArrayToDataView(arr) {
     return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
 }
@@ -63,12 +75,28 @@ export function uint8ArrayToBinaryStr(buf) {
     }
     return ret;
 }
+// FORK PATCH (TLS-05): the highest record sequence number accepted in
+// one traffic-key epoch. RFC 8446 allows up to 2^64 - 1; the bound is 2^48
+// (exact in a JS number, far above any session here). Exceeding it is an error.
+export const MAX_RECORD_SEQUENCE_NUMBER = 2 ** 48;
+export function assertValidRecordSequence(recordNumber) {
+    if (!Number.isSafeInteger(recordNumber)
+        || recordNumber < 0
+        || recordNumber > MAX_RECORD_SEQUENCE_NUMBER) {
+        throw new Error(`Record sequence number ${recordNumber} out of range`);
+    }
+}
+export function packRecordSequence(recordNumber) {
+    assertValidRecordSequence(recordNumber);
+    const seq = new Uint8Array(8);
+    new DataView(seq.buffer).setBigUint64(0, BigInt(recordNumber));
+    return seq;
+}
 export function generateIV(iv, recordNumber) {
-    // make the recordNumber a buffer, so we can XOR with the main IV
-    // to generate the specific IV to decrypt this packet
+    // FORK PATCH (TLS-05): RFC 8446 5.3: the 64-bit big-endian sequence
+    // number, left-padded to the IV length, XORed with the static IV.
     const recordBuffer = new Uint8Array(iv.length);
-    const recordBufferView = new DataView(recordBuffer.buffer);
-    recordBufferView.setUint32(iv.length - 4, recordNumber);
+    recordBuffer.set(packRecordSequence(recordNumber), iv.length - 8);
     return xor(iv, recordBuffer);
 }
 /**

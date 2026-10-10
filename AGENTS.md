@@ -64,9 +64,12 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
 
 **One session.**
 1. *Setup.* The client sends its ordinary node credential (`sk-` key or Cashu
-   token) in `setup.auth`. The node validates it (`validate_bearer_key`),
-   reserves the model's max cost (`pay_for_request`), and forwards the setup to
-   the sidecar *without* the credential.
+   token) in `setup.auth` and the signature of the offer it verified in
+   `setup.offer_sig`. The node validates the setup and the credential
+   (`validate_bearer_key`), freezes that offer's rates, reserves a full-context
+   prompt plus the pinned `max_tokens` (`pay_for_request`), and only then
+   dials the sidecar and forwards the setup *without* the credential. The
+   sidecar opens no provider connection before a valid setup.
 2. *Handshake.* The client does the TLS handshake with Venice through the relay
    and discloses only the handshake traffic secrets. The sidecar verifies the
    certificate chain, hostname, CertificateVerify and both Finished messages.
@@ -78,9 +81,13 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
    proves it is the canonical suffix**, so Venice cannot start on anything
    else.
 5. *Response.* It streams back; the client decrypts and verifies it.
-6. *Settlement.* π_C3 proves the disclosed usage event (or a complete HTTP error
-   response). The node charges it with `adjust_payment_for_tokens`, or releases
-   the reservation for a 4xx/503, and returns a signed receipt.
+6. *Settlement.* π_C3 proves the disclosed usage event (or, for an upstream
+   HTTP error, only the response head; the body stays private). The node
+   charges the usage at the frozen offer rates (EHBP's
+   `finalize_ehbp_actual_cost_payment`), or releases the reservation for a
+   4xx/503, and returns a signed receipt bound to the sid and attestation.
+   π_C2/π_C3 compare inside the circuit (the node learns one bit), and the
+   client checks every proof parameter against its own records (`params.ts`).
 7. *Abort.* Before the record is released: release. After it, with no
    disclosure: charge the reservation.
 
@@ -88,8 +95,8 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
 
 | Concern | File |
 |---|---|
-| sidecar state machine, record hold, tail anchoring, error disclosure | `crypto/relay/src/main.rs` (+ `tls.rs` handshake verification) |
-| ZK statements / circuits | `crypto/zkbench/src/statements.rs`, `gadgets.rs`, `bin/cu-prover.rs` |
+| sidecar state machine, setup gate and limits, record hold, tail anchoring, error-head disclosure | `crypto/relay/src/main.rs` (`handle_setup`, `handle_control`, `validate_error_head`; + `tls.rs` handshake verification) |
+| ZK statements / circuits (one-bit equality `eq_bytes`) | `crypto/zkbench/src/statements.rs`, `gadgets.rs`, `bin/cu-prover.rs` (`--job-stdin`); tests `tests/disclosure.rs` |
 | node offer, model→provider candidate, billing glue | `routstr-core/routstr/confidential.py` |
 | node relay + interception | `routstr-core/routstr/confidential_ws.py` |
 | node hooks | `core/main.py` (routes), `core/settings.py` (`CONFIDENTIAL_SIDECAR_URL`), `payment/models.py` (`confidential_upstream` field) |
@@ -109,6 +116,7 @@ cd /tmp/cu-mint && MINT_BACKEND_BOLT11_SAT=FakeWallet MINT_PRIVATE_KEY=TEST_PRIV
 cd $P/crypto && cargo build --release -p cu-sidecar -p zkbench
 ./zkbench/target/release/cu-sidecar --listen 127.0.0.1:7444 --upstream api.venice.ai:443 \
   --key-env VENICE_API_KEY --offer relay/offer.venice.json --node-settles &
+#   (limits: --max-sessions 32, --max-body 8388608; 15 s setup / 600 s session timeouts)
 # node: RELAYS points nowhere so nothing is published to Nostr
 cd $P/routstr-core && DATABASE_URL=sqlite+aiosqlite:////tmp/node.db NSEC=<test nsec> \
   CONFIDENTIAL_SIDECAR_URL=http://127.0.0.1:7444 CASHU_MINTS=http://127.0.0.1:3338 \
@@ -125,9 +133,14 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun ≥ 1.4 and se
 `x-routstr-verify: confidential`.
 
 **Checks.**
-- `crypto/tools/provider-profile-check.py`: the provider assumptions, live (10/10).
-- `crypto/tools/adversarial-model-swap.sh` (with `AUTH=… CU_NODE=…`): the
-  model/cap swap attacks.
+- `crypto/tools/provider-profile-check.py`: the provider assumptions A1–A11,
+  live (11/11); `--self-test` proves the negative controls.
+- `crypto/tools/regression-modality.py`: image/data-URI rejection per model.
+- `crypto/tools/adversarial-model-swap.sh` (with `AUTH=… CU_NODE=…
+  NODE_LOG=routstr-core/logs/app_<date>.log` on a dedicated node): the
+  model/cap swap attacks plus an honest control, as a gate (exit ≠ 0 on any
+  deviation).
+- `crypto/tools/stall-repro.sh`: repeated sessions, fails below a success rate.
 - Unit tests:
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
   - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`
@@ -140,7 +153,8 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun ≥ 1.4 and se
 - **Never log or commit `VENICE_API_KEY`**, node nsecs or Cashu tokens. Scan
   diffs before committing.
 - **Never let a test node announce itself.** Set `RELAYS` to an unreachable
-  relay. The listing code now skips loopback/private URLs (the
+  relay, and stop test nodes when done (a forgotten node without `RELAYS`
+  keeps re-announcing). The listing code now skips loopback/private URLs (the
   `fix/no-announce-unroutable-urls` branch).
 - **Rebuild after SDK changes.** routstrd uses the SDK via a
   `node_modules/@routstr/sdk` symlink to `../routstr-sdk`, which loads
@@ -156,7 +170,8 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun ≥ 1.4 and se
 - **`crypto/` builds into `zkbench/target`** (see `crypto/.cargo/config.toml`).
 - **Open items.**
   - P1 rests on the client never seeing the N→U ciphertext (paper §5); a 2PC
-    handshake would remove that.
-  - π_C2/π_C3 compare outside the circuit (REVIEW #29).
+    handshake would remove that, as a new protocol version.
   - routstrd does not pre-warm.
+  - The SDK release (version bump) and routstrd's `@routstr/sdk` bump are
+    the maintainers' step.
   - The sidecar and prover are not yet in any upstream repo.

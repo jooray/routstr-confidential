@@ -5,7 +5,7 @@ import { getHash } from "./decryption-utils.js";
 import { areUint8ArraysEqual, asciiToUint8Array, concatenateUint8Arrays } from "./generics.js";
 import { MOZILLA_ROOT_CA_LIST } from "./mozilla-root-cas.js";
 import { expectReadWithLength, packWithLength } from "./packets.js";
-import { defaultFetchCertificateBytes, loadX509FromDer, loadX509FromPem } from "./x509.js";
+import { loadX509FromDer, loadX509FromPem } from "./x509.js";
 const CERT_VERIFY_TXT = asciiToUint8Array('TLS 1.3, server CertificateVerify');
 let ROOT_CAS;
 export function parseCertificates(data, { version }) {
@@ -103,102 +103,325 @@ export async function getSignatureDataTls12({ clientRandom, serverRandom, curveT
             .slice(1)
     ]);
 }
-export async function verifyCertificateChain(chain, host, logger, fetchCertificateBytes = defaultFetchCertificateBytes, additionalRootCAs) {
+// FORK PATCH (TLS-02/TLS-09): RFC 5280 path validation.
+// The longest path accepted (leaf + intermediates + trust anchor).
+const MAX_CHAIN_DEPTH = 8;
+// The most issuer candidates tried while building a path.
+const MAX_PATH_BUILDING_ATTEMPTS = 64;
+const EKU_SERVER_AUTH = '1.3.6.1.5.5.7.3.1';
+const EKU_ANY = '2.5.29.37.0';
+/**
+ * Verifies the server certificate chain against the root store
+ * (the bundled Mozilla roots + TLS_ADDITIONAL_ROOT_CA_LIST + additionalRootCAs).
+ *
+ * FORK PATCH (TLS-02/TLS-04/TLS-09): RFC 5280 path validation. Every
+ * certificate in the path must be within validity and carry no unprocessed
+ * critical extension; every issuer must assert basicConstraints CA:TRUE,
+ * honour pathLenConstraint, include keyCertSign if keyUsage is present and
+ * serverAuth/anyExtendedKeyUsage if extendedKeyUsage is present; the leaf's
+ * extendedKeyUsage, if present, must include serverAuth/anyExtendedKeyUsage;
+ * nameConstraints (dNSName and directoryName) are enforced, and a constraint
+ * of any other name type that would apply rejects the path. Path building
+ * backtracks over candidate issuers. AIA issuer fetching happens only when a
+ * fetchCertificateBytes function is passed explicitly (off by default).
+ */
+export async function verifyCertificateChain(chain, host, logger, fetchCertificateBytes, additionalRootCAs) {
     const rootCAs = [
         ...loadRootCAs(),
-        ...(additionalRootCAs || [])
+        ...filterTrustAnchors(additionalRootCAs || [])
     ];
     const leaf = chain[0];
-    const commonNames = [
-        ...leaf.getSubjectField('CN'),
-        ...leaf.getAlternativeDNSNames()
-    ];
-    if (!commonNames.some(cn => matchHostname(host, cn))) {
+    if (!leaf) {
+        throw new Error('No certificates received');
+    }
+    // RFC 6125 6.4.4: CN is consulted only when there is no SAN dNSName
+    const sanNames = leaf.getAlternativeDNSNames();
+    const referenceNames = sanNames.length
+        ? sanNames
+        : leaf.getSubjectField('CN');
+    if (!referenceNames.some(cn => matchHostname(host, cn))) {
         throw new Error(`Certificate is not for host ${host}`);
     }
-    const remainingChain = chain.slice(1);
-    let cert = leaf;
-    for (let i = 0;; i++) {
-        const cn = cert.getSubjectField('CN');
-        if (!cert.isWithinValidity()) {
-            throw new Error(`Certificate ${cn} (i: ${i}) is outside validity`);
-        }
-        // Prefer a trusted issuer and stop once it validates the current cert.
-        let issuer = findIssuer(rootCAs, cert);
-        const reachedTrustAnchor = Boolean(issuer);
-        if (!issuer) {
-            issuer = findIssuer(remainingChain, cert);
-            if (issuer) {
-                remainingChain.splice(remainingChain.indexOf(issuer), 1);
-            }
-        }
-        // if not found, we'll try fetching it via AIA extension
-        if (!issuer) {
-            const aiaExt = cert.getAIAExtension();
-            if (!aiaExt) {
-                throw new Error(`Missing issuer for certificate ${cn} (i: ${i})`);
-            }
-            if (TLS_INTERMEDIATE_CA_CACHE?.[aiaExt]) {
-                issuer = TLS_INTERMEDIATE_CA_CACHE[aiaExt];
-            }
-            else {
-                logger.debug({ aiaExt, cn }, 'fetching issuer certificate via AIA extension');
-                const bytes = await fetchCertificateBytes(aiaExt);
-                issuer = await loadX509FromPem(bytes);
-                TLS_INTERMEDIATE_CA_CACHE[aiaExt] = issuer;
-            }
-        }
-        if (!issuer.isWithinValidity()) {
-            throw new Error(`Issuer Cert ${cn} is not within validity period`);
-        }
-        if (!(await issuer.verifyIssued(cert))) {
-            const icn = issuer.getSubjectField('CN');
-            throw new Error(`Verification of ${cn} failed by issuer ${icn} (i: ${i})`);
-        }
-        if (reachedTrustAnchor) {
-            return;
-        }
-        cert = issuer;
+    checkCertificateCommon(leaf, 'leaf');
+    const leafEku = leaf.getExtendedKeyUsages();
+    if (leafEku && !leafEku.includes(EKU_SERVER_AUTH) && !leafEku.includes(EKU_ANY)) {
+        throw new Error('Leaf certificate extendedKeyUsage does not allow serverAuth');
     }
+    const ctx = {
+        host,
+        logger,
+        fetchCertificateBytes,
+        rootCAs,
+        intermediates: chain.slice(1),
+        attempts: 0,
+        errors: [],
+    };
+    const path = await buildPath([leaf], ctx);
+    if (!path) {
+        throw new Error(`Certificate chain verification failed for ${host}: ${ctx.errors.join('; ') || 'no valid path'}`);
+    }
+    logger?.debug?.({ depth: path.length }, 'certificate path validated');
 }
-function findIssuer(chain, cert) {
-    for (const element of chain) {
-        if (element.isIssuer(cert)) {
-            return element;
+/**
+ * Depth-first path building from path[path.length - 1] towards a trust
+ * anchor. Returns the validated path (leaf ... anchor) or undefined.
+ */
+async function buildPath(path, ctx) {
+    const cert = path[path.length - 1];
+    const cn = cert.getSubjectField('CN');
+    const candidates = [
+        ...ctx.rootCAs
+            .filter(ca => ca.isIssuer(cert))
+            .map(ca => ({ issuer: ca, anchor: true })),
+        ...ctx.intermediates
+            .filter(ca => !path.includes(ca) && ca.isIssuer(cert))
+            .map(ca => ({ issuer: ca, anchor: false })),
+    ];
+    if (!candidates.length && ctx.fetchCertificateBytes) {
+        const aiaExt = cert.getAIAExtension();
+        if (aiaExt) {
+            try {
+                let fetched = TLS_INTERMEDIATE_CA_CACHE?.[aiaExt];
+                if (!fetched) {
+                    ctx.logger?.debug?.({ aiaExt, cn }, 'fetching issuer certificate via AIA extension');
+                    const bytes = await ctx.fetchCertificateBytes(aiaExt);
+                    fetched = loadX509FromPem(bytes);
+                    TLS_INTERMEDIATE_CA_CACHE[aiaExt] = fetched;
+                }
+                if (fetched.isIssuer(cert)) {
+                    candidates.push({ issuer: fetched, anchor: false });
+                }
+            }
+            catch (err) {
+                ctx.errors.push(`AIA fetch for ${cn} failed: ${err?.message || err}`);
+            }
         }
+    }
+    if (!candidates.length) {
+        ctx.errors.push(`Missing issuer for certificate ${cn} (i: ${path.length - 1})`);
+        return undefined;
+    }
+    for (const { issuer, anchor } of candidates) {
+        ctx.attempts += 1;
+        if (ctx.attempts > MAX_PATH_BUILDING_ATTEMPTS) {
+            ctx.errors.push('too many path-building attempts');
+            return undefined;
+        }
+        const icn = issuer.getSubjectField('CN');
+        if (!anchor && path.length + 2 > MAX_CHAIN_DEPTH) {
+            ctx.errors.push(`chain longer than ${MAX_CHAIN_DEPTH} certificates`);
+            continue;
+        }
+        try {
+            await checkIssuer(issuer, path, ctx.host);
+        }
+        catch (err) {
+            ctx.errors.push(`issuer ${icn} of ${cn} (i: ${path.length - 1}) rejected: ${err?.message || err}`);
+            continue;
+        }
+        if (anchor) {
+            return [...path, issuer];
+        }
+        const result = await buildPath([...path, issuer], ctx);
+        if (result) {
+            return result;
+        }
+    }
+    return undefined;
+}
+/** checks every certificate in a path must pass */
+function checkCertificateCommon(cert, label) {
+    if (!cert.isWithinValidity()) {
+        throw new Error(`Certificate ${label} is outside validity`);
+    }
+    const unhandled = cert.getUnhandledCriticalExtensions();
+    if (unhandled.length) {
+        throw new Error(`Certificate ${label} has unhandled critical extension(s) ${unhandled.join(', ')}`);
     }
 }
 /**
- * Checks if a hostname matches a common name
+ * Checks that `issuer` may issue path[path.length - 1], given the
+ * certificates below it (path[0] is the leaf).
+ */
+async function checkIssuer(issuer, path, host) {
+    checkCertificateCommon(issuer, 'issuer');
+    const bc = issuer.getBasicConstraints();
+    if (!bc?.ca) {
+        throw new Error('not a CA (basicConstraints CA:TRUE missing)');
+    }
+    if (typeof bc.pathLength === 'number') {
+        // non-self-issued intermediates between this issuer and the leaf
+        const intermediatesBelow = path
+            .slice(1)
+            .filter(c => !c.isSelfIssued())
+            .length;
+        if (intermediatesBelow > bc.pathLength) {
+            throw new Error(`pathLenConstraint ${bc.pathLength} exceeded`);
+        }
+    }
+    const ku = issuer.getKeyUsages();
+    if (ku && !ku.includes('keyCertSign')) {
+        throw new Error('keyUsage does not include keyCertSign');
+    }
+    const eku = issuer.getExtendedKeyUsages();
+    if (eku && !eku.includes(EKU_SERVER_AUTH) && !eku.includes(EKU_ANY)) {
+        throw new Error('extendedKeyUsage does not allow serverAuth');
+    }
+    checkNameConstraints(issuer, path, host);
+    const subject = path[path.length - 1];
+    let verified = false;
+    try {
+        verified = await issuer.verifyIssued(subject);
+    }
+    catch (err) {
+        throw new Error(`signature verification error: ${err?.message || err}`);
+    }
+    if (!verified) {
+        throw new Error('signature verification failed');
+    }
+}
+/**
+ * RFC 5280 4.2.1.10, applied to every certificate below the constraining CA
+ * (self-issued intermediates excepted) and to the hostname being verified.
+ */
+function checkNameConstraints(issuer, path, host) {
+    const nc = issuer.getNameConstraints();
+    if (!nc) {
+        return;
+    }
+    const subjects = path.filter((c, i) => i === 0 || !c.isSelfIssued());
+    const all = [...nc.permitted, ...nc.excluded];
+    // constraint types not evaluated here: reject if they could apply
+    for (const { type } of all) {
+        if (type === 'dns' || type === 'dn') {
+            continue;
+        }
+        const applies = type === 'unknown'
+            || subjects.some(c => {
+                const sanTypes = c.getAlternativeNames().map(n => n.type);
+                switch (type) {
+                    case 'email':
+                        return sanTypes.includes('email') || c.hasSubjectEmailAddress();
+                    case 'other':
+                        return sanTypes.some(t => t === 'guid' || t === 'upn');
+                    default:
+                        return sanTypes.includes(type);
+                }
+            });
+        if (applies) {
+            throw new Error(`unsupported nameConstraints type '${type}' applies to the path`);
+        }
+    }
+    const permittedDns = nc.permitted.filter(t => t.type === 'dns').map(t => t.value);
+    const excludedDns = nc.excluded.filter(t => t.type === 'dns').map(t => t.value);
+    const dnsNames = [
+        host,
+        ...subjects.flatMap(c => c.getAlternativeNames()
+            .filter(n => n.type === 'dns')
+            .map(n => n.value)),
+    ];
+    for (const name of dnsNames) {
+        if (permittedDns.length && !permittedDns.some(c => dnsNameWithinSubtree(name, c))) {
+            throw new Error(`name '${name}' is outside the permitted dNSName subtrees`);
+        }
+        if (excludedDns.some(c => dnsNameWithinSubtree(name, c))) {
+            throw new Error(`name '${name}' is within an excluded dNSName subtree`);
+        }
+    }
+    const permittedDn = nc.permitted.filter(t => t.type === 'dn').map(t => t.value);
+    const excludedDn = nc.excluded.filter(t => t.type === 'dn').map(t => t.value);
+    if (permittedDn.length || excludedDn.length) {
+        for (const c of subjects) {
+            const rdns = c.getSubjectRdns();
+            if (!rdns.length) {
+                continue;
+            }
+            if (permittedDn.length && !permittedDn.some(base => isRdnPrefix(base, rdns))) {
+                throw new Error('subject is outside the permitted directoryName subtrees');
+            }
+            if (excludedDn.some(base => isRdnPrefix(base, rdns))) {
+                throw new Error('subject is within an excluded directoryName subtree');
+            }
+        }
+    }
+}
+function isRdnPrefix(base, rdns) {
+    return base.length <= rdns.length
+        && base.every((rdn, i) => rdn === rdns[i]);
+}
+/**
+ * dNSName subtree match: the name equals the constraint or extends it with
+ * labels on the left. A leading '.' (common practice) permits subdomains only.
+ */
+function dnsNameWithinSubtree(name, constraint) {
+    const n = normalizeDnsName(name);
+    const c = normalizeDnsName(constraint);
+    if (!c) {
+        return true;
+    }
+    if (c.startsWith('.')) {
+        return n.endsWith(c);
+    }
+    return n === c || n.endsWith(`.${c}`);
+}
+function normalizeDnsName(name) {
+    let n = String(name).toLowerCase();
+    if (n.endsWith('.')) {
+        n = n.slice(0, -1);
+    }
+    return n;
+}
+/**
+ * Checks if a hostname matches a reference identifier from the certificate.
+ * FORK PATCH (TLS-04): RFC 6125 6.4.3: case-insensitive, one trailing
+ * dot stripped, '*' only as the entire leftmost label, matching exactly one
+ * label, and only with at least two labels after it ('*.x.y' does not match
+ * 'x.y', '*.com' matches nothing).
  * @param host the hostname, eg. "google.com"
- * @param commonName the common name from the certificate,
+ * @param commonName the name from the certificate,
  * 	eg. "*.google.com", "google.com"
  */
 function matchHostname(host, commonName) {
-    // write a regex to match the common name
-    // and check if it matches the hostname
-    const hostComps = host.split('.');
-    const cnComps = commonName.split('.');
-    if (cnComps.length !== hostComps.length) {
-        // can ignore the first component if it's a wildcard
-        if (cnComps[0] === '*'
-            && cnComps.length === hostComps.length + 1) {
-            cnComps.shift();
-        }
-        else {
+    const h = normalizeDnsName(host);
+    const p = normalizeDnsName(commonName);
+    if (!h || !p || h.includes('*')) {
+        return false;
+    }
+    const hostComps = h.split('.');
+    const cnComps = p.split('.');
+    if (cnComps.length !== hostComps.length
+        || hostComps.some(comp => !comp)) {
+        return false;
+    }
+    if (cnComps[0] === '*') {
+        if (cnComps.length < 3) {
             return false;
         }
+        cnComps.shift();
+        hostComps.shift();
     }
-    return hostComps.every((comp, i) => (comp === cnComps[i]
-        || cnComps[i] === '*'));
+    return cnComps.every((comp, i) => (!comp.includes('*')
+        && comp === hostComps[i]));
 }
 function loadRootCAs() {
     if (ROOT_CAS) {
         return ROOT_CAS;
     }
-    ROOT_CAS = MOZILLA_ROOT_CA_LIST.map(loadX509FromPem);
+    ROOT_CAS = filterTrustAnchors(MOZILLA_ROOT_CA_LIST.map(loadX509FromPem));
     if (typeof TLS_ADDITIONAL_ROOT_CA_LIST !== 'undefined') {
-        ROOT_CAS.push(...TLS_ADDITIONAL_ROOT_CA_LIST.map(loadX509FromPem));
+        ROOT_CAS.push(...filterTrustAnchors(TLS_ADDITIONAL_ROOT_CA_LIST.map(loadX509FromPem)));
     }
     return ROOT_CAS;
+}
+// FORK PATCH (TLS-02): only CA certificates (basicConstraints CA:TRUE)
+// may act as trust anchors; anything else in a root list is ignored.
+function filterTrustAnchors(certs) {
+    return certs.filter(cert => {
+        try {
+            return !!cert.getBasicConstraints()?.ca;
+        }
+        catch {
+            return false;
+        }
+    });
 }

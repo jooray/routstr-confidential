@@ -37,6 +37,19 @@ where
     c
 }
 
+/// Cache key for a circuit family `tag` with shape parameters `parts`
+/// (64-bit FNV-1a over the full values, not a lossy bit-packing).
+fn shape_key(tag: u64, parts: &[usize]) -> u64 {
+    let mut k = 0xcbf2_9ce4_8422_2325u64 ^ tag;
+    for p in parts {
+        for b in (*p as u64).to_le_bytes() {
+            k = (k ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+        k = (k ^ 0xff).wrapping_mul(0x0100_0000_01b3);
+    }
+    k
+}
+
 /// A constant bit as a *real* gate output (never a raw const node, which the
 /// circuit builder cannot renumber).
 fn cbit(b: &mut CircuitBuilder, node: mpz_circuits::Node<mpz_circuits::Feed>, bit: bool) -> mpz_circuits::Node<mpz_circuits::Feed> {
@@ -84,7 +97,7 @@ pub fn pad_key_circuit() -> Arc<Circuit> {
 
 /// Extract `len` bytes starting at byte `start` from an `in_len`-byte input.
 pub fn select_circuit(in_len: usize, start: usize, len: usize) -> Arc<Circuit> {
-    cache(0xC3_0000_0000 ^ ((in_len as u64) << 32) ^ ((start as u64) << 8) ^ len as u64, || {
+    cache(shape_key(0xC3, &[in_len, start, len]), || {
         let mut b = CircuitBuilder::new();
         let inp: Vec<_> = (0..in_len * 8).map(|_| b.add_input()).collect();
         for bit in &inp[start * 8..(start + len) * 8] {
@@ -170,6 +183,36 @@ pub fn ctr_block_circuit() -> Arc<Circuit> {
         for bit in &counter {
             let out = b.add_id_gate(*bit);
             b.add_output(out);
+        }
+        b.build().unwrap()
+    })
+}
+
+/// Byte-string equality of two `len`-byte inputs, AND-reduced to one bit.
+///
+/// Used so a proof reveals only *whether* a decrypted range equals the
+/// expected public bytes, never the decrypted bytes themselves: a verifier
+/// that chose a window over some other plaintext learns nothing beyond one bit.
+pub fn eq_circuit(len: usize) -> Arc<Circuit> {
+    cache(shape_key(0xE9, &[len]), || {
+        let mut b = CircuitBuilder::new();
+        let a: Vec<_> = (0..len * 8).map(|_| b.add_input()).collect();
+        let c: Vec<_> = (0..len * 8).map(|_| b.add_input()).collect();
+        let mut acc = None;
+        for i in 0..len * 8 {
+            let x = b.add_xor_gate(a[i], c[i]);
+            let same = b.add_inv_gate(x);
+            acc = Some(match acc {
+                None => same,
+                Some(prev) => b.add_and_gate(prev, same),
+            });
+        }
+        let all = acc.expect("eq_circuit needs len > 0");
+        // Emit a whole byte so the output is a `Vector<U8>` (1 == equal).
+        b.add_output(all);
+        for _ in 0..7 {
+            let z = cbit(&mut b, all, false);
+            b.add_output(z);
         }
         b.build().unwrap()
     })
@@ -273,6 +316,23 @@ pub fn xor_bytes<VM: Vm<Binary>>(
     Ok(vm.call(call)?)
 }
 
+/// One byte, 1 iff `a == b` (both `len` bytes); nothing else is revealed.
+pub fn eq_bytes<VM: Vm<Binary>>(
+    vm: &mut VM,
+    a: &Vector<U8>,
+    b: &Vector<U8>,
+) -> anyhow::Result<Vector<U8>> {
+    if a.len() != b.len() || a.len() == 0 {
+        anyhow::bail!("eq_bytes: lengths {} and {} differ or are zero", a.len(), b.len());
+    }
+    let call = Call::builder(eq_circuit(a.len()))
+        .arg(a.to_raw())
+        .arg(b.to_raw())
+        .build()
+        .expect("eq input length");
+    Ok(vm.call(call)?)
+}
+
 /// XOR a vector with a constant byte string.
 pub fn xor_const<VM: Vm<Binary>>(
     vm: &mut VM,
@@ -290,6 +350,9 @@ pub fn select<VM: Vm<Binary>>(
     start: usize,
     len: usize,
 ) -> anyhow::Result<Vector<U8>> {
+    if len == 0 || start.checked_add(len).is_none_or(|end| end > a.len()) {
+        anyhow::bail!("select [{start}, +{len}) out of range for {} bytes", a.len());
+    }
     let circ = select_circuit(a.len(), start, len);
     let call = Call::builder(circ).arg(a.to_raw()).build().unwrap();
     Ok(vm.call(call)?)
@@ -415,7 +478,9 @@ pub fn decrypt_window<VM: Vm<Binary>>(
     sel_start: usize,
     sel_len: usize,
 ) -> anyhow::Result<Vector<U8>> {
-    assert_eq!(ct_window.len(), w);
+    if ct_window.len() != w || w == 0 || sel_len == 0 || sel_start + sel_len > w {
+        anyhow::bail!("decrypt_window: inconsistent window (w={w}, sel={sel_start}+{sel_len})");
+    }
     let block_start = off / 16;
     let prefix = off % 16;
     let nblocks = (prefix + w).div_ceil(16);
@@ -442,6 +507,9 @@ pub fn decrypt_record_content<VM: Vm<Binary>>(
     seq: u64,
     ct: &Vector<U8>,
 ) -> anyhow::Result<Vector<U8>> {
+    if ct.len() < 2 {
+        anyhow::bail!("decrypt_record_content: record has no content");
+    }
     let nblocks = ct.len().div_ceil(16);
     let mut ks_blocks: Vec<Vector<U8>> = Vec::with_capacity(nblocks);
     for j in 1..=nblocks {

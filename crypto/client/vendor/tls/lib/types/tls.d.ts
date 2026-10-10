@@ -86,7 +86,10 @@ export type TLSConnectionOptions = TLSHelloBaseOptions & {
     /**
      * Fetch certificate bytes from a URL
      * Used when the AIA extension is present in a certificate
-     * to fetch the issuer certificate
+     * to fetch the issuer certificate.
+     * FORK PATCH (TLS-09): AIA fetching happens only when this is
+     * passed; by default the chain must be complete (server-sent
+     * intermediates + root store).
      */
     fetchCertificateBytes?(url: string): Promise<Uint8Array>;
 };

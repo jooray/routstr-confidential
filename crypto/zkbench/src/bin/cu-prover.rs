@@ -4,7 +4,10 @@
 //!
 //! * **stdio** (used by the e2e driver): the mpz framed protocol is carried as
 //!   raw bytes on stdin/stdout; the proof type, role, public params and
-//!   (optionally) the private witness are read from a JSON file.
+//!   (optionally) the private witness are read either from stdin itself
+//!   (`--job-stdin`: a 4-byte big-endian length and the JSON job, before the
+//!   mpz bytes, so the witness never touches the disk) or from a JSON file
+//!   (`--proof-file`).
 //! * **bench**: runs every statement over the `local` and `wan` transports.
 //!
 //! stdout carries *only* mpz bytes in stdio mode; all logging goes to stderr.
@@ -44,11 +47,10 @@ impl StdioBridge {
     }
 }
 
-fn stdio_duplex() -> (Compat<tokio::io::DuplexStream>, StdioBridge) {
+fn stdio_duplex(mut stdin: tokio::io::Stdin) -> (Compat<tokio::io::DuplexStream>, StdioBridge) {
     let (a, b) = tokio::io::duplex(1 << 20);
     let (mut br, mut bw) = tokio::io::split(b);
     tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match stdin.read(&mut buf).await {
@@ -94,15 +96,28 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 async fn run_stdio(args: &[String]) -> Result<()> {
-    let path = arg_value(args, "--proof-file").context("--proof-file is required")?;
     let role = parse_role(&arg_value(args, "--role").unwrap_or_else(|| "prover".into()))?;
-    let pf: ProofFile = serde_json::from_str(&std::fs::read_to_string(&path)?)
-        .with_context(|| format!("parsing {path}"))?;
+    let mut stdin = tokio::io::stdin();
+    let pf: ProofFile = if args.iter().any(|a| a == "--job-stdin") {
+        let mut len = [0u8; 4];
+        stdin.read_exact(&mut len).await.context("reading the job length")?;
+        let len = u32::from_be_bytes(len) as usize;
+        if len > 16 << 20 {
+            anyhow::bail!("job of {len} bytes is too large");
+        }
+        let mut job = vec![0u8; len];
+        stdin.read_exact(&mut job).await.context("reading the job")?;
+        serde_json::from_slice(&job).context("parsing the job")?
+    } else {
+        let path = arg_value(args, "--proof-file").context("--job-stdin or --proof-file is required")?;
+        serde_json::from_str(&std::fs::read_to_string(&path)?)
+            .with_context(|| format!("parsing {path}"))?
+    };
     eprintln!(
         "cu-prover: proof={} role={:?} params_ok=true",
         pf.proof, role
     );
-    let (io, bridge) = stdio_duplex();
+    let (io, bridge) = stdio_duplex(stdin);
     // `run_io` consumes and drops its endpoint, so once it returns the stdout
     // forwarder can reach EOF. Wait for it before this process exits, or the
     // protocol's final bytes are lost and the peer stalls.

@@ -5,7 +5,6 @@
 // (`/v1/confidential/zk?proof=..&session_id=..`).
 
 import { spawn } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
 
 export const CU_PROVER =
   process.env.CU_PROVER ||
@@ -20,16 +19,19 @@ export interface ZkJob {
 
 /** Run one proof end-to-end: spawn cu-prover and pipe it to the ZK websocket. */
 export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Promise<void> {
-  const tmp = `/tmp/cu-zk-${job.proof}-${process.pid}-${Date.now()}.json`
-  writeFileSync(tmp, JSON.stringify({ proof: job.proof, params: job.params, witness: job.witness ?? null }))
-
   const ws = new WebSocket(zkUrl)
   ws.binaryType = 'arraybuffer'
 
-  const child = spawn(CU_PROVER, ['--proof-file', tmp, '--role', job.role], {
+  // The job (params + witness) goes to cu-prover on stdin, length-prefixed,
+  // ahead of the proof bytes: the witness never touches the disk.
+  const child = spawn(CU_PROVER, ['--job-stdin', '--role', job.role], {
     stdio: ['pipe', 'pipe', 'inherit'],
     env: process.env,
   })
+  const jobBytes = Buffer.from(JSON.stringify({ proof: job.proof, params: job.params, witness: job.witness ?? null }))
+  const lenPrefix = Buffer.alloc(4)
+  lenPrefix.writeUInt32BE(jobBytes.length)
+  child.stdin.write(Buffer.concat([lenPrefix, jobBytes]))
 
   const pending: Buffer[] = []
   let wsOpen = false

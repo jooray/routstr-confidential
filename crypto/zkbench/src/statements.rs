@@ -17,7 +17,7 @@ use mpz_hash::sha256::Sha256;
 use crate::Role;
 use crate::gadgets::{
     aes_block, alphabet_circuit, concat, ctr_block, expand_label, hmac_sha256, public_bytes,
-    record_keys, secret_bytes, select, splice_circuit, xor_bytes,
+    eq_bytes, record_keys, secret_bytes, select, splice_circuit, xor_bytes,
 };
 
 /// The one key alphabet the fixed-size π_N membership circuit implements.
@@ -117,7 +117,8 @@ pub struct Window {
     /// Sub-range inside the window that must match `expected`.
     pub sel_start: usize,
     pub sel_len: usize,
-    /// The expected bytes (the pinned suffix for π_C2, the disclosed `R` for π_C3).
+    /// The expected bytes (the pinned suffix). Compared inside the circuit:
+    /// the verifier learns one bit, never the decrypted window.
     pub expected: Vec<u8>,
 }
 
@@ -138,8 +139,14 @@ pub struct PiC3 {
     /// Tail records in wire order (earliest first); each contributes its
     /// content (inner plaintext minus the trailing content-type byte).
     pub records: Vec<TailRecord>,
-    /// The disclosed plaintext `R` (a suffix of the concatenated content).
+    /// The disclosed plaintext `R`. Compared inside the circuit: the verifier
+    /// learns one bit, never the decrypted records.
     pub expected: Vec<u8>,
+    /// Content bytes after `R` up to the end of the records. 0 for the usage
+    /// event (R ends the transcript); for an upstream error R is the response
+    /// head and `skip` is the (undisclosed) body length that follows it.
+    #[serde(default)]
+    pub skip: usize,
 }
 
 /// Proof parameters (prover and verifier share the same value).
@@ -319,10 +326,15 @@ fn build_pi_c2<VM: Vm<Binary>>(
 
     let mut checks = vec![key_schedule_check(vm, &d, &p.session)?];
     let ct = public_bytes(vm, &p.ct_window)?;
+    if p.sel_len != p.expected.len() {
+        anyhow::bail!("π_C2: sel_len {} != |expected| {}", p.sel_len, p.expected.len());
+    }
     let out = crate::gadgets::decrypt_window(
         vm, &k, &iv, p.seq, &ct, p.off, p.w, p.sel_start, p.sel_len,
     )?;
-    checks.push(Check::full("suffix", out, p.expected.clone()));
+    let expected = public_bytes(vm, &p.expected)?;
+    let eq = eq_bytes(vm, &out, &expected)?;
+    checks.push(Check::full("suffix", eq, vec![1u8]));
     Ok(checks)
 }
 
@@ -342,15 +354,15 @@ fn build_pi_c3<VM: Vm<Binary>>(
         contents.push(crate::gadgets::decrypt_record_content(vm, &k, &iv, r.seq, &ct)?);
     }
     let all = concat(vm, &contents)?;
-    if all.len() < p.expected.len() {
-        // Not enough disclosed material; the verifier will fail the check.
-        let zero = public_bytes(vm, &[0u8])?;
-        checks.push(Check::full("disclosure", zero, p.expected.clone()));
-        return Ok(checks);
-    }
-    let start = all.len() - p.expected.len();
+    let start = all
+        .len()
+        .checked_sub(p.expected.len())
+        .and_then(|x| x.checked_sub(p.skip))
+        .ok_or_else(|| anyhow::anyhow!("π_C3: records do not cover R plus skip"))?;
     let out = select(vm, &all, start, p.expected.len())?;
-    checks.push(Check::full("disclosure", out, p.expected.clone()));
+    let expected = public_bytes(vm, &p.expected)?;
+    let eq = eq_bytes(vm, &out, &expected)?;
+    checks.push(Check::full("disclosure", eq, vec![1u8]));
     Ok(checks)
 }
 

@@ -1,9 +1,9 @@
 import { crypto } from "./crypto/index.js";
 import { packClientHello } from "./utils/client-hello.js";
-import { CONTENT_TYPE_MAP, MAX_ENC_PACKET_SIZE, PACKET_TYPE, SUPPORTED_CIPHER_SUITE_MAP, SUPPORTED_NAMED_CURVE_MAP, SUPPORTED_NAMED_CURVES, SUPPORTED_RECORD_TYPE_MAP } from "./utils/constants.js";
+import { CONTENT_TYPE_MAP, KEY_UPDATE_TYPE_MAP, MAX_ENC_PACKET_SIZE, PACKET_TYPE, SUPPORTED_CIPHER_SUITE_MAP, SUPPORTED_NAMED_CURVE_MAP, SUPPORTED_NAMED_CURVES, SUPPORTED_RECORD_TYPE_MAP, TLS_PROTOCOL_VERSION_MAP } from "./utils/constants.js";
 import { computeSharedKeys, computeSharedKeysTls12, computeUpdatedTrafficMasterSecret, deriveTrafficKeysForSide } from "./utils/decryption-utils.js";
 import { generateFinishTls12, packClientFinishTls12, packFinishMessagePacket, verifyFinishMessage } from "./utils/finish-messages.js";
-import { areUint8ArraysEqual, chunkUint8Array, concatenateUint8Arrays, toHexStringWithWhitespace } from "./utils/generics.js";
+import { areUint8ArraysEqualConstantTime, chunkUint8Array, concatenateUint8Arrays, toHexStringWithWhitespace } from "./utils/generics.js";
 import { createRsaPreMasterSecret, packClientCurveKeyShare, packClientRsaKeyShare, processServerKeyShare } from "./utils/key-share.js";
 import { packKeyUpdateRecord } from "./utils/key-update.js";
 import { logger as LOGGER } from "./utils/logger.js";
@@ -41,11 +41,28 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
     let handshakePacketStream = new Uint8Array();
     let clientCertificateRequested = false;
     let certificatesVerified = false;
-    const processPacketUnsafe = async ({ type, packet: { content, header } }) => {
+    // FORK PATCH (TLS-10): any failure while processing a received
+    // record (decryption, parsing, validation) ends the client: it is marked
+    // ended at once, so records already queued are dropped, end(err) is
+    // called, and the error is rethrown so handleReceivedBytes() rejects.
+    const processPacketUnsafe = async (pkt) => {
         if (ended) {
             logger.warn('connection closed, ignoring packet');
             return;
         }
+        try {
+            await processPacketInner(pkt);
+        }
+        catch (err) {
+            logger.error({ err }, 'error processing record');
+            if (!ended) {
+                ended = true;
+                end(err);
+            }
+            throw err;
+        }
+    };
+    const processPacketInner = async ({ type, packet: { content, header } }) => {
         let contentType;
         let ctx = { type: 'plaintext' };
         // if the cipher spec has changed,
@@ -117,19 +134,13 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             }, 'cannot process message');
             return;
         }
-        try {
-            await processRecord({
-                content,
-                contentType: contentType
-                    ? CONTENT_TYPE_MAP[contentType]
-                    : undefined,
-                header,
-            });
-        }
-        catch (err) {
-            logger.error({ err }, 'error processing record');
-            end(err);
-        }
+        await processRecord({
+            content,
+            contentType: contentType
+                ? CONTENT_TYPE_MAP[contentType]
+                : undefined,
+            header,
+        });
     };
     const processPacket = (pkt) => (enqueueServerPacket(processPacketUnsafe, pkt));
     async function processRecord({ content: record, contentType, header, }) {
@@ -146,6 +157,9 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         if (!hello.supportsPsk && earlySecret) {
                             throw new Error('Server does not support PSK');
                         }
+                        // FORK PATCH (TLS-01): the server must select a
+                        // version and a cipher suite the client offered.
+                        assertOfferedVersionAndSuite(hello);
                         cipherSuite = hello.cipherSuite;
                         connTlsVersion = hello.serverTlsVersion;
                         serverRandom = hello.serverRandom;
@@ -202,6 +216,22 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                         await processServerFinish(content);
                         break;
                     case SUPPORTED_RECORD_TYPE_MAP.KEY_UPDATE:
+                        // FORK PATCH (TLS-08): validate request_update.
+                        // A server update_requested would oblige the client to
+                        // send its own KeyUpdate, which the protocol's fixed
+                        // client epoch accounting cannot absorb: it is a
+                        // protocol error that ends the client.
+                        if (connTlsVersion !== 'TLS1_3' || !handshakeDone) {
+                            throw new Error('Unexpected KeyUpdate');
+                        }
+                        if (content.length !== 1
+                            || (content[0] !== KEY_UPDATE_TYPE_MAP.UPDATE_NOT_REQUESTED
+                                && content[0] !== KEY_UPDATE_TYPE_MAP.UPDATE_REQUESTED)) {
+                            throw new Error('Malformed KeyUpdate');
+                        }
+                        if (content[0] === KEY_UPDATE_TYPE_MAP.UPDATE_REQUESTED) {
+                            throw new Error('Server KeyUpdate with update_requested is not supported');
+                        }
                         const newMasterSecret = await computeUpdatedTrafficMasterSecret(keys.serverSecret, cipherSuite);
                         const newKeys = await deriveTrafficKeysForSide(newMasterSecret, cipherSuite);
                         keys = {
@@ -331,6 +361,24 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             logger.warn({ record: record, contentType: contentType?.toString(16) }, 'cannot process record');
         }
     }
+    // FORK PATCH (TLS-01)
+    function assertOfferedVersionAndSuite({ serverTlsVersion, cipherSuite: suite }) {
+        const offeredVersions = supportedProtocolVersions
+            || Object.keys(TLS_PROTOCOL_VERSION_MAP);
+        if (!offeredVersions.includes(serverTlsVersion)) {
+            throw new Error(`Server selected TLS version ${serverTlsVersion}, which was not offered`);
+        }
+        const offeredSuites = cipherSuites
+            || Object.keys(SUPPORTED_CIPHER_SUITE_MAP);
+        if (!offeredSuites.includes(suite)) {
+            throw new Error(`Server selected cipher suite ${suite}, which was not offered`);
+        }
+        // TLS 1.3 suites are named without "_WITH_"; TLS 1.2 suites with it
+        const isTls13Suite = !suite.includes('_WITH_');
+        if (isTls13Suite !== (serverTlsVersion === 'TLS1_3')) {
+            throw new Error(`Cipher suite ${suite} cannot be used with ${serverTlsVersion}`);
+        }
+    }
     function setAlpn(alpn) {
         selectedAlpn = alpn || applicationLayerProtocols?.[0];
         if (selectedAlpn && !applicationLayerProtocols?.includes(selectedAlpn)) {
@@ -392,7 +440,8 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             secret: keys.masterSecret,
             cipherSuite: cipherSuite,
         });
-        if (!areUint8ArraysEqual(genServerFinish, serverFinish)) {
+        // FORK PATCH (TLS-06): constant-time Finished comparison.
+        if (!areUint8ArraysEqualConstantTime(genServerFinish, serverFinish)) {
             throw new Error('Server finish does not match');
         }
     }
@@ -652,6 +701,8 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
          * Handle bytes received from the server.
          * Could be a complete or partial TLS packet
          */
+        // FORK PATCH (TLS-10): rejects if any record fails; the client
+        // has then ended (hasEnded() is true) and drops all later records.
         async handleReceivedBytes(data) {
             await Promise.all(Array.from(processor.onData(data))
                 .map(processPacket));
