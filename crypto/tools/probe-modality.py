@@ -224,7 +224,7 @@ def main() -> int:
     unsafe = [m for m, v in verdicts.items() if v == "unsafe"]
     unknown = [m for m, v in verdicts.items() if v == "unknown"]
     print("\nSUMMARY")
-    print(f"  text_only_ok (safe): {safe}")
+    print(f"  text-only (safe for model_allowlist): {safe}")
     print(f"  unsafe (amplification): {unsafe}")
     print(f"  unknown: {unknown}")
 

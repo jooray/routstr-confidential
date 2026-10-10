@@ -98,6 +98,7 @@ CU_PROVER=../zkbench/target/release/cu-prover \
 ```
 
 > The model must be on the sidecar's `text_only_ok` allow-list (GAP-3 gate).
+> *(2026-10-10: superseded. The node reserves a full-context prompt; the sidecar offer has no `price_list`, and its optional allowlist is `model_allowlist`, empty by default, so every model the node serves is offered.)*
 > `deepseek-v4-flash` is; the vision-capable `gemini-3-flash-preview` used in
 > earlier runs is now refused at setup (escrow refunded). See the "Fix pass"
 > section and `VENICE-TESTS-ADDENDUM.md`.

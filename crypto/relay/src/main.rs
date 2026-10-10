@@ -53,8 +53,6 @@ struct Offer {
     v: u8,
     upstream_host: String,
     #[serde(default)]
-    price_list: serde_json::Value,
-    #[serde(default)]
     head_template: String,
     #[serde(default = "default_key_alphabet")]
     key_alphabet: String,
@@ -66,20 +64,32 @@ struct Offer {
     max_tokens_cap: u64,
     #[serde(default)]
     notary_pubkey: String,
-    /// Optional model allowlist (empty = every model the node prices). It
-    /// was the modality gate (GAP-3) when escrow priced the prompt as
-    /// `prompt_tokens <= LEN` (SPEC §5.1), which an accepted `image_url` part
-    /// breaks: the attacker picks the image, so its token cost is not bounded
-    /// by body bytes (probe: one ~50-byte URL cost 554 → 2050 tokens on a
-    /// vision model). A model is usable confidentially only if it *rejects*
-    /// multimodal parts; `text_only_ok[model] == true` marks such a model.
-    /// When the map is non-empty the sidecar refuses any setup for a model not
-    /// explicitly marked true, so the confidential path cannot be priced this
-    /// way even if the node's own model list is broader. The node now reserves
-    /// a full-context prompt, which bounds image parts too, so the shipped
-    /// offer leaves the map empty.
-    #[serde(default)]
-    text_only_ok: HashMap<String, bool>,
+    /// Optional model allowlist; empty = every model the node serves through
+    /// `upstream_host`. Models and prices come from the node, which signs
+    /// the offer clients see (this file carries no prices). A list of ids;
+    /// the earlier name `text_only_ok` (a map `{id: true}`) is accepted too.
+    /// It was a modality gate while escrow priced the prompt by the body
+    /// length; the node now reserves a full-context prompt, which bounds
+    /// image parts as well, so the shipped offer leaves it empty.
+    #[serde(default, alias = "text_only_ok", deserialize_with = "de_model_allowlist")]
+    model_allowlist: Vec<String>,
+}
+
+/// `["id", …]`, or the legacy `{"id": true, …}` map (entries marked true).
+fn de_model_allowlist<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Allow {
+        List(Vec<String>),
+        Map(HashMap<String, bool>),
+    }
+    let mut ids = match Allow::deserialize(d)? {
+        Allow::List(v) => v,
+        Allow::Map(m) => m.into_iter().filter(|(_, ok)| *ok).map(|(id, _)| id).collect(),
+    };
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 fn default_protocol() -> u8 {
@@ -299,9 +309,6 @@ async fn main() -> Result<()> {
         Offer {
             v: 1,
             upstream_host: host.clone(),
-            price_list: serde_json::json!({
-                "mistral-small-3-2-24b-instruct": {"in": 0.0, "cached_in": 0.0, "out": 0.0}
-            }),
             head_template: default_head_template_for(&host, key.len()),
             key_alphabet: default_key_alphabet(),
             key_length: key.len(),
@@ -316,7 +323,7 @@ async fn main() -> Result<()> {
             ],
             max_tokens_cap: default_max_tokens_cap(),
             notary_pubkey: String::new(),
-            text_only_ok: HashMap::new(),
+            model_allowlist: Vec::new(),
         }
     };
     match arg("--protocol").as_deref() {
@@ -979,15 +986,9 @@ fn handle_setup(
     if max_tokens > app.offer.max_tokens_cap {
         bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
     }
-    // GAP-3: only models verified to reject multimodal parts may be
-    // priced by the LEN bound. The gate is active only when the offer
-    // carries a non-empty text_only_ok map (backwards compatible).
-    if !app.offer.text_only_ok.is_empty()
-        && app.offer.text_only_ok.get(&model) != Some(&true)
-    {
-        bail!(
-            "model {model:?} is not marked text_only_ok; refusing (an accepted image part can exceed the LEN-priced escrow)"
-        );
+    // The operator's optional allowlist (empty = all; the node applies the same list).
+    if !app.offer.model_allowlist.is_empty() && !app.offer.model_allowlist.contains(&model) {
+        bail!("model {model:?} is not in the offer's model_allowlist");
     }
     let nonce_n = os_random_32();
     let mut h = Vec::new();
@@ -1904,5 +1905,33 @@ fn write_attestation(dir: &Option<std::path::PathBuf>, a: &serde_json::Value) {
 fn write_receipt(dir: &Option<std::path::PathBuf>, r: &serde_json::Value) {
     if let Some(dir) = dir {
         let _ = std::fs::write(dir.join("receipt.json"), serde_json::to_string_pretty(r).unwrap_or_default());
+    }
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::Offer;
+
+    fn parse(extra: &str) -> Offer {
+        let text = format!(r#"{{"upstream_host": "api.example.com"{extra}}}"#);
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn model_allowlist_list_map_and_legacy_fields() {
+        assert!(parse("").model_allowlist.is_empty());
+        assert_eq!(parse(r#", "model_allowlist": ["b", "a", "a"]"#).model_allowlist, vec!["a", "b"]);
+        // legacy name and shape: only entries marked true
+        assert_eq!(parse(r#", "text_only_ok": {"a": true, "b": false}"#).model_allowlist, vec!["a"]);
+        // an old offer file with a price_list still parses (the field is ignored)
+        let o = parse(r#", "price_list": {"m": {"in": 0.0}}, "text_only_ok": {}"#);
+        assert!(o.model_allowlist.is_empty());
+        assert!(!serde_json::to_string(&o).unwrap().contains("price_list"));
+    }
+
+    #[test]
+    fn shipped_offer_parses() {
+        let o: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
+        assert!(o.model_allowlist.is_empty());
     }
 }

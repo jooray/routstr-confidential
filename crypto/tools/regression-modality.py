@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Regression gate (VENICE-TESTS style): every model the confidential offer
-advertises must reject multimodal content parts, by URL *and* by data URI.
+"""Modality check (VENICE-TESTS style): do the given models reject multimodal
+content parts, by URL *and* by data URI?
+
+Since 2026-10-10 this is no longer a gate: the node reserves a full-context
+prompt, which bounds image parts too, and the sidecar offer's optional
+``model_allowlist`` is empty by default. Kept for operators who want to
+restrict confidential mode to text-only models. The history:
 
 Why: a model that *accepts* an ``image_url`` part is not bounded by body bytes:
 the client picks the image, so one ~50-byte URL (or a small inline data URI)
@@ -10,8 +15,8 @@ can cost hundreds to thousands of tokens (GAP-3; probe evidence in
 Venice later enables vision on an allow-listed model, or a new model is added
 to the offer, the check fails here.
 
-The authoritative list is read from ``relay/offer.venice.json`` (``text_only_ok``
-and ``price_list`` keys) so the test follows the offer, not a hardcoded set.
+Models: ``--model`` (repeatable), else the offer file's ``model_allowlist`` (or
+the legacy ``text_only_ok`` map).
 
 Usage:
     VENICE_API_KEY=... python3 -I regression-modality.py [--offer PATH] [--json OUT] [--model M]...
@@ -249,10 +254,12 @@ def main() -> int:
     else:
         with open(args.offer) as f:
             offer = json.load(f)
-        # every model in the price list must be in the allow-list too
-        models = sorted(set((offer.get("text_only_ok") or {}).keys()) | set((offer.get("price_list") or {}).keys()))
+        allow = offer.get("model_allowlist")
+        if allow is None:
+            allow = [m for m, ok in (offer.get("text_only_ok") or {}).items() if ok is True]
+        models = sorted(set(allow))
     if not models:
-        print("no models to check (empty offer)", file=sys.stderr)
+        print("no models to check (the offer has no model_allowlist; pass --model)", file=sys.stderr)
         return 2
 
     now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
