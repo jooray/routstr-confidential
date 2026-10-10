@@ -87,7 +87,9 @@ receives about 22 MB and sends about 1.2 MB. A cold request's waiting time is do
 22 MB: seconds on a fast connection (about 3 s on a 100 Mbit/s link, about 7 s on a home connection with
 a 2 Mbit/s uplink and a 50 Mbit/s downlink), but about a minute on a slow or congested one (45-70 s to the
 first token, measured from a laptop on poor Wi-Fi behind a satellite link that got only 2-5 Mbit/s from
-the node). The TLS session and the proofs then add a few seconds. routstrd therefore **pre-warms**: once
+the node). Measured from a good home connection (about 100 Mbit/s down) against a production node: about
+14-16 s to the first token cold, of which 5-12 s is receiving the 2PC data. The TLS session and the proofs
+then add well under a second, plus the provider's own latency. routstrd therefore **pre-warms**: once
 you send confidential requests, it prepares the expensive part for the next one in the background (see
 below), which hides it. The answer streams as usual. The node's signed receipt is checked against the
 usage the provider reported; a failed check fails the request.

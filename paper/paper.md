@@ -776,6 +776,19 @@ latency; arming took 42.8 s in the background. A cold request thus waits about a
 while a pre-warmed one waits about 1 s when fully armed, or 2-3 s with the SDK's pre-warming, which arms
 only up to the key share.
 
+The same laptop on a good link (5 GHz Wi-Fi, about 100 Mbit/s down, 60-80 ms to the node) gives the
+numbers a typical user should expect from node-only v2:
+
+| Good home link | Node-only (v2) |
+|---|---|
+| Cold: 2PC preprocessing | 5.1-11.7 s (3 runs) |
+| Cold: online 2PC, proofs (over the channel), provider | 0.3 s, 0.3 s, 1.3 s |
+| Cold: time to first token | 13.8-16.2 s |
+| Fully armed: arming (background) / claim to body / first token | 6.7 s / 73 ms / 1.05 s |
+
+The cold path is still dominated by receiving the 22 MB of garbled tables; pre-warming removes it from
+the request path.
+
 ## 6.4 Over a network and bandwidth
 
 A cold 2PC session (preprocessing, key share, ECtF and both phases, until both parties finish) on an
