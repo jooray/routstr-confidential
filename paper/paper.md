@@ -422,7 +422,8 @@ is billed. A client therefore cannot run a different model or a larger cap than 
   equals the suffix. The verifier decodes one bit.
 
 Because the anchor is a hash of the secret that the 2PC itself output to both parties, the statement
-does not recompute the key schedule: it costs 7 SHA-256 compressions and 6 AES blocks, 0.10 s locally.
+does not recompute the key schedule: it costs 7 SHA-256 compressions and 15 AES blocks for the 230-byte
+suffix, 0.16 s locally.
 
 **Parameter validation by C.** The public parameters of $\pi_{C2S}$ and $\pi_{C3S}$ come from N. C checks
 each against its own view before proving: $\pi_{C2S}$ must be a window ending at the end of C's own final
@@ -621,7 +622,9 @@ salt are fresh per session.
    be padded inside the JSON body; the response side needs provider-side padding or batching.
 6. *DoS and limits.* The node and its relay validate the setup and reserve before opening any connection
    to U, bound concurrent sessions (32), the time to setup (15 s), the session lifetime (600 s), the 2PC
-   (180 s) and the body (8 MiB). The 2PC's preprocessing makes a session expensive for N (about 22 MB of
+   (180 s) and the body (8 MiB); before the credential record is written the relay buffers no more of
+   C's bytes than the declared body needs, and C cannot make N preallocate more proof-channel
+   correlations than N asks for itself. The 2PC's preprocessing makes a session expensive for N (about 22 MB of
    upload and 0.5 s of CPU each), which a reservation per session limits, but per-client limits must also
    bound it; the node refuses new sessions from a client address with twelve unused ones.
 7. *Error metadata.* On an upstream error N learns the status line, the response headers and the body
@@ -704,13 +707,13 @@ single-party variant's pair $\pi_{C1}$ + $\pi_N$ (section 7):
 
 | Proof | Local | 50 ms RTT | Data | SHA-256 compr. | AES blocks |
 |---|---|---|---|---|---|
-| $\pi_{NK}$ (credential record) | 0.17 s | 1.17 s | 1.45 MB | 5 | 15 |
-| $\pi_{C2S}$ (suffix) | 0.10 s | 0.79 s | 0.96 MB | 7 | 6 |
-| $\pi_{C3S}$ (usage) | 0.22 s | 1.22 s | 1.47 MB | 7 | 38 |
-| v1 $\pi_{C1}$ (record material) | 0.46 s | 1.51 s | 1.66 MB | 32 | 18 |
+| $\pi_{NK}$ (credential record) | 0.16 s | 1.23 s | 1.45 MB | 5 | 15 |
+| $\pi_{C2S}$ (suffix) | 0.16 s | 1.22 s | 1.45 MB | 7 | 15 |
+| $\pi_{C3S}$ (usage) | 0.20 s | 1.27 s | 1.47 MB | 7 | 38 |
+| v1 $\pi_{C1}$ (record material) | 0.46 s | 1.57 s | 1.66 MB | 32 | 18 |
 | v1 $\pi_N$ (head template) | 0.08 s | 0.79 s | 0.95 MB | 4 | 0 |
-| v1 $\pi_{C2}$ (suffix) | 0.45 s | 1.51 s | 1.67 MB | 36 | 6 |
-| v1 $\pi_{C3}$ (usage) | 0.46 s | 1.53 s | 1.67 MB | 28 | 38 |
+| v1 $\pi_{C2}$ (suffix) | 0.47 s | 1.58 s | 1.67 MB | 36 | 15 |
+| v1 $\pi_{C3}$ (usage) | 0.46 s | 1.56 s | 1.67 MB | 28 | 38 |
 
 The 50 ms RTT column uses 100 Mbit/s. At 50 ms RTT about 0.7 s of each proof is fixed cost (OT setup and the final flush). Data sizes move in
 steps of about 0.48 MB per direction because the OT extension runs in fixed chunks.
@@ -837,15 +840,15 @@ versions share):
 
 | | v1 | v2 |
 |---|---|---|
-| Cold | 3.8 s ($\pi_{C1}$ + $\pi_N$ + $\pi_{C2}$) | about 5.0 s (2PC 3.05, $\pi_{NK}$ 1.17, $\pi_{C2S}$ 0.79) |
-| Pre-warmed | 1.5 s ($\pi_{C2}$) | 0.8 s ($\pi_{C2S}$); 0.04 s over a pre-warmed proof channel |
+| Cold | 3.9 s ($\pi_{C1}$ + $\pi_N$ + $\pi_{C2}$) | about 5.5 s (2PC 3.05, $\pi_{NK}$ 1.23, $\pi_{C2S}$ 1.22) |
+| Pre-warmed | 1.6 s ($\pi_{C2}$) | 1.2 s ($\pi_{C2S}$); 0.04 s over a pre-warmed proof channel |
 
 Cold, v2 is somewhat slower than v1 on a fast link and several seconds slower on a slow uplink (the 2PC
 alone takes 7.4 s at 2 Mbit/s). Pre-warmed, v2 is faster, because only its cheaper suffix proof is on
 the path.
 
 Data per request: v1 moves about 5.9 MB of proofs; v2 about 23.3 MB of 2PC traffic (22.1 MB to the
-client, 1.2 MB from it) and 3.9 MB of proofs, about 27 MB in all. N uploads about 24 MB per v2 request
+client, 1.2 MB from it) and 4.4 MB of proofs, about 28 MB in all. N uploads about 24 MB per v2 request
 (100 requests per minute is about 0.3 Gbit/s), against about 3 MB for v1, and spends about 0.5 s of CPU
 on the 2PC. The 2PC cost is constant in the size of the prompt and the response.
 
@@ -926,10 +929,10 @@ record of fixed length.
 | Client can recover the API key | yes, if it sees N's egress ciphertext | no |
 | New cryptography in the trust base | ZK proofs | ZK proofs and a 2PC |
 | Key exchange | X25519 | P-256 |
-| Data per request | ≈5.9 MB | ≈27 MB (22 MB of it to the client) |
+| Data per request | ≈5.9 MB | ≈28 MB (22 MB of it to the client) |
 | Node upload per request | ≈3 MB | ≈24 MB |
-| Cold critical-path work | ≈3.8 s (50 ms RTT, 100 Mbit/s) | ≈5.0 s (50 ms RTT, 100 Mbit/s); 2PC alone ≈7.4 s on a 2/50 Mbit/s link |
-| Pre-warmed suffix proof | 0.45 s local, 1.5 s at 50 ms RTT | 0.10 s local, 0.8 s at 50 ms RTT |
+| Cold critical-path work | ≈3.9 s (50 ms RTT, 100 Mbit/s) | ≈5.5 s (50 ms RTT, 100 Mbit/s); 2PC alone ≈7.4 s on a 2/50 Mbit/s link |
+| Pre-warmed suffix proof | 0.47 s local, 1.6 s at 50 ms RTT | 0.16 s local, 1.2 s at 50 ms RTT |
 
 v1 suits nodes whose upstream path is under their own control, clients on slow or metered links
 (above all slow downlinks), and clients that cannot pre-warm. v2 suits nodes on shared or untrusted infrastructure and nodes with
@@ -981,7 +984,7 @@ being used. We therefore layer several limits, from free and always on to priced
 3. **Global and per-address caps.** N serves at most a fixed number of concurrent sessions (32 by
    default), each limited to 600 s, with 15 s to send its setup. It also refuses a new session from a
    client address that already holds a set number of unused sessions, that is, set up but with no
-   credential record written yet (3 by default; HTTP 429). The address is the TCP peer, or, only for
+   credential record written yet (12 by default; HTTP 429). The address is the TCP peer, or, only for
    peers configured as trusted reverse proxies, the rightmost `X-Forwarded-For` entry; a client cannot
    name its own address. Clients behind one address, such as all Tor users of an onion service, share
    the limit.
@@ -1079,7 +1082,7 @@ provider, without having to review the node's software.
 | Trusted hardware or attested software | no | no | no | no | yes |
 | Streaming, native-speed payload | yes | yes | no | yes | yes |
 | Added latency, pre-warmed (local) | 0.10 s proof | 0.45 s proof | 5.8-129 s | ≈10 s | ≈0 |
-| Data per request | ≈27 MB, constant | ≈5.9 MB | 41 MB-1.4 GB | transcript size | ≈0 |
+| Data per request | ≈28 MB, constant | ≈5.9 MB | 41 MB-1.4 GB | transcript size | ≈0 |
 | Third-party-verifiable transcript | no | no | yes | yes | attestation only |
 | Provider requirement | TLS 1.3 profile with P-256 | TLS 1.3 profile | TLS 1.2+ | TLS 1.2/1.3 | any |
 

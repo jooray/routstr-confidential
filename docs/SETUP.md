@@ -215,7 +215,9 @@ node; the session fee and the surcharge price the work of a request that is used
 `routstr-core/docs/confidential-upstream.md` for the exact rules.
 
 `--protocol 2` selects the two-party handshake (`1` is the single-party variant). Limits: `--max-sessions`
-(32) and `--max-body` (8 MiB); sessions time out after 600 s.
+(32) and `--max-body` (8 MiB); sessions time out after 600 s. Client bytes held before the credential
+record is written are capped at about the declared body length, and a client cannot raise the proof
+channel's preallocation above the sidecar's own.
 
 **2. The node**: build routstr-core from the `confidential-2pc` branch (its `Dockerfile` is the upstream one)
 and set

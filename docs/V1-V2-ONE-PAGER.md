@@ -20,7 +20,7 @@ the request exists.
 | Model / token cap / billing | pinned by proofs, provider-reported usage | same |
 | Who holds which TLS secret | client: all of them | client: handshake, response and body keys; node: handshake keys and the one key for its own record; nobody: the master secret |
 | Key exchange | X25519 | P-256 (the joint key share needs a full curve point) |
-| Data per request, client and node (both directions) | about 6 MB | about 27 MB (23.3 MB 2PC: 22.1 MB to the client, 1.2 MB from it; 4 MB proofs) |
+| Data per request, client and node (both directions) | about 6 MB | about 28 MB (23.3 MB 2PC: 22.1 MB to the client, 1.2 MB from it; 4.4 MB proofs) |
 | Node upload per request | about 3 MB | about 24 MB (100 requests/min about 0.3 Gbit/s) |
 | New cryptography in the trust base | ZK proofs | ZK proofs **and** a 2PC (node-only authenticated garbling, share conversion), not yet externally reviewed |
 
@@ -36,9 +36,9 @@ the request exists.
 
 Across a network link (from the component benchmarks, 2026-10 node-only garbling): the cold 2PC takes **3.1 s on
 a 100 Mbit/s symmetric link, 5.4 s on a 7/50 Mbit/s home link and 7.4 s on 2/50 Mbit/s** (80 ms RTT); its
-online part is about 0.5 s. In exchange π_C1 (1.5 s) disappears and π_C2 drops from 1.5 s to 0.8 s. Cold, v2 is
+online part is about 0.5 s. In exchange π_C1 (1.6 s) disappears and the suffix proof drops from 1.6 s to 1.2 s. Cold, v2 is
 about a second slower than v1 on a fast link and several seconds slower on a slow uplink. **Pre-warmed,
-v2 is faster** (only the suffix proof is on the path, and it is half the cost), so v2 wants pre-warm: the tables
+v2 is faster** (only the suffix proof is on the path, and it is cheaper), so v2 wants pre-warm: the tables
 cannot be reused, one set per request, but they are input-independent and can be built and sent ahead.
 
 **Security for the client (prompt and answer).** v1: nothing new; the client alone runs standard TLS. v2: the

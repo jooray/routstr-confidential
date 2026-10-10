@@ -521,7 +521,13 @@ Billing in this section supersedes the
   attestation_hash, time`, signed; the SDK requires the signature and checks
   `sid` and `attestation_hash`.
 - **Limits.** Node and sidecar validate setup before any provider connection;
-  32 sessions each, 15 s to setup, 600 s per session, 8 MiB body.
+  32 sessions each, 15 s to setup, 600 s per session, 8 MiB body. In v2 the
+  client bytes the sidecar holds before relaying them (during the 2PC
+  preprocessing and until the credential record is written) are capped at the
+  declared body plus record overhead (`client_buffer_cap`); the proof channel
+  preallocates the smaller of the two sides' requests (`agreed_prealloc`).
+- **Attestation.** Both clients check that the signed attestation names their
+  own `sid`, `th_sh` and `th_sf`, not only that its signature verifies.
 - **Client.** routstrd answers 400 for `x-routstr-verify: confidential` when
   the mode is off or the endpoint is not `POST /v1/chat/completions`; the SDK
   surfaces post-response check failures, re-verifies cached offers per call,
