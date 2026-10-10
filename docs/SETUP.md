@@ -85,9 +85,30 @@ used (`GET https://<node>/v1/confidential/offer`).
 What to expect: each request first runs a two-party computation with the node, which moves about 21 MB in
 each direction. That takes about 2 s on a fast symmetric link, but it is bound by your upload speed: from a
 typical home connection it took about 25 s, so a cold request currently waits roughly half a minute for its
-first token. The TLS session and proofs then add a few seconds. (This work can be done before a request
-exists; routstrd does not pre-warm sessions yet.) The answer streams as usual. The node's signed receipt is checked against the usage the provider
+first token. The TLS session and proofs then add a few seconds. routstrd therefore **pre-warms**: once you
+send confidential requests, it prepares the expensive part for the next one in the background (see below).
+The answer streams as usual. The node's signed receipt is checked against the usage the provider
 reported; a failed check fails the request.
+
+**Pre-warming** is on by default and driven by your traffic. After a confidential request for a node,
+model and `max_tokens`, routstrd arms a session in the background (setup, reservation, the two-party
+preprocessing; no connection to the provider yet), so the next matching request skips the preprocessing.
+It keeps one armed session while requests keep coming, two on bursts or overlapping requests, and closes
+them a few minutes after the last request: an idle routstrd keeps nothing open and nothing reserved. Each
+armed session reserves funds on your node credential until it is used or closed (released, no charge),
+and costs about 21 MB each way to prepare. Tune or disable it in `config.json`:
+
+```json
+"confidentialUpstream": {
+  "prewarm": { "enabled": true, "activityWindowMinutes": 10, "maxPerKey": 3, "maxTotal": 4, "maxAgeSeconds": 480 }
+}
+```
+
+A request uses an armed session only if its model and `max_tokens` match exactly (they are pinned at
+setup) and its body fits the armed length; otherwise it runs cold. Responses carry
+`x-routstr-confidential-prewarmed: 1` when they used one. Measured from a home connection: about 35 s to
+the first token cold, about 12 s warm (most of the remaining time is the two proofs, whose setup is the
+next thing to move into the armed session).
 
 ## 2. Running a node
 

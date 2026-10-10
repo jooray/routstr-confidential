@@ -18,16 +18,16 @@ Each has `origin` = Routstr upstream and `fork` = `jooray/<repo>`.
 
 | Path | Git | What |
 |---|---|---|
-| `routstr-core/` | branch **`confidential-upstream`** → PR [Routstr/routstr-core#824](https://github.com/Routstr/routstr-core/pull/824); **`fix/no-announce-unroutable-urls`** → PR [#823](https://github.com/Routstr/routstr-core/pull/823) | the node (Python/FastAPI) |
-| `routstr-sdk/` | branch **`confidential-upstream`** → PR [Routstr/routstr-sdk#90](https://github.com/Routstr/routstr-sdk/pull/90) | client SDK (TypeScript) |
-| `routstrd/` | branch **`confidential-upstream`** → PR [Routstr/routstrd#137](https://github.com/Routstr/routstrd/pull/137) | client daemon (TypeScript/Bun) |
-| `crypto/` | this repo | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `zkbench` (mpz2 VOLE-ZK circuits π_C1, π_N, π_C2, π_C3 + `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (test scripts), `runs/` (session evidence) |
+| `routstr-core/` | **`confidential-2pc`** (v2, deployed on routstr.cypherpunk.today); `confidential-upstream` (v1); `fix/no-announce-unroutable-urls` → PR [#823](https://github.com/Routstr/routstr-core/pull/823) | the node (Python/FastAPI) |
+| `routstr-sdk/` | **`confidential-2pc`** (v2 + pre-warming); `confidential-upstream` (v1) | client SDK (TypeScript) |
+| `routstrd/` | **`confidential-upstream`** (works with either SDK branch; pre-warm config) | client daemon (TypeScript/Bun) |
+| `crypto/` | this repo | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (v2 two-party key schedule + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK circuits: v2 π_NK, π_C2S, π_C3S; v1 π_C1, π_N, π_C2, π_C3; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (test scripts), `runs/` (session evidence) |
 | `paper/` | — | the paper (`paper.md` → `build.sh` → `paper.pdf`) |
 | `docs/` | — | engineering docs and research (below) |
 
-Each confidential branch is one commit on `origin/main`. Merge order: SDK
-first and release it; then routstrd (bump `@routstr/sdk`); the node PR and
-#823 are independent. Local-only branches `confidential-upstream-on-tlsn`
+The upstream PRs (core #824, SDK #90, routstrd #137) are closed while the
+work is tested on these fork branches; they will be reopened (probably v2
+only) after user testing. Local-only branches `confidential-upstream-on-tlsn`
 (core, SDK) are pre-rebase snapshots on top of unmerged TLSN work. Ignore
 them.
 
@@ -160,7 +160,11 @@ key schedule, `cu-2pc` binary for the client), `zkbench` v2 statements
 checks the ClientHello carries exactly the joint P-256 share), the TLS fork's
 `external` hooks, and the v2 paths in `driver.ts` / the SDK `session.ts`.
 Run a v2 stack like the v1 one with `--protocol 2` on the sidecar; the client
-needs `cu-2pc` next to `cu-prover` (or `CU_2PC`). Note: routstr-core persists
+needs `cu-2pc` next to `cu-prover` (or `CU_2PC`). The sidecar dials the provider
+only when the ClientHello arrives, so pre-warmed (armed) sessions hold no
+provider connection. The node's uvicorn needs `--ws-ping-timeout 300`
+(docs/SETUP.md). This branch (`twopc-v2`) is the repo's default branch; the
+v1 proof of concept is the `v1-poc` branch. Note: routstr-core persists
 settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
 
 ## Gotchas
@@ -184,9 +188,13 @@ settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
   provider list. This is a pre-existing limitation, not confidential-specific.
 - **`crypto/` builds into `zkbench/target`** (see `crypto/.cargo/config.toml`).
 - **Open items.**
-  - P1 rests on the client never seeing the N→U ciphertext (paper §5); a 2PC
-    handshake would remove that, as a new protocol version.
-  - routstrd does not pre-warm.
+  - v1's P1 rests on the client never seeing the N→U ciphertext; v2 removes
+    that assumption. v2's cost is ~21 MB each way per request (client upload
+    dominates on home links); node-only garbling would turn it into a download.
+  - Pre-warming (SDK `client/confidential/prewarm.ts`, routstrd
+    `confidentialUpstream.prewarm`) arms v2 sessions up to the joint key share
+    only while there is traffic; the ZK proofs' OT/VOLE setup is not yet
+    pre-warmed (it dominates a warm request over a WAN).
   - The SDK release (version bump) and routstrd's `@routstr/sdk` bump are
     the maintainers' step.
   - The sidecar and prover are not yet in any upstream repo.

@@ -28,14 +28,18 @@ The client is the TLS 1.3 client of the provider *through* the node. Client and 
 | `paper/` | the paper (`paper.md` → `build.sh`) |
 | `docs/` | `APPROACH.md` (engineering overview), `ADVERSARIAL-QA.md`, `REVIEW-2026-10-09.md` (findings and fixes), `ONE-PAGER.md` |
 
-## Routstr integration (pull requests)
+## Routstr integration (branches)
 
-| Repo | PR | Merge |
+The upstream pull requests are closed while this is tested on fork branches; they will be reopened after
+user testing. To try it: [`docs/SETUP.md`](docs/SETUP.md).
+
+| Repo | Branch | What |
 |---|---|---|
-| routstr-sdk | [Routstr/routstr-sdk#90](https://github.com/Routstr/routstr-sdk/pull/90): confidential transport (Bun/Node) | **first**, then release the SDK |
-| routstr-core | [Routstr/routstr-core#824](https://github.com/Routstr/routstr-core/pull/824): node side (offer, relay, normal billing) | independent; inert until `CONFIDENTIAL_SIDECAR_URL` is set |
-| routstrd | [Routstr/routstrd#137](https://github.com/Routstr/routstrd/pull/137): opt-in requests | **after** the SDK release (bump `@routstr/sdk`) |
-| routstr-core | [Routstr/routstr-core#823](https://github.com/Routstr/routstr-core/pull/823): never announce loopback/private URLs | independent small fix |
+| [jooray/routstr-core](https://github.com/jooray/routstr-core/tree/confidential-2pc) | `confidential-2pc` | node side (offer, relay, normal billing); inert until `CONFIDENTIAL_SIDECAR_URL` is set |
+| [jooray/routstr-sdk](https://github.com/jooray/routstr-sdk/tree/confidential-2pc) | `confidential-2pc` | client transport, v1 and v2, traffic-driven pre-warming |
+| [jooray/routstrd](https://github.com/jooray/routstrd/tree/confidential-upstream) | `confidential-upstream` | opt-in header and config (`confidentialUpstream`, incl. `prewarm`) |
+
+This repo's default branch is `twopc-v2` (protocol v2); the v1 proof of concept is the `v1-poc` branch.
 
 ## Build
 

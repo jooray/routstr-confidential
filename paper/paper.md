@@ -626,15 +626,26 @@ protocol path is shorter. An earlier interleaved comparison of the single-party 
 HTTPS call (60 tokens, n = 8) measured +1.07 s to first token cold and about +0.25 s pre-warmed.
 $\pi_{C3S}$ and settlement run after the client's stream has ended and add no latency.
 
-**Pre-warming.** A client that holds a balance with a node can keep armed sessions: setup and
-reservation, preprocessing, the joint key share, the relayed handshake, both 2PC phases, the handshake
-verification and $\pi_{NK}$ all happen before a request exists. A request claims a session; N writes the
-credential record and the KeyUpdate, C's body follows, and only $\pi_{C2S}$, which depends on the prompt,
-remains on the path. Because the garbled tables are single-use and N may write only in epoch 0, the
-preprocessing cannot be shared between requests: pre-warming is how the protocol hides it. An armed
-session holds a reservation until it is claimed or discarded (released), and its body length is fixed at
-arming, so a client that does not know its next body must pad it, which the JSON body allows. The
-reference client implements arming; the client daemon does not pre-warm yet.
+**Pre-warming.** Because the garbled tables are single-use and N may write only in epoch 0, the
+preprocessing cannot be shared between requests; pre-warming is how the protocol hides it. A client arms
+a session before a request exists: setup and reservation, preprocessing and the joint key share. It stops
+there, before the ClientHello, so an armed session holds no connection to the provider (N dials U only
+when the ClientHello arrives). A request claims the session: the handshake with both online 2PC phases,
+$\pi_{NK}$, the credential record and KeyUpdate, the body and $\pi_{C2S}$. An armed session holds a
+reservation until it is claimed or discarded (released at no charge), and its body length is fixed at
+arming: the client pads a shorter body with JSON whitespace between the private part and the suffix,
+choosing the length from recent bodies (power-of-two buckets). The client daemon arms only while it sees
+traffic: after a confidential request for a given node, model and token cap it keeps one armed session
+(two on bursts or overlapping requests, at most three per key and four in total), retires sessions
+before the node's session limit, and closes them a few minutes after the last request, so an idle client
+holds nothing. (The reference client's `--arm` mode, used for the local benchmarks, arms further,
+through the handshake and $\pi_{NK}$.)
+
+Measured against a deployed node from a home connection: a cold request reached its first token after
+35 s, almost all of it the client uploading its half of the preprocessing; a claimed armed session after
+about 12 s: handshake and online 2PC 1.3 s, $\pi_{NK}$ 5.4 s, $\pi_{C2S}$ 3.0 s, the provider 2.2 s.
+The two proofs dominate, and most of their time is their own OT/VOLE setup, which is also independent of
+the request and can be moved into the armed session as well.
 
 ## 6.4 Over a network and bandwidth
 
