@@ -148,6 +148,21 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun ≥ 1.4 and se
 - Under a sandbox, some routstrd tests fail the same way on `origin/main`
   (subprocess and network tests).
 
+## Protocol v2 (branch `twopc-v2`)
+
+v2 closes P1: client and node run the TLS 1.3 key schedule as a two-party
+computation, so the client never holds the key of the credential record
+(`docs/TWOPC-DESIGN.md`, trade-offs in `docs/V1-V2-ONE-PAGER.md`). Branches:
+`twopc-v2` here, `confidential-2pc` in routstr-core and routstr-sdk (routstrd
+needs no change). Pieces: `crypto/twopc` (ECtF + dual-execution garbled
+key schedule, `cu-2pc` binary for the client), `zkbench` v2 statements
+(`pi_nk`, `pi_c2s`, `pi_c3s`), sidecar `--protocol 2` (`relay/src/tls_v2.rs`
+checks the ClientHello carries exactly the joint P-256 share), the TLS fork's
+`external` hooks, and the v2 paths in `driver.ts` / the SDK `session.ts`.
+Run a v2 stack like the v1 one with `--protocol 2` on the sidecar; the client
+needs `cu-2pc` next to `cu-prover` (or `CU_2PC`). Note: routstr-core persists
+settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
+
 ## Gotchas
 
 - **Never log or commit `VENICE_API_KEY`**, node nsecs or Cashu tokens. Scan

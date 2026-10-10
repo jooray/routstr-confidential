@@ -166,3 +166,163 @@ pub fn all() -> Vec<(&'static str, Params, Witness)> {
         ("pi_c3", pi_c3().0, pi_c3().1),
     ]
 }
+
+// ---------------------------------------------------------------------------
+// Protocol v2 (two-party handshake) fixtures
+// ---------------------------------------------------------------------------
+//
+// The secrets are the RFC 8448 session's c_ap_0 / s_ap_0, with
+// c_ap_1 = traffic_update(c_ap_0) and (K_0, IV_0) derived from c_ap_0, i.e.
+// exactly what the v2 2PC outputs to each party for that session.
+
+use crate::statements::{PiC2S, PiC3S, PiNK};
+
+/// The v2 2PC outputs for the fixture session.
+pub struct V2Secrets {
+    pub c_ap_1: [u8; 32],
+    pub s_ap_0: [u8; 32],
+    pub k0: [u8; 16],
+    pub iv0: [u8; 12],
+}
+
+impl V2Secrets {
+    pub fn h1(&self) -> [u8; 32] {
+        cu_crypto::hkdf::sha256(&self.c_ap_1)
+    }
+    pub fn h2(&self) -> [u8; 32] {
+        cu_crypto::hkdf::sha256(&self.s_ap_0)
+    }
+    pub fn hk(&self) -> [u8; 32] {
+        let mut kiv = self.k0.to_vec();
+        kiv.extend_from_slice(&self.iv0);
+        cu_crypto::hkdf::sha256(&kiv)
+    }
+}
+
+pub fn v2_secrets() -> V2Secrets {
+    let ks = ks();
+    V2Secrets {
+        c_ap_1: *ks.c_ap_1.as_bytes(),
+        s_ap_0: *ks.s_ap_0.as_bytes(),
+        k0: ks.c_ap_0.key(),
+        iv0: ks.c_ap_0.iv(),
+    }
+}
+
+/// π_C2S: the pinned suffix on the final epoch-1 body record (seq 3).
+pub fn pi_c2s() -> (Params, Witness) {
+    let v = v2_secrets();
+    let secret = cu_crypto::keyschedule::Secret::new(v.c_ap_1);
+    let suffix = b",\"model\":\"mistral-small-3-2-24b-instruct\",\"max_tokens\":12,\"n\":1,\"stream\":true}".to_vec();
+    let mut inner = vec![b'x'; 400];
+    inner.extend_from_slice(&suffix);
+    inner.push(0x17);
+    let w = window_params(secret.key(), secret.iv(), 3, &inner, &suffix);
+    (
+        Params::PiC2S(PiC2S {
+            h1: v.h1(),
+            seq: w.seq,
+            ct_window: w.ct_window,
+            off: w.off,
+            w: w.w,
+            sel_start: w.sel_start,
+            sel_len: w.sel_len,
+            expected: w.expected,
+        }),
+        Witness::Secret(v.c_ap_1),
+    )
+}
+
+/// π_C3S: the usage disclosure on the tail server record under s_ap_0.
+pub fn pi_c3s() -> (Params, Witness) {
+    let (p, _) = pi_c3();
+    let Params::PiC3(p) = p else { unreachable!() };
+    let v = v2_secrets();
+    (
+        Params::PiC3S(PiC3S {
+            h2: v.h2(),
+            records: p.records,
+            expected: p.expected,
+            skip: p.skip,
+        }),
+        Witness::Secret(v.s_ap_0),
+    )
+}
+
+/// π_NK pieces, so tests can build variants (another key, another template).
+pub struct PiNKParts {
+    pub template: Vec<u8>,
+    pub key_offsets: Vec<usize>,
+    pub key: Vec<u8>,
+}
+
+pub fn pi_nk_parts() -> PiNKParts {
+    let prefix: &[u8] =
+        b"POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer ";
+    let key = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOP".to_vec();
+    let tail: &[u8] = b"\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: 400\r\n\r\n";
+    let mut template = prefix.to_vec();
+    let key_offsets: Vec<usize> = (0..key.len()).map(|i| prefix.len() + i).collect();
+    template.extend(std::iter::repeat_n(0u8, key.len()));
+    template.extend_from_slice(tail);
+    PiNKParts { template, key_offsets, key }
+}
+
+/// The real credential record ciphertext `C_1` (tag excluded) that N writes
+/// at epoch 0, seq 0 for `template` with `key` spliced in.
+pub fn pi_nk_ciphertext(v: &V2Secrets, template: &[u8], key_offsets: &[usize], key: &[u8]) -> Vec<u8> {
+    let mut p = template.to_vec();
+    for (i, off) in key_offsets.iter().enumerate() {
+        p[*off] = key[i];
+    }
+    p.push(0x17);
+    let stream = aesgcm::ctr_keystream(&v.k0, &v.iv0, 0, p.len());
+    xor(&p, &stream)
+}
+
+/// π_NK params for an explicit `C_1` (the record N actually writes).
+pub fn pi_nk_params(v: &V2Secrets, parts: &PiNKParts, c1: &[u8]) -> PiNK {
+    let head_len = parts.template.len();
+    let header: [u8; 5] = aesgcm::record_header(head_len + 1);
+    let mut record = header.to_vec();
+    record.extend_from_slice(c1);
+    PiNK {
+        hk: v.hk(),
+        head_len,
+        key_len: parts.key.len(),
+        key_alphabet: SUPPORTED_KEY_ALPHABET.to_string(),
+        key_offsets: parts.key_offsets.clone(),
+        template: parts.template.clone(),
+        c_commit: cu_crypto::transcript::hash(&record),
+        header,
+    }
+}
+
+/// π_NK: the Venice-style head of `pi_n` under K_0 / IV_0.
+pub fn pi_nk() -> (Params, Witness) {
+    let v = v2_secrets();
+    let parts = pi_nk_parts();
+    let c1 = pi_nk_ciphertext(&v, &parts.template, &parts.key_offsets, &parts.key);
+    // The record really is what AES-128-GCM seals at seq 0 (tag excluded).
+    let mut inner = parts.template.clone();
+    for (i, off) in parts.key_offsets.iter().enumerate() {
+        inner[*off] = parts.key[i];
+    }
+    inner.push(0x17);
+    let header = aesgcm::record_header(inner.len());
+    let sealed = aesgcm::gcm_seal(&v.k0, &v.iv0, 0, &header, &inner);
+    assert_eq!(&sealed[..c1.len()], &c1[..]);
+    (
+        Params::PiNK(pi_nk_params(&v, &parts, &c1)),
+        Witness::NodeKey { k0: v.k0, iv0: v.iv0, key: parts.key.clone() },
+    )
+}
+
+/// The three v2 statements.
+pub fn all_v2() -> Vec<(&'static str, Params, Witness)> {
+    vec![
+        ("pi_nk", pi_nk().0, pi_nk().1),
+        ("pi_c2s", pi_c2s().0, pi_c2s().1),
+        ("pi_c3s", pi_c3s().0, pi_c3s().1),
+    ]
+}

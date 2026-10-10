@@ -11,6 +11,7 @@
 //! appears only inside the single credential record written to the upstream.
 
 mod tls;
+mod tls_v2;
 mod wsio;
 
 use std::collections::HashMap;
@@ -47,6 +48,9 @@ use crate::wsio::ws_duplex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Offer {
+    /// Protocol version: 1 (paper §4) or 2 (two-party handshake, docs/TWOPC-DESIGN.md).
+    #[serde(default = "default_protocol")]
+    v: u8,
     upstream_host: String,
     #[serde(default)]
     price_list: serde_json::Value,
@@ -73,6 +77,10 @@ struct Offer {
     /// way even if the node's own model list is broader.
     #[serde(default)]
     text_only_ok: HashMap<String, bool>,
+}
+
+fn default_protocol() -> u8 {
+    1
 }
 
 fn default_key_alphabet() -> String {
@@ -158,6 +166,12 @@ const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600)
 #[derive(Debug)]
 enum Ev {
     ServerBytes(Vec<u8>),
+    /// v2: the joint P-256 key share P = P_C + P_N.
+    KeyShare([u8; 65]),
+    /// v2: the handshake traffic secrets from 2PC phase A.
+    Hs(HsSecrets),
+    /// v2: N's outputs of 2PC phase B.
+    Ap(Box<ApN>),
     TcpClosed,
     ZkDone {
         proof: String,
@@ -169,8 +183,29 @@ enum Ev {
     },
 }
 
+/// v2: N's outputs of the two-party key schedule (K_0/IV_0 never leave N).
+#[derive(Debug)]
+struct ApN {
+    k0: Zeroizing<[u8; 16]>,
+    iv0: Zeroizing<[u8; 12]>,
+    h1: [u8; 32],
+    h2: [u8; 32],
+    hk: [u8; 32],
+}
+
+/// v2: what the session hands the 2PC task once U's messages arrive.
+#[derive(Debug)]
+enum TwoPcCmd {
+    Handshake { server_share: [u8; 65], th_sh: [u8; 32] },
+    App { th_sf: [u8; 32] },
+}
+
 struct SessionShared {
     params: StdMutex<HashMap<String, Params>>,
+    /// v2: the command channel of this session's 2PC (taken by `/zk?proof=twopc`).
+    twopc_rx: StdMutex<Option<mpsc::UnboundedReceiver<TwoPcCmd>>>,
+    /// v2: N's epoch-0 key and IV, for the π_N witness.
+    k0_iv0: StdMutex<Option<Zeroizing<Vec<u8>>>>,
     key: Arc<Zeroizing<Vec<u8>>>,
     evt: mpsc::UnboundedSender<Ev>,
     insecure: bool,
@@ -243,6 +278,7 @@ async fn main() -> Result<()> {
         serde_json::from_str::<Offer>(&text).with_context(|| format!("parsing {path}"))?
     } else {
         Offer {
+            v: 1,
             upstream_host: host.clone(),
             price_list: serde_json::json!({
                 "mistral-small-3-2-24b-instruct": {"in": 0.0, "cached_in": 0.0, "out": 0.0}
@@ -264,6 +300,15 @@ async fn main() -> Result<()> {
             text_only_ok: HashMap::new(),
         }
     };
+    match arg("--protocol").as_deref() {
+        None => {}
+        Some("1") => offer.v = 1,
+        Some("2") => offer.v = 2,
+        Some(other) => bail!("unsupported --protocol {other}"),
+    }
+    if offer.v == 2 && insecure {
+        bail!("--insecure-no-proofs is a v1 test mode");
+    }
     if offer.upstream_host.is_empty() {
         offer.upstream_host = host.clone();
     }
@@ -393,6 +438,9 @@ enum ClientMsg {
     Ku1 {
         record: String,
     },
+    /// v2: the client verified π_NK and claims the session; N writes the
+    /// credential record and the KeyUpdate under K_0.
+    ReleaseHead {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -401,6 +449,9 @@ enum SessionState {
     Handshake,
     AwaitKu0,
     AwaitC1,
+    /// v2: the client Finished is relayed; client records are held until N
+    /// has written the credential record and the KeyUpdate.
+    AwaitHead,
     Body,
     Attested,
     Settled,
@@ -423,8 +474,11 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (to_client, mut from_client) = mpsc::unbounded_channel::<Message>();
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<Ev>();
+    let (twopc_tx, twopc_rx) = mpsc::unbounded_channel::<TwoPcCmd>();
     let shared = Arc::new(SessionShared {
         params: StdMutex::new(HashMap::new()),
+        twopc_rx: StdMutex::new((app.offer.v == 2).then_some(twopc_rx)),
+        k0_iv0: StdMutex::new(None),
         key: app.key.clone(),
         evt: evt_tx.clone(),
         insecure: app.insecure,
@@ -439,7 +493,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         }
     });
 
-    let mut st = Session::default();
+    let mut st = Session { v2: app.offer.v == 2, twopc_tx: Some(twopc_tx), ..Session::default() };
     let mut log = RelayLog::default();
     let mut client_pending: Vec<u8> = Vec::new();
     let mut server_pending: Vec<u8> = Vec::new();
@@ -502,6 +556,25 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 return Err(e);
                             }
                         }
+                    Message::Binary(data) if st.v2 => {
+                        if st.sid.is_none() {
+                            bail!("TLS bytes before setup");
+                        }
+                        log.client_raw.extend_from_slice(&data);
+                        match st.state {
+                            SessionState::Handshake => {
+                                client_pending.extend_from_slice(&data);
+                                v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
+                            }
+                            SessionState::AwaitHead => st.held_client.extend_from_slice(&data),
+                            SessionState::Body => {
+                                client_pending.extend_from_slice(&data);
+                                relay_body(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
+                            }
+                            _ => bail!("unexpected client record in state {:?}", st.state),
+                        }
+                        v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
+                    }
                     Message::Binary(data) => {
                         match st.state {
                             SessionState::Handshake => {
@@ -532,41 +605,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 }
                             }
                             SessionState::Body => {
-                                let mut buf = std::mem::take(&mut client_pending);
-                                buf.extend_from_slice(&data);
+                                client_pending.extend_from_slice(&data);
                                 log.client_raw.extend_from_slice(&data);
-                                let (recs, used) = parse_records(&buf);
-                                for r in recs {
-                                    // The epoch-2 plaintext must be exactly the
-                                    // declared Content-Length: bytes past it would
-                                    // be a smuggled second request, and records
-                                    // after the π_C2-proven final record would let
-                                    // the proven suffix not be the body's tail.
-                                    if r.ctype != CT_APPLICATION_DATA || r.payload.len() < 18 {
-                                        bail!("unexpected epoch-2 client record");
-                                    }
-                                    let content = r.payload.len() - 17;
-                                    if st.body_bytes + content > st.body_len {
-                                        bail!("client body exceeds declared length {}", st.body_len);
-                                    }
-                                    st.body_bytes += content;
-                                    st.body_records += 1;
-                                    if st.body_bytes == st.body_len {
-                                        // The record that completes the body (and
-                                        // carries the pinned suffix) is held until
-                                        // π_C2 verifies: the upstream cannot start
-                                        // inference without the full body, so a
-                                        // client that swaps the model or caps is
-                                        // stopped before it costs anything.
-                                        st.held = Some(r.bytes());
-                                        info!("final body record held until π_C2 verifies");
-                                    } else {
-                                        tcp_tx.write_all(&r.bytes()).await?;
-                                        st.sent.extend_from_slice(&r.bytes());
-                                    }
-                                    log.client_app.push(r);
-                                }
-                                client_pending = buf[used..].to_vec();
+                                relay_body(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                             }
                             _ => bail!("unexpected client record in state {:?}", st.state),
                         }
@@ -585,6 +626,29 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         for r in recs { log.server_all.push(r); }
                         server_pending.drain(..used);
                         if to_client.send(Message::Binary(bytes.into())).is_err() { break; }
+                        if st.v2 {
+                            v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
+                        }
+                    }
+                    Ev::KeyShare(p) => {
+                        if !st.v2 || st.joint.is_some() { bail!("unexpected key share"); }
+                        st.joint = Some(p);
+                        side(&mut st, "2pc key share ready".into());
+                        v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
+                        v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
+                    }
+                    Ev::Hs(s) => {
+                        if !st.v2 || st.hs_secrets.is_some() { bail!("unexpected handshake secrets"); }
+                        st.hs_secrets = Some(s);
+                        v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
+                    }
+                    Ev::Ap(ap) => {
+                        if !st.v2 || st.ap.is_some() { bail!("unexpected 2PC application output"); }
+                        let mut kiv = Zeroizing::new(ap.k0.to_vec());
+                        kiv.extend_from_slice(&ap.iv0[..]);
+                        *shared.k0_iv0.lock().unwrap() = Some(kiv);
+                        st.ap = Some(ap);
+                        v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
                     }
                     Ev::TcpClosed => {
                         info!("upstream closed the connection");
@@ -653,8 +717,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 st.assembled = Some(asm);
                                 info!("pi_c1 assembled; c_commit + pi_n params sent");
                             }
-                            "pi_c2" => {
-                                let same = match (&proven, shared.params.lock().unwrap().get("pi_c2")) {
+                            "pi_c2" | "pi_c2s" => {
+                                let same = match (&proven, shared.params.lock().unwrap().get(proof.as_str())) {
                                     (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
                                     _ => false,
                                 };
@@ -675,14 +739,14 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                     side(&mut st, "pi_c2 verified; final body record released".into());
                                 }
                             }
-                            "pi_c3" => {
+                            "pi_c3" | "pi_c3s" => {
                                 if st.state == SessionState::Settled {
                                     continue;
                                 }
                                 if !st.c2_ok {
                                     bail!("π_C3 before π_C2 verified: the suffix (model, caps) is not proven");
                                 }
-                                let same = match (&proven, shared.params.lock().unwrap().get("pi_c3")) {
+                                let same = match (&proven, shared.params.lock().unwrap().get(proof.as_str())) {
                                     (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
                                     _ => false,
                                 };
@@ -762,6 +826,18 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
 #[derive(Default)]
 struct Session {
     state: SessionState,
+    /// Protocol v2 (two-party handshake).
+    v2: bool,
+    twopc_tx: Option<mpsc::UnboundedSender<TwoPcCmd>>,
+    joint: Option<[u8; 65]>,
+    ch_checked: bool,
+    hs_cmd_sent: bool,
+    app_cmd_sent: bool,
+    ap: Option<Box<ApN>>,
+    /// v2: client bytes after its Finished, held until the head is written.
+    held_client: Vec<u8>,
+    /// v2: the KeyUpdate record N writes after the credential record.
+    ku_record: Option<Vec<u8>>,
     sid: Option<String>,
     body_len: usize,
     head_len: usize,
@@ -885,6 +961,7 @@ fn handle_setup(
         "pubkey":app.offer.notary_pubkey,"head_len":head.len(),
         "suffix": canonical_suffix(&model, max_tokens),
         "armed": armed,
+        "v": app.offer.v,
     }));
     Ok(())
 }
@@ -1003,6 +1080,29 @@ async fn handle_control(
             side(st, format!("credential_written len={} c_commit={}", a.record.len(), hex::encode(a.c_commit)));
             send(serde_json::json!({"type":"head_written"}));
         }
+        ClientMsg::ReleaseHead {} => {
+            if !st.v2 || st.state != SessionState::AwaitHead {
+                bail!("release_head out of order");
+            }
+            let a = st.assembled.as_ref().ok_or_else(|| anyhow!("credential record not assembled"))?;
+            let ku = st.ku_record.clone().ok_or_else(|| anyhow!("no KeyUpdate record"))?;
+            // Atomic write: epoch-0 seq 0 (credential) then seq 1 (KeyUpdate).
+            let mut out = a.record.clone();
+            out.extend_from_slice(&ku);
+            tcp_tx.write_all(&out).await?;
+            st.sent.extend_from_slice(&out);
+            let (len, commit) = (a.record.len(), hex::encode(a.c_commit));
+            st.state = SessionState::Body;
+            info!(record_len = len, "credential record + KeyUpdate written to upstream (epoch 0)");
+            side(st, format!("credential_written len={len} c_commit={commit}"));
+            send(serde_json::json!({"type":"head_written"}));
+            let mut held = std::mem::take(&mut st.held_client);
+            relay_body(st, log, &mut held, tcp_tx).await?;
+            if !held.is_empty() {
+                st.held_client = held;
+                bail!("partial client record buffered across the head write");
+            }
+        }
         ClientMsg::BodySuffix { suffix } => {
             if st.state != SessionState::Body && st.state != SessionState::Attested {
                 bail!("body_suffix out of order");
@@ -1029,18 +1129,20 @@ async fn handle_control(
             // Epoch-2 sequence of the final body record (KU1 is not in client_app).
             let seq = (st.body_records - 1) as u64;
             let (w, off, sel_start) = window(suffix.len(), inner_len);
-            let params = Params::PiC2(zkbench::statements::PiC2 {
-                session: session_of(st)?,
-                seq,
-                ct_window: last.payload[off..off + w].to_vec(),
-                off,
-                w,
-                sel_start,
-                sel_len: suffix.len(),
-                expected: suffix,
-            });
-            shared.params.lock().unwrap().insert("pi_c2".into(), params.clone());
-            send(serde_json::json!({"type":"zk_params","proof":"pi_c2","params":params}));
+            let ct_window = last.payload[off..off + w].to_vec();
+            let params = if st.v2 {
+                let ap = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?;
+                Params::PiC2S(zkbench::statements::PiC2S {
+                    h1: ap.h1, seq, ct_window, off, w, sel_start, sel_len: suffix.len(), expected: suffix,
+                })
+            } else {
+                Params::PiC2(zkbench::statements::PiC2 {
+                    session: session_of(st)?, seq, ct_window, off, w, sel_start, sel_len: suffix.len(), expected: suffix,
+                })
+            };
+            let name = if st.v2 { "pi_c2s" } else { "pi_c2" };
+            shared.params.lock().unwrap().insert(name.into(), params.clone());
+            send(serde_json::json!({"type":"zk_params","proof":name,"params":params}));
         }
         ClientMsg::Disclose { r, tail_lens, skip } => {
             // Only once, and only after the upstream closed: the anchor is the
@@ -1123,14 +1225,15 @@ async fn handle_control(
                 r_len = r.len(),
                 "pi_c3 records"
             );
-            let params = Params::PiC3(zkbench::statements::PiC3 {
-                session: session_of(st)?,
-                records,
-                expected: r,
-                skip,
-            });
-            shared.params.lock().unwrap().insert("pi_c3".into(), params.clone());
-            send(serde_json::json!({"type":"zk_params","proof":"pi_c3","params":params}));
+            let params = if st.v2 {
+                let ap = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?;
+                Params::PiC3S(zkbench::statements::PiC3S { h2: ap.h2, records, expected: r, skip })
+            } else {
+                Params::PiC3(zkbench::statements::PiC3 { session: session_of(st)?, records, expected: r, skip })
+            };
+            let name = if st.v2 { "pi_c3s" } else { "pi_c3" };
+            shared.params.lock().unwrap().insert(name.into(), params.clone());
+            send(serde_json::json!({"type":"zk_params","proof":name,"params":params}));
         }
     }
     Ok(())
@@ -1166,7 +1269,189 @@ fn session_of(st: &Session) -> Result<SessionPublic> {
     })
 }
 
-fn fill_head_now(app: &Arc<AppState>, st: &Session, _log: &RelayLog) -> Result<(Vec<u8>, Vec<usize>)> {
+/// Relay complete body records from `buf` (leaving a partial one in it). The
+/// body plaintext must be exactly the declared length, and the record that
+/// completes it (the pinned suffix) is held until π_C2 verifies.
+async fn relay_body(
+    st: &mut Session,
+    log: &mut RelayLog,
+    buf: &mut Vec<u8>,
+    tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    let (recs, used) = parse_records(buf);
+    for r in recs {
+        // Bytes past the declared Content-Length would be a smuggled second
+        // request, and records after the proven final record would let the
+        // proven suffix not be the body's tail.
+        if r.ctype != CT_APPLICATION_DATA || r.payload.len() < 18 {
+            bail!("unexpected body record");
+        }
+        let content = r.payload.len() - 17;
+        if st.body_bytes + content > st.body_len {
+            bail!("client body exceeds declared length {}", st.body_len);
+        }
+        st.body_bytes += content;
+        st.body_records += 1;
+        if st.body_bytes == st.body_len {
+            // The upstream cannot start inference without the full body, so a
+            // client that swaps the model or caps is stopped before it costs
+            // anything.
+            st.held = Some(r.bytes());
+            info!("final body record held until π_C2 verifies");
+        } else {
+            tcp_tx.write_all(&r.bytes()).await?;
+            st.sent.extend_from_slice(&r.bytes());
+        }
+        log.client_app.push(r);
+    }
+    buf.drain(..used);
+    Ok(())
+}
+
+/// v2, before the client Finished: relay the ClientHello only once the joint
+/// key share is known and the hello offers exactly that share (else C could
+/// complete the handshake alone), then CCS and the client Finished. Anything
+/// after the Finished waits for the credential record.
+async fn v2_pump_client(
+    st: &mut Session,
+    pending: &mut Vec<u8>,
+    tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    if st.state != SessionState::Handshake {
+        return Ok(());
+    }
+    loop {
+        let (recs, _) = parse_records(pending);
+        let Some(r) = recs.into_iter().next() else { return Ok(()) };
+        let n = 5 + r.payload.len();
+        if !st.ch_checked {
+            let Some(joint) = st.joint else { return Ok(()) }; // wait for the 2PC
+            if r.ctype != tls::CT_HANDSHAKE {
+                bail!("first client record must be the ClientHello");
+            }
+            let msgs = tls::parse_handshake_messages(&r.payload);
+            let [(ty, msg)] = msgs.as_slice() else { bail!("ClientHello must be one message in one record") };
+            if *ty != tls::HS_CLIENT_HELLO || msg.len() != r.payload.len() {
+                bail!("first client record must be exactly the ClientHello");
+            }
+            tls_v2::check_client_hello(msg, &joint)?;
+            st.ch_checked = true;
+            info!("v2 ClientHello checked: one P-256 share, the joint key");
+        } else if r.ctype == tls::CT_CHANGE_CIPHER_SPEC {
+            // relayed as is
+        } else if r.ctype == CT_APPLICATION_DATA {
+            // The client Finished (one encrypted record); then C waits for N.
+            st.state = SessionState::AwaitHead;
+        } else {
+            bail!("unexpected client record type {} during the v2 handshake", r.ctype);
+        }
+        tcp_tx.write_all(&pending[..n]).await?;
+        st.sent.extend_from_slice(&pending[..n]);
+        pending.drain(..n);
+        if st.state == SessionState::AwaitHead {
+            st.held_client.append(pending);
+            return Ok(());
+        }
+    }
+}
+
+/// v2: advance the joint handshake as U's messages and the 2PC outputs arrive.
+async fn v2_progress(
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &mut RelayLog,
+) -> Result<()> {
+    let Some((ch, sh)) = tls_v2::hellos(&log.client_raw, &log.server_raw) else { return Ok(()) };
+    if !st.ch_checked {
+        return Ok(());
+    }
+    let cmd = st.twopc_tx.clone().ok_or_else(|| anyhow!("no 2PC channel"))?;
+    if !st.hs_cmd_sent {
+        let server_share = tls_v2::server_hello_share(&sh)?;
+        cmd.send(TwoPcCmd::Handshake { server_share, th_sh: tls_v2::th_sh(&ch, &sh) })
+            .map_err(|_| anyhow!("2PC task gone"))?;
+        st.hs_cmd_sent = true;
+    }
+    let Some(hs) = st.hs_secrets.clone() else { return Ok(()) };
+    if !st.app_cmd_sent {
+        let Some(th_sf) = tls_v2::th_sf(&ch, &sh, &log.server_raw, &hs.server_hs)? else { return Ok(()) };
+        cmd.send(TwoPcCmd::App { th_sf }).map_err(|_| anyhow!("2PC task gone"))?;
+        st.app_cmd_sent = true;
+    }
+    if st.handshake.is_none() && st.state == SessionState::AwaitHead {
+        // The full fail-closed check (chain, hostname, CertificateVerify, both
+        // Finished) before anything is written under K_0.
+        let info = verify_handshake(&log.client_raw, &log.server_raw, &hs, &app.host)?;
+        info!(th_sh = %hex::encode(info.th_sh), "v2 handshake verified: chain + hostname + CertificateVerify + both Finished");
+        side(st, format!("handshake_verified th_sh={}", hex::encode(info.th_sh)));
+        st.handshake = Some(info);
+        let _ = to_client.send(Message::Text(serde_json::json!({"type":"hs_verified"}).to_string().into()));
+    }
+    if st.assembled.is_none() && st.handshake.is_some() {
+        let Some(ap) = st.ap.as_ref() else { return Ok(()) };
+        let (head, offsets) = fill_head_now(app, st)?;
+        let rec = tls_v2::seal_record(&ap.k0, &ap.iv0, 0, &head, CT_APPLICATION_DATA);
+        let header: [u8; 5] = rec[..5].try_into()?;
+        let c_commit = cu_crypto::transcript::hash(&rec[..rec.len() - 16]);
+        st.ku_record = Some(tls_v2::seal_record(&ap.k0, &ap.iv0, 1, &tls_v2::KEY_UPDATE_NOT_REQUESTED, tls::CT_HANDSHAKE));
+        let (template, _) = placeholder_head(&app.offer.head_template, app.key.len(), st.body_len)?;
+        let params = Params::PiNK(zkbench::statements::PiNK {
+            hk: ap.hk,
+            head_len: st.head_len,
+            key_len: app.key.len(),
+            key_alphabet: app.offer.key_alphabet.clone(),
+            key_offsets: offsets,
+            template,
+            c_commit,
+            header,
+        });
+        shared.params.lock().unwrap().insert("pi_nk".into(), params.clone());
+        st.c_commit = Some(c_commit);
+        st.assembled = Some(Assembled { record: rec, c_commit, header });
+        let _ = to_client.send(Message::Text(serde_json::json!({
+            "type":"c_commit","params": params, "c_commit": hex::encode(c_commit),
+            "h1": hex::encode(ap.h1), "h2": hex::encode(ap.h2), "hk": hex::encode(ap.hk),
+        }).to_string().into()));
+        info!("v2 credential record assembled under K_0; π_NK params sent");
+    }
+    Ok(())
+}
+
+/// Lifetime of one session's 2PC (preprocessing through phase B).
+const TWOPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// N's side of the two-party key schedule, driven by the session task.
+async fn run_twopc_n<Io>(io: Io, mut rx: mpsc::UnboundedReceiver<TwoPcCmd>, evt: mpsc::UnboundedSender<Ev>) -> Result<()>
+where
+    Io: futures::AsyncRead + futures::AsyncWrite + Send + Unpin + 'static,
+{
+    let mut party = twopc::Party::new(twopc::Role::N, io).await?;
+    party.preprocess().await?;
+    let joint = party.key_share().await?;
+    let _ = evt.send(Ev::KeyShare(joint));
+    let Some(TwoPcCmd::Handshake { server_share, th_sh }) = rx.recv().await else {
+        bail!("session ended before the ServerHello");
+    };
+    let hs = party.handshake(&server_share, th_sh).await?;
+    let _ = evt.send(Ev::Hs(HsSecrets { client_hs: hs.c_hs, server_hs: hs.s_hs }));
+    let Some(TwoPcCmd::App { th_sf }) = rx.recv().await else {
+        bail!("session ended before the server Finished");
+    };
+    match party.application(th_sf).await? {
+        twopc::ApOut::N { k0, iv0, h1, h2, hk } => {
+            let _ = evt.send(Ev::Ap(Box::new(ApN { k0: Zeroizing::new(k0), iv0: Zeroizing::new(iv0), h1, h2, hk })));
+        }
+        _ => bail!("2PC returned the client's outputs to the node"),
+    }
+    let steps: Vec<String> = party.take_timings().iter().map(|t| format!("{}={}ms", t.step, t.ms)).collect();
+    info!(steps = %steps.join(" "), "2pc done");
+    party.close().await;
+    Ok(())
+}
+
+fn fill_head_now(app: &Arc<AppState>, st: &Session) -> Result<(Vec<u8>, Vec<usize>)> {
     let (mut head, offsets) = placeholder_head(&app.offer.head_template, app.key.len(), st.body_len)?;
     for (i, off) in offsets.iter().enumerate() {
         head[*off] = app.key[i];
@@ -1180,7 +1465,7 @@ fn assemble(app: &Arc<AppState>, st: &Session, _log: &RelayLog) -> Result<Assemb
         Some(Params::PiC1(p)) => p,
         _ => bail!("no π_C1 material"),
     };
-    let (http_head, _) = fill_head_now(app, st, _log)?;
+    let (http_head, _) = fill_head_now(app, st)?;
     // TLS 1.3 inner plaintext ends with the application_data content type.
     let mut plain = http_head.clone();
     plain.push(0x17);
@@ -1261,9 +1546,28 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
     let started = std::time::Instant::now();
     info!(proof, sid, "zk start");
     let shared = app.sessions.lock().unwrap().get(sid).cloned().ok_or_else(|| anyhow!("unknown sid"))?;
+    if proof == "twopc" {
+        let rx = shared.twopc_rx.lock().unwrap().take().ok_or_else(|| anyhow!("2PC not available for this session"))?;
+        let (io, bridge) = ws_duplex(socket);
+        let result = tokio::time::timeout(TWOPC_TIMEOUT, run_twopc_n(io, rx, shared.evt.clone()))
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("2PC timed out")));
+        bridge.finish().await;
+        info!(elapsed_ms = started.elapsed().as_millis() as u64, ok = result.is_ok(), "2pc end");
+        if let Err(e) = &result {
+            let _ = shared.evt.send(Ev::ZkDone { proof: "twopc".into(), ok: false, err: Some(e.to_string()), params: None });
+        }
+        return result;
+    }
     let params = shared.params.lock().unwrap().get(proof).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
     let (role, witness) = match proof {
         "pi_n" => (Role::Prover, Some(Witness::Key(shared.key.to_vec()))),
+        "pi_nk" => {
+            let kiv = shared.k0_iv0.lock().unwrap().clone().ok_or_else(|| anyhow!("no K_0 yet"))?;
+            let k0: [u8; 16] = kiv[..16].try_into()?;
+            let iv0: [u8; 12] = kiv[16..28].try_into()?;
+            (Role::Prover, Some(Witness::NodeKey { k0, iv0, key: shared.key.to_vec() }))
+        }
         _ => (Role::Verifier, None),
     };
     let (io, bridge) = ws_duplex(socket);

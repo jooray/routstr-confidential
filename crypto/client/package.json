@@ -6,7 +6,9 @@
   "description": "Confidential-upstream client: vendored @reclaimprotocol/tls fork + session driver",
   "scripts": {
     "e2e": "node --experimental-strip-types src/driver.ts",
-    "baseline": "node --experimental-strip-types src/baseline.ts"
+    "baseline": "node --experimental-strip-types src/baseline.ts",
+    "v2-layout": "node --experimental-strip-types src/v2-layout-test.ts",
+    "v2-selfcheck": "node --experimental-strip-types src/v2-fork-selfcheck.ts"
   },
   "dependencies": {
     "@noble/ciphers": "^1.3.0",

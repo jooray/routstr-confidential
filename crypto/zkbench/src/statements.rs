@@ -15,6 +15,7 @@ use mpz_vm_core::{
 use mpz_hash::sha256::Sha256;
 
 use crate::Role;
+pub use crate::statements_v2::{PiC2S, PiC3S, PiNK};
 use crate::gadgets::{
     aes_block, alphabet_circuit, concat, ctr_block, expand_label, hmac_sha256, public_bytes,
     eq_bytes, record_keys, secret_bytes, select, splice_circuit, xor_bytes,
@@ -35,6 +36,12 @@ pub enum Proof {
     PiN,
     PiC2,
     PiC3,
+    /// v2: head template under K_0 (N proves; anchored by `hk`).
+    PiNK,
+    /// v2: body suffix under c_ap_1 (anchored by `h1`).
+    PiC2S,
+    /// v2: usage disclosure under s_ap_0 (anchored by `h2`).
+    PiC3S,
 }
 
 impl Proof {
@@ -44,6 +51,9 @@ impl Proof {
             Proof::PiN => "pi_n",
             Proof::PiC2 => "pi_c2",
             Proof::PiC3 => "pi_c3",
+            Proof::PiNK => "pi_nk",
+            Proof::PiC2S => "pi_c2s",
+            Proof::PiC3S => "pi_c3s",
         }
     }
     pub fn from_name(s: &str) -> Option<Self> {
@@ -52,12 +62,15 @@ impl Proof {
             "pi_n" => Some(Proof::PiN),
             "pi_c2" => Some(Proof::PiC2),
             "pi_c3" => Some(Proof::PiC3),
+            "pi_nk" => Some(Proof::PiNK),
+            "pi_c2s" => Some(Proof::PiC2S),
+            "pi_c3s" => Some(Proof::PiC3S),
             _ => None,
         }
     }
     /// True when the client (prover side process) is the prover.
     pub fn client_proves(&self) -> bool {
-        !matches!(self, Proof::PiN)
+        !matches!(self, Proof::PiN | Proof::PiNK)
     }
 }
 
@@ -100,7 +113,7 @@ pub struct PiN {
     pub header: [u8; 5],
 }
 
-fn default_key_alphabet() -> String {
+pub(crate) fn default_key_alphabet() -> String {
     SUPPORTED_KEY_ALPHABET.to_string()
 }
 
@@ -156,6 +169,9 @@ pub enum Params {
     PiN(PiN),
     PiC2(PiC2),
     PiC3(PiC3),
+    PiNK(PiNK),
+    PiC2S(PiC2S),
+    PiC3S(PiC3S),
 }
 
 impl Params {
@@ -165,6 +181,9 @@ impl Params {
             Params::PiN(_) => Proof::PiN,
             Params::PiC2(_) => Proof::PiC2,
             Params::PiC3(_) => Proof::PiC3,
+            Params::PiNK(_) => Proof::PiNK,
+            Params::PiC2S(_) => Proof::PiC2S,
+            Params::PiC3S(_) => Proof::PiC3S,
         }
     }
 }
@@ -176,6 +195,14 @@ pub enum Witness {
     Hs([u8; 32]),
     /// π_N: the API key bytes.
     Key(Vec<u8>),
+    /// π_C2S/π_C3S (v2): a 32-byte traffic secret (c_ap_1 or s_ap_0).
+    Secret([u8; 32]),
+    /// π_NK (v2): the epoch-0 AES key and IV and the API key bytes.
+    NodeKey {
+        k0: [u8; 16],
+        iv0: [u8; 12],
+        key: Vec<u8>,
+    },
 }
 
 /// A single value the verifier must check after decoding.
@@ -189,7 +216,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn full(label: impl Into<String>, value: Vector<U8>, expected: Vec<u8>) -> Self {
+    pub(crate) fn full(label: impl Into<String>, value: Vector<U8>, expected: Vec<u8>) -> Self {
         Self {
             label: label.into(),
             value,
@@ -266,6 +293,9 @@ pub fn build<VM: Vm<Binary>>(
         Params::PiN(p) => build_pi_n(vm, role, p, witness),
         Params::PiC2(p) => build_pi_c2(vm, role, p, witness),
         Params::PiC3(p) => build_pi_c3(vm, role, p, witness),
+        Params::PiNK(p) => crate::statements_v2::build_pi_nk(vm, role, p, witness),
+        Params::PiC2S(p) => crate::statements_v2::build_pi_c2s(vm, role, p, witness),
+        Params::PiC3S(p) => crate::statements_v2::build_pi_c3s(vm, role, p, witness),
     }
 }
 

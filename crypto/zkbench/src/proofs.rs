@@ -238,6 +238,9 @@ pub fn stats(params: &Params) -> Stats {
         Params::PiC3(_) => 7,
         // SHA256(header || C1) = 4 compressions
         Params::PiN(_) => 1,
+        // v2: SHA256(secret) + keyed ipad/opad + key + iv = 1 + 2 + 2 + 2 = 7
+        // compressions; counted separately below.
+        Params::PiC2S(_) | Params::PiC3S(_) | Params::PiNK(_) => 0,
     };
     let mut sha256_compressions = hmacs * 4;
     let mut aes_blocks = 0usize;
@@ -257,6 +260,21 @@ pub fn stats(params: &Params) -> Stats {
                 aes_blocks += r.ct.len().div_ceil(16);
             }
         }
+        Params::PiC2S(p) => {
+            sha256_compressions = 7;
+            aes_blocks += (p.off % 16 + p.w).div_ceil(16);
+        }
+        Params::PiC3S(p) => {
+            sha256_compressions = 7;
+            for r in &p.records {
+                aes_blocks += r.ct.len().div_ceil(16);
+            }
+        }
+        Params::PiNK(p) => {
+            // hk (28 bytes, one block) + SHA256(header || C_1).
+            sha256_compressions = 1 + sha256_blocks(5 + p.head_len + 1);
+            aes_blocks += (p.head_len + 1).div_ceil(16);
+        }
     }
     if matches!(params, Params::PiN(_)) {
         sha256_compressions = 4;
@@ -265,6 +283,11 @@ pub fn stats(params: &Params) -> Stats {
         sha256_compressions,
         aes_blocks,
     }
+}
+
+/// SHA-256 compressions for a message of `len` bytes.
+fn sha256_blocks(len: usize) -> usize {
+    (len * 8 + 1 + 64).div_ceil(512)
 }
 
 /// Outcome of a prover‖verifier run over an emulated transport.

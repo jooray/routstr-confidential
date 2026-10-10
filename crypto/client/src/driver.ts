@@ -37,7 +37,8 @@ import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
 
 import { concat, epoch1Material, fromHex, hex, sha256 } from './advice.ts'
 import { runZk } from './zkbridge.ts'
-import { checkPiC1Params, checkPiC2Params, checkPiC3Params } from './params.ts'
+import { checkPiC1Params, checkPiC2Params, checkPiC2SParams, checkPiC3Params, checkPiC3SParams } from './params.ts'
+import { TwoPc, type ApOut } from './twopc.ts'
 
 setCryptoImplementation(webcryptoCrypto)
 
@@ -63,6 +64,13 @@ const ADV_NO_SUFFIX = argv.includes('--adv-no-suffix')
 // ends with ADV_SUFFIX_MODEL's suffix: π_C2 itself must then fail.
 const ADV_CLAIM_CANONICAL = argv.includes('--adv-claim-canonical')
 const INSECURE = argv.includes('--insecure-no-proofs')
+// v2 adversarial probe: put our own P-256 key share in the ClientHello instead
+// of the joint one (we would then hold the whole ECDHE secret). The node must
+// refuse to relay it.
+const ADV_OWN_SHARE = argv.includes('--adv-own-keyshare')
+// Protocol version: 2 = two-party handshake (docs/TWOPC-DESIGN.md). Taken from
+// the offer; `--v2` forces it (direct sidecar mode).
+let PROTO = argv.includes('--v2') ? 2 : 1
 const ARM = argv.includes('--arm')
 // π_C2 and π_C3 both run in one session. Serial (default) waits for π_C2 before
 // starting π_C3; `--parallel-proofs` lets them overlap, for the stall study.
@@ -230,7 +238,7 @@ class Session {
   private controlUrl(): string {
     if (NODE_MODE) {
       const base = NODE!.replace(/^http/, 'ws').replace(/\/$/, '')
-      return `${base}/v1/confidential/ws?session_id=${this.uuid}&v=1`
+      return `${base}/v1/confidential/ws?session_id=${this.uuid}&v=${PROTO}`
     }
     return `${SIDECAR.replace(/^http/, 'ws')}/session`
   }
@@ -278,32 +286,37 @@ class Session {
         .then(() => this.tls.handleReceivedBytes(bytes))
         .catch((e) => console.error(`[client ${this.label}] handleReceivedBytes:`, e))
     }
-    this.tls = makeTLSClient({
-      host: 'api.venice.ai',
-      verifyServerCertificate: true,
-      cipherSuites: ['TLS_AES_128_GCM_SHA256'],
-      supportedProtocolVersions: ['TLS1_3'],
-      namedCurves: ['X25519'],
-      applicationLayerProtocols: ['http/1.1'],
-      write: (packet: { header: Uint8Array; content: Uint8Array }) => {
-        const record = concat(packet.header, packet.content)
-        if (this.epoch2) this.bodyRecords.push(record)
-        this.sendBytes(record)
-      },
-      onRead: () => {},
-      onApplicationData: (rec: Uint8Array) => {
-        if (!this.ttft) this.ttft = Date.now()
-        this.responseChunks.push(rec)
-        this.responseBytes = concat(this.responseBytes, rec)
-        this.responseRecordCount++
-      },
-      onTlsEnd: () => {
-        this.tlsEnded = true
-      },
-      onHandshake: () => this.handshakeDone(),
-      logger: { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } as any,
-    })
+    if (PROTO === 1) this.makeTls()
     return this.wsReady
+  }
+
+  makeTls(external?: any): void {
+      this.tls = makeTLSClient({
+        ...(external ? { external } : {}),
+        host: 'api.venice.ai',
+        verifyServerCertificate: true,
+        cipherSuites: ['TLS_AES_128_GCM_SHA256'],
+        supportedProtocolVersions: ['TLS1_3'],
+        namedCurves: external ? ['SECP256R1'] : ['X25519'],
+        applicationLayerProtocols: ['http/1.1'],
+        write: (packet: { header: Uint8Array; content: Uint8Array }) => {
+          const record = concat(packet.header, packet.content)
+          if (this.epoch2) this.bodyRecords.push(record)
+          this.sendBytes(record)
+        },
+        onRead: () => {},
+        onApplicationData: (rec: Uint8Array) => {
+          if (!this.ttft) this.ttft = Date.now()
+          this.responseChunks.push(rec)
+          this.responseBytes = concat(this.responseBytes, rec)
+          this.responseRecordCount++
+        },
+        onTlsEnd: () => {
+          this.tlsEnded = true
+        },
+        onHandshake: () => this.handshakeDone(),
+        logger: { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } as any,
+      })
   }
 
   private handshakeDone!: () => void
@@ -356,6 +369,7 @@ class Session {
     this.tReady = Date.now()
     console.log(`[client ${this.label}] sid=${this.sid} head_len=${this.ready.head_len}`)
 
+    if (PROTO === 2) return this.armV2()
     this.handshakeP = new Promise<void>((res) => (this.handshakeDone = res))
     await this.tls.startHandshake()
     await Promise.race([this.handshakeP, timeout(15000, 'handshake')])
@@ -392,6 +406,52 @@ class Session {
     this.log({ ev: 'ku0_sent' })
   }
 
+  /** v2: the 2PC with the node, then a TLS handshake with no local ECDHE. */
+  async armV2(): Promise<void> {
+    if (this.ready.v !== 2) throw new Error('node did not start a v2 session')
+    this.twopc = new TwoPc()
+    this.twopc.start(this.zkUrl('twopc', this.sid))
+    const t2pc = Date.now()
+    let keyShare = await this.twopc.keyShare()
+    if (ADV_OWN_SHARE) {
+      const { p256 } = await import('@noble/curves/p256')
+      keyShare = p256.getPublicKey(p256.utils.randomPrivateKey(), false)
+    }
+    this.tKeyShare = Date.now()
+    this.log({ ev: 'twopc_key_share', ms: this.tKeyShare - t2pc })
+    this.makeTls({
+      keyShare,
+      onServerHello: async (serverShare: Uint8Array, thSH: Uint8Array) => {
+        this.thSH = thSH
+        const t = Date.now()
+        const out = await this.twopc!.handshake(serverShare, thSH)
+        this.tPhaseA = Date.now() - t
+        this.clientHs = out.clientHs
+        this.serverHs = out.serverHs
+        return out
+      },
+      onServerFinished: async (thSF: Uint8Array) => {
+        this.thSF = thSF
+        const t = Date.now()
+        this.ap = await this.twopc!.application(thSF)
+        this.tPhaseB = Date.now() - t
+        return { serverAp0: this.ap.serverAp0, clientAp1: this.ap.clientAp1 }
+      },
+    })
+    this.handshakeP = new Promise<void>((res) => (this.handshakeDone = res))
+    await this.tls.startHandshake()
+    await Promise.race([this.handshakeP, this.errP, timeout(30000, 'handshake')])
+    await this.waitT('hs_verified', 30000)
+    this.tHs = Date.now()
+    this.log({ ev: 'hs_verified', phase_a_ms: this.tPhaseA, phase_b_ms: this.tPhaseB })
+  }
+
+  twopc: TwoPc | undefined
+  ap: ApOut | undefined
+  tKeyShare = 0
+  tPhaseA = 0
+  tPhaseB = 0
+
   hs!: Uint8Array
   thSH!: Uint8Array
   thSF!: Uint8Array
@@ -417,6 +477,18 @@ class Session {
     mkdirSync(this.runDir, { recursive: true })
     this.log = (o: unknown) => this.logLines.push(JSON.stringify(o))
 
+    if (PROTO === 2) {
+      // π_NK: the node's head record under K_0 is the published template with
+      // an alphabet key, and K_0 is the one the 2PC anchored (hk).
+      this.tC1Sent = Date.now()
+      const commit = await this.waitT('c_commit', 60000)
+      checkPiNKParams(commit.params, OFFER, this.ap!, body.length)
+      await runZk(this.zkUrl('pi_nk', this.sid), { proof: 'pi_nk', role: 'verifier', params: commit.params })
+      this.log({ ev: 'pi_nk_ok' })
+      this.tProofsReady = Date.now()
+      this.prepared = true
+      return
+    }
     const mat = epoch1Material(this.hs, this.thSH, this.thSF, this.ready.head_len + 1)
     const cur = this.tls.getKeys()
     const cAp1 = new Uint8Array(cur!.clientSecret)
@@ -468,11 +540,16 @@ class Session {
     const runDir = this.runDir
     const logLines = this.logLines
 
-    // Epoch 1: the client's KeyUpdate is seq 1 (seq 0 is the node's record).
-    this.tls.skipSendSequence(1)
-    const ku1 = await this.tls.updateTrafficKeysSilently(false)
     this.tRecordStart = Date.now()
-    this.sendText({ type: 'ku1', record: hex(concat(ku1.header, ku1.content)) })
+    if (PROTO === 2) {
+      // The node writes epoch 0 (credential + KeyUpdate); we start epoch 1.
+      this.sendText({ type: 'release_head' })
+    } else {
+      // Epoch 1: the client's KeyUpdate is seq 1 (seq 0 is the node's record).
+      this.tls.skipSendSequence(1)
+      const ku1 = await this.tls.updateTrafficKeysSilently(false)
+      this.sendText({ type: 'ku1', record: hex(concat(ku1.header, ku1.content)) })
+    }
     await this.waitT('head_written', 30000)
     this.tHeadWritten = Date.now()
     this.log({ ev: 'head_written' })
@@ -516,19 +593,25 @@ class Session {
     const claimed = ADV_CLAIM_CANONICAL ? new TextEncoder().encode(this.ready.suffix) : suffixBytes
     this.sendText({ type: 'body_suffix', suffix: hex(claimed) })
     const c2params = await this.waitT('zk_params', 30000)
+    const lastBody = this.bodyRecords[this.bodyRecords.length - 1] ?? new Uint8Array(0)
     if (!ADV_SUFFIX_MODEL && !ADV_CLAIM_CANONICAL) {
-      checkPiC2Params(c2params.params, {
-        session: this.sessionValues(),
-        seq: this.bodyRecords.length - 1,
-        record: this.bodyRecords[this.bodyRecords.length - 1] ?? new Uint8Array(0),
-        suffix: suffixBytes,
-      })
+      if (PROTO === 2) {
+        checkPiC2SParams(c2params.params, { h1: this.ap!.h1, seq: this.bodyRecords.length - 1, record: lastBody, suffix: suffixBytes })
+      } else {
+        checkPiC2Params(c2params.params, {
+          session: this.sessionValues(),
+          seq: this.bodyRecords.length - 1,
+          record: lastBody,
+          suffix: suffixBytes,
+        })
+      }
     }
-    const c2Promise = runZk(this.zkUrl('pi_c2', this.sid), {
-      proof: 'pi_c2',
+    const c2Name = PROTO === 2 ? 'pi_c2s' : 'pi_c2'
+    const c2Promise = runZk(this.zkUrl(c2Name, this.sid), {
+      proof: c2Name,
       role: 'prover',
       params: c2params.params,
-      witness: { Hs: Array.from(this.hs) },
+      witness: PROTO === 2 ? { Secret: Array.from(this.ap!.clientAp1) } : { Hs: Array.from(this.hs) },
     })
       .then(() => this.log({ ev: 'pi_c2_ok' }))
       .catch((e) => this.log({ ev: 'pi_c2_fail', err: String(e) }))
@@ -586,13 +669,19 @@ class Session {
     this.sendText({ type: 'disclose', r: hex(r), tail_lens: tailLens, skip })
 
     const c3 = await this.waitT('zk_params', 30000)
-    checkPiC3Params(c3.params, { session: this.sessionValues(), serverRecords: this.serverRecords, r, skip })
-    await runZk(this.zkUrl('pi_c3', this.sid), {
-      proof: 'pi_c3',
+    if (PROTO === 2) {
+      checkPiC3SParams(c3.params, { h2: this.ap!.h2, serverRecords: this.serverRecords, r, skip })
+    } else {
+      checkPiC3Params(c3.params, { session: this.sessionValues(), serverRecords: this.serverRecords, r, skip })
+    }
+    const c3Name = PROTO === 2 ? 'pi_c3s' : 'pi_c3'
+    await runZk(this.zkUrl(c3Name, this.sid), {
+      proof: c3Name,
       role: 'prover',
       params: c3.params,
-      witness: { Hs: Array.from(this.hs) },
+      witness: PROTO === 2 ? { Secret: Array.from(this.ap!.serverAp0) } : { Hs: Array.from(this.hs) },
     })
+    this.twopc?.close()
     this.log({ ev: 'pi_c3_ok' })
 
     const terminal = await Promise.race([
@@ -680,6 +769,9 @@ class Session {
       handshake_ms: Math.max(0, this.tHs - this.tReady),
       ku0_ms: Math.max(0, this.tKu0 - this.tHs),
       pi_c1_ms: this.tProofsReady - this.tC1Sent,
+      ...(PROTO === 2
+        ? { twopc_key_share_ms: this.tKeyShare - this.tReady, twopc_phase_a_ms: this.tPhaseA, twopc_phase_b_ms: this.tPhaseB, twopc: this.twopc?.timings }
+        : {}),
       record_ku1_ms: this.tHeadWritten - this.tRecordStart,
       claim_to_body_ms: tBodyWrite - tClaim,
       upstream_ttft_ms: ttftAbs - tBodyWrite,
@@ -699,7 +791,8 @@ class Session {
       reserved_msats: receipt.reserved_msats,
       balance_msats: receipt.balance_msats,
       phases,
-      proofs: ['pi_c1', 'pi_n', 'pi_c2', 'pi_c3'],
+      protocol: PROTO,
+      proofs: PROTO === 2 ? ['twopc', 'pi_nk', 'pi_c2s', 'pi_c3s'] : ['pi_c1', 'pi_n', 'pi_c2', 'pi_c3'],
     }
   }
 }
@@ -845,17 +938,46 @@ function checkPiNParams(params: any, ready: any, s: Uint8Array, bodyLen: number)
   }
 }
 
+/**
+ * π_NK (v2): rebuild the statement from the signed offer, our body length and
+ * the anchor hk our own 2PC output, so the node cannot prove a different
+ * template, key placement or key.
+ */
+function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): void {
+  const p = params?.PiNK
+  if (!p) throw new Error('π_NK params missing')
+  const tpl: string = offer?.head_template ?? ''
+  const keyLen: number = offer?.key_length ?? p.key_len
+  const alphabet: string = offer?.key_alphabet ?? '[A-Za-z0-9_-]'
+  const token = `{KEY:${keyLen}}`
+  if (!tpl.includes(token)) throw new Error('π_NK: template lacks key token')
+  if ((p.key_alphabet ?? alphabet) !== alphabet) throw new Error('π_NK: key alphabet differs from the offer')
+  const filled = new TextEncoder().encode(tpl.replace(token, '\u0000'.repeat(keyLen)).replace('{LEN}', String(bodyLen)))
+  const offs: number[] = []
+  filled.forEach((b, i) => b === 0 && offs.push(i))
+  const eq = (a: ArrayLike<number>, b: ArrayLike<number>) => a.length === b.length && Array.from(a).every((x, i) => x === b[i])
+  if (p.key_len !== keyLen || offs.length !== keyLen) throw new Error('π_NK: key length mismatch')
+  if (!eq(p.template, filled)) throw new Error('π_NK: template differs from the published one')
+  if (!eq(p.key_offsets, offs)) throw new Error('π_NK: key offsets differ from the template')
+  if (p.head_len !== filled.length) throw new Error('π_NK: head_len mismatch')
+  if (!eq(p.hk, ap.hk)) throw new Error('π_NK: hk is not the anchor from our 2PC')
+  const n = filled.length + 1
+  if (!eq(p.header, [0x17, 0x03, 0x03, (n + 16) >> 8, (n + 16) & 0xff])) throw new Error('π_NK: record header mismatch')
+}
+
 async function verifyOffer(): Promise<void> {
   if (!VERIFY_OFFER) {
     try {
       if (!NODE) {
         // Direct sidecar mode: the sidecar's /offer (template, no price list).
         OFFER = await (await fetch(`${SIDECAR.replace(/\/$/, '')}/offer`)).json()
+        if (OFFER?.v === 2) PROTO = 2
         return
       }
       const raw = await (await fetch(`${NODE!.replace(/\/$/, '')}/v1/confidential/offer`)).json()
       OFFER = raw.sig_payload ? JSON.parse(raw.sig_payload) : raw
       OFFER_SIG = raw.sig
+      if (OFFER?.v === 2) PROTO = 2
     } catch (e) {
       console.error('[client] could not fetch the offer:', e)
     }
@@ -878,6 +1000,7 @@ async function verifyOffer(): Promise<void> {
     }
     OFFER_PUBKEY = parsed.notary_pubkey
     OFFER = parsed
+    if (parsed.v === 2) PROTO = 2
     OFFER_SIG = offer.sig
   } catch (e) {
     console.error('[client] offer verification failed:', e)

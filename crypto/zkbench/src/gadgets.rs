@@ -527,3 +527,82 @@ pub fn decrypt_record_content<VM: Vm<Binary>>(
 pub fn raw(v: &Vector<U8>) -> Slice {
     v.to_raw()
 }
+
+// ---------------------------------------------------------------------------
+// Protocol v2 helpers (secret-anchored statements)
+// ---------------------------------------------------------------------------
+
+/// SHA-256 of a byte vector computed in-circuit.
+pub fn sha256_bytes<VM: Vm<Binary>>(vm: &mut VM, data: &Vector<U8>) -> anyhow::Result<Array<U8, 32>> {
+    let mut h = Sha256::new();
+    h.update(data);
+    Ok(h.finalize(vm)?)
+}
+
+/// HMAC-SHA256 keyed once: the ipad/opad blocks of a 32-byte key are
+/// compressed a single time, so every further MAC under the same key costs two
+/// compressions instead of four.
+#[derive(Debug, Clone)]
+pub struct HmacKeyed {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl HmacKeyed {
+    pub fn new<VM: Vm<Binary>>(vm: &mut VM, key: &Vector<U8>) -> anyhow::Result<Self> {
+        assert_eq!(key.len(), 32);
+        let pad = Call::builder(pad_key_circuit()).arg(key.to_raw()).build().unwrap();
+        let key64: Vector<U8> = vm.call(pad)?;
+        let ipad = public_bytes(vm, &[0x36u8; 64])?;
+        let opad = public_bytes(vm, &[0x5cu8; 64])?;
+        let ipad_x = xor_bytes(vm, &key64, &ipad)?;
+        let opad_x = xor_bytes(vm, &key64, &opad)?;
+        let mut inner = Sha256::new();
+        inner.update(&ipad_x);
+        inner.compress(vm)?;
+        let mut outer = Sha256::new();
+        outer.update(&opad_x);
+        outer.compress(vm)?;
+        Ok(Self { inner, outer })
+    }
+
+    pub fn mac<VM: Vm<Binary>>(&self, vm: &mut VM, msg: &Vector<U8>) -> anyhow::Result<Array<U8, 32>> {
+        let mut inner = self.inner.clone();
+        inner.update(msg);
+        let d = inner.finalize(vm)?;
+        let mut outer = self.outer.clone();
+        outer.update(&d.into());
+        Ok(outer.finalize(vm)?)
+    }
+
+    /// `HKDF-Expand-Label(secret, label, context, len)` (`len` ≤ 32) under
+    /// this keyed state.
+    pub fn expand_label<VM: Vm<Binary>>(
+        &self,
+        vm: &mut VM,
+        label: &str,
+        context: &[u8],
+        len: usize,
+    ) -> anyhow::Result<Vector<U8>> {
+        let mut info = cu_crypto::hkdf::hkdf_label(label, context, len as u16);
+        info.push(0x01); // T(1)
+        let msg = public_bytes(vm, &info)?;
+        let full: Vector<U8> = self.mac(vm, &msg)?.into();
+        if len == 32 { Ok(full) } else { select(vm, &full, 0, len) }
+    }
+}
+
+/// Derive `(K, IV)` from a traffic secret with one keyed HMAC state
+/// (6 compressions instead of 8).
+pub fn record_keys_keyed<VM: Vm<Binary>>(
+    vm: &mut VM,
+    secret: &Vector<U8>,
+) -> anyhow::Result<(Array<U8, 16>, Array<U8, 12>)> {
+    let h = HmacKeyed::new(vm, secret)?;
+    let k = h.expand_label(vm, "key", &[], 16)?;
+    let iv = h.expand_label(vm, "iv", &[], 12)?;
+    Ok((
+        k.try_into().expect("16-byte AES key"),
+        iv.try_into().expect("12-byte IV"),
+    ))
+}

@@ -9,6 +9,7 @@ pub mod fixtures;
 pub mod gadgets;
 pub mod proofs;
 pub mod statements;
+pub mod statements_v2;
 pub mod transport;
 
 /// Which side of a proof we are building.
@@ -19,4 +20,4 @@ pub enum Role {
 }
 
 pub use proofs::{CheckResult, run_io, run_pair_ideal, stats, Stats};
-pub use statements::{Check, Params, PiC1, PiC2, PiC3, PiN, Proof, SessionPublic, Witness};
+pub use statements::{Check, Params, PiC1, PiC2, PiC2S, PiC3, PiC3S, PiN, PiNK, Proof, SessionPublic, Witness};

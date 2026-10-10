@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 cu-crypto = { path = "../cu-crypto" }
 zkbench = { path = "../zkbench" }
+twopc = { path = "../twopc" }
 
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }

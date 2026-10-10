@@ -129,3 +129,35 @@ export function checkPiC3Params(
   }
   if (covered < own.r.length + own.skip) fail("π_C3", "records do not cover the disclosure");
 }
+
+// ---------------------------------------------------------------------------
+// Protocol v2 (two-party handshake): the proofs anchor on public hashes of the
+// secrets the 2PC gave us (h1 = SHA256(c_ap_1), h2 = SHA256(s_ap_0)) instead
+// of the handshake values; the windows are checked exactly as in v1.
+// ---------------------------------------------------------------------------
+
+/** π_C2S: the end of our own final epoch-1 body record, anchored on our h1. */
+export function checkPiC2SParams(
+  params: unknown,
+  own: { h1: Uint8Array; seq: number; record: Uint8Array; suffix: Uint8Array },
+): void {
+  const p = (params as { PiC2S?: Record<string, any> } | null)?.PiC2S
+  if (!p) fail('π_C2S', 'missing')
+  if (!eq(p.h1, own.h1)) fail('π_C2S', 'anchor h1 is not ours')
+  const zeros = { clientHs: new Uint8Array(0), serverHs: new Uint8Array(0), thSH: new Uint8Array(0), thSF: new Uint8Array(0) }
+  const empty = { client_hs: [], server_hs: [], th_sh: [], th_sf: [] }
+  checkPiC2Params({ PiC2: { ...p, session: empty } }, { session: zeros, seq: own.seq, record: own.record, suffix: own.suffix })
+}
+
+/** π_C3S: the final server records as we received them, anchored on our h2. */
+export function checkPiC3SParams(
+  params: unknown,
+  own: { h2: Uint8Array; serverRecords: Uint8Array[]; r: Uint8Array; skip: number },
+): void {
+  const p = (params as { PiC3S?: Record<string, any> } | null)?.PiC3S
+  if (!p) fail('π_C3S', 'missing')
+  if (!eq(p.h2, own.h2)) fail('π_C3S', 'anchor h2 is not ours')
+  const zeros = { clientHs: new Uint8Array(0), serverHs: new Uint8Array(0), thSH: new Uint8Array(0), thSF: new Uint8Array(0) }
+  const empty = { client_hs: [], server_hs: [], th_sh: [], th_sf: [] }
+  checkPiC3Params({ PiC3: { ...p, session: empty } }, { session: zeros, serverRecords: own.serverRecords, r: own.r, skip: own.skip })
+}

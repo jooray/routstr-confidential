@@ -68,6 +68,9 @@ async fn mutation_fails(mut params: Params, witness: zkbench::Witness) {
         Params::PiC2(p) => p.expected[0] ^= 1,
         Params::PiC3(p) => p.expected[0] ^= 1,
         Params::PiN(p) => p.c_commit[0] ^= 1,
+        Params::PiNK(p) => p.c_commit[0] ^= 1,
+        Params::PiC2S(p) => p.expected[0] ^= 1,
+        Params::PiC3S(p) => p.expected[0] ^= 1,
     }
     let res = run_pair_ideal(&params, &witness).await;
     let ok = matches!(&res, Ok(rs) if rs.iter().all(|r| r.ok));
@@ -76,7 +79,7 @@ async fn mutation_fails(mut params: Params, witness: zkbench::Witness) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutations_fail() {
-    for (_, params, witness) in fixtures::all() {
+    for (_, params, witness) in fixtures::all().into_iter().chain(fixtures::all_v2()) {
         mutation_fails(params, witness).await;
     }
 }
