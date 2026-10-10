@@ -529,6 +529,39 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         .map_err(|_| anyhow!("sidecar at capacity; retry later"))?;
     handle_setup(setup, &app, &shared, &to_client, &mut st)?;
 
+    // v2: the 2PC preprocessing (tens of MB over the client's link) runs before
+    // the ClientHello exists. The provider closes an idle connection within
+    // seconds (Cloudflare: ~15 s with no ClientHello), so dial it only once the
+    // joint key share is ready. A ClientHello that races ahead is buffered.
+    if st.v2 {
+        let wait = tokio::time::sleep(TWOPC_TIMEOUT);
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                _ = &mut wait => bail!("2PC preprocessing did not finish within {}s", TWOPC_TIMEOUT.as_secs()),
+                ev = evt_rx.recv() => match ev {
+                    Some(Ev::KeyShare(p)) => {
+                        st.joint = Some(p);
+                        side(&mut st, "2pc key share ready".into());
+                        break;
+                    }
+                    Some(Ev::ZkDone { proof, err, .. }) => bail!("{proof} failed before the handshake: {err:?}"),
+                    Some(other) => bail!("unexpected event before the key share: {other:?}"),
+                    None => bail!("session events closed"),
+                },
+                msg = ws_rx.next() => match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        log.client_raw.extend_from_slice(&data);
+                        client_pending.extend_from_slice(&data);
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => bail!("client left during 2PC preprocessing"),
+                    Some(Ok(Message::Text(_))) => bail!("unexpected control message during 2PC preprocessing"),
+                    _ => {}
+                },
+            }
+        }
+    }
+
     let tcp = TcpStream::connect(&app.upstream)
         .await
         .with_context(|| format!("connecting to {}", app.upstream))?;
@@ -549,6 +582,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 }
             }
         });
+    }
+
+    if st.v2 {
+        v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
     }
 
     let deadline = tokio::time::sleep(SESSION_TIMEOUT);
