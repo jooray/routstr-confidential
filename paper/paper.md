@@ -964,6 +964,53 @@ For existing deployments the change is additive: the ordinary proxy path and old
 Requests that opted in fail closed and are never sent on the plain path, since a silent downgrade would
 break the privacy promise.
 
+## 8.1 Denial-of-service protection and fees
+
+A confidential session is expensive for the node before the provider sees a byte: N garbles the
+key-schedule circuit and sends about 22 MB, spends about 0.5 s of CPU, and holds a reservation on the
+client's credential. Pre-warming makes this cheaper to abuse, because a session can be armed without ever
+being used. We therefore layer several limits, from free and always on to priced and optional.
+
+1. **Nothing reaches the provider before a request.** The relay dials U only when C's ClientHello
+   arrives, after setup and the 2PC preprocessing, so armed and abandoned sessions never open provider
+   connections and the provider sees exactly one connection per completed or attempted request.
+2. **Validation before work.** N validates the setup and the credential and makes the reservation before
+   it contacts the relay; the relay validates the setup before it starts the 2PC. A client without funds
+   gets no garbled circuit.
+3. **Global and per-address caps.** N serves at most a fixed number of concurrent sessions (32 by
+   default), each limited to 600 s, with 15 s to send its setup. It also refuses a new session from a
+   client address that already holds a set number of unused sessions, that is, set up but with no
+   credential record written yet (3 by default; HTTP 429). The address is the TCP peer, or, only for
+   peers configured as trusted reverse proxies, the rightmost `X-Forwarded-For` entry; a client cannot
+   name its own address. Clients behind one address, such as all Tor users of an onion service, share
+   the limit.
+4. **Fees in the signed offer (section 4.8).** A session fee $f_s$ on completed requests, an abandon fee
+   $f_a \ge f_s$ on sessions that end without a completed request, and a rate surcharge, all 0 by
+   default. The abandon fee works as a deposit: it is reserved at setup and, when the session is used, all
+   but $f_s$ of it is in effect returned. A completed request therefore never pays $f_a$, while every
+   abandoned session costs its holder $f_a$. C must echo the fees it accepts, so a client that does not
+   know about them is refused rather than charged.
+5. **Client-side restraint.** The client daemon arms sessions only while it sees confidential traffic,
+   keeps at most one armed session for a node that charges an abandon fee, arms only if that fee is
+   below a configured limit (5 sats by default), and closes armed sessions after a few idle minutes; it
+   logs every abandon fee it pays.
+
+**How the deployed node is set up.** The case-study node charges no session fee and no surcharge, and an
+abandon fee of 2 sats. A typical confidential chat on its cheapest models costs 0.1 to 1 sat of inference
+(25 msat for a short exchange in our test), so the fee would dominate the price of a completed request if
+it were charged there; instead only waste is priced. A paying user pays exactly the inference; an idle
+pre-warmed session costs 2 sats; and a client opening sessions it does not use is limited to three at a
+time per address, each costing 2 sats. We measured both cases on the live node: a completed request was
+charged 25 msat, an abandoned session 2000 msat. Separately, each request reserves the model's
+worst-case prompt for its duration (about 157 sats for a model with a 1M-token context at these rates)
+and releases what it does not use, so a credential needs that much balance to start a session even
+though it is not spent.
+
+**What remains.** The fees and limits bound the cost per session and per address, not the total: many
+addresses can still open sessions, each paying $f_a$, which is a priced service rather than an attack. An
+operator who wants a different trade-off raises $f_a$, lowers the per-address limit, or charges a
+session fee to cover the node's bandwidth.
+
 # 9. Related work and alternatives
 
 **MPC-TLS (TLSNotary).** The prover and a notary jointly act as the TLS client, and all record
