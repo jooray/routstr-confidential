@@ -137,6 +137,26 @@ async fn short_preallocation_extends_online() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_cannot_raise_the_preallocation() {
+    let (a, b, _counters) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
+    // A client asking for the most correlations gets the node's (smaller) amount.
+    let greedy = Prealloc { nk: 1 << 25, cp: 1 << 25 };
+    let c = tokio::spawn(async move { ZkChannel::open(a, Party::Client, greedy).await });
+    let n = tokio::spawn(async move { ZkChannel::open(b, Party::Node, Prealloc::default()).await });
+    let (mut client, node) = (c.await.unwrap().expect("client open"), n.await.unwrap().expect("node open"));
+    let (nk, cp) = node.available();
+    assert_eq!(client.available(), (nk, cp));
+    // Ferret's next sizes up are n = 1024k (nk) and 2048k (cp).
+    assert!(nk < 1 << 20 && cp < 1 << 21, "node preallocated nk {nk} cp {cp}");
+    // The proofs still run on the agreed chains.
+    let node_task = spawn_node(node, session());
+    let r = client_all(&mut client, &session()).await;
+    assert!(r.iter().all(|x| x.is_ok()), "{r:?}");
+    client.close().await;
+    assert!(node_task.await.unwrap().iter().all(|(_, ok)| *ok));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tampered_proof_fails_and_poisons() {
     let (a, b, _) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
     let (mut client, node) = open_pair(a, b, Prealloc::default()).await;

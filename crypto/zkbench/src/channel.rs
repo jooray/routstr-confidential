@@ -360,14 +360,24 @@ pub struct Prealloc {
 
 impl Default for Prealloc {
     /// Sized from the circuits (`ot_demand_with` on the fixtures: π_NK ≈ 231k
-    /// for a 190-byte head, π_C2S ≈ 197k, π_C3S ≈ 403k for a 600-byte tail)
-    /// with margin. A Ferret iteration is coarse (n = 256k, 512k, 1024k, …),
-    /// so these pick n = 512k for nk (≈ 473k usable: heads up to ~1 kB) and
-    /// n = 1024k for cp (≈ 967k usable: π_C2S plus a tail of ~1.5 kB).
+    /// for a 190-byte head, π_C2S ≈ 256k for the 230-byte production suffix,
+    /// π_C3S ≈ 403k for a 600-byte tail) with margin. A Ferret iteration is
+    /// coarse (n = 256k, 512k, 1024k, …), so these pick n = 512k for nk
+    /// (≈ 473k usable: heads up to ~1 kB) and n = 1024k for cp (≈ 967k usable:
+    /// π_C2S plus a tail of over 1 kB).
     /// Anything larger extends online.
     fn default() -> Self {
         Self { nk: 300_000, cp: 800_000 }
     }
+}
+
+/// Upper bound on one chain's preallocation, whatever either side asks for.
+const MAX_PREALLOC: u64 = 1 << 25;
+
+/// One chain's preallocation as both parties compute it from their own value
+/// and the peer's: the smaller one, so a peer can only lower it.
+fn agreed_prealloc(mine: usize, peer: u64) -> usize {
+    (mine as u64).min(peer).min(MAX_PREALLOC) as usize
 }
 
 /// The exact number of correlations one proof consumes, built on the prover
@@ -456,8 +466,8 @@ pub struct ZkChannel {
 
 impl ZkChannel {
     /// Opens the channel over `io` and preprocesses both chains concurrently.
-    /// Both parties must call this; the larger of the two sides' preallocation
-    /// wins on each chain.
+    /// Both parties must call this; the smaller of the two sides'
+    /// preallocation wins on each chain.
     pub async fn open<IO>(io: IO, party: Party, prealloc: Prealloc) -> Result<Self>
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -478,9 +488,11 @@ impl ZkChannel {
         if peer.version != CHANNEL_VERSION {
             bail!("proof channel version {} != {}", peer.version, CHANNEL_VERSION);
         }
-        let cap = 1usize << 25;
-        let nk_n = (prealloc.nk as u64).max(peer.nk).min(cap as u64) as usize;
-        let cp_n = (prealloc.cp as u64).max(peer.cp).min(cap as u64) as usize;
+        // The smaller of the two wins: neither side can make the other
+        // preallocate more than it asked for itself (a short chain extends
+        // online). Both sides compute the same value.
+        let nk_n = agreed_prealloc(prealloc.nk, peer.nk);
+        let cp_n = agreed_prealloc(prealloc.cp, peer.cp);
 
         let nk = Chain::new(party == Party::Node);
         let cp = Chain::new(party == Party::Client);
