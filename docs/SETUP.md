@@ -146,13 +146,23 @@ podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=...
   --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
 ```
 
-**Denial-of-service limit.** The node refuses a new confidential session from a client address that
-already has 3 unused sessions (set up, credential not yet written; pre-warmed sessions count):
-`CONFIDENTIAL_MAX_UNUSED_PER_IP` (0 disables). The address comes from the reverse proxy's `X-Real-IP`
-or `X-Forwarded-For` only when the connection comes from a trusted proxy
-(`CONFIDENTIAL_TRUSTED_PROXIES`, default `127.0.0.1,::1,self`, where `self` is the node's own addresses,
-which is where a rootless container port forwarder connects from); other peers, such as a Tor sidecar,
-count as their own address, so all Tor clients share one limit.
+**Denial-of-service limit.** The node refuses a new confidential session (HTTP 429, WebSocket close
+1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 3, 0 disables)
+unused sessions: set up but with no credential record written yet. Pre-warmed sessions count. The limit is
+only as good as the node's idea of the client address, which depends on how the node is reached:
+
+| Deployment | What to set | Result |
+|---|---|---|
+| Node reached directly (no reverse proxy, no port-forwarding layer that rewrites the source address) | nothing | the TCP peer address is the client |
+| Reverse proxy on the same host (nginx, Caddy, Traefik) connecting to the node over loopback | nothing, if the proxy appends `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) | the rightmost `X-Forwarded-For` entry, the one the proxy added |
+| Reverse proxy that reaches the node from another address (another host, a container network) | `CONFIDENTIAL_TRUSTED_PROXIES` = that address | as above |
+| Rootless container with a published port (podman/docker forwarder: the node sees its **own** address for every connection) behind a reverse proxy | `CONFIDENTIAL_TRUSTED_PROXIES=127.0.0.1,::1,self` | as above; `self` means the node's own addresses |
+| Same, **without** a reverse proxy | do not trust `self` (anyone could then set the header); either put a proxy in front, run the container with host networking, or raise/disable the limit | otherwise every client shares one address and one limit |
+| Proxy that puts the client in another header (e.g. Cloudflare's `CF-Connecting-IP`) | `CONFIDENTIAL_CLIENT_IP_HEADER` = that header | used as is |
+| Tor onion service | nothing | all Tor clients arrive from the Tor daemon's address and share one limit |
+
+Only peers in `CONFIDENTIAL_TRUSTED_PROXIES` (default `127.0.0.1,::1`) can name the client by header; for
+any other peer the header is ignored, so a client cannot choose its own address.
 
 `--protocol 2` selects the two-party handshake (`1` is the single-party variant). Limits: `--max-sessions`
 (32) and `--max-body` (8 MiB); sessions time out after 600 s.
