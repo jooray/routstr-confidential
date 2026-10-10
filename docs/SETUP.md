@@ -100,10 +100,12 @@ and costs about 21 MB each way to prepare. Tune or disable it in `config.json`:
 
 ```json
 "confidentialUpstream": {
-  "prewarm": { "enabled": true, "activityWindowMinutes": 10, "maxPerKey": 3, "maxTotal": 4, "maxAgeSeconds": 480 }
+  "prewarm": { "enabled": true, "activityWindowMinutes": 10, "maxPerKey": 2, "maxTotal": 2, "maxAgeSeconds": 480 }
 }
 ```
 
+Nodes refuse more than 3 unused sessions per client address by default (see section 2), so keep
+`maxTotal` at 2 or lower; a client behind a shared address (NAT, Tor) shares that limit with others.
 A request uses an armed session only if its model and `max_tokens` match exactly (they are pinned at
 setup) and its body fits the armed length; otherwise it runs cold. Responses carry
 `x-routstr-confidential-prewarmed: 1` when they used one. Measured from a home connection: about 35 s to
@@ -143,6 +145,14 @@ podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=...
   --listen 0.0.0.0:7444 --upstream api.venice.ai:443 --key-env UPSTREAM_API_KEY \
   --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
 ```
+
+**Denial-of-service limit.** The node refuses a new confidential session from a client address that
+already has 3 unused sessions (set up, credential not yet written; pre-warmed sessions count):
+`CONFIDENTIAL_MAX_UNUSED_PER_IP` (0 disables). The address comes from the reverse proxy's `X-Real-IP`
+or `X-Forwarded-For` only when the connection comes from a trusted proxy
+(`CONFIDENTIAL_TRUSTED_PROXIES`, default `127.0.0.1,::1,self`, where `self` is the node's own addresses,
+which is where a rootless container port forwarder connects from); other peers, such as a Tor sidecar,
+count as their own address, so all Tor clients share one limit.
 
 `--protocol 2` selects the two-party handshake (`1` is the single-party variant). Limits: `--max-sessions`
 (32) and `--max-body` (8 MiB); sessions time out after 600 s.
