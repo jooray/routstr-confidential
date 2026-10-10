@@ -1,14 +1,14 @@
 # twopc benchmark (protocol v2 two-party key schedule)
 
-`cargo run --release -p twopc --example bench -- --runs 5` on an Apple M2 Max,
-both parties in one process (tokio multi-thread), median of 5 sessions after a
-warm-up. Times are C's wall clock per API step. Bytes are what each side wrote
-to the transport during its own step (mux frame headers included).
+Node-only authenticated garbling: three-halves tables, 64-bit salted check rows, Ferret MAC COTs
+(`docs/TWOPC-DESIGN.md`, "Security model"). Until 2026-10 this crate ran dual execution; its numbers are kept
+below for comparison.
 
-WAN emulation (`twopc::testutil::emulated_pair`): 25 ms one-way latency
-(50 ms RTT), and a serial link per direction at the given rate (full duplex).
-Unlike `zkbench::transport`, latency is pipelined (it is not charged again for
-every 64 KiB chunk), so bulk transfers are bandwidth-bound as on a real link.
+`cargo run --release -p twopc --example bench -- --runs 3` on an Apple M2 Max, with both parties in one
+process. Link emulation is `zkbench::transport::emulated_link`: a rate per direction and a pipelined one-way
+delay. Wall time covers a whole cold session (new → preprocess → key share → ECtF + phase A → phase B) until
+both parties finish. Medians of 3 runs, except dual execution on uplinks ≤ 7 Mbit/s (1 run each). MB = 10^6
+bytes on the wire, counting mux headers and all OT traffic.
 
 ## Circuits
 
@@ -17,78 +17,88 @@ every 64 KiB chunk), so bulk transfers are bandwidth-bound as on a real link.
 | phase A | 298 088 | 1 421 372 | 14 | 512 | 512 | 768 |
 | phase B | 358 091 | 1 705 600 | 17 | 768 | 480 | 1504 |
 
-Each circuit is garbled twice (dual execution): 1 312 358 AND gates garbled per
-session, 656 179 by each party.
+N garbles each circuit once: 656 179 AND gates per session.
 
-Phase A compressions: HS = HMAC(public salt, x) 2 (the salt's ipad/opad states
-are constants) · HS keyed states 2 · c_hs 2 · s_hs 2 — **8 on the critical
-path to c_hs/s_hs** — plus derived_hs 2 · its keyed states 2 · MS 2 = 6.
-Plus a 256-bit modular adder (x_C + x_N mod p, ~770 AND).
-Phase B: MS keyed states 2 · c_ap_0 2 · s_ap_0 2 · c_ap_0 keyed states 2 ·
-c_ap_1 2 · K_0 2 · IV_0 2 · h1, h2, hk 1 each = 17.
-Every HKDF-Expand-Label here fits one inner block (info + 0x01 ≤ 55 bytes).
+## Cold session, per link
 
-## Local (no delay, unlimited bandwidth)
+| link | dual execution (before) | node-only PoC, no cuts (Ferret) | **now** | client up / down, now | before (dual ex.) |
+|---|---|---|---|---|---|
+| local, unlimited | 0.17 s | 0.67 s | **0.63 s** | 1.21 / 22.12 MB | 21.1 / 21.1 MB |
+| 40 ms, 2 Mbit/s up / 50 down | 85.2 s | 11.6 s | **7.38 s** | 1.21 / 22.12 MB | 21.1 / 21.1 MB |
+| 40 ms, 7 Mbit/s up / 50 down | 24.9 s | 8.27 s | **5.41 s** | 1.21 / 22.12 MB | 21.1 / 21.1 MB |
+| 25 ms, 100 Mbit/s symmetric | 2.27 s | 4.07 s | **3.05 s** | 1.21 / 22.12 MB | 21.1 / 21.1 MB |
+| 40 ms, 2 Mbit/s up / 10 down | 85.2 s | 32.2 s | **20.0 s** | 1.21 / 22.12 MB | 21.1 / 21.1 MB |
 
-| step | ms | C→N bytes | N→C bytes |
+The PoC without cuts moved 1.21 MB up and 32.23 MB down (Ferret), or 0.06 up and 52.84 MB down (KOS MAC COTs).
+
+Where the 10 MB (−31 %) of download went, measured:
+
+- Check rows projected to 64 bits: −5.3 MB.
+- Three-halves tables (24 B + 5 bits per AND instead of 32 B): −4.8 MB.
+
+Where the time went, beyond the bytes. Ferret's 1.2 MB upload has two parts, separated by a 65-byte N→C
+message, so any small N→C message queued behind megabytes of tables stalls an OT round trip. N therefore
+schedules the tables around C's upload. Phase A's tables start once C is uploading (64 KiB received). Phase
+B's tables start once C has passed Ferret's last interactive point (500 kB received), or once N's COTs are
+done (`TABLES_GATE`). The tables go on a low-priority bulk channel of the mux. N computes the two phases'
+check rows in parallel (80 ms instead of 200 ms).
+
+| link | cuts, FIFO (Ferret) | cuts, FIFO (KOS MACs) | cuts + scheduling (Ferret, shipped) |
 |---|---|---|---|
-| preprocess | 126.5 | 21 061 301 | 21 049 065 |
-| key_share | 2.6 | 41 | 74 |
-| ectf | 4.9 | 231 | 81 |
-| phase_a (eval) | 23.8 | 20 566 | 20 620 |
-| check_a | 2.4 | 109 | 41 |
-| phase_b (eval) | 26.5 | 24 182 | 24 224 |
-| check_b | 2.5 | 109 | 41 |
-| **total** | 189.3 | | |
+| local | 0.68 s | 0.51 s | 0.63 s |
+| 2 / 50 Mbit/s | 9.97 s | 8.05 s | 7.38 s |
+| 7 / 50 Mbit/s | 6.66 s | 7.98 s | 5.41 s |
+| 100 / 100 Mbit/s | 3.25 s | 4.29 s | 3.05 s |
+| 2 / 10 Mbit/s | 24.1 s | 35.4 s | 20.0 s |
 
-## WAN 50 ms RTT, 100 Mbit/s
+**MAC-COT backend: Ferret, the only one.** KOS uploads nothing (0.06 MB) but makes N send 16 B per COT: 42.7 MB
+down instead of 22.1 MB. With scheduling, Ferret is faster on every measured link, and on a 10 Mbit/s
+downlink by 15 s. KOS would only win on uplinks well below 2 Mbit/s with a fast downlink. A KOS fallback would
+add a negotiated mode for that corner, so there is none.
 
-| step | ms | C→N bytes | N→C bytes |
+## Steps at 40 ms, 2 Mbit/s up / 50 Mbit/s down (C's view)
+
+| step | ms | C sent | C recv |
 |---|---|---|---|
-| preprocess | 1 834.6 | 21 036 708 | 21 049 065 |
-| key_share | 57.1 | 24 634* | 74 |
-| ectf | 108.5 | 231 | 81 |
-| phase_a (eval) | 75.7 | 20 566 | 20 620 |
-| check_a | 55.1 | 109 | 41 |
-| phase_b (eval) | 79.2 | 24 182 | 24 224 |
-| check_b | 54.4 | 114 | 114 |
-| **total** | 2 264.6 | | |
+| preprocess | 6 819.6 | 1 213 910 | 22 072 758 |
+| key_share | 84.3 | 41 | 74 |
+| ectf | 170.4 | 231 | 12 427 |
+| phase_a | 126.4 | 73 | 8 201 |
+| phase_b | 131.2 | 238 | 24 077 |
 
-## WAN 50 ms RTT, 20 Mbit/s
+The critical path of preprocessing on a slow uplink is C's Ferret upload (1.2 MB, about 4.9 s at 2 Mbit/s),
+followed by the d bits, the seed, and the check rows (5.3 MB). Online: about 1.5 round trips per phase, and
+no separate equality-check round trip (dual execution needed 2).
 
-| step | ms | C→N bytes | N→C bytes |
+## Local (no delay)
+
+| step | ms | C sent | C recv |
 |---|---|---|---|
-| preprocess | 8 558.4 | 21 036 708 | 21 049 065 |
-| key_share | 65.1 | 24 634* | 74 |
-| ectf | 113.7 | 231 | 81 |
-| phase_a (eval) | 85.7 | 20 566 | 20 620 |
-| check_a | 58.7 | 109 | 41 |
-| phase_b (eval) | 92.2 | 24 182 | 24 224 |
-| check_b | 56.3 | 109 | 41 |
-| **total** | 9 030.0 | | |
+| preprocess | 552.5 | 1 213 910 | 22 072 758 |
+| key_share | 2.4 | 41 | 74 |
+| ectf | 4.8 | 231 | 12 427 |
+| phase_a | 32.8 | 73 | 8 201 |
+| phase_b | 40.0 | 238 | 24 077 |
 
-\* The tail of C's preprocessing (the KOS extension message for its 1 280
-evaluator inputs, queued behind the garbled tables) leaves the mux after
-`preprocess` returns, so it is counted in `key_share`. The key share itself is
-~115 bytes.
+CPU: N garbles (six TCCR per AND), runs Ferret, computes the check material, about 0.5 s per session in
+total. C's preprocessing is about 0.4 s (Ferret, key propagation). Each online phase takes 35–45 ms
+(evaluation plus the check).
 
-## Round trips (online)
+## Live (real Venice, local node and sidecar, 2026-10-10)
 
-| step | round trips | notes |
-|---|---|---|
-| key_share | 1.5 (C waits 1) | C→N commit, N→C P_N, C→N open |
-| ectf | 1.5 | A2M (N→C offsets, C→N masked) then M2A (both directions). The measured ~2 RTT includes C waiting for N to finish key_share; in the real flow ClientHello/ServerHello sit in between |
-| phase eval | 1 | `d` and garbler-own labels both ways at once, then the derandomised evaluator labels; both runs run concurrently |
-| equality check | 1 | commitments both ways, then openings both ways |
+`deepseek-v4-flash`, 40 tokens, client and node on one host:
 
-So after the ServerHello: ECtF + phase A ≈ 3.5 RTT + ~30 ms compute (≈ 210–240 ms
-at 50 ms RTT); after the server Finished: phase B ≈ 2 RTT + ~30 ms (≈ 130–150 ms).
+| run | cu-2pc preprocess | bytes C sent / received | phase A / B | receipt, usage |
+|---|---|---|---|---|
+| reference client, cold | 758 ms | 1 213 915 / 22 072 656 | 32 / 39 ms | ok, match |
+| reference client, `--arm` | 701 ms | 1 213 915 / 22 072 758 | 47 / 40 ms | ok, match (claim → body 5 ms) |
+| SDK `ConfidentialSession` | 840 ms | n/a | 32 / 38 ms | ok, match |
 
-## Cost summary
+Tracing: `TWOPC_TRACE=1` prints preprocessing milestones and per-channel byte counts to stderr. It prints
+timings and counts only, never secrets.
 
-- Preprocessing moves ~21 MB in each direction per session (the garbled tables:
-  656 k AND × 32 B per run) and is bandwidth-bound: ~1.8 s at 100 Mbit/s,
-  ~8.6 s at 20 Mbit/s. It is input independent and can run in a pre-warm.
-- Online traffic is ~45 kB each way for the whole session.
-- CPU: ~130 ms per party per session for garbling + evaluation (single
-  session, M2 Max).
+## Before: dual execution (for comparison)
+
+Each circuit was garbled twice, once per party: 1 312 358 AND gates per session, 32 B each, about 21 MB in
+each direction. At 50 ms RTT and 100 Mbit/s the preprocessing took 1.8 s; at 20 Mbit/s, 8.6 s. Online, each
+phase was 1 RTT of evaluation plus 1 RTT of equality check.

@@ -176,7 +176,7 @@ async fn cu_2pc_binary_end_to_end() {
         .collect();
     assert_eq!(
         steps,
-        ["preprocess", "key_share", "ectf", "phase_a", "check_a", "phase_b", "check_b"]
+        ["preprocess", "key_share", "ectf", "phase_a", "phase_b"]
     );
 }
 

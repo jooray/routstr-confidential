@@ -1320,36 +1320,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mpz-garble-core"
-version = "0.1.0-alpha.6"
-source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
-dependencies = [
- "aes 0.9.3",
- "bitvec",
- "blake3",
- "cfg-if",
- "cipher 0.5.2",
- "derive_builder",
- "itybity 0.3.3",
- "mpz-circuits",
- "mpz-common",
- "mpz-core",
- "mpz-memory-core",
- "mpz-ot-core",
- "mpz-vm-core",
- "once_cell",
- "opaque-debug",
- "rand 0.10.3",
- "rand_chacha 0.10.0",
- "rand_core 0.10.1",
- "rangeset",
- "serde",
- "serde_arrays",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "mpz-hash"
 version = "0.1.0-alpha.6"
 source = "git+https://github.com/tlsnotary/mpz2?rev=8f897838f4e24aff9da8e8b012e8ba35ae770141#8f897838f4e24aff9da8e8b012e8ba35ae770141"
@@ -2326,7 +2296,6 @@ dependencies = [
 name = "twopc"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "cu-crypto",
  "futures",
  "getrandom 0.3.4",
@@ -2335,8 +2304,6 @@ dependencies = [
  "mpz-common",
  "mpz-core",
  "mpz-fields",
- "mpz-garble-core",
- "mpz-memory-core",
  "mpz-ole",
  "mpz-ot",
  "mpz-ot-core",
@@ -2348,31 +2315,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
- "zeroize",
-]
-
-[[package]]
-name = "twopc-ag"
-version = "0.1.0"
-dependencies = [
- "cu-crypto",
- "futures",
- "getrandom 0.3.4",
- "mpz-circuits",
- "mpz-common",
- "mpz-core",
- "mpz-fields",
- "mpz-ole",
- "mpz-ot",
- "mpz-ot-core",
- "mpz-share-conversion",
- "p256",
- "rand 0.10.3",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-util",
- "twopc",
  "zeroize",
  "zkbench",
 ]

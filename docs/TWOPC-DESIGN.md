@@ -39,8 +39,9 @@ C sends nothing in epoch 0. There is no π_C1 and no KU0/KU1 from C.
 ## Session flow
 
 1. **Setup** as v1 (credential, offer_sig, reservation). `ready` carries `v: 2`.
-2. **Preprocessing** (before ClientHello; in pre-warm, off the request path): OT setup, both garbled circuits
-   for both phases generated and transferred (dual execution). A pre-warmed session stops after step 3 and
+2. **Preprocessing** (before ClientHello; in pre-warm, off the request path): N garbles both phase circuits
+   once and streams the tables to C; N's wire masks are authenticated to C (IT-MACs under C's key) and checked
+   (see "Security model"); OT setup for C's inputs; ECtF OLEs. A pre-warmed session stops after step 3 and
    waits for a request; N opens the connection to U only when the ClientHello arrives. In parallel, one proof
    channel per session (`zkchan`) generates the OT/VOLE correlations for π_NK, π_C2S and π_C3S, so the proofs
    on the request path need only a few round trips.
@@ -53,15 +54,15 @@ C sends nothing in epoch 0. There is no π_C1 and no KU0/KU1 from C.
    abort. N checks ServerHello: group secp256r1, suite as offered; extracts the server share S.
 5. **ECtF.** `Q_C = a_C·S`, `Q_N = a_N·S`. Point-addition share conversion (two A2M + one M2A over P-256, as in
    TLSNotary's key-exchange) gives additive shares `x_C + x_N = x(Q_C + Q_N) mod p`.
-6. **Phase A (dual execution GC; before client Finished, the server allows ~15 s).** Inputs x_C, x_N
+6. **Phase A (N garbles, C evaluates; before client Finished, the server allows ~15 s).** Inputs x_C, x_N
    (circuit adds mod p), th_SH, output masks. Computes HS (salt public), keyed HS states, c_hs, s_hs,
    derived_hs, MS. Outputs c_hs, s_hs public; MS leaves as XOR shares (masked with both parties' masks).
-   Equality check before either party uses an output.
+   C runs the consistency check before it decodes; N gets its outputs only from C's authenticated report.
 7. C decrypts the server flight with s_hs, verifies the certificate (WebPKI), CertificateVerify and server
    Finished, and sends client Finished. N does the same verification with c_hs/s_hs (as in v1 §4.2).
-8. **Phase B (dual execution GC).** Inputs MS shares, th_SF. Computes c_ap_0, s_ap_0, c_ap_1, K_0, IV_0, h1, h2,
-   hk. Outputs to C: s_ap_0, c_ap_1 (masked with C's mask); to N: K_0, IV_0 (masked with N's mask); public:
-   h1, h2, hk. Equality check.
+8. **Phase B (N garbles, C evaluates).** Inputs MS shares, th_SF. Computes c_ap_0, s_ap_0, c_ap_1, K_0, IV_0,
+   h1, h2, hk. Outputs to C: s_ap_0, c_ap_1 (masked with C's mask); to N: K_0, IV_0 (masked with N's mask);
+   public: h1, h2, hk. Same check and report as phase A.
 9. **π_N (N→C):** knowledge of K_0, IV_0 with SHA256(K_0‖IV_0) = hk, and the head record's ciphertext
    CTR-decrypts (seq 0) to the published template with key positions in the alphabet. N then writes the
    credential record (seq 0) and the KeyUpdate (seq 1) under K_0 after C's Finished.
@@ -74,21 +75,92 @@ C sends nothing in epoch 0. There is no π_C1 and no KU0/KU1 from C.
 ## Security model of the 2PC
 
 Each party must be protected against a malicious peer, and **neither ever reveals its inputs** (unlike
-TLSNotary's DEAP or Garble-then-Prove, where one side opens its shares afterwards).
+TLSNotary's DEAP or Garble-then-Prove, where one side opens its shares afterwards). Since 2026-10 the garbled
+circuits are **node-only authenticated garbling**: only N garbles, C evaluates and checks. It replaces the
+earlier dual execution (each side garbled once, outputs compared), which cost the client a 21 MB upload per
+session. There is one version; nothing is negotiated.
 
-- **Garbled circuits: dual execution** (Mohassel–Franklin 2006; Huang–Katz–Evans 2012) on mpz2's semi-honest
-  half-gates garbler. Each phase is garbled twice: run 1 N garbles / C evaluates, run 2 C garbles / N
-  evaluates. Private outputs are XOR-masked with the owner's random mask input, so each evaluator learns
-  only masked vectors. **Equality check on output labels** (HKE12): C computes
-  `s_C = H(A_i^{v1_i} ‖ B_i^{v1_i})_i` (A = labels of N's circuit it evaluated, B = its own labels for the
-  value it decoded), N computes `s_N = H(A_i^{v2_i} ‖ B_i^{v2_i})_i`; compare by commit-then-open. A cheating
-  party learns at most one bit (whether the check passed) and the session aborts. No output is used (sent to U,
-  used to encrypt, or revealed) before the check passes.
-- **ECtF**: semi-honest M2A/A2M over OLE/OT. A deviation only shifts the result (wrong ECDHE), which the TLS
-  handshake itself detects (server Finished under s_hs fails), or a selective failure of ≤ 1 bit. Every
-  session uses fresh ephemeral scalars, so per-session leakage of a bit or two of a one-time share is harmless.
-- **Phase consistency**: a party feeding different shares/masks across phases or runs gets an abort
-  (mismatch) or a key unknown to everyone (rejected by U); it never gets a key it can read.
+**Construction** (`crypto/twopc`, `lib.rs` and `gc.rs`):
+
+- *Garbling.* N garbles each phase once with three-halves garbling (Rosulek–Roy, CRYPTO 2021): free XOR with
+  a global Δ_A, 1.5κ + 5 bits per AND gate (24.6 B instead of half-gates' 32 B). The hash is mpz2's
+  fixed-key-AES TCCR. Every wire's point-and-permute mask is λ_w = lsb of N's zero-label, and C sees only the
+  pointer bits Λ_w = z_w ⊕ λ_w.
+- *Authenticated masks.* Random COTs with C as sender (Ferret over KOS; C holds Δ_B, a 128-bit key with
+  127 random bits) authenticate, by `Fix`, N's mask λ of every circuit input and AND output, and
+  t_k = λ_i·λ_j for every AND gate. That is 1.3 M IT-MACs, with M = K ⊕ x·Δ_B over GF(2^128). The other
+  wires' masks follow by linearity. N commits all of this and the tables before C sends its challenge seed.
+- *Product check.* QuickSilver-style over GF(2^128), batched with χ from C's seed. Error ≤ 2n/2^128.
+- *Openings.* Masks of C's input wires, of the transcript-hash wires and of every output wire, with one hash
+  of their MACs. C decodes only with authenticated masks.
+- *AND-gate consistency check.* For gate k = (i, j → o) the relation is
+  e_k = λ_o ⊕ t_k ⊕ Λ_i·λ_j ⊕ Λ_j·λ_i ⊕ Λ_o ⊕ Λ_i·Λ_j = 0. N sends one check row per base wire (circuit
+  inputs and AND outputs), each padded by hashes of that wire's two labels, plus Y_N. C combines them with
+  its active labels and its MAC keys, and accepts iff π(Y_N ⊕ Y_C ⊕ K_tot) = 0. Rows and Y_N travel
+  projected to 64 bits (π = the low 64 bits; all arithmetic stays in GF(2^128)). The row hash is tweaked by a
+  per-session salt from C's seed, revealed only after the tables are committed.
+- *Output.* C decodes, then sends N the output pointer bits and a hash of its output labels. N recomputes the
+  labels from its keys and checks the hash, so C cannot change N's outputs without an inactive label, which
+  needs Δ_A. No output is used (sent to U, used to encrypt, or revealed) before these checks pass.
+
+**Malicious N (protects the client's s_ap_0, c_ap_1 and shares):**
+
+- *Correctness.* If any AND gate is evaluated inconsistently with the committed masks, then
+  E = Σχ^k·e_k ≠ 0, except with probability n/2^128 over χ (chosen after N committed). C then accepts only
+  if π(Δ_B·E) equals a value N fixed without any information on Δ_B. For E ≠ 0 the map Δ ↦ π(Δ·E) is onto
+  GF(2)^64, so this has probability ≤ 2^-63 per phase (Δ_B has 127 uniform bits) and N cannot grind: it learns
+  nothing about Δ_B, and the first failure ends the session. With all gates consistent, C's outputs are the
+  correct function of its input, N's effective input and the real transcript: C's inputs and the transcript
+  hash are pinned by pointer checks against opened masks. Soundness is about 2^-62 per session.
+- *Why the salt matters for 64-bit rows.* With E = 0, a label that is not N's honest label but has the
+  right pointer bit cannot change any output. It only changes the check sum by the difference of two
+  truncated hashes. Without a salt, a garbler that reuses its labels across sessions could precompute (about
+  2^64 work, once) a table deviation whose 64-bit hash difference is 0. That would leak, without an abort,
+  which of two paths C's evaluation took (via the output-label hash). With the salt, everything that fixes
+  such a label (tables, Δ_A, N's keys) is committed before the salt is known, so the difference is a fresh
+  64-bit value: the check fails except with probability 2^-64. Labels N picks online (its own inputs, the
+  transcript hash, the corrections for C's inputs) shift by amounts N already knows, so they carry no
+  information about C. The test `check_rows_bound_to_session_salt` covers this.
+- *Leakage: selective failure only.* N can make C abort depending on C's private values: corrupted tables,
+  rows or OT correlations make the abort a predicate of C's inputs. Per phase N observes one of {C aborted, C's
+  output labels rejected, success}, and the session ends at the first failure. That is at most log2 5 ≈ 2.3
+  bits per session about fresh, single-use values (the ECDHE share, the MS share, the masks). Dual execution
+  leaked log2 3 ≈ 1.6. Removing this leakage needs evaluator-shared masks (WRK17/KRRW18-style triples), which
+  cost more than dual execution's bandwidth.
+
+**Malicious C (protects the node's K_0, IV_0 and the API key):** C sees the tables, its active labels and
+pointer bits, the opened masks (its own inputs, the public transcript hash, the outputs it decodes anyway),
+COT corrections padded by N's choice bits, the product-check pair (masked by a random VOLE), check rows
+padded by hashes of inactive labels (which need Δ_A), and Y_N, which C can compute itself. N's private outputs
+stay masked by m_N and MS by r_N. C cannot report a wrong output to N. Its own input choice is free, as in
+any 2PC. Inconsistent MS shares across phases yield a key nobody knows.
+
+**ECtF**: semi-honest M2A/A2M over OLE/OT, unchanged. A deviation only shifts the result (wrong ECDHE), which
+the TLS handshake detects (the server Finished under s_hs fails), or causes a selective failure. Every session
+uses fresh ephemeral scalars, shares, masks, labels, Δ_A and Δ_B.
+
+**What is proven, what is argued, what is assumed:**
+
+| part | status |
+|---|---|
+| QuickSilver product check, IT-MAC openings | standard (QuickSilver/Wolverine soundness), GF(2^128) |
+| three-halves garbling privacy and authenticity | Rosulek–Roy proof, under their hash assumption (instantiated, as in mpz2, with fixed-key-AES TCCR) |
+| AND-gate consistency check with garbler-held masks, 64-bit projection, salt | argued above; **no published proof** for this garbler-only variant |
+| leakage bound (≤ log2 5 bits per session) | counting argument above |
+| Ferret/KOS against a malicious receiver (N), KOS consistency-check leakage of a few Δ bits with negligible probability | assumed from mpz2 |
+| ECtF | semi-honest only, as before |
+| external review | **none yet** |
+
+**Cost** (`crypto/twopc/BENCH.md`): per session the client uploads 1.21 MB (Ferret) and downloads 22.1 MB
+(three-halves tables 16.2 MB, check rows 5.3 MB). A cold 2PC takes 7.4 s on a 2/50 Mbit/s, 80 ms RTT home link,
+5.4 s at 7/50, 3.1 s on a 100 Mbit/s symmetric link, and 20 s with a 10 Mbit/s downlink. Dual execution took
+85 s, 25 s, 2.3 s and 85 s. The anchors h1, h2 and hk stay SHA-256: the reasons, and a sound zero-AND
+replacement (IT-MAC import) for later, are in `docs/TWOPC-NODE-GARBLING.md` §0.
+
+Correctness against the reference key schedule and every deviation listed in the tests (corrupt tables or
+control bits, a logic change, a wrong product, a lying output mask, a bad check value, bad or wrongly salted
+rows, garbage garbler labels, a wrong OT correlation, a wrong transcript hash, and a cheating evaluator) are
+covered by `cargo test --release -p twopc`.
 
 ## Residual differences vs v1
 
@@ -99,8 +171,9 @@ TLSNotary's DEAP or Garble-then-Prove, where one side opens its shares afterward
 
 ## Components (branch `twopc-v2`)
 
-- `crypto/twopc`: the 2PC crate (ECtF, dual-execution key-schedule circuits, equality check) and the
-  `cu-2pc` binary (C side, spawned by the client).
+- `crypto/twopc`: the 2PC crate (ECtF, key-schedule circuits, node-only authenticated garbling with
+  three-halves tables and the IT-MAC consistency check) and the `cu-2pc` binary (C side, spawned by the
+  client).
 - `crypto/zkbench`: v2 statements `PiNK`, `PiC2S`, `PiC3S` (secret-anchored).
 - `crypto/relay`: sidecar v2 flow.
 - `crypto/client`: TLS fork hooks (external key share and injected secrets) and the v2 driver.

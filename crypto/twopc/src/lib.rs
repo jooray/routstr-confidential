@@ -1,4 +1,7 @@
-//! Two-party TLS 1.3 key schedule for protocol v2 (`docs/TWOPC-DESIGN.md`).
+//! Two-party TLS 1.3 key schedule for protocol v2 (`docs/TWOPC-DESIGN.md`),
+//! with **only N garbling**: authenticated garbling with garbler-held masks
+//! and an IT-MAC consistency check (the node garbles, the client evaluates
+//! and mostly downloads).
 //!
 //! C (the client) and N (the node) jointly run the client side of a TLS 1.3
 //! ECDHE(P-256) + SHA-256 key schedule so that neither learns the ECDHE secret
@@ -11,104 +14,84 @@
 //! | K_0, IV_0 (of c_ap_0) | never | yes |
 //! | h1 = SHA256(c_ap_1), h2 = SHA256(s_ap_0), hk = SHA256(K_0‖IV_0) | yes | yes |
 //!
-//! # API (as implemented)
+//! # API
 //!
 //! ```ignore
 //! let mut p = Party::new(Role::C, io).await?;   // io: futures AsyncRead + AsyncWrite
-//! p.preprocess().await?;                         // OT setup, all garbled tables, OLEs
+//! p.preprocess().await?;                         // input independent (pre-warm)
 //! let joint: [u8; 65] = p.key_share().await?;    // commit-then-open joint P-256 share
 //! let hs: HsSecrets = p.handshake(&server_share, th_sh).await?;  // ECtF + phase A
 //! let ap: ApOut = p.application(th_sf).await?;   // phase B
+//! p.close().await;
 //! ```
 //!
-//! Differences from the requested shape: `Party::new` needs a running tokio
-//! runtime (it spawns the channel multiplexer tasks); `Party::close` flushes
-//! the last bytes to the transport and should be awaited before the transport
-//! is dropped; `take_timings` returns per-step wall time and transport bytes.
+//! `Party::new` needs a running tokio runtime (it spawns the channel
+//! multiplexer); `close` flushes the transport; `take_timings` returns per-step
+//! wall time and transport bytes.
 //!
 //! # Protocol
 //!
-//! One transport carries six multiplexed channels ([`mux`]): KOS random-COT
-//! for each garbled-circuit run, share conversion, the two runs' garbled data,
-//! and a control channel.
+//! N garbles both phase circuits once ([`gc`]: three-halves garbling,
+//! Rosulek–Roy 2021, 1.5κ+5 bits per AND, global offset Δ_A). C is protected
+//! by **IT-MACs on N's wire masks** under C's key Δ_B and a batched
+//! consistency check of every AND gate:
 //!
-//! * **Preprocess** (input independent). Each party garbles both phase
-//!   circuits with its own global offset Δ (mpz2 `garble-core` half-gates) and
-//!   sends the tables and output decoding bits to the peer. Run 1 = N garbles,
-//!   C evaluates; run 2 = C garbles, N evaluates. Each garbler, as KOS sender
-//!   with correlation Δ, generates random COTs for every evaluator input bit
-//!   of both phases (Chou–Orlandi base OT). The random OLEs for ECtF are
-//!   generated too.
+//! * **Preprocess.** Random COTs with C as sender (Δ_B; Ferret over KOS)
+//!   authenticate, by `Fix` (N sends `d = λ ⊕ r`), N's mask λ_w of every
+//!   circuit input and AND output, and `t_k = λ_i·λ_j` of every AND gate.
+//!   N sends the garbled tables and the `d` bits, then C sends a random seed
+//!   (χ). N proves `t_k = λ_i·λ_j` for all gates (QuickSilver-style, two field
+//!   elements), opens the masks of C's input wires, the transcript-hash wires
+//!   and all output wires (values + one hash of MACs), and sends one 64-bit
+//!   check row per base wire and `Y_N` (`gc::check_material`). KOS random COT
+//!   with N as sender (Δ_A) for C's input bits, and the ECtF OLEs.
 //! * **Key share.** C commits to `SHA256(tag‖SEC1(P_C)‖nonce)`, N sends `P_N`,
-//!   C opens; N checks the opening and both compute `P = P_C + P_N`.
+//!   C opens; both compute `P = P_C + P_N`.
 //! * **Handshake.** ECtF ([`ectf`]) turns `a_C·S`, `a_N·S` into additive shares
-//!   `x_C + x_N = x(ECDHE) mod p`. Phase A (both runs at once) computes
-//!   `c_hs, s_hs` and `MS ⊕ r_C ⊕ r_N`; afterwards C's MS share is `r_C` and
-//!   N's is `MS ⊕ r_C`.
+//!   `x_C + x_N = x(ECDHE) mod p`; phase A computes `c_hs, s_hs` and
+//!   `MS ⊕ r_C ⊕ r_N` (C's MS share is `r_C`, N's is `MS ⊕ r_C`).
 //! * **Application.** Phase B takes the MS shares and computes
 //!   `(s_ap_0‖c_ap_1) ⊕ m_C`, `(K_0‖IV_0) ⊕ m_N`, h1, h2, hk.
+//! * **Online, per phase.** C sends `d = x ⊕ b` (Beaver derandomisation of its
+//!   COTs), N sends its own and the transcript-hash input labels, then the
+//!   corrections for C's labels. C checks the pointer bits of its own and of
+//!   the transcript-hash wires against the opened masks, evaluates, runs the
+//!   consistency check, decodes its outputs with the opened (authenticated)
+//!   masks and only then sends N the output pointer bits plus a hash of the
+//!   output labels, which N checks against its labels. About 1.5 round trips.
 //!
-//! Online, for each phase both runs execute concurrently: the evaluator sends
-//! `d = x ⊕ b` (b = its random-COT choice bits) while the garbler sends the
-//! active labels of its own inputs and of its transcript hash; the garbler
-//! answers `K ⊕ R ⊕ d·Δ`, from which the evaluator gets `K ⊕ x·Δ` (Beaver
-//! derandomisation of the random COT). Then both evaluate, decode, and run the
-//! equality check. 2 round trips per phase (plus 1.5 for ECtF).
+//! # Security (sketch; `docs/TWOPC-DESIGN.md` has the full argument)
 //!
-//! # Security argument (sketch)
-//!
-//! * **Inputs are never revealed.** Every private input enters only as a
-//!   garbled-circuit input (evaluator labels via OT, garbler labels that are
-//!   uniformly random to the evaluator), or as an OLE input in ECtF. Nothing
-//!   is opened afterwards (unlike DEAP / Garble-then-Prove).
-//! * **Outputs.** Every output wire is decoded by both evaluators, so a
-//!   private output is XOR-masked inside the circuit with a uniformly random
-//!   mask that only its owner inputs; the other party sees a one-time-padded
-//!   value. MS is masked by both parties' masks (`MS ⊕ r_C ⊕ r_N`) so each
-//!   side's view of it is padded by the other's mask.
-//! * **Dual execution (Mohassel–Franklin 2006, Huang–Katz–Evans 2012).**
-//!   Against a malicious garbler, each party relies only on the circuit *it*
-//!   garbled for correctness of what the peer sees, and on the circuit the
-//!   *peer* garbled for what it decodes itself. The equality check compares
-//!   the two decoded output vectors through labels: C hashes
-//!   `(A_i^{v1_i}, B_i^{v1_i})` — A = labels of N's circuit it evaluated, B =
-//!   its own run-2 labels for the bit it decoded — and N hashes
-//!   `(A_i^{v2_i}, B_i^{v2_i})` symmetrically. A party can only produce the
-//!   other's hash if both runs decoded the same vector: for a differing bit it
-//!   would need the *inactive* label of the peer's circuit, which half-gates
-//!   garbling hides. The hashes are exchanged commit-then-open (each commits
-//!   before seeing the other's hash), and on mismatch the session aborts.
-//!   **No output is returned before the check passes.**
-//! * **Leakage: at most one bit per session.** A corrupt garbler (wrong
-//!   circuit, wrong decode bits, inconsistent inputs between the runs, or a
-//!   different transcript hash) and selective failure on the OT (KOS with a
-//!   malicious sender) can only make the honest party's decoded vector a
-//!   function of the honest input that differs from the correct one; the
-//!   adversary learns whether the equality check passed — one predicate on
-//!   the honest input — and the session aborts. KOS is secure against a
-//!   malicious receiver (its consistency check can leak a few bits of Δ with
-//!   exponentially small probability, the documented KOS15 leakage; it does
-//!   not reveal inputs).
-//! * **ECtF** uses mpz2's semi-honest A2M/M2A. A deviating party only shifts
-//!   the result (the shares then sum to a wrong x), which yields wrong
-//!   handshake secrets and the TLS server Finished check fails; a malicious
-//!   OLE sender can at worst cause a selective failure that again surfaces as
-//!   one success/failure bit. Every session uses fresh scalars and shares.
-//! * **Phase consistency.** A party may feed different MS shares to phase B
-//!   than phase A gave it, or different masks; within a phase the dual
-//!   execution forces both runs to agree (else abort), and across phases the
-//!   only effect is a key nobody knows (rejected by the server). It never
-//!   yields a key the cheater can read: the MS shares are uniformly random
-//!   to the other party.
-//! * **Key share.** C commits before seeing `P_N`, so it cannot pick
-//!   `P_C = T − P_N` for a target T whose discrete log it knows; N's share is
-//!   uniformly random, so the joint P is uniformly random as long as one side
-//!   is honest.
-//! * Randomness: all scalars, masks, labels and Δ come from a ChaCha12 CSPRNG
-//!   seeded from the OS (`getrandom`).
+//! * **Malicious N.** Every base mask λ and product t is fixed under Δ_B
+//!   before χ; the products are checked over GF(2^128) (error ≤ 2n/2^128). An
+//!   AND gate evaluated inconsistently with the committed masks makes the
+//!   (GF(2^128)) combination E = Σχ^k e_k non-zero except with probability
+//!   n/2^128, and then C accepts only if the 64-bit projection of `Δ_B·E`
+//!   hits a value fixed before Δ_B is used: ≤ 2^-63 per phase (Δ_B has 127
+//!   uniform bits and N learns nothing about it). With all gates consistent,
+//!   C's outputs are the correct function of the inputs (C's inputs and the
+//!   transcript hash are pinned by the pointer checks against opened masks;
+//!   outputs decode with authenticated masks). What N can still do is a
+//!   *selective failure*: make C abort depending on C's private values. Per
+//!   phase N observes one of {abort, labels rejected, success} and the session
+//!   ends at the first failure: ≤ log2 5 ≈ 2.3 bits per session.
+//! * **Malicious C.** C is the evaluator; it sees the tables, active labels
+//!   and pointer bits, the opened masks (its inputs, the public transcript
+//!   hash, the outputs), check rows padded by hashes of inactive labels, and
+//!   `Y_N` (a value C can compute itself). It cannot report a wrong output to
+//!   N without an inactive output label (needs Δ_A).
+//! * **Inputs are never revealed** by either party (nothing is opened after
+//!   the evaluation). Private outputs are XOR-masked inside the circuit by
+//!   their owner's random mask; MS by both parties' masks.
+//! * **ECtF** uses mpz2's semi-honest A2M/M2A: a deviation only shifts the
+//!   result (the TLS server Finished then fails) or causes a selective
+//!   failure. All scalars, masks, labels and Δ are fresh per session
+//!   (ChaCha12 seeded from the OS).
 
 pub mod circuits;
+
 mod ectf;
+pub mod gc;
 mod mux;
 #[doc(hidden)]
 pub mod testutil;
@@ -122,15 +105,11 @@ use futures::{AsyncRead, AsyncWrite};
 use mpz_common::{Context, Flush};
 use mpz_core::Block;
 use mpz_fields::p256::P256 as Fp;
-use mpz_garble_core::{
-    Delta, EncryptedGate, EvaluatorOutput, GarbledCircuit, Garbler, GarblerOutput, Key, Mac,
-    evaluate_garbled_circuits,
-};
-use mpz_ot::{chou_orlandi, kos};
+use mpz_ot::{chou_orlandi, ferret, kos};
 use mpz_ot_core::rcot::{RCOTReceiver, RCOTReceiverOutput, RCOTSender, RCOTSenderOutput};
+use p256::elliptic_curve::PrimeField;
 use p256::elliptic_curve::group::Group;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use p256::elliptic_curve::PrimeField;
 use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -138,9 +117,9 @@ use sha2::{Digest, Sha256};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use zeroize::Zeroize;
 
-use circuits::{from_bits, spec, to_bits};
 pub use mux::Counters;
 use mux::{FrameChan, Mux};
+use circuits::{Spec, from_bits, spec, to_bits};
 
 /// Errors. `Abort` means a check failed (possible cheating); the session must
 /// be discarded.
@@ -166,7 +145,6 @@ pub enum Role {
     N,
 }
 
-/// Handshake traffic secrets, given to both parties.
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct HsSecrets {
@@ -180,7 +158,6 @@ impl std::fmt::Debug for HsSecrets {
     }
 }
 
-/// Phase B outputs.
 #[derive(Clone)]
 pub enum ApOut {
     C {
@@ -264,73 +241,141 @@ enum Stage {
     Failed,
 }
 
-/// Test-only deviations used by the malicious tests.
+/// Test-only deviations.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Cheat {
     #[default]
     None,
-    /// As garbler, corrupt encrypted gates of this phase.
+    /// N: corrupt the half-ciphertexts of 64 AND gates of a phase.
     CorruptGate(usize),
-    /// As garbler, flip the decoding bit of output 0 of this phase.
-    FlipDecode(usize),
-    /// Use a different value for own input bit `bit` of `phase` in the run
-    /// this party garbles than in the run it evaluates.
-    InconsistentInput { phase: usize, bit: usize },
-    /// C opens its key-share commitment to a different point.
+    /// N: flip control (dicing) bits of 64 AND gates of a phase.
+    CorruptControlBits(usize),
+    /// N: commit the mask of one AND output of a phase flipped (turns that
+    /// AND into a NAND as far as the decoded values go, "logic change").
+    FlipLambda(usize),
+    /// N: wrong t_k for one AND gate (product check must fail).
+    BadT,
+    /// N: lie about one opened output mask of a phase (flips C's output).
+    LieOpen(usize),
+    /// N: send a garbage label for its first own input of a phase.
+    BadInputLabel(usize),
+    /// N: run the KOS for C's input labels with a different Δ than garbling.
+    KosDelta,
+    /// N: add random offsets to every check row of a phase.
+    BadRows(usize),
+    /// N: computes the check rows of a phase under a different salt.
+    WrongSalt(usize),
+    /// N: flip Y_N of a phase.
+    BadYn(usize),
+    /// C: report one flipped output bit of a phase to N.
+    FlipOutput(usize),
+    /// C: opens its key-share commitment to a different point.
     BadOpen,
 }
 
 type KosS = kos::Sender<chou_orlandi::Receiver>;
 type KosR = kos::Receiver<chou_orlandi::Sender>;
+type FerS = ferret::Sender<KosS>;
+type FerR = ferret::Receiver<KosR>;
 
-struct GarblerPhase {
-    in_keys: Vec<Key>,
-    out_keys: Vec<Key>,
+
+/// N's per-phase state.
+struct NPhase {
+    k: Vec<Block>,
+    lam: Vec<bool>,
 }
 
-struct EvalPhase {
-    tables: Option<Vec<EncryptedGate>>,
-    decode: Vec<bool>,
+/// C's per-phase state.
+struct CPhase {
+    tables: Vec<gc::Gate3>,
+    ck: Option<gc::CheckKeys>,
+    rows: Vec<u64>,
+    y_n: u64,
+    /// Per-session salt of the check-row hash (from the challenge seed).
+    salt: u128,
+    /// Opened masks: C's input wires, th wires, outputs.
+    lam_c: Vec<bool>,
+    lam_th: Vec<bool>,
+    lam_out: Vec<bool>,
 }
 
-struct Pre {
-    g: Vec<GarblerPhase>,
-    e: Vec<EvalPhase>,
-    /// Garbler side: random-COT keys for the peer's input bits (A then B).
-    cot_keys: Vec<Block>,
-    /// Evaluator side: random-COT choices and MACs for own input bits.
-    cot_choices: Vec<bool>,
-    cot_msgs: Vec<Block>,
+enum Pre {
+    N {
+        ph: Vec<NPhase>,
+        /// KOS keys for C's input bits (phase A then B).
+        cot_keys: Vec<Block>,
+    },
+    C {
+        ph: Vec<CPhase>,
+        cot_choices: Vec<bool>,
+        cot_msgs: Vec<Block>,
+    },
 }
 
-/// Channel numbers on the mux.
-const CH_COT1: usize = 0; // KOS for run 1 (N sender)
-const CH_COT2: usize = 1; // KOS for run 2 (C sender)
+const CH_COTA: usize = 0; // KOS for C's input labels (N sender, Δ_A)
+const CH_COTB: usize = 1; // MAC COTs (C sender, Δ_B)
 const CH_SC: usize = 2; // share conversion
-const CH_RUN1: usize = 3; // run 1 data (N garbles)
-const CH_RUN2: usize = 4; // run 2 data (C garbles)
-const CH_CTL: usize = 5; // key share, equality checks
+const CH_N2C: usize = 3; // all N→C protocol messages
+const CH_C2N: usize = 4; // all C→N protocol messages
+const CH_TAB: usize = 5; // N→C garbled tables (bulk: lowest priority on the link)
 const N_CH: usize = 6;
 
-const TAG_KS: &[u8] = b"routstr-twopc-v2 key-share commit";
-const TAG_EQ: &[u8] = b"routstr-twopc-v2 equality";
-const TAG_EQC: &[u8] = b"routstr-twopc-v2 equality commit";
+/// N streams phase A's tables once this many MAC-COT bytes from C arrived
+/// (C has N's OT bootstrap messages and is uploading the first part of the
+/// Ferret extension), and phase B's once C is past the first part (484 184
+/// bytes with mpz2 rev 8f89783 and this circuit size; measured with
+/// `TWOPC_TRACE=1`), i.e. past the last small N→C Ferret message. Either gate
+/// also opens when N's MAC COTs are complete, or after `TABLES_MAX_WAIT`.
+const TABLES_GATE: [u64; 2] = [64 * 1024, 500_000];
+const TABLES_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// One side of the two-party key schedule.
+const TAG_KS: &[u8] = b"routstr-twopc-v2 key-share commit";
+const TAG_OPEN: &[u8] = b"routstr-twopc-ag open";
+const TAG_OUT: &[u8] = b"routstr-twopc-ag output labels";
+const TAG_CHI: &[u8] = b"routstr-twopc-ag chi";
+
+
+/// Number of MAC COTs per phase: inputs + AND outputs + AND products.
+fn macs_per_phase(s: &Spec) -> usize {
+    s.circ.inputs().len() + 2 * s.circ.and_count()
+}
+
+/// Circuit-derived index lists, computed once.
+struct Shape {
+    ands: Vec<(usize, usize, usize)>,
+    base: Vec<usize>,
+}
+
+static SHAPES: std::sync::LazyLock<[Shape; 2]> = std::sync::LazyLock::new(|| {
+    let f = |p| {
+        let s = spec(p);
+        Shape {
+            ands: gc::and_gates(&s.circ),
+            base: gc::base_wires(&s.circ),
+        }
+    };
+    [f(0), f(1)]
+});
+
 pub struct Party {
     role: Role,
     mux: Option<Mux>,
     counters: Arc<Counters>,
-    /// [run 1, run 2]
-    ctx_cot: [Context; 2],
+    ctx_a: Context,
+    ctx_b: Context,
     ctx_sc: Context,
-    ch_run: [FrameChan; 2],
-    ch_ctl: FrameChan,
+    n2c: FrameChan,
+    c2n: FrameChan,
+    tab: FrameChan,
     rng: StdRng,
-    delta: Delta,
-    kos_s: Option<KosS>,
-    kos_r: Option<KosR>,
+    /// N: garbling offset Δ_A. C: MAC key Δ_B.
+    delta: Block,
+    kos_a_s: Option<KosS>,
+    kos_a_r: Option<KosR>,
+    /// MAC COTs (C = Ferret sender with Δ_B, N = receiver).
+    mac_s: Option<Box<FerS>>,
+    mac_r: Option<Box<FerR>>,
     sc: ectf::Sc,
     stage: Stage,
     pre: Option<Pre>,
@@ -348,6 +393,13 @@ impl Drop for Party {
     }
 }
 
+static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("TWOPC_TRACE").is_some());
+fn tr(t0: Instant, who: &str, what: &str) {
+    if *TRACE {
+        eprintln!("[{who} {:8.1} ms] {what}", t0.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
 fn os_rng() -> StdRng {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("OS randomness");
@@ -356,8 +408,16 @@ fn os_rng() -> StdRng {
     r
 }
 
-fn pack(bits: &[bool]) -> Vec<u8> {
-    from_bits(bits)
+fn blocks_to_bytes(v: &[Block]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 * v.len());
+    for b in v {
+        out.extend_from_slice(b.as_bytes());
+    }
+    out
+}
+
+fn bytes_to_blocks(b: &[u8]) -> Vec<Block> {
+    b.chunks_exact(16).map(|c| Block::new(c.try_into().unwrap())).collect()
 }
 
 fn unpack(bytes: &[u8], n: usize) -> Vec<bool> {
@@ -366,18 +426,18 @@ fn unpack(bytes: &[u8], n: usize) -> Vec<bool> {
     b
 }
 
-fn blocks_to_bytes<'a>(it: impl Iterator<Item = &'a Block>) -> Vec<u8> {
-    let mut v = Vec::new();
-    for b in it {
-        v.extend_from_slice(b.as_bytes());
-    }
-    v
+fn sel(bit: bool, b: Block) -> Block {
+    Block::SELECT_MASK[bit as usize] & b
 }
 
-fn bytes_to_blocks(b: &[u8]) -> Vec<Block> {
-    b.chunks_exact(16)
-        .map(|c| Block::new(c.try_into().unwrap()))
-        .collect()
+fn chi(seed: &[u8], what: &[u8]) -> Block {
+    let h: [u8; 32] = Sha256::new()
+        .chain_update(TAG_CHI)
+        .chain_update(seed)
+        .chain_update(what)
+        .finalize()
+        .into();
+    Block::new(h[..16].try_into().unwrap())
 }
 
 fn parse_point(b: &[u8]) -> Result<ProjectivePoint> {
@@ -412,60 +472,109 @@ fn random_scalar(rng: &mut StdRng) -> Scalar {
     }
 }
 
-/// Field element from 32 big-endian bytes.
 fn fp_from_be(be: &[u8]) -> Result<Fp> {
     let mut le: [u8; 32] = be.try_into().map_err(|_| Error::Protocol("coord".into()))?;
     le.reverse();
     Fp::try_from(le).map_err(|_| Error::Protocol("non-canonical coordinate".into()))
 }
 
+fn perr<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> Error {
+    move |e| Error::Protocol(format!("{what}: {e}"))
+}
+
+macro_rules! rcot_send {
+    ($s:expr, $ctx:expr, $n:expr) => {{
+        let s = $s;
+        s.alloc($n).map_err(perr("cot alloc"))?;
+        let f = s.queue_send_rcot($n).map_err(perr("cot queue"))?;
+        s.flush($ctx).await.map_err(perr("cot flush"))?;
+        let RCOTSenderOutput { keys, .. } = f.await.map_err(perr("cot"))?;
+        keys
+    }};
+}
+
+macro_rules! rcot_recv {
+    ($r:expr, $ctx:expr, $n:expr) => {{
+        let r = $r;
+        r.alloc($n).map_err(perr("cot alloc"))?;
+        let f = r.queue_recv_rcot($n).map_err(perr("cot queue"))?;
+        r.flush($ctx).await.map_err(perr("cot flush"))?;
+        let RCOTReceiverOutput { choices, msgs, .. } = f.await.map_err(perr("cot"))?;
+        (choices, msgs)
+    }};
+}
+
 impl Party {
-    /// Creates a party over `io`, a duplex byte stream to the peer. Must be
-    /// called inside a tokio runtime.
     pub async fn new<IO>(role: Role, io: IO) -> Result<Party>
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let (mux, mut chans) = Mux::start(io, N_CH);
+        let (mux, mut chans) = Mux::start(io, N_CH, &[CH_TAB]);
         let counters = mux.counters.clone();
         let mut take = |i: usize| std::mem::replace(&mut chans[i], tokio::io::duplex(1).0);
-        let ctx_cot = [
-            Context::new_single_threaded(take(CH_COT1).compat()),
-            Context::new_single_threaded(take(CH_COT2).compat()),
-        ];
+        let ctx_a = Context::new_single_threaded(take(CH_COTA).compat());
+        let ctx_b = Context::new_single_threaded(take(CH_COTB).compat());
         let ctx_sc = Context::new_single_threaded(take(CH_SC).compat());
-        let ch_run = [FrameChan::new(take(CH_RUN1)), FrameChan::new(take(CH_RUN2))];
-        let ch_ctl = FrameChan::new(take(CH_CTL));
+        let n2c = FrameChan::new(take(CH_N2C));
+        let tab = FrameChan::new(take(CH_TAB));
+        let c2n = FrameChan::new(take(CH_C2N));
 
         let mut rng = os_rng();
-        let delta = Delta::random(&mut rng);
+        let mut delta = Block::random(&mut rng);
+        delta.set_lsb(true);
         let sc = match role {
             Role::C => ectf::Sc::new_sender(&mut rng),
             Role::N => ectf::Sc::new_receiver(&mut rng),
         };
-        let (kos_s, kos_r) = (
-            Some(kos::Sender::new(
-                kos::SenderConfig::default(),
-                *delta.as_block(),
-                chou_orlandi::Receiver::new_with_seed(rng.random()),
-            )),
-            Some(kos::Receiver::new(
-                kos::ReceiverConfig::default(),
-                chou_orlandi::Sender::new_with_seed(rng.random()),
-            )),
-        );
+        let fcfg = || {
+            ferret::FerretConfig::builder()
+                .lpn_type(ferret::LpnType::Regular)
+                .build()
+                .expect("ferret config")
+        };
+        let (mut kos_a_s, mut kos_a_r, mut mac_s, mut mac_r) = (None, None, None, None);
+        match role {
+            Role::N => {
+                kos_a_s = Some(kos::Sender::new(
+                    kos::SenderConfig::default(),
+                    delta,
+                    chou_orlandi::Receiver::new_with_seed(rng.random()),
+                ));
+                let kr = kos::Receiver::new(
+                    kos::ReceiverConfig::default(),
+                    chou_orlandi::Sender::new_with_seed(rng.random()),
+                );
+                mac_r = Some(Box::new(ferret::Receiver::new(fcfg(), rng.random(), kr)));
+            }
+            Role::C => {
+                kos_a_r = Some(kos::Receiver::new(
+                    kos::ReceiverConfig::default(),
+                    chou_orlandi::Sender::new_with_seed(rng.random()),
+                ));
+                let ks = kos::Sender::new(
+                    kos::SenderConfig::default(),
+                    delta,
+                    chou_orlandi::Receiver::new_with_seed(rng.random()),
+                );
+                mac_s = Some(Box::new(ferret::Sender::new(fcfg(), rng.random(), ks)));
+            }
+        }
         Ok(Party {
             role,
             mux: Some(mux),
             counters,
-            ctx_cot,
+            ctx_a,
+            ctx_b,
             ctx_sc,
-            ch_run,
-            ch_ctl,
+            n2c,
+            tab,
+            c2n,
             rng,
             delta,
-            kos_s,
-            kos_r,
+            kos_a_s,
+            kos_a_r,
+            mac_s,
+            mac_r,
             sc,
             stage: Stage::New,
             pre: None,
@@ -481,21 +590,16 @@ impl Party {
         self.role
     }
 
-    /// Transport byte counters (frame headers included).
     pub fn counters(&self) -> Arc<Counters> {
         self.counters.clone()
     }
 
-    /// Returns and clears the per-step timings recorded so far.
     pub fn take_timings(&mut self) -> Vec<StepTiming> {
         std::mem::take(&mut self.timings)
     }
 
-    /// Flushes everything to the transport and stops the mux. Await this
-    /// before dropping the transport (e.g. before the process exits).
     pub async fn close(mut self) {
         let mux = self.mux.take();
-        // Dropping the party drops the channel ends, so the pumps see EOF.
         drop(self);
         if let Some(m) = mux {
             m.close().await;
@@ -515,38 +619,6 @@ impl Party {
         });
     }
 
-    fn g_run(&self) -> usize {
-        match self.role {
-            Role::N => 0,
-            Role::C => 1,
-        }
-    }
-
-    /// Own and peer input-bit counts of a phase.
-    fn bits(&self, phase: usize) -> (usize, usize) {
-        let s = spec(phase);
-        match self.role {
-            Role::C => (s.c_bits, s.n_bits),
-            Role::N => (s.n_bits, s.c_bits),
-        }
-    }
-
-    fn own_range(&self, phase: usize) -> std::ops::Range<usize> {
-        let s = spec(phase);
-        match self.role {
-            Role::C => s.c_range(),
-            Role::N => s.n_range(),
-        }
-    }
-
-    fn peer_range(&self, phase: usize) -> std::ops::Range<usize> {
-        let s = spec(phase);
-        match self.role {
-            Role::C => s.n_range(),
-            Role::N => s.c_range(),
-        }
-    }
-
     fn check_stage(&self, want: Stage, what: &'static str) -> Result<()> {
         if self.stage != want {
             return Err(Error::State(what));
@@ -561,12 +633,38 @@ impl Party {
         r
     }
 
-    /// Input-independent preprocessing: OT extension, garbled tables of both
-    /// phases in both runs, random OLEs for ECtF.
+    #[cfg(test)]
+    fn cheat(&self) -> Cheat {
+        self.cheat
+    }
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn cheat(&self) {}
+
+    /// Input-independent preprocessing.
     pub async fn preprocess(&mut self) -> Result<()> {
         self.check_stage(Stage::New, "preprocess must be first")?;
+        if *TRACE {
+            let c = self.counters.clone();
+            let who = if self.role == Role::C { "C" } else { "N" };
+            tokio::spawn(async move {
+                let t0 = Instant::now();
+                let mut last = (0, 0);
+                for _ in 0..200 {
+                    let v = (c.ch_recv(CH_COTB), c.ch_recv(CH_TAB));
+                    if v != last {
+                        eprintln!("[{who} {:8.1} ms] recv cotb={} tab={}", t0.elapsed().as_secs_f64() * 1e3, v.0, v.1);
+                        last = v;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            });
+        }
         let m = self.mark();
-        let r = self.preprocess_inner().await;
+        let r = match self.role {
+            Role::N => self.preprocess_n().await,
+            Role::C => self.preprocess_c().await,
+        };
         let r = self.fail(r);
         self.record("preprocess", m);
         r?;
@@ -574,149 +672,455 @@ impl Party {
         Ok(())
     }
 
-    async fn preprocess_inner(&mut self) -> Result<()> {
-        let role = self.role;
-        let g_run = self.g_run();
-        let e_run = 1 - g_run;
-        let (own_a, peer_a) = self.bits(0);
-        let (own_b, peer_b) = self.bits(1);
+    async fn preprocess_n(&mut self) -> Result<()> {
+        #[allow(unused_variables)]
+        let cheat = self.cheat();
         let delta = self.delta;
         let mut grng = StdRng::from_seed(self.rng.random());
-        #[cfg(test)]
-        let cheat = self.cheat;
+        let c_bits = spec(0).c_bits + spec(1).c_bits;
+        let n_mac = macs_per_phase(spec(0)) + macs_per_phase(spec(1)) + 128;
 
-        // Garble both phases off the async thread.
         let garble = tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            for phase in 0..2 {
-                let s = spec(phase);
-                let in_keys: Vec<Key> = (0..s.circ.inputs().len())
-                    .map(|_| Key::from(Block::random(&mut grng)))
-                    .collect();
-                let mut gb = Garbler::default();
-                let mut it = gb.generate(&s.circ, delta, &in_keys).expect("garble");
-                let gates: Vec<EncryptedGate> = it.by_ref().collect();
-                let GarblerOutput { outputs } = it.finish().expect("garbler finish");
-                let mut tables = bincode::serialize(&gates).expect("serialize");
-                let mut decode: Vec<bool> = outputs.iter().map(|k| k.pointer()).collect();
-                #[cfg(test)]
-                {
-                    if cheat == Cheat::CorruptGate(phase) {
-                        // A corrupted row only matters if the evaluator uses it
-                        // (selective failure), so corrupt both rows of 64 gates.
-                        for g in 0..64 {
-                            let k = 8 + 32 * (g * (gates.len() / 64));
-                            tables[k + 3] ^= 0x10;
-                            tables[k + 16 + 3] ^= 0x10;
-                        }
-                    }
-                    if cheat == Cheat::FlipDecode(phase) {
-                        decode[0] = !decode[0];
-                    }
-                }
-                let _ = &mut tables;
-                let _ = &mut decode;
-                out.push((
-                    GarblerPhase {
-                        in_keys,
-                        out_keys: outputs,
-                    },
-                    tables,
-                    pack(&decode),
-                ));
-            }
-            out
+            (0..2)
+                .map(|p| {
+                    let s = spec(p);
+                    let in_keys: Vec<Block> = (0..s.circ.inputs().len()).map(|_| Block::random(&mut grng)).collect();
+                    gc::garble(&s.circ, delta, &in_keys, p, &mut grng)
+                })
+                .collect::<Vec<_>>()
         });
 
+        #[allow(unused_mut)]
+        let mut kos_delta_cheat = false;
+        #[cfg(test)]
+        if cheat == Cheat::KosDelta {
+            kos_delta_cheat = true;
+        }
+        if kos_delta_cheat {
+            let mut d2 = Block::random(&mut self.rng);
+            d2.set_lsb(true);
+            self.kos_a_s = Some(kos::Sender::new(
+                kos::SenderConfig::default(),
+                d2,
+                chou_orlandi::Receiver::new_with_seed(self.rng.random()),
+            ));
+        }
+
         let Party {
-            ctx_cot,
+            ctx_a,
+            ctx_b,
             ctx_sc,
-            ch_run,
-            kos_s,
-            kos_r,
+            n2c,
+            c2n,
+            tab,
+            kos_a_s,
+            mac_r,
             sc,
+            counters,
             ..
         } = self;
-        let [ctx1, ctx2] = ctx_cot;
-        let (ctx_g, ctx_e) = if g_run == 0 { (ctx1, ctx2) } else { (ctx2, ctx1) };
-        let [ch1, ch2] = ch_run;
-        let (ch_g, ch_e) = if g_run == 0 { (ch1, ch2) } else { (ch2, ch1) };
-        let _ = e_run;
 
+        // Garble and stream the tables while the OTs run, scheduled around C's
+        // MAC-COT upload (Ferret, ~1.16 MB C→N, in two parts separated by a
+        // small N→C message). Any small N→C message sent after the tables sits
+        // behind them in the link buffers and stalls an OT round trip, so
+        // phase A's tables wait until C is uploading the first part (N's OT
+        // setup messages have arrived) and phase B's until the second part
+        // (`TABLES_GATE`). The download then overlaps C's upload.
+        let mac_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = |threshold: u64| {
+            let counters = counters.clone();
+            let mac_done = mac_done.clone();
+            async move {
+                let t0 = Instant::now();
+                while counters.ch_recv(CH_COTB) < threshold
+                    && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
+                    && t0.elapsed() < TABLES_MAX_WAIT
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+        };
+        let mut gates = vec![gate(TABLES_GATE[0]), gate(TABLES_GATE[1])].into_iter();
         let send_fut = async {
-            let garbled = garble
-                .await
-                .map_err(|e| Error::Protocol(format!("garbling task: {e}")))?;
+            let g = garble.await.map_err(perr("garbling task"))?;
+            #[allow(unused_mut)]
             let mut keep = Vec::new();
-            for (gp, tables, decode) in garbled {
-                ch_g.send(&tables).await?;
-                ch_g.send(&decode).await?;
-                keep.push(gp);
+            #[allow(unused_mut)]
+            for (p, (k, mut tables)) in g.into_iter().enumerate() {
+                #[cfg(test)]
+                if cheat == Cheat::CorruptGate(p) {
+                    let n = tables.len();
+                    for g in 0..64 {
+                        let t = &mut tables[g * (n / 64)];
+                        t.g[0] ^= 1;
+                        t.g[2] ^= 1 << 40;
+                    }
+                }
+                #[cfg(test)]
+                if cheat == Cheat::CorruptControlBits(p) {
+                    let n = tables.len();
+                    for g in 0..64 {
+                        tables[g * (n / 64)].z ^= 0b00011;
+                    }
+                }
+                if let Some(g) = gates.next() {
+                    g.await;
+                }
+                tab.send(&gc::tables_to_bytes(&tables)).await?;
+                keep.push(k);
             }
             Ok::<_, Error>(keep)
         };
-        let recv_fut = async {
-            let mut ev = Vec::new();
-            for phase in 0..2 {
-                let s = spec(phase);
-                let tables = ch_e.recv().await?;
-                let gates: Vec<EncryptedGate> = bincode::deserialize(&tables)
-                    .map_err(|e| Error::Protocol(format!("tables: {e}")))?;
-                if gates.len() != s.circ.and_count() {
-                    return Err(Error::Protocol("garbled table size".into()));
-                }
-                let decode = ch_e.recv_exact(s.out_bits.div_ceil(8)).await?;
-                ev.push(EvalPhase {
-                    tables: Some(gates),
-                    decode: unpack(&decode, s.out_bits),
-                });
-            }
-            Ok::<_, Error>(ev)
-        };
-        let cot_s_fut = async {
-            let s = kos_s.as_mut().unwrap();
-            let n = peer_a + peer_b;
-            s.alloc(n).map_err(|e| Error::Protocol(format!("kos: {e}")))?;
-            let f = s
-                .queue_send_rcot(n)
-                .map_err(|e| Error::Protocol(format!("kos: {e}")))?;
-            s.flush(ctx_g)
-                .await
-                .map_err(|e| Error::Protocol(format!("kos: {e}")))?;
-            let RCOTSenderOutput { keys, .. } =
-                f.await.map_err(|e| Error::Protocol(format!("kos: {e}")))?;
+        let cot_a_fut = async {
+            let keys = rcot_send!(kos_a_s.as_mut().unwrap(), ctx_a, c_bits);
             Ok::<_, Error>(keys)
         };
-        let cot_r_fut = async {
-            let r = kos_r.as_mut().unwrap();
-            let n = own_a + own_b;
-            r.alloc(n).map_err(|e| Error::Protocol(format!("kos: {e}")))?;
-            let f = r
-                .queue_recv_rcot(n)
-                .map_err(|e| Error::Protocol(format!("kos: {e}")))?;
-            r.flush(ctx_e)
-                .await
-                .map_err(|e| Error::Protocol(format!("kos: {e}")))?;
-            let RCOTReceiverOutput { choices, msgs, .. } =
-                f.await.map_err(|e| Error::Protocol(format!("kos: {e}")))?;
-            Ok::<_, Error>((choices, msgs))
+        let cot_b_fut = async {
+            let (r, m) = rcot_recv!(mac_r.as_mut().unwrap().as_mut(), ctx_b, n_mac);
+            mac_done.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok::<_, Error>((r, m))
         };
         let sc_fut = sc.preprocess(ctx_sc);
-
-        let (g, e, keys, cr, scr) = futures::join!(send_fut, recv_fut, cot_s_fut, cot_r_fut, sc_fut);
-        let g = g?;
-        let e = e?;
-        let cot_keys = keys?;
-        let (cot_choices, cot_msgs) = cr?;
+        let (keys, cot_keys, macs, scr) = futures::join!(send_fut, cot_a_fut, cot_b_fut, sc_fut);
+        let keys = keys?;
+        let cot_keys = cot_keys?;
+        let (r_bits, r_macs) = macs?;
         scr?;
-        if cot_keys.len() != peer_a + peer_b || cot_choices.len() != own_a + own_b {
+        if cot_keys.len() != c_bits || r_bits.len() != n_mac {
             return Err(Error::Protocol("cot count".into()));
         }
-        let _ = role;
-        self.pre = Some(Pre {
-            g,
-            e,
-            cot_keys,
+
+        // Commit (Fix) λ for the base wires and t for every AND gate.
+        let mut d_bits = Vec::with_capacity(n_mac);
+        let mut st = Vec::new(); // (lam, mac, t_mac) per phase
+        let mut off = 0usize;
+        for (p, k) in keys.iter().enumerate() {
+            let shape = &SHAPES[p];
+            let s = spec(p);
+            let nb = shape.base.len();
+            #[allow(unused_mut)]
+            let mut base_lam: Vec<bool> = shape.base.iter().map(|&w| k[w].lsb()).collect();
+            #[cfg(test)]
+            if cheat == Cheat::FlipLambda(p) {
+                // An internal AND gate (half-way through the circuit).
+                let i = s.circ.inputs().len() + s.circ.and_count() / 2;
+                base_lam[i] = !base_lam[i];
+            }
+            let base_mac = r_macs[off..off + nb].to_vec();
+            for (i, l) in base_lam.iter().enumerate() {
+                d_bits.push(l ^ r_bits[off + i]);
+            }
+            off += nb;
+            let (lam, mac) = gc::propagate_n(&s.circ, &base_lam, &base_mac);
+            let na = shape.ands.len();
+            let mut t_mac = Vec::with_capacity(na);
+            for (a, &(i, j, _)) in shape.ands.iter().enumerate() {
+                #[allow(unused_mut)]
+                let mut t = lam[i] & lam[j];
+                #[cfg(test)]
+                if cheat == Cheat::BadT && p == 1 && a == 1000 {
+                    t = !t;
+                }
+                d_bits.push(t ^ r_bits[off + a]);
+                t_mac.push(r_macs[off + a]);
+            }
+            off += na;
+            st.push((lam, mac, t_mac));
+        }
+        let mask_bits = &r_bits[off..off + 128];
+        let mask_macs = &r_macs[off..off + 128];
+        n2c.send(&from_bits(&d_bits)).await?;
+
+        // Challenge.
+        let seed = c2n.recv_exact(32).await?;
+        let t_seed = Instant::now();
+        let chi_dv = chi(&seed, b"dvzk");
+        let chi_ck = [chi(&seed, b"check0"), chi(&seed, b"check1")];
+        let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
+
+        // Product check, openings, consistency-check material (CPU, blocking).
+        let mask_bits = mask_bits.to_vec();
+        let mask_macs = mask_macs.to_vec();
+        let (st, keys, msgs) = tokio::task::spawn_blocking(move || {
+            // Check rows and Y_N per phase.
+            let rows_of = |p: usize| -> (Vec<u8>, Vec<u8>) {
+                let (lam, mac, t_mac) = &st[p];
+                let s = spec(p);
+                let pw = gc::powers(chi_ck[p], t_mac.len());
+                #[allow(unused_mut)]
+                let mut salt_p = salt;
+                #[cfg(test)]
+                if cheat == Cheat::WrongSalt(p) {
+                    salt_p ^= 1 << 7;
+                }
+                let cm = gc::check_material(
+                    &s.circ,
+                    salt_p,
+                    p,
+                    &SHAPES[p].ands,
+                    &SHAPES[p].base,
+                    &keys[p],
+                    lam,
+                    mac,
+                    t_mac,
+                    &pw,
+                    delta,
+                );
+                #[allow(unused_mut)]
+                let mut y_n = cm.y_n;
+                #[cfg(test)]
+                if cheat == Cheat::BadYn(p) {
+                    y_n ^= 1;
+                }
+                #[allow(unused_mut)]
+                let mut rows = cm.rows;
+                #[cfg(test)]
+                if cheat == Cheat::BadRows(p) {
+                    let mut r = os_rng();
+                    for x in rows.iter_mut() {
+                        *x ^= r.random::<u64>();
+                    }
+                }
+                (rows.iter().flat_map(|r| r.to_le_bytes()).collect(), y_n.to_le_bytes().to_vec())
+            };
+            let mut msgs: Vec<Vec<u8>> = Vec::new();
+            let rows = std::thread::scope(|sc| {
+                let r0 = sc.spawn(|| rows_of(0));
+                let r1 = sc.spawn(|| rows_of(1));
+                let mut acc = (Block::ZERO, Block::ZERO);
+                for (p, (lam, mac, t_mac)) in st.iter().enumerate() {
+                    let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), t_mac.len());
+                    gc::dvzk_prover_acc(&SHAPES[p].ands, lam, mac, t_mac, &pw, &mut acc);
+                }
+                // Random mask a* = Σ r_i X^i.
+                let mut a_star = Block::ZERO;
+                let mut m_star = Block::ZERO;
+                for i in 0..128 {
+                    a_star ^= sel(mask_bits[i], Block::MONOMIAL[i]);
+                    m_star ^= Block::MONOMIAL[i].gfmul(mask_macs[i]);
+                }
+                let u = acc.0 ^ m_star;
+                let v = acc.1 ^ a_star;
+                msgs.push(blocks_to_bytes(&[u, v]));
+
+                // Openings: C's inputs, th, outputs (both phases), one MAC hash.
+                let mut bits = Vec::new();
+                let mut h = Sha256::new();
+                h.update(TAG_OPEN);
+                for (p, (lam, mac, _)) in st.iter().enumerate() {
+                    let s = spec(p);
+                    let n_feed = s.circ.feed_count();
+                    let wires = s
+                        .c_range()
+                        .chain(s.th_range())
+                        .chain(s.circ.outputs())
+                        .collect::<Vec<_>>();
+                    for (idx, &w) in wires.iter().enumerate() {
+                        #[allow(unused_mut)]
+                        let mut b = lam[w];
+                        #[cfg(test)]
+                        if cheat == Cheat::LieOpen(p) && w == n_feed - 1 && idx > 0 {
+                            b = !b;
+                        }
+                        let _ = (idx, n_feed);
+                        bits.push(b);
+                        h.update(mac[w].as_bytes());
+                    }
+                }
+                let hd: [u8; 32] = h.finalize().into();
+                let mut open = from_bits(&bits);
+                open.extend_from_slice(&hd);
+                msgs.push(open);
+                [r0.join().expect("rows thread"), r1.join().expect("rows thread")]
+            });
+            for (r, y) in rows {
+                msgs.push(r);
+                msgs.push(y);
+            }
+
+            (st, keys, msgs)
+        })
+        .await
+        .map_err(perr("preprocess task"))?;
+        tr(t_seed, "N", "post-seed compute done");
+        for msg in msgs {
+            n2c.send(&msg).await?;
+        }
+
+        let ph = st
+            .into_iter()
+            .zip(keys)
+            .map(|((lam, _, _), k)| NPhase { k, lam })
+            .collect();
+        self.pre = Some(Pre::N { ph, cot_keys });
+        Ok(())
+    }
+
+    async fn preprocess_c(&mut self) -> Result<()> {
+        let delta_b = self.delta;
+        let own_bits = spec(0).c_bits + spec(1).c_bits;
+        let n_mac = macs_per_phase(spec(0)) + macs_per_phase(spec(1)) + 128;
+        let seed: [u8; 32] = self.rng.random();
+        let Party {
+            ctx_a,
+            ctx_b,
+            ctx_sc,
+            n2c,
+            c2n,
+            tab,
+            kos_a_r,
+            mac_s,
+            sc,
+            ..
+        } = self;
+
+        let t0 = Instant::now();
+        let recv_fut = async {
+            let mut t = Vec::new();
+            for p in 0..2 {
+                let s = spec(p);
+                let n = s.circ.and_count();
+                let b = tab.recv_exact(gc::tables_len(n)).await?;
+                tr(t0, "C", "tables phase recv");
+                t.push(gc::tables_from_bytes(&b, n).ok_or_else(|| Error::Protocol("tables".into()))?);
+            }
+            let d = n2c.recv_exact((n_mac - 128).div_ceil(8)).await?;
+            tr(t0, "C", "d recv");
+            Ok::<_, Error>((t, unpack(&d, n_mac - 128)))
+        };
+        let cot_a_fut = async {
+            let (c, m) = rcot_recv!(kos_a_r.as_mut().unwrap(), ctx_a, own_bits);
+            tr(t0, "C", "kos (input) done");
+            Ok::<_, Error>((c, m))
+        };
+        let cot_b_fut = async {
+            let keys = rcot_send!(mac_s.as_mut().unwrap().as_mut(), ctx_b, n_mac);
+            tr(t0, "C", "mac cot done");
+            Ok::<_, Error>(keys)
+        };
+        let sc_fut = async {
+            let r = sc.preprocess(ctx_sc).await;
+            tr(t0, "C", "ole done");
+            r
+        };
+        let (rcv, cr, kb, scr) = futures::join!(recv_fut, cot_a_fut, cot_b_fut, sc_fut);
+        let (tables, d) = rcv?;
+        let (cot_choices, cot_msgs) = cr?;
+        let kb = kb?;
+        scr?;
+        if kb.len() != n_mac || cot_choices.len() != own_bits {
+            return Err(Error::Protocol("cot count".into()));
+        }
+        // Keys of the committed values: K[x] = K[r] ⊕ d·Δ_B.
+        // (The last 128 COTs stay random: they mask the product check.)
+        let kfix: Vec<Block> = kb
+            .iter()
+            .enumerate()
+            .map(|(i, k)| if i < d.len() { *k ^ sel(d[i], delta_b) } else { *k })
+            .collect();
+        // The χ challenge only after N's tables and commitments are in.
+        c2n.send(&seed).await?;
+        tr(t0, "C", "seed sent");
+
+        // Receive the rest while computing the keys.
+        let recv2 = async {
+            let dv = n2c.recv_exact(32).await?;
+            let n_open: usize = (0..2)
+                .map(|p| {
+                    let s = spec(p);
+                    s.c_bits + s.th_bits + s.out_bits
+                })
+                .sum();
+            let open = n2c.recv_exact(n_open.div_ceil(8) + 32).await?;
+            let mut rows = Vec::new();
+            for p in 0..2 {
+                let r = n2c.recv_exact(8 * SHAPES[p].base.len()).await?;
+                let y = n2c.recv_exact(8).await?;
+                let r: Vec<u64> = r.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+                rows.push((r, u64::from_le_bytes(y[..].try_into().unwrap())));
+            }
+            Ok::<_, Error>((dv, open, rows))
+        };
+        let chi_dv = chi(&seed, b"dvzk");
+        let chi_ck = [chi(&seed, b"check0"), chi(&seed, b"check1")];
+        let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
+        let compute = tokio::task::spawn_blocking(move || {
+            let mut off = 0;
+            let mut per = Vec::new();
+            let mut acc = Block::ZERO;
+            for p in 0..2 {
+                let s = spec(p);
+                let shape = &SHAPES[p];
+                let nb = shape.base.len();
+                let key = gc::propagate_c(&s.circ, &kfix[off..off + nb], delta_b);
+                off += nb;
+                let na = shape.ands.len();
+                let t_key = kfix[off..off + na].to_vec();
+                off += na;
+                let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), na);
+                gc::dvzk_verifier_acc(&shape.ands, &key, &t_key, delta_b, &pw, &mut acc);
+                let pw = gc::powers(chi_ck[p], na);
+                let ck = gc::check_keys(&shape.ands, &key, &t_key, &pw);
+                per.push((key, ck));
+            }
+            let mut k_star = Block::ZERO;
+            for i in 0..128 {
+                k_star ^= Block::MONOMIAL[i].gfmul(kfix[off + i]);
+            }
+            (per, acc ^ k_star)
+        });
+        let (r2, comp) = futures::join!(recv2, compute);
+        tr(t0, "C", "rows recv + keys computed");
+        let (dv, open, rows) = r2?;
+        let (per, w) = comp.map_err(perr("preprocess task"))?;
+
+        // Product check: Σχ B ⊕ K* = U ⊕ V·Δ_B.
+        let uv = bytes_to_blocks(&dv);
+        if w != uv[0] ^ uv[1].gfmul(delta_b) {
+            return Err(Error::Abort("AND-product (t = λ_i·λ_j) check failed".into()));
+        }
+
+        // Openings.
+        let n_open = open.len() - 32;
+        let mut bits = to_bits(&open[..n_open]).into_iter();
+        let mut h = Sha256::new();
+        h.update(TAG_OPEN);
+        let mut ph = Vec::new();
+        for (p, ((key, ck), (rws, y_n))) in per.into_iter().zip(rows).enumerate() {
+            let s = spec(p);
+            let mut take = |r: std::ops::Range<usize>| -> Vec<bool> {
+                r.map(|w| {
+                    let b = bits.next().unwrap_or(false);
+                    h.update((key[w] ^ sel(b, delta_b)).as_bytes());
+                    b
+                })
+                .collect()
+            };
+            let lam_c = take(s.c_range());
+            let lam_th = take(s.th_range());
+            let lam_out = take(s.circ.outputs());
+            ph.push(CPhase {
+                tables: Vec::new(),
+                ck: Some(ck),
+                rows: rws,
+                y_n,
+                salt,
+                lam_c,
+                lam_th,
+                lam_out,
+            });
+            let _ = p;
+        }
+        let hd: [u8; 32] = h.finalize().into();
+        if hd[..] != open[n_open..] {
+            return Err(Error::Abort("opened masks do not match their MACs".into()));
+        }
+        for (cp, t) in ph.iter_mut().zip(tables) {
+            cp.tables = t;
+        }
+        self.pre = Some(Pre::C {
+            ph,
             cot_choices,
             cot_msgs,
         });
@@ -724,7 +1128,6 @@ impl Party {
     }
 
     /// Joint P-256 key share: C commits to `P_C`, N sends `P_N`, C opens.
-    /// Returns `P_C + P_N` (65-byte uncompressed SEC1) to both.
     pub async fn key_share(&mut self) -> Result<[u8; 65]> {
         self.check_stage(Stage::Preprocessed, "key_share after preprocess")?;
         let m = self.mark();
@@ -750,25 +1153,24 @@ impl Party {
                     .chain_update(nonce)
                     .finalize()
                     .into();
-                self.ch_ctl.send(&com).await?;
-                let pn = self.ch_ctl.recv_exact(65).await?;
+                self.c2n.send(&com).await?;
+                let pn = self.n2c.recv_exact(65).await?;
                 let p_n = parse_point(&pn)?;
                 #[allow(unused_mut)]
                 let mut open = own.to_vec();
                 #[cfg(test)]
                 if self.cheat == Cheat::BadOpen {
-                    // A rogue key T - P_N for a T we "know".
                     let t = ProjectivePoint::GENERATOR * Scalar::from(7u64);
                     open = encode_point(&(t - p_n)).to_vec();
                 }
                 open.extend_from_slice(&nonce);
-                self.ch_ctl.send(&open).await?;
+                self.c2n.send(&open).await?;
                 p_own + p_n
             }
             Role::N => {
-                let com = self.ch_ctl.recv_exact(32).await?;
-                self.ch_ctl.send(&own).await?;
-                let open = self.ch_ctl.recv_exact(97).await?;
+                let com = self.c2n.recv_exact(32).await?;
+                self.n2c.send(&own).await?;
+                let open = self.c2n.recv_exact(97).await?;
                 let check: [u8; 32] = Sha256::new()
                     .chain_update(TAG_KS)
                     .chain_update(&open[..65])
@@ -788,8 +1190,7 @@ impl Party {
         Ok(encode_point(&joint))
     }
 
-    /// ECtF + phase A. `server_share` is the ServerHello key_share (65-byte
-    /// uncompressed P-256), `th_sh = SHA256(ClientHello‖ServerHello)`.
+    /// ECtF + phase A.
     pub async fn handshake(&mut self, server_share: &[u8], th_sh: [u8; 32]) -> Result<HsSecrets> {
         self.check_stage(Stage::KeyShared, "handshake after key_share")?;
         let r = self.handshake_inner(server_share, th_sh).await;
@@ -831,7 +1232,6 @@ impl Party {
         };
         hs.c_hs.copy_from_slice(&out[0..32]);
         hs.s_hs.copy_from_slice(&out[32..64]);
-        // MS shares: C keeps r_C; N keeps (MS ⊕ r_C ⊕ r_N) ⊕ r_N.
         match self.role {
             Role::C => self.ms_share = r_mask,
             Role::N => {
@@ -844,7 +1244,7 @@ impl Party {
         Ok(hs)
     }
 
-    /// Phase B. `th_sf = SHA256(ClientHello..server Finished)`.
+    /// Phase B.
     pub async fn application(&mut self, th_sf: [u8; 32]) -> Result<ApOut> {
         self.check_stage(Stage::Handshaken, "application after handshake")?;
         let r = self.application_inner(th_sf).await;
@@ -919,167 +1319,186 @@ impl Party {
         Ok(res)
     }
 
-    /// Runs one phase in both runs concurrently plus the equality check.
-    /// `own` are this party's input bytes, `th` the garbler's transcript hash.
-    /// Returns the decoded output bytes only if the check passes.
+    /// One phase. Returns the decoded output bytes (only after the checks).
     async fn run_phase(&mut self, phase: usize, own: Vec<u8>, th: [u8; 32]) -> Result<Vec<u8>> {
-        let names = [("phase_a", "check_a"), ("phase_b", "check_b")][phase];
+        let name = ["phase_a", "phase_b"][phase];
         let m = self.mark();
+        let r = match self.role {
+            Role::N => self.phase_n(phase, own, th).await,
+            Role::C => self.phase_c(phase, own, th).await,
+        };
+        self.record(name, m);
+        r
+    }
+
+    async fn phase_n(&mut self, phase: usize, own: Vec<u8>, th: [u8; 32]) -> Result<Vec<u8>> {
+        #[allow(unused_variables)]
+        let cheat = self.cheat();
         let s = spec(phase);
-        let g_run = self.g_run();
-        let (own_n, peer_n) = self.bits(phase);
-        let own_range = self.own_range(phase);
-        let peer_range = self.peer_range(phase);
-        let th_range = s.th_range();
         let own_bits = to_bits(&own);
-        if own_bits.len() != own_n {
+        if own_bits.len() != s.n_bits {
             return Err(Error::Input("input length".into()));
         }
         let th_bits = to_bits(&th);
-        #[allow(unused_mut)]
-        let mut g_own_bits = own_bits.clone();
-        #[cfg(test)]
-        if let Cheat::InconsistentInput { phase: p, bit } = self.cheat {
-            if p == phase {
-                g_own_bits[bit] = !g_own_bits[bit];
-            }
-        }
-        // Offsets into the random-COT vectors (phase A first).
-        let (own_a, peer_a) = self.bits(0);
-        let e_off = if phase == 0 { 0 } else { own_a };
-        let g_off = if phase == 0 { 0 } else { peer_a };
         let delta = self.delta;
-
-        let pre = self.pre.as_mut().ok_or(Error::State("not preprocessed"))?;
-        let tables = pre.e[phase]
-            .tables
-            .take()
-            .ok_or(Error::State("phase already used"))?;
-        let decode = pre.e[phase].decode.clone();
-        let in_keys = pre.g[phase].in_keys.clone();
-        let out_keys = pre.g[phase].out_keys.clone();
-        let cot_keys = pre.cot_keys[g_off..g_off + peer_n].to_vec();
-        let choices = pre.cot_choices[e_off..e_off + own_n].to_vec();
-        let cot_msgs = pre.cot_msgs[e_off..e_off + own_n].to_vec();
-
-        let Party { ch_run, .. } = self;
-        let [ch1, ch2] = ch_run;
-        let (ch_g, ch_e) = if g_run == 0 { (ch1, ch2) } else { (ch2, ch1) };
-
-        // Garbler side of the run this party garbled.
-        let g_fut = async {
-            let mut labels: Vec<Block> = Vec::with_capacity(g_own_bits.len() + 256);
-            for (i, b) in own_range.clone().zip(&g_own_bits) {
-                labels.push(*in_keys[i].auth(*b, &delta).as_block());
-            }
-            for (i, b) in th_range.clone().zip(&th_bits) {
-                labels.push(*in_keys[i].auth(*b, &delta).as_block());
-            }
-            ch_g.send(&blocks_to_bytes(labels.iter())).await?;
-            let d = ch_g.recv_exact(peer_n.div_ceil(8)).await?;
-            let d = unpack(&d, peer_n);
-            let adj: Vec<Block> = peer_range
-                .clone()
-                .enumerate()
-                .map(|(j, i)| {
-                    let base = *in_keys[i].as_block() ^ cot_keys[j];
-                    if d[j] { base ^ *delta.as_block() } else { base }
-                })
-                .collect();
-            ch_g.send(&blocks_to_bytes(adj.iter())).await?;
-            Ok::<_, Error>(())
+        let c_off = if phase == 0 { 0 } else { spec(0).c_bits };
+        let Some(Pre::N { ph, cot_keys }) = self.pre.as_mut() else {
+            return Err(Error::State("not preprocessed"));
         };
-
-        // Evaluator side of the run the peer garbled.
-        let e_fut = async {
-            let d: Vec<bool> = own_bits.iter().zip(&choices).map(|(x, b)| x ^ b).collect();
-            ch_e.send(&pack(&d)).await?;
-            let gl = ch_e.recv_exact(16 * (peer_n + 256)).await?;
-            let gl = bytes_to_blocks(&gl);
-            let el = ch_e.recv_exact(16 * own_n).await?;
-            let el = bytes_to_blocks(&el);
-            let mut macs = vec![Mac::from(Block::ZERO); s.circ.inputs().len()];
-            for (j, i) in peer_range.clone().enumerate() {
-                macs[i] = Mac::from(gl[j]);
-            }
-            for (j, i) in th_range.clone().enumerate() {
-                macs[i] = Mac::from(gl[peer_n + j]);
-            }
-            for (j, i) in own_range.clone().enumerate() {
-                macs[i] = Mac::from(el[j] ^ cot_msgs[j]);
-            }
-            let circ = s.circ.clone();
-            let out = tokio::task::spawn_blocking(move || {
-                evaluate_garbled_circuits(vec![(circ, macs, GarbledCircuit { gates: tables })])
-            })
-            .await
-            .map_err(|e| Error::Protocol(format!("eval task: {e}")))?
-            .map_err(|e| Error::Protocol(format!("eval: {e}")))?;
-            let EvaluatorOutput { outputs } = out
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::Protocol("eval output".into()))?;
-            Ok::<_, Error>(outputs)
-        };
-
-        let (gr, er) = futures::join!(g_fut, e_fut);
-        gr?;
-        let out_macs = er?;
-        if out_macs.len() != s.out_bits {
-            return Err(Error::Protocol("output size".into()));
+        let st = std::mem::replace(&mut ph[phase], NPhase { k: Vec::new(), lam: Vec::new() });
+        if st.k.is_empty() {
+            return Err(Error::State("phase already used"));
         }
-        let v: Vec<bool> = out_macs
-            .iter()
-            .zip(&decode)
-            .map(|(m, d)| m.pointer() ^ d)
+        let cot = cot_keys[c_off..c_off + s.c_bits].to_vec();
+
+        // Own and transcript-hash labels, sent at once.
+        let mut labels = Vec::with_capacity(s.n_bits + s.th_bits);
+        for (w, b) in s.n_range().zip(&own_bits) {
+            labels.push(st.k[w] ^ sel(*b, delta));
+        }
+        for (w, b) in s.th_range().zip(&th_bits) {
+            labels.push(st.k[w] ^ sel(*b, delta));
+        }
+        #[cfg(test)]
+        if cheat == Cheat::BadInputLabel(phase) {
+            labels[0] = labels[0] ^ Block::new([0x5a; 16]);
+        }
+        self.n2c.send(&blocks_to_bytes(&labels)).await?;
+        let d = self.c2n.recv_exact(s.c_bits.div_ceil(8)).await?;
+        let d = unpack(&d, s.c_bits);
+        let adj: Vec<Block> = s
+            .c_range()
+            .enumerate()
+            .map(|(j, w)| st.k[w] ^ cot[j] ^ sel(d[j], delta))
             .collect();
-        self.record(names.0, m);
+        self.n2c.send(&blocks_to_bytes(&adj)).await?;
 
-        // Equality check (HKE12) over output labels, commit-then-open.
-        let m = self.mark();
+        // C's verdict and output pointer bits.
+        let msg = self.c2n.recv().await?;
+        if msg.first() != Some(&1) {
+            return Err(Error::Abort("peer aborted (consistency check failed on C)".into()));
+        }
+        if msg.len() != 1 + s.out_bits.div_ceil(8) + 32 {
+            return Err(Error::Protocol("output message length".into()));
+        }
+        let pbits = unpack(&msg[1..1 + s.out_bits.div_ceil(8)], s.out_bits);
         let mut h = Sha256::new();
-        h.update(TAG_EQ);
+        h.update(TAG_OUT);
         h.update([phase as u8]);
-        for i in 0..s.out_bits {
-            let own_label = *out_keys[i].auth(v[i], &delta).as_block();
-            let ev_label = *out_macs[i].as_block();
-            // A = run-1 label (N's circuit), B = run-2 label (C's circuit).
-            let (a, b) = match self.role {
-                Role::C => (ev_label, own_label),
-                Role::N => (own_label, ev_label),
-            };
-            h.update(a.as_bytes());
-            h.update(b.as_bytes());
+        let mut v = Vec::with_capacity(s.out_bits);
+        for (w, pb) in s.circ.outputs().zip(&pbits) {
+            let lab = st.k[w] ^ sel(*pb ^ st.lam[w], delta);
+            h.update(lab.as_bytes());
+            v.push(*pb ^ st.lam[w]);
         }
-        let digest: [u8; 32] = h.finalize().into();
-        let nonce: [u8; 32] = self.rng.random();
-        let com: [u8; 32] = Sha256::new()
-            .chain_update(TAG_EQC)
-            .chain_update(digest)
-            .chain_update(nonce)
-            .finalize()
-            .into();
-        self.ch_ctl.send(&com).await?;
-        let peer_com = self.ch_ctl.recv_exact(32).await?;
-        let mut open = digest.to_vec();
-        open.extend_from_slice(&nonce);
-        self.ch_ctl.send(&open).await?;
-        let peer_open = self.ch_ctl.recv_exact(64).await?;
-        let check: [u8; 32] = Sha256::new()
-            .chain_update(TAG_EQC)
-            .chain_update(&peer_open[..32])
-            .chain_update(&peer_open[32..])
-            .finalize()
-            .into();
-        let ok_open = check[..] == peer_com[..];
-        let ok_eq = peer_open[..32] == digest[..];
-        self.record(names.1, m);
-        if !ok_open {
-            return Err(Error::Abort("equality-check commitment does not open".into()));
-        }
-        if !ok_eq {
-            return Err(Error::Abort("dual-execution equality check failed".into()));
+        let hd: [u8; 32] = h.finalize().into();
+        if hd[..] != msg[msg.len() - 32..] {
+            return Err(Error::Abort("output labels do not authenticate".into()));
         }
         Ok(from_bits(&v))
     }
+
+    async fn phase_c(&mut self, phase: usize, own: Vec<u8>, th: [u8; 32]) -> Result<Vec<u8>> {
+        #[allow(unused_variables)]
+        let cheat = self.cheat();
+        let s = spec(phase);
+        let own_bits = to_bits(&own);
+        if own_bits.len() != s.c_bits {
+            return Err(Error::Input("input length".into()));
+        }
+        let th_bits = to_bits(&th);
+        let delta_b = self.delta;
+        let c_off = if phase == 0 { 0 } else { spec(0).c_bits };
+        let Some(Pre::C {
+            ph,
+            cot_choices,
+            cot_msgs,
+        }) = self.pre.as_mut()
+        else {
+            return Err(Error::State("not preprocessed"));
+        };
+        let st = ph[phase].ck.take().ok_or(Error::State("phase already used"))?;
+        let tables = std::mem::take(&mut ph[phase].tables);
+        let rows = std::mem::take(&mut ph[phase].rows);
+        let y_n = ph[phase].y_n;
+        let salt = ph[phase].salt;
+        let lam_c = ph[phase].lam_c.clone();
+        let lam_th = ph[phase].lam_th.clone();
+        let lam_out = ph[phase].lam_out.clone();
+        let b = cot_choices[c_off..c_off + s.c_bits].to_vec();
+        let msgs = cot_msgs[c_off..c_off + s.c_bits].to_vec();
+
+        let d: Vec<bool> = own_bits.iter().zip(&b).map(|(x, r)| x ^ r).collect();
+        self.c2n.send(&from_bits(&d)).await?;
+        let gl = bytes_to_blocks(&self.n2c.recv_exact(16 * (s.n_bits + s.th_bits)).await?);
+        let el = bytes_to_blocks(&self.n2c.recv_exact(16 * s.c_bits).await?);
+        let mut inl = vec![Block::ZERO; s.circ.inputs().len()];
+        for (j, w) in s.c_range().enumerate() {
+            inl[w] = el[j] ^ msgs[j];
+        }
+        for (j, w) in s.n_range().chain(s.th_range()).enumerate() {
+            inl[w] = gl[j];
+        }
+
+        let ok_in = s.c_range().enumerate().all(|(j, w)| inl[w].lsb() == own_bits[j] ^ lam_c[j])
+            && s.th_range().enumerate().all(|(j, w)| inl[w].lsb() == th_bits[j] ^ lam_th[j]);
+
+        let circ = s.circ.clone();
+        let (ok_check, out_labels) = tokio::task::spawn_blocking(move || {
+            let l = gc::evaluate(&circ, &inl, &tables, phase);
+            let ok = gc::run_check(salt, phase, &SHAPES[phase].ands, &SHAPES[phase].base, &l, &st, &rows, y_n, delta_b);
+            let out: Vec<Block> = circ.outputs().map(|w| l[w]).collect();
+            (ok, out)
+        })
+        .await
+        .map_err(perr("eval task"))?;
+
+        if !ok_in || !ok_check {
+            let _ = self.c2n.send(&[0u8]).await;
+            return Err(Error::Abort(if !ok_in {
+                "input label pointer bits do not match the opened masks".into()
+            } else {
+                "garbled-circuit consistency check failed".into()
+            }));
+        }
+        // Decode with the authenticated masks; then report to N.
+        let v: Vec<bool> = out_labels.iter().zip(&lam_out).map(|(l, m)| l.lsb() ^ m).collect();
+        #[allow(unused_mut)]
+        let mut pbits: Vec<bool> = out_labels.iter().map(|l| l.lsb()).collect();
+        let mut h = Sha256::new();
+        h.update(TAG_OUT);
+        h.update([phase as u8]);
+        for l in &out_labels {
+            h.update(l.as_bytes());
+        }
+        let hd: [u8; 32] = h.finalize().into();
+        #[cfg(test)]
+        if cheat == Cheat::FlipOutput(phase) {
+            pbits[100] = !pbits[100];
+        }
+        let mut msg = vec![1u8];
+        msg.extend_from_slice(&from_bits(&pbits));
+        msg.extend_from_slice(&hd);
+        self.c2n.send(&msg).await?;
+        Ok(from_bits(&v))
+    }
+}
+
+/// Bytes of the protocol messages per session, by direction, as computed
+/// from the circuit sizes (for reports). Excludes OT extension traffic.
+pub fn message_sizes() -> (usize, usize) {
+    let mut n2c = 0;
+    let mut c2n = 0;
+    for p in 0..2 {
+        let s = spec(p);
+        n2c += gc::tables_len(s.circ.and_count()); // three-halves tables
+        n2c += macs_per_phase(s).div_ceil(8); // d bits (approx; one message)
+        n2c += 8 * SHAPES[p].base.len() + 8; // check rows + Y_N (64-bit)
+        n2c += (s.c_bits + s.th_bits + s.out_bits).div_ceil(8);
+        n2c += 16 * (s.n_bits + s.th_bits + s.c_bits); // online labels
+        c2n += s.c_bits.div_ceil(8) + 1 + s.out_bits.div_ceil(8) + 32;
+    }
+    n2c += 32 + 32;
+    c2n += 32;
+    (c2n, n2c)
 }

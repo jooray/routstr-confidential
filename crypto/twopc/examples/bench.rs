@@ -1,15 +1,19 @@
-//! Benchmark: wall time and transport bytes per step, locally and over an
-//! emulated WAN (25 ms one-way, 100 Mbit/s and 20 Mbit/s).
+//! Benchmark of the two-party key schedule (node-only authenticated garbling)
+//! on emulated links (`zkbench::transport::emulated_link`: per-direction rate,
+//! pipelined one-way delay).
 //!
-//! `cargo run --release -p twopc --example bench [-- --runs N]`
+//! `cargo run --release -p twopc --example bench [-- --runs N] [--only <scenario prefix>]`
+//!
+//! Wall time is a full cold session (Party::new → preprocess → key_share →
+//! handshake → application) until *both* parties are done. Bytes are what
+//! crossed the link in each direction (mux headers and all OT traffic).
 
-use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use p256::ProjectivePoint;
 use p256::elliptic_curve::PrimeField;
-use twopc::testutil::emulated_pair;
-use twopc::{Party, Role, StepTiming, circuit_stats};
+use twopc::{Party, Role, circuit_stats};
+use zkbench::transport::emulated_link;
 
 fn server_share() -> [u8; 65] {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
@@ -21,38 +25,62 @@ fn server_share() -> [u8; 65] {
     p.to_encoded_point(false).as_bytes().try_into().unwrap()
 }
 
-async fn session(delay: Duration, rate: f64) -> (Vec<StepTiming>, Vec<StepTiming>) {
-    let (io_c, io_n) = emulated_pair(delay, rate);
+type Steps = Vec<(&'static str, f64, u64, u64)>;
+
+struct Res {
+    wall_ms: f64,
+    c2n: u64,
+    n2c: u64,
+    c_steps: Steps,
+}
+
+async fn session(delay: Duration, up: f64, down: f64) -> Res {
+    // a = C: a→b is C's uplink.
+    let (io_c, io_n, counters) = emulated_link(delay, up, down);
     let share = server_share();
     let th_sh = [1u8; 32];
     let th_sf = [2u8; 32];
-    let run = move |role: Role, io| async move {
+    let t0 = Instant::now();
+    let run = move |role, io| async move {
         let mut p = Party::new(role, io).await.unwrap();
         p.preprocess().await.unwrap();
         p.key_share().await.unwrap();
         p.handshake(&share, th_sh).await.unwrap();
         p.application(th_sf).await.unwrap();
-        let t = p.take_timings();
+        let t: Steps = p
+            .take_timings()
+            .into_iter()
+            .map(|s| (s.step, s.ms, s.bytes_sent, s.bytes_recv))
+            .collect();
         p.close().await;
         t
     };
-    let (c, n) = tokio::join!(
-        tokio::spawn(run(Role::C, io_c)),
-        tokio::spawn(run(Role::N, io_n))
-    );
-    (c.unwrap(), n.unwrap())
+    let (c, n) = tokio::join!(tokio::spawn(run(Role::C, io_c)), tokio::spawn(run(Role::N, io_n)));
+    let (c, _n) = (c.unwrap(), n.unwrap());
+    Res {
+        wall_ms: t0.elapsed().as_secs_f64() * 1e3,
+        c2n: counters.p2v(),
+        n2c: counters.v2p(),
+        c_steps: c,
+    }
+}
+
+fn mb(b: u64) -> String {
+    format!("{:.2}", b as f64 / 1e6)
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let runs: usize = std::env::args()
-        .skip_while(|a| a != "--runs")
+    let args: Vec<String> = std::env::args().collect();
+    let runs: usize = args
+        .iter()
+        .skip_while(|a| *a != "--runs")
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
+    let only: Option<String> = args.iter().skip_while(|a| *a != "--only").nth(1).cloned();
 
-    println!("## Circuits\n");
-    println!("| circuit | AND | XOR | SHA-256 compressions | C input bits | N input bits | output bits |");
+    println!("| circuit | AND | XOR | SHA-256 compressions | C in | N in | out |");
     println!("|---|---|---|---|---|---|---|");
     for s in circuit_stats() {
         println!(
@@ -60,47 +88,48 @@ async fn main() {
             s.name, s.and_gates, s.xor_gates, s.compressions, s.c_input_bits, s.n_input_bits, s.output_bits
         );
     }
+    let (c2n, n2c) = twopc::message_sizes();
+    println!("\nProtocol messages (computed, excl. OT extension): C→N {c2n} B, N→C {n2c} B\n");
 
-    let scenarios: [(&str, Duration, f64); 3] = [
-        ("local (no delay, unlimited)", Duration::ZERO, f64::INFINITY),
-        ("WAN 50 ms RTT, 100 Mbit/s", Duration::from_millis(25), 100e6 / 8.0),
-        ("WAN 50 ms RTT, 20 Mbit/s", Duration::from_millis(25), 20e6 / 8.0),
+    let mbit = |x: f64| x * 1e6 / 8.0;
+    let scenarios: Vec<(&str, Duration, f64, f64)> = vec![
+        ("local (no delay, unlimited)", Duration::ZERO, f64::INFINITY, f64::INFINITY),
+        ("home: 40 ms one-way, 2 Mbit/s up, 50 Mbit/s down", Duration::from_millis(40), mbit(2.0), mbit(50.0)),
+        ("home: 40 ms one-way, 7 Mbit/s up, 50 Mbit/s down", Duration::from_millis(40), mbit(7.0), mbit(50.0)),
+        ("symmetric: 25 ms one-way, 100 Mbit/s", Duration::from_millis(25), mbit(100.0), mbit(100.0)),
+        ("slow down: 40 ms one-way, 2 Mbit/s up, 10 Mbit/s down", Duration::from_millis(40), mbit(2.0), mbit(10.0)),
     ];
-    for (name, delay, rate) in scenarios {
-        // warm-up (circuit construction, page faults)
-        let _ = session(delay, rate).await;
-        let mut acc: BTreeMap<&'static str, (Vec<f64>, u64, u64, usize)> = BTreeMap::new();
-        let mut order: Vec<&'static str> = Vec::new();
+
+    // Warm-up (circuit construction, page faults).
+    let _ = session(Duration::ZERO, f64::INFINITY, f64::INFINITY).await;
+
+    for (name, delay, up, down) in scenarios {
+        if let Some(o) = &only {
+            if !name.starts_with(o.as_str()) {
+                continue;
+            }
+        }
+        let mut walls = Vec::new();
+        let mut last = None;
         for _ in 0..runs {
-            let (c, n) = session(delay, rate).await;
-            for t in c {
-                if !order.contains(&t.step) {
-                    order.push(t.step);
-                }
-                let e = acc.entry(t.step).or_insert((Vec::new(), 0, 0, 0));
-                e.0.push(t.ms);
-                e.1 = t.bytes_sent;
-                e.3 += 1;
-            }
-            // N→C bytes from N's own view (what N wrote during that step).
-            for t in n {
-                if let Some(e) = acc.get_mut(t.step) {
-                    e.2 = t.bytes_sent;
-                }
-            }
+            let r = session(delay, up, down).await;
+            walls.push(r.wall_ms);
+            last = Some(r);
         }
-        println!("\n## {name} (ms: C's view, median of {runs}; bytes: written by each side during its step)\n");
-        println!("| step | ms | C→N bytes | N→C bytes |");
+        walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let r = last.unwrap();
+        println!("## {name}\n");
+        println!(
+            "cold session {:.2} s (median of {runs}), C→N {} MB, N→C {} MB\n",
+            walls[walls.len() / 2] / 1e3,
+            mb(r.c2n),
+            mb(r.n2c)
+        );
+        println!("| step (C) | ms | C sent | C recv |");
         println!("|---|---|---|---|");
-        let mut total = 0.0;
-        for step in order {
-            let (ms, s, r, _) = &acc[step];
-            let mut v = ms.clone();
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let med = v[v.len() / 2];
-            total += med;
-            println!("| {step} | {med:.1} | {s} | {r} |");
+        for (s, ms, snt, rcv) in &r.c_steps {
+            println!("| {s} | {ms:.1} | {snt} | {rcv} |");
         }
-        println!("| **total** | {total:.1} | | |");
+        println!();
     }
 }

@@ -1,10 +1,91 @@
-# twopc-ag: only N garbles (feasibility PoC)
+# Node-only garbling: design notes and PoC report
 
-Status: working PoC, not integrated. The crate is `crypto/twopc-ag`; `crypto/twopc`, the sidecar and the clients
-are unchanged. Tests: `cargo test --release -p twopc-ag` (14). Benchmark:
-`cargo run --release -p twopc-ag --example bench [-- --runs N] [--only <scenario prefix>]`.
+Status (2026-10-10): **integrated and the only 2PC.** The PoC crate `crypto/twopc-ag` was merged into
+`crypto/twopc` (same `Party` API, same outputs, binary `cu-2pc`), and dual execution was deleted. The security
+model is in `docs/TWOPC-DESIGN.md` ("Security model of the 2PC") and the measurements are in
+`crypto/twopc/BENCH.md`. Tests: `cargo test --release -p twopc` (21 unit tests and 2 tests of the `cu-2pc`
+binary). This file keeps the PoC report (§1–§7, as written before integration) and records the three download
+cuts (§0).
 
-## Verdict
+## 0. The download cuts (verified, built, measured)
+
+| | client up | client down | cold, 2/50 Mbit/s | 7/50 | 100/100 | 2/10 |
+|---|---|---|---|---|---|---|
+| dual execution (before) | 21.1 MB | 21.1 MB | 85.2 s | 24.9 s | 2.27 s | 85.2 s |
+| PoC (Ferret), no cuts | 1.21 MB | 32.2 MB | 11.6 s | 8.27 s | 4.07 s | 32.2 s |
+| **shipped**: cuts 1+2, Ferret, scheduling | 1.21 MB | 22.1 MB | **7.38 s** | **5.41 s** | 3.05 s | **20.0 s** |
+
+The PoC's projection was ~5–6 s at 2/50. The floor is C's Ferret upload: 1.2 MB, about 4.9 s at 2 Mbit/s.
+Everything after it (the d bits, the seed, 5.3 MB of check rows) is on the critical path.
+
+**Cut 1: check rows over 64 bits (−5.3 MB). Built, with a fix.**
+- What changed: only the comparison is projected. Rows and Y_N travel as their low 64 bits (π, GF(2)-linear),
+  and C accepts iff π(Y_N ⊕ Y_C ⊕ K_tot) = 0. MACs, Δ_B, χ and the product check stay in GF(2^128).
+- A wrong evaluation (E ≠ 0) passes only if π(Δ_B·E) hits a value fixed without knowledge of Δ_B. For E ≠ 0
+  this is ≤ 2^-63 per phase (Δ_B has 127 random bits, and Δ ↦ π(Δ·E) is onto). There is nothing to grind,
+  because N learns nothing about Δ_B.
+- E = 0 with some e_k ≠ 0 still needs 2^128 work (χ in GF(2^128), drawn after N's commitments).
+- **What the plain projection did not cover.** With E = 0, a *garbage* label that has the right pointer bit
+  changes only the hash term of the check, and with 64-bit rows the hash matches w.p. 2^-64. A garbler
+  that keeps Δ_A and its keys fixed across sessions could precompute (once, ~2^64 TCCR calls, e.g. a table
+  tweak δ in the left half of an AND output) a deviation whose truncated hash matches. That deviation passes
+  the check and changes no output, but C's output-label hash then reveals which path the evaluation took. That
+  is silent leakage, bit by bit, and not an abort.
+- **Fix: a per-session salt.** The check-row hash tweak is keyed by a salt from C's challenge seed, which N
+  sees only after it has committed its tables, d bits, Δ_A and keys. Everything that fixes such a label is then
+  committed before the salt, so the hash difference is a fresh 64-bit value: 2^-64, no precomputation.
+- Labels N chooses online (its own inputs, the transcript hash, the corrections for C's inputs) shift by
+  amounts N knows, so they reveal nothing about C. The test is `check_rows_bound_to_session_salt`.
+
+**Cut 2: three-halves garbling (−4.8 MB). Built.**
+- `gc::and_garble3` / `and_eval3`: 3 × 64-bit halves plus 5 control bits per AND. The evaluator makes 3 TCCR
+  calls, the garbler 6, with tweaks (phase, gate, slot) disjoint from the check tweaks.
+- The garbler solves the 2×5 linear system per gate. The evaluator's matrix R_st is uniform in the coset
+  Rp[s][t] + span(S1, S2).
+- Composition with the check: the check uses only colour bits (lsb) and the fact that an honest evaluation
+  ends with one of two Δ_A-related labels per base wire. Three-halves keeps both properties: free XOR, lsb
+  Δ = 1, outputs K0 ⊕ v·Δ. The check rows need no re-derivation. Wrong control bits or ciphertexts give
+  garbage labels, which the check catches.
+- Tests:
+  - `three_halves_gate_all_cases`: every permute pair, every dicing pair, every colour pair, 64 trials.
+  - `three_halves_control_bits_hide_permute_bits`: the decrypted control bits are uniform for every permute
+    pair.
+  - `garble_evaluate_matches_plaintext`, `tables_roundtrip`.
+  - `corrupt_control_bits_detected_by_evaluator`, `corrupt_garbled_table_detected_by_evaluator`.
+- Caveat: the paper (eprint 2021/749) could not be fetched here (Cloudflare challenge). The scheme was
+  rebuilt from its structure: V_st = [[1,0,s,0,s⊕t],[0,1,0,t,s⊕t]] and dicing randomness r$. The evaluator
+  matrices (S1, S2, Rp) come from a public C++ reimplementation, read as reference only. The garbler is
+  derived independently and checked exhaustively. **The external review must compare the matrices with
+  RR21's figure.** Correctness does not depend on them, but the privacy argument does.
+
+**Cut 3: dropping the h1/h2/hk compressions (~−2 MB). Not done; the hashes stay.** What a replacement must do:
+- bind C's witness in π_C2S/π_C3S to the c_ap_1/s_ap_0 the 2PC produced, against a malicious C;
+- bind N's witness in π_NK to K_0‖IV_0, against a malicious N;
+- be checkable in QuickSilver;
+- leak nothing usable about the secrets to the other party.
+
+Options:
+- *Linear / universal hash keyed by the verifier.* Not binding if the key is known before the witness is
+  committed. If the key stays secret, the public anchor itself leaks a 128-bit linear function of c_ap_1 to N.
+- *IT-MAC import* (sound, zero AND gates).
+  - C's mask bits are already authenticated under Δ_A: the KOS COT gives C, for x = d ⊕ b, the MAC
+    M = K ⊕ x·Δ_A. N's mask bits are authenticated under Δ_B through λ and Λ.
+  - Each proof would commit the mask as its witness and then, after a verifier challenge χ, open the same
+    random linear combination Σχ^j·x_j ⊕ r both in the ZK VM and under the 2PC MACs. r is committed in both
+    systems beforehand.
+  - This removes SHA-256 from the 2PC (about 63k AND, ~2.1 MB) and from all three proofs.
+  - Cost: a two-stage commit in the zkbench statements, exporting MAC material from cu-2pc to cu-prover and
+    keeping it in the sidecar, new message flows on the proof channel, param changes in both clients, and a
+    new cross-system argument for review.
+  - That is weeks of work and new attack surface for ~9 % of the download. It is worth doing later together
+    with removing SHA-256 from the proofs, not as a bandwidth cut now.
+- *AES-based Davies–Meyer anchor* (one AES-128 per anchor, ~6.4k AND instead of ~21k). It saves ~1.45 MB.
+  It needs second-preimage resistance of DM with adversary-chosen AES-128 keys (ideal-cipher model), which is
+  a non-standard assumption for a binding anchor. Rejected.
+- *One compression over c_ap_1 ‖ s_ap_0* (a single anchor for π_C2S and π_C3S). It saves ~0.7 MB and changes
+  the witness of both proofs and both clients' params. Too little for the churn.
+
+## Verdict (PoC, before integration)
 
 It works. With N as the only garbler, a cold session moves **0.06–1.2 MB from the client** instead of 21 MB. On a
 2 Mbit/s home uplink the cold session drops from **85 s to 9.6 s**, and on 7 Mbit/s from 25 s to 8.4 s. The client

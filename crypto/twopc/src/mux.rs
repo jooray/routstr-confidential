@@ -9,6 +9,12 @@
 //!
 //! Byte counters cover everything written to / read from the real transport,
 //! frame headers included.
+//!
+//! Channels can be marked *bulk* (the garbled tables): their frames are sent
+//! only when no frame of a normal channel is waiting, and at most a few
+//! chunks of bulk data are queued inside the mux. Without this, the interactive
+//! OT extension rounds that run during preprocessing would wait behind
+//! megabytes of queued tables on every round trip.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,12 +31,16 @@ const MAX_MUX_FRAME: usize = 1 << 20;
 /// which the peer has not started reading yet never blocks other channels.
 const CHAN_BUF: usize = 64 << 20;
 const PUMP_CHUNK: usize = 64 * 1024;
+/// Bulk chunks queued inside the mux (the rest waits in the channel buffer).
+const BULK_QUEUE: usize = 2;
 
 /// Bytes on the real transport.
 #[derive(Debug, Default)]
 pub struct Counters {
     pub sent: AtomicU64,
     pub recv: AtomicU64,
+    /// Payload bytes received per channel.
+    pub(crate) ch_recv: Vec<AtomicU64>,
 }
 
 impl Counters {
@@ -39,6 +49,9 @@ impl Counters {
     }
     pub fn recv(&self) -> u64 {
         self.recv.load(Ordering::Relaxed)
+    }
+    pub(crate) fn ch_recv(&self, ch: usize) -> u64 {
+        self.ch_recv.get(ch).map_or(0, |c| c.load(Ordering::Relaxed))
     }
 }
 
@@ -52,13 +65,17 @@ pub(crate) struct Mux {
 impl Mux {
     /// Starts the mux tasks (requires a tokio runtime) and returns the local
     /// end of each of the `n` channels.
-    pub fn start<IO>(io: IO, n: usize) -> (Mux, Vec<DuplexStream>)
+    pub fn start<IO>(io: IO, n: usize, bulk: &[usize]) -> (Mux, Vec<DuplexStream>)
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let counters = Arc::new(Counters::default());
+        let counters = Arc::new(Counters {
+            ch_recv: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            ..Counters::default()
+        });
         let (mut rd, mut wr) = io.split();
         let (tx, mut rx) = mpsc::channel::<(u8, Vec<u8>)>(256);
+        let (tx_bulk, mut rx_bulk) = mpsc::channel::<(u8, Vec<u8>)>(BULK_QUEUE);
 
         let mut locals = Vec::with_capacity(n);
         let mut remotes_w = Vec::with_capacity(n);
@@ -68,7 +85,7 @@ impl Mux {
             let (mut rr, rw) = tokio::io::split(remote);
             remotes_w.push(rw);
             locals.push(local);
-            let tx = tx.clone();
+            let tx = if bulk.contains(&ch) { tx_bulk.clone() } else { tx.clone() };
             pumps.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; PUMP_CHUNK];
                 loop {
@@ -84,10 +101,26 @@ impl Mux {
             }));
         }
         drop(tx);
+        drop(tx_bulk);
 
         let c_w = counters.clone();
         let writer = tokio::spawn(async move {
-            while let Some((ch, data)) = rx.recv().await {
+            let (mut hi_open, mut lo_open) = (true, true);
+            loop {
+                // Normal frames first; bulk only when none is waiting.
+                let next = tokio::select! {
+                    biased;
+                    m = rx.recv(), if hi_open => match m {
+                        Some(m) => Some(m),
+                        None => { hi_open = false; None }
+                    },
+                    m = rx_bulk.recv(), if lo_open => match m {
+                        Some(m) => Some(m),
+                        None => { lo_open = false; None }
+                    },
+                    else => break,
+                };
+                let Some((ch, data)) = next else { continue };
                 let mut hdr = [0u8; 5];
                 hdr[0] = ch;
                 hdr[1..].copy_from_slice(&(data.len() as u32).to_be_bytes());
@@ -96,7 +129,7 @@ impl Mux {
                 }
                 c_w.sent.fetch_add(5 + data.len() as u64, Ordering::Relaxed);
                 // Coalesce: only flush when nothing else is queued.
-                if rx.is_empty() && wr.flush().await.is_err() {
+                if rx.is_empty() && rx_bulk.is_empty() && wr.flush().await.is_err() {
                     break;
                 }
             }
@@ -122,6 +155,7 @@ impl Mux {
                     break;
                 }
                 c_r.recv.fetch_add(5 + len as u64, Ordering::Relaxed);
+                c_r.ch_recv[ch].fetch_add(len as u64, Ordering::Relaxed);
                 if remotes_w[ch].write_all(&data).await.is_err() {
                     // Local side dropped; ignore data for it.
                     continue;
