@@ -530,20 +530,23 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     handle_setup(setup, &app, &shared, &to_client, &mut st)?;
 
     // v2: the 2PC preprocessing (tens of MB over the client's link) runs before
-    // the ClientHello exists. The provider closes an idle connection within
-    // seconds (Cloudflare: ~15 s with no ClientHello), so dial it only once the
-    // joint key share is ready. A ClientHello that races ahead is buffered.
+    // the ClientHello exists, and a pre-warmed session then waits for a request.
+    // The provider closes an idle connection within seconds (Cloudflare: ~15 s
+    // with no ClientHello), so dial it only when the client's ClientHello
+    // arrives, after the joint key share is ready.
     if st.v2 {
-        let wait = tokio::time::sleep(TWOPC_TIMEOUT);
-        tokio::pin!(wait);
-        loop {
+        let prep = tokio::time::sleep(TWOPC_TIMEOUT);
+        tokio::pin!(prep);
+        let armed = tokio::time::sleep(SESSION_TIMEOUT);
+        tokio::pin!(armed);
+        while st.joint.is_none() || client_pending.is_empty() {
             tokio::select! {
-                _ = &mut wait => bail!("2PC preprocessing did not finish within {}s", TWOPC_TIMEOUT.as_secs()),
+                _ = &mut prep, if st.joint.is_none() => bail!("2PC preprocessing did not finish within {}s", TWOPC_TIMEOUT.as_secs()),
+                _ = &mut armed => bail!("pre-warmed session unused for {}s", SESSION_TIMEOUT.as_secs()),
                 ev = evt_rx.recv() => match ev {
-                    Some(Ev::KeyShare(p)) => {
+                    Some(Ev::KeyShare(p)) if st.joint.is_none() => {
                         st.joint = Some(p);
                         side(&mut st, "2pc key share ready".into());
-                        break;
                     }
                     Some(Ev::ZkDone { proof, err, .. }) => bail!("{proof} failed before the handshake: {err:?}"),
                     Some(other) => bail!("unexpected event before the key share: {other:?}"),
@@ -554,7 +557,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         log.client_raw.extend_from_slice(&data);
                         client_pending.extend_from_slice(&data);
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => bail!("client left during 2PC preprocessing"),
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => bail!("client left before the handshake"),
                     Some(Ok(Message::Text(_))) => bail!("unexpected control message during 2PC preprocessing"),
                     _ => {}
                 },
@@ -1471,7 +1474,8 @@ async fn v2_progress(
     Ok(())
 }
 
-/// Lifetime of one session's 2PC (preprocessing through phase B).
+/// Limit on one session's 2PC preprocessing and key share (the session may
+/// then stay armed, waiting for a request, up to `SESSION_TIMEOUT`).
 const TWOPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// N's side of the two-party key schedule, driven by the session task.
@@ -1480,8 +1484,12 @@ where
     Io: futures::AsyncRead + futures::AsyncWrite + Send + Unpin + 'static,
 {
     let mut party = twopc::Party::new(twopc::Role::N, io).await?;
-    party.preprocess().await?;
-    let joint = party.key_share().await?;
+    let joint = tokio::time::timeout(TWOPC_TIMEOUT, async {
+        party.preprocess().await?;
+        party.key_share().await
+    })
+    .await
+    .map_err(|_| anyhow!("2PC preprocessing timed out"))??;
     let _ = evt.send(Ev::KeyShare(joint));
     let Some(TwoPcCmd::Handshake { server_share, th_sh }) = rx.recv().await else {
         bail!("session ended before the ServerHello");
@@ -1601,7 +1609,7 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
     if proof == "twopc" {
         let rx = shared.twopc_rx.lock().unwrap().take().ok_or_else(|| anyhow!("2PC not available for this session"))?;
         let (io, bridge) = ws_duplex(socket);
-        let result = tokio::time::timeout(TWOPC_TIMEOUT, run_twopc_n(io, rx, shared.evt.clone()))
+        let result = tokio::time::timeout(SESSION_TIMEOUT, run_twopc_n(io, rx, shared.evt.clone()))
             .await
             .unwrap_or_else(|_| Err(anyhow!("2PC timed out")));
         bridge.finish().await;
