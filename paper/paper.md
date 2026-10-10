@@ -1,7 +1,8 @@
 ---
 title: "Confidential and verifiable upstream inference over standard TLS 1.3"
 subtitle: "A no-trusted-hardware protocol for LLM routing nodes"
-author: "routstr-confidential project"
+author: '`Juraj Bednar \href{mailto:juraj@bednar.io}{<juraj@bednar.io>}\\[0.5em]\small Coauthors: Claude Opus 5.5, Claude Sonnet 5.5, Kimi K3,\\ \small DeepSeek V4.1 Flash, GPT-6 Astra, GLM-5.3 Flash`{=latex}'
+author-meta: "Juraj Bednar, with Claude Opus 5.5, Claude Sonnet 5.5, Kimi K3, DeepSeek V4.1 Flash, GPT-6 Astra, GLM-5.3 Flash"
 date: "2026-10-10"
 abstract: |
   LLM routing nodes forward user requests to upstream providers with the node's own API key, so users
