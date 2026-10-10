@@ -494,14 +494,29 @@ which can quote the request, stays private. For statuses the provider answers be
 unambiguous for the same reason as the usage event: a strict status line followed by well-formed
 `Name: value` header lines cannot come from model output, nor from chunk framing.
 
+**Pricing the node's work (optional).** A session costs N about 22 MB of upload and 0.5 s of CPU before U
+sees a byte, and a pre-warmed session (section 6) costs it before any request exists, so an unpriced armed
+session is a cheap way to make N work. N can therefore publish, in the same signed offer, a rate surcharge
+(already folded into the signed price list, so the check above is unchanged), a session fee $f_s$ and an
+abandon fee $f_a \ge f_s$. C accepts both fees by echoing them in its setup; N refuses a setup that does
+not, so a client that does not know about fees is never charged one. N reserves the amount above plus
+$\max(f_s, f_a)$. A completed session is charged the usage at the signed rates plus $f_s$ (capped at the
+reservation), and C's receipt check becomes $cost \le \lceil (r_{in} p + r_{out} o)/1000 \rceil + f_s$. A
+4xx/503 from U is charged $f_s$: the request reached U and N did the 2PC. A session that N's relay accepted
+but that ends without a complete request reaching U (armed and never used, aborted, C gone) is charged
+$f_a$ instead of nothing. N cannot tell a pre-warmed session from a cold one and does not need to. With
+the per-address limit on unused sessions this bounds what an idle or hostile client can make N do: each
+unused session costs its holder $f_a$. Both fees are 0 by default, and then the protocol is exactly as
+described above.
+
 ## 4.9 Aborts
 
 | Situation | Outcome |
 |---|---|
-| Any 2PC check fails, the ClientHello is rejected, or the handshake does not verify | session discarded before anything is written under $K_0$; reservation released |
-| Abort before N releases the final body record (including a failed $\pi_{C2S}$) | U never received a complete request; reservation released |
+| Any 2PC check fails, the ClientHello is rejected, or the handshake does not verify | session discarded before anything is written under $K_0$; reservation released (less the abandon fee $f_a$, if N charges one) |
+| Abort before N releases the final body record (including a failed $\pi_{C2S}$, or an armed session never used) | U never received a complete request; reservation released (less $f_a$) |
 | Usage disclosed | charged per section 4.8 |
-| U returned a 4xx or 503 (disclosed) | reservation released |
+| U returned a 4xx or 503 (disclosed) | reservation released (less the session fee $f_s$) |
 | Released, no usage disclosed (or another 5xx) | full reservation charged; C keeps its transcript and attestation |
 
 # 5. Security analysis

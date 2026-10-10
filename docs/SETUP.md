@@ -99,7 +99,7 @@ model and `max_tokens`, routstrd arms a session in the background (setup, reserv
 preprocessing; no connection to the provider yet), so the next matching request skips the preprocessing.
 It keeps one armed session while requests keep coming, two on bursts or overlapping requests, and closes
 them a few minutes after the last request: an idle routstrd keeps nothing open and nothing reserved. Each
-armed session reserves funds on your node credential until it is used or closed (released, no charge),
+armed session reserves funds on your node credential until it is used or closed (released, no charge unless the node has an abandon fee, below),
 and costs about 22 MB of download and 1.2 MB of upload to prepare. Tune or disable it in `config.json`:
 
 ```json
@@ -107,6 +107,19 @@ and costs about 22 MB of download and 1.2 MB of upload to prepare. Tune or disab
   "prewarm": { "enabled": true, "activityWindowMinutes": 10, "maxPerKey": 2, "maxTotal": 2, "maxAgeSeconds": 480 }
 }
 ```
+
+**What you pay.** A confidential request costs the provider's usage at the rates in the node's signed
+offer, as a normal request does. A node may also charge for its own work (section 2): a percentage
+surcharge, already included in the offer's rates; a **session fee** added to each completed request
+(`session_fee_msat`); and an **abandon fee** (`abandon_fee_msat`, at least the session fee) for a session
+that is set up and then ends without a request reaching the provider, for example a pre-warmed session that
+is never used. The client accepts both fees from the signed offer, checks every receipt against usage × the
+signed rates + the session fee (a provider refusal, 4xx/503, may cost the session fee only), and sizes its
+deposit to include the larger fee, which the node reserves. With an abandon fee, an armed session that is
+never used costs you that fee, so routstrd arms at most **one** session for such a node, and none if the
+abandon fee is above `prewarm.maxSessionFeeMsat` (default 5000 msat = 5 sat; `0` never pre-warms a node
+that charges one). Abandon fees paid for unused armed sessions are logged (`[confidential-prewarm] …
+abandon fee … paid`). Most nodes charge no fees; then nothing changes.
 
 Nodes refuse more than 3 unused sessions per client address by default (see section 2), so keep
 `maxTotal` at 2 or lower; a client behind a shared address (NAT, Tor) shares that limit with others.
@@ -168,6 +181,27 @@ only as good as the node's idea of the client address, which depends on how the 
 
 Only peers in `CONFIDENTIAL_TRUSTED_PROXIES` (default `127.0.0.1,::1`) can name the client by header; for
 any other peer the header is ignored, so a client cannot choose its own address.
+
+**Surcharge and session fees (optional).** Each session costs the node about 22 MB of upload and 0.5 s of
+CPU (below), and a pre-warmed session costs it before any request exists. Three settings, all off (0) by
+default, let the node charge for that:
+
+| Setting | Effect |
+|---|---|
+| `CONFIDENTIAL_RATE_SURCHARGE_PCT` | percentage added to the per-token rates of confidential sessions (the signed offer lists the surcharged rates) |
+| `CONFIDENTIAL_SESSION_FEE_MSAT` | flat fee added to every completed request; also charged when the provider refuses the request (4xx/503), since it reached the provider |
+| `CONFIDENTIAL_ABANDON_FEE_MSAT` | charged instead when a session the sidecar accepted ends without a request reaching the provider (armed but never used, aborted, client gone); at least the session fee, and equal to it when unset. Reserved at setup |
+
+The abandon fee is the anti-DoS mechanism: together with the per-address limit above, every unused session
+now costs its holder money, while a session that is used costs only the session fee. For example, with an
+abandon fee of 10 sat and a session fee of 2 sat, a pre-warmed session that is used costs usage + 2 sat and
+one that is never used costs 10 sat. All values go into the signed offer (and the model listing), so clients
+see them before they pay. A client must accept the fees in its setup; older clients that do not are refused
+(HTTP 409 `session_fee_not_accepted`) rather than charged fees they do not check. Like the other settings,
+they are persisted in the node's database after the first start (change them with
+`PATCH /admin/api/settings`). Size the abandon fee to what one session's ~22 MB of egress and CPU cost the
+node; the session fee and the surcharge price the work of a request that is used. See
+`routstr-core/docs/confidential-upstream.md` for the exact rules.
 
 `--protocol 2` selects the two-party handshake (`1` is the single-party variant). Limits: `--max-sessions`
 (32) and `--max-body` (8 MiB); sessions time out after 600 s.

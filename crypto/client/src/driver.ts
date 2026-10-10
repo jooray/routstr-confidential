@@ -73,6 +73,11 @@ const ADV_OWN_SHARE = argv.includes('--adv-own-keyshare')
 // the offer; `--v2` forces it (direct sidecar mode).
 let PROTO = argv.includes('--v2') ? 2 : 1
 const ARM = argv.includes('--arm')
+// Arm one session (setup, 2PC preprocessing, proof channel) and close it
+// unused: with an abandon fee, the node charges exactly that fee.
+const ABANDON = argv.includes('--abandon')
+// Behave like a client that does not know about session fees (no echo).
+const NO_ACCEPT_FEE = argv.includes('--no-accept-fee')
 // π_C2 and π_C3 both run in one session. Serial (default) waits for π_C2 before
 // starting π_C3; `--parallel-proofs` lets them overlap, for the stall study.
 const SERIAL_PROOFS = !argv.includes('--parallel-proofs')
@@ -98,6 +103,10 @@ let OFFER_PUBKEY: string | undefined
 let OFFER: any = null
 // The signature of the offer we verified: the node settles at its rates.
 let OFFER_SIG: string | undefined
+/** The signed offer's fee on a completed request (msats); 0 when none. */
+let SESSION_FEE = 0
+/** The signed offer's fee for a session that ends unused (msats, ≥ SESSION_FEE). */
+let ABANDON_FEE = 0
 
 // ---------------------------------------------------------------------------
 // Minimal message bus
@@ -359,6 +368,10 @@ class Session {
       }
       setup.auth = this.token ?? ''
       if (OFFER_SIG) setup.offer_sig = OFFER_SIG
+      // Accept the signed offer's fees (the node refuses a setup that does
+      // not echo them).
+      if (SESSION_FEE > 0 && !NO_ACCEPT_FEE) setup.session_fee_msat = SESSION_FEE
+      if (ABANDON_FEE > 0 && !NO_ACCEPT_FEE) setup.abandon_fee_msat = ABANDON_FEE
       this.sendText(setup)
     } else {
       this.sendText({
@@ -756,10 +769,15 @@ class Session {
       }
     }
 
+    // A receipt may never name a larger session fee than the signed offer.
+    if ((receipt.session_fee_msat ?? 0) > SESSION_FEE || (receipt.abandon_fee_msat ?? 0) > ABANDON_FEE) {
+      throw new Error('receipt names larger fees than the signed offer')
+    }
     if (upstreamStatus >= 400) {
+      // A provider refusal (4xx/503) costs at most the session fee.
       const unbilled = upstreamStatus === 503 || upstreamStatus < 500
       const errOk =
-        receipt.usage?.error_status === upstreamStatus && (!unbilled || (receipt.cost_msats ?? 0) === 0)
+        receipt.usage?.error_status === upstreamStatus && (!unbilled || (receipt.cost_msats ?? 0) <= SESSION_FEE)
       console.log(
         `[client ${this.label}] error receipt: status=${upstreamStatus} cost_msats=${receipt.cost_msats} ok=${errOk} signature_ok=${okSig}`,
       )
@@ -775,22 +793,25 @@ class Session {
       receipt.usage?.usage?.prompt_tokens === ownUsage.usage?.prompt_tokens &&
       receipt.usage?.usage?.completion_tokens === ownUsage.usage?.completion_tokens &&
       receipt.model === ownUsage.model
-    // The node may charge less than the signed rates (cached input), never more.
+    // The node may charge less than the signed rates (cached input), never
+    // more; the rates include any surcharge, the session fee comes on top.
     const rates = OFFER?.price_list?.[MODEL]
     const maxCost = rates
       ? Math.ceil(
           (rates.in * (ownUsage.usage?.prompt_tokens ?? 0) +
             rates.out * (ownUsage.usage?.completion_tokens ?? 0)) / 1000,
-        )
+        ) + SESSION_FEE
       : Infinity
     const costOk = (receipt.cost_msats ?? 0) <= maxCost
     console.log(
       `[client ${this.label}] receipt: model=${receipt.model} cost_msats=${receipt.cost_msats} ` +
         `reserved_msats=${receipt.reserved_msats} balance_msats=${receipt.balance_msats} ` +
+        `session_fee_msat=${receipt.session_fee_msat ?? 0} abandon_fee_msat=${receipt.abandon_fee_msat ?? 0} ` +
+        `rate_surcharge_pct=${receipt.rate_surcharge_pct ?? 0} ` +
         `usage_match=${usageMatch} cost_ok=${costOk} signature_ok=${okSig}`,
     )
     if (!usageMatch) throw new Error('receipt usage does not match our own plaintext')
-    if (!costOk) throw new Error(`receipt cost exceeds the usage at the signed rates (${maxCost} msats)`)
+    if (!costOk) throw new Error(`receipt cost exceeds the usage at the signed rates + session fee (${maxCost} msats)`)
 
     const modelMatch = [...text.matchAll(/"model":"([^"]+)"/g)].map((m) => m[1])
     const effective = modelMatch[modelMatch.length - 1]
@@ -1049,6 +1070,16 @@ async function verifyOffer(): Promise<void> {
     OFFER = parsed
     if (parsed.v === 2) PROTO = 2
     OFFER_SIG = offer.sig
+    for (const k of ['session_fee_msat', 'abandon_fee_msat']) {
+      const v = parsed[k]
+      if (v !== undefined && !(Number.isSafeInteger(v) && v >= 0)) throw new Error(`offer ${k} is malformed`)
+    }
+    SESSION_FEE = parsed.session_fee_msat ?? 0
+    ABANDON_FEE = Math.max(parsed.abandon_fee_msat ?? 0, SESSION_FEE)
+    console.log(
+      `[client] offer session_fee_msat=${SESSION_FEE} abandon_fee_msat=${ABANDON_FEE} ` +
+        `rate_surcharge_pct=${parsed.rate_surcharge_pct ?? 0}`,
+    )
   } catch (e) {
     console.error('[client] offer verification failed:', e)
     process.exit(4)
@@ -1061,6 +1092,16 @@ async function verifyOffer(): Promise<void> {
 
 async function main() {
   await verifyOffer()
+
+  if (ABANDON) {
+    const s = new Session('abandon', ESCROW_TOKENS[0])
+    await s.connect()
+    await s.arm()
+    await s.prepareProofs()
+    console.log(`ABANDONED sid=${s.sid} (armed, closed unused; abandon fee ${ABANDON_FEE} msats)`)
+    s.close()
+    process.exit(0)
+  }
 
   if (ARM || POOL > 0) {
     const n = Math.max(1, POOL || 1)
