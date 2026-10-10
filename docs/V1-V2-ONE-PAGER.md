@@ -19,7 +19,7 @@ node's traffic. The price is bandwidth: about 21 MB each way per request, sent b
 | Model / token cap / billing | pinned by proofs, provider-reported usage | same |
 | Who holds which TLS secret | client: all of them | client: handshake, response and body keys; node: handshake keys and the one key for its own record; nobody: the master secret |
 | Key exchange | X25519 | P-256 (the joint key share needs a full curve point) |
-| Data per request, client to node | about 6 MB | about 46 MB (42 MB 2PC tables, 4 MB proofs) |
+| Data per request, client and node (both directions) | about 6 MB | about 46 MB (42 MB 2PC tables, 4 MB proofs) |
 | Node upload per request | about 3 MB | about 23 MB (100 requests/min about 0.3 Gbit/s) |
 | New cryptography in the trust base | ZK proofs | ZK proofs **and** a 2PC (dual execution, share conversion), not yet externally reviewed |
 
