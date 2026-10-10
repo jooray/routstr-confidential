@@ -183,6 +183,25 @@ struct AppState {
 const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Hard limit on one session's lifetime (handshake to settlement).
 const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// Largest TLS 1.3 record on the wire: header + 2^14 plaintext + 256 expansion.
+const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
+
+/// Most client bytes a v2 session buffers before relaying them (during the 2PC
+/// preprocessing and until the credential record is written): the ClientHello,
+/// CCS and Finished, then a body of `body_len` bytes in full-size records with
+/// the suffix in its own record. Anything beyond is not an honest client.
+fn client_buffer_cap(body_len: usize) -> usize {
+    body_len + body_len / 256 + 4 * MAX_TLS_RECORD
+}
+
+/// Append client bytes to a pre-relay buffer, failing once it exceeds the cap.
+fn buffer_client(buf: &mut Vec<u8>, data: &[u8], body_len: usize) -> Result<()> {
+    if buf.len() + data.len() > client_buffer_cap(body_len) {
+        bail!("client sent more than {} bytes before they could be relayed", client_buffer_cap(body_len));
+    }
+    buf.extend_from_slice(data);
+    Ok(())
+}
 
 #[derive(Debug)]
 enum Ev {
@@ -567,8 +586,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 },
                 msg = ws_rx.next() => match msg {
                     Some(Ok(Message::Binary(data))) => {
+                        buffer_client(&mut client_pending, &data, st.body_len)?;
                         log.client_raw.extend_from_slice(&data);
-                        client_pending.extend_from_slice(&data);
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => bail!("client left before the handshake"),
                     Some(Ok(Message::Text(_))) => bail!("unexpected control message during 2PC preprocessing"),
@@ -631,10 +650,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         log.client_raw.extend_from_slice(&data);
                         match st.state {
                             SessionState::Handshake => {
-                                client_pending.extend_from_slice(&data);
+                                buffer_client(&mut client_pending, &data, st.body_len)?;
                                 v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
                             }
-                            SessionState::AwaitHead => st.held_client.extend_from_slice(&data),
+                            SessionState::AwaitHead => buffer_client(&mut st.held_client, &data, st.body_len)?,
                             SessionState::Body => {
                                 client_pending.extend_from_slice(&data);
                                 relay_body(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
@@ -1933,5 +1952,40 @@ mod offer_tests {
     fn shipped_offer_parses() {
         let o: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
         assert!(o.model_allowlist.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use super::{buffer_client, client_buffer_cap, MAX_TLS_RECORD};
+
+    #[test]
+    fn honest_body_fits_and_excess_is_refused() {
+        let body_len = 8 << 20;
+        // The body in full-size records (+22 bytes each), the suffix record,
+        // ClientHello, CCS and Finished.
+        let records = body_len / (1 << 14) + 1;
+        let honest = body_len + records * 22 + 3 * MAX_TLS_RECORD;
+        assert!(honest <= client_buffer_cap(body_len));
+
+        let mut buf = Vec::new();
+        let chunk = vec![0u8; 64 * 1024];
+        while buf.len() + chunk.len() <= client_buffer_cap(body_len) {
+            buffer_client(&mut buf, &chunk, body_len).unwrap();
+        }
+        let before = buf.len();
+        assert!(buffer_client(&mut buf, &chunk, body_len).is_err());
+        assert_eq!(buf.len(), before, "a refused chunk is not buffered");
+        // A small body caps the buffer near its size, not at the global limit.
+        assert!(client_buffer_cap(100) < 5 * MAX_TLS_RECORD);
+    }
+}
+
+#[cfg(test)]
+mod suffix_tests {
+    #[test]
+    fn proof_fixtures_use_the_production_suffix() {
+        let s = super::canonical_suffix("mistral-small-3-2-24b-instruct", 12);
+        assert_eq!(s.as_bytes(), zkbench::fixtures::SUFFIX);
     }
 }
