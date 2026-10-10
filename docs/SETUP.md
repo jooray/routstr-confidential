@@ -117,7 +117,7 @@ is never used. The client accepts both fees from the signed offer, checks every 
 signed rates + the session fee (a provider refusal, 4xx/503, may cost the session fee only), and sizes its
 deposit to include the larger fee, which the node reserves. With an abandon fee, an armed session that is
 never used costs you that fee, so routstrd arms at most **one** session for such a node, and none if the
-abandon fee is above `prewarm.maxSessionFeeMsat` (default 20000 msat = 20 sat; `0` never pre-warms a node
+abandon fee is above `prewarm.maxSessionFeeMsat` (default 5000 msat = 5 sat; `0` never pre-warms a node
 that charges one). Abandon fees paid for unused armed sessions are logged (`[confidential-prewarm] …
 abandon fee … paid`). Most nodes charge no fees; then nothing changes.
 
