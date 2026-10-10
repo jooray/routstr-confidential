@@ -677,6 +677,11 @@ class Session {
     const attOk = verifySig(attJson, attMsg.sig, this.ready.pubkey, attMsg.sig_scheme)
     this.log({ ev: 'attestation', sig_ok: attOk })
     if (!attOk) throw new Error('attestation signature invalid')
+    // The signed attestation must name this session and the handshake we did.
+    const a = JSON.parse(attJson)
+    if (a?.sid !== this.sid || a.th_sh !== hex(this.thSH) || a.th_sf !== hex(this.thSF)) {
+      throw new Error('attestation names another session or handshake')
+    }
 
     await settleFlush(this)
     // Serial mode (default): finish π_C2 before starting π_C3. The node refuses
