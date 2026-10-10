@@ -583,7 +583,9 @@ phase A's compressions are on the path to $c_{hs}$ and $s_{hs}$.
 | Phase B / its check | 26 ms / 7 ms | ≈24 kB each way |
 
 Online, the whole 2PC moves about 45 kB in each direction. Preprocessing is bandwidth-bound: at 50 ms
-RTT it takes 1.8 s at 100 Mbit/s and 8.6 s at 20 Mbit/s. The online steps take about 0.45 s at 50 ms RTT
+RTT it takes 1.8 s at 100 Mbit/s and 8.6 s at 20 Mbit/s. Measured against a deployed node from a home
+connection, it took 24.6 s; the rest of that session (online 2PC about 0.5 s, proofs about 3 s) was small by
+comparison, so on consumer uplinks pre-warming is what makes v2 usable. The online steps take about 0.45 s at 50 ms RTT
 (3.5 round trips plus about 30 ms of computation after the ServerHello, 2 round trips after the server
 Finished).
 

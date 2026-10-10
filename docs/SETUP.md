@@ -82,9 +82,11 @@ refused: it is never silently sent in the clear. Only `POST /v1/chat/completions
 is required (it is pinned and reserved for), and only models the node lists in its confidential offer are
 used (`GET https://<node>/v1/confidential/offer`).
 
-What to expect: each request first runs a two-party computation with the node (about 21 MB in each
-direction, under a second on a fast connection, several seconds on a slow uplink), then the TLS session and
-proofs. The answer streams as usual. The node's signed receipt is checked against the usage the provider
+What to expect: each request first runs a two-party computation with the node, which moves about 21 MB in
+each direction. That takes about 2 s on a fast symmetric link, but it is bound by your upload speed: from a
+typical home connection it took about 25 s, so a cold request currently waits roughly half a minute for its
+first token. The TLS session and proofs then add a few seconds. (This work can be done before a request
+exists; routstrd does not pre-warm sessions yet.) The answer streams as usual. The node's signed receipt is checked against the usage the provider
 reported; a failed check fails the request.
 
 ## 2. Running a node
@@ -134,7 +136,11 @@ routstr-core persists settings in its database: if the node has run before, set 
 `PATCH /admin/api/settings` as well. The node then serves `GET /v1/confidential/offer` (signed with its Nostr
 key) and marks the offered models in `/v1/models` with `confidential_upstream`. Its reverse proxy must pass
 WebSockets for `/v1/confidential/ws` and `/v1/confidential/zk` (`Upgrade`/`Connection` headers, read timeout
-of a few minutes).
+of a few minutes). Run the node's server with a long WebSocket ping timeout, e.g.
+`uvicorn routstr:fastapi_app --host 0.0.0.0 --port 8000 --proxy-headers --ws-ping-interval 20
+--ws-ping-timeout 300` instead of the image's default `fastapi run routstr`: while a client uploads its
+~21 MB of 2PC data, its keepalive reply waits behind it, and the default 20 s timeout drops the session on any
+slower uplink.
 
 **3. Check it.**
 
