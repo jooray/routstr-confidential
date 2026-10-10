@@ -193,8 +193,10 @@ settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
     dominates on home links); node-only garbling would turn it into a download.
   - Pre-warming (SDK `client/confidential/prewarm.ts`, routstrd
     `confidentialUpstream.prewarm`) arms v2 sessions up to the joint key share
-    only while there is traffic; the ZK proofs' OT/VOLE setup is not yet
-    pre-warmed (it dominates a warm request over a WAN).
+    only while there is traffic, plus one pre-warmed proof channel per
+    session (`/zk?proof=zkchan`, `cu-prover --channel`,
+    `zkbench/src/channel.rs`) holding the OT/VOLE correlations for π_NK,
+    π_C2S and π_C3S; per-proof `/zk?proof=pi_*` is the fallback.
   - The SDK release (version bump) and routstrd's `@routstr/sdk` bump are
     the maintainers' step.
   - The sidecar and prover are not yet in any upstream repo.

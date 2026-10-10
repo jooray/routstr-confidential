@@ -641,11 +641,20 @@ before the node's session limit, and closes them a few minutes after the last re
 holds nothing. (The reference client's `--arm` mode, used for the local benchmarks, arms further,
 through the handshake and $\pi_{NK}$.)
 
-Measured against a deployed node from a home connection: a cold request reached its first token after
-35 s, almost all of it the client uploading its half of the preprocessing; a claimed armed session after
-about 12 s: handshake and online 2PC 1.3 s, $\pi_{NK}$ 5.4 s, $\pi_{C2S}$ 3.0 s, the provider 2.2 s.
-The two proofs dominate, and most of their time is their own OT/VOLE setup, which is also independent of
-the request and can be moved into the armed session as well.
+The proofs' own setup is pre-warmed too. Each proof needs OT/VOLE correlations (Chou-Orlandi base OT,
+KOS, Ferret), and generating them per proof costs about twelve round trips and up to 1.5 MB, which over a
+home uplink took 5.4 s for $\pi_{NK}$ and 3.0 s for $\pi_{C2S}$. These correlations are independent of the
+request, so an armed session also opens one proof channel and generates, during arming, the correlations
+for both directions (N proves $\pi_{NK}$, C proves $\pi_{C2S}$ and $\pi_{C3S}$), with a fresh $\Delta$
+per session; each correlation is used once, a failed proof closes the channel, and a session without a
+channel falls back to one connection per proof.
+
+Measured against a deployed node from a home connection (about 2-7 Mbit/s up): a cold request reached its
+first token after about 35 s, almost all of it the client uploading its half of the 2PC preprocessing.
+With an armed session, $\pi_{NK}$ took 0.21-0.25 s, $\pi_{C2S}$ 0.04 s and $\pi_{C3S}$ 0.06 s over the
+channel, claim to body took about 1.0 s (handshake and both online 2PC phases), and the first token came
+after 2.0-3.2 s, most of it the provider's own latency. Arming took about 55 s on that uplink, in the
+background.
 
 ## 6.4 Over a network and bandwidth
 
@@ -798,6 +807,13 @@ on a live node.
 prompt in the clear, and users verify attestations. This is fast and streams, and it works with any
 provider. It rests on the hardware vendor and on the measured code, and the guarantee is only as good as
 the user's review of every software version the enclave runs (section 1).
+
+The two approaches compose. Our protocol removes the need to trust the reseller in the middle, while C
+remains the TLS endpoint of the provider. If the provider itself serves inference from an enclave and
+binds its TLS key or an encryption key to an attestation (attested or end-to-end-encrypted inference
+offered by some providers), C can verify that attestation end to end through N, which only relays sealed
+records. The user then gets math-based guarantees about the node and the provider's attestation about the
+provider, without having to review the node's software.
 
 | | This work (v2) | v1 variant | MPC-TLS | Proxy zkTLS | TEE |
 |---|---|---|---|---|---|

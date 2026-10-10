@@ -107,8 +107,9 @@ and costs about 21 MB each way to prepare. Tune or disable it in `config.json`:
 A request uses an armed session only if its model and `max_tokens` match exactly (they are pinned at
 setup) and its body fits the armed length; otherwise it runs cold. Responses carry
 `x-routstr-confidential-prewarmed: 1` when they used one. Measured from a home connection: about 35 s to
-the first token cold, about 12 s warm (most of the remaining time is the two proofs, whose setup is the
-next thing to move into the armed session).
+the first token cold, about 2-3 s warm (the armed session also pre-generates the setup of the
+zero-knowledge proofs, so they take well under a second; most of a warm request is the provider's own
+latency). Arming itself takes about a minute on a slow uplink, in the background.
 
 ## 2. Running a node
 

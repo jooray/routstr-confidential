@@ -41,7 +41,9 @@ C sends nothing in epoch 0. There is no π_C1 and no KU0/KU1 from C.
 1. **Setup** as v1 (credential, offer_sig, reservation). `ready` carries `v: 2`.
 2. **Preprocessing** (before ClientHello; in pre-warm, off the request path): OT setup, both garbled circuits
    for both phases generated and transferred (dual execution). A pre-warmed session stops after step 3 and
-   waits for a request; N opens the connection to U only when the ClientHello arrives.
+   waits for a request; N opens the connection to U only when the ClientHello arrives. In parallel, one proof
+   channel per session (`zkchan`) generates the OT/VOLE correlations for π_NK, π_C2S and π_C3S, so the proofs
+   on the request path need only a few round trips.
 3. **Joint key share (P-256 only).** C commits to `P_C = a_C·G` (SHA-256 of the SEC1 point + 32-byte nonce),
    N sends `P_N = a_N·G`, C opens. Both compute `P = P_C + P_N`. (Commit-first prevents a rogue-key choice
    `P_C = T − P_N`.) Fresh scalars per session.
