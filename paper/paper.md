@@ -622,7 +622,7 @@ salt are fresh per session.
    to U, bound concurrent sessions (32), the time to setup (15 s), the session lifetime (600 s), the 2PC
    (180 s) and the body (8 MiB). The 2PC's preprocessing makes a session expensive for N (about 22 MB of
    upload and 0.5 s of CPU each), which a reservation per session limits, but per-client limits must also
-   bound it; the node refuses new sessions from a client address with three unused ones.
+   bound it; the node refuses new sessions from a client address with twelve unused ones.
 7. *Error metadata.* On an upstream error N learns the status line, the response headers and the body
    length, but not the body.
 8. *Endpoint hygiene.* Keys live in C's process; N holds the API key in memory. C's certificate
@@ -991,7 +991,8 @@ being used. We therefore layer several limits, from free and always on to priced
    abandoned session costs its holder $f_a$. C must echo the fees it accepts, so a client that does not
    know about them is refused rather than charged.
 5. **Client-side restraint.** The client daemon arms sessions only while it sees confidential traffic,
-   keeps at most one armed session for a node that charges an abandon fee, arms only if that fee is
+   keeps a bounded number of armed sessions for a node that charges an abandon fee (six by default, sized
+   for parallel coding agents), arms only if that fee is
    below a configured limit (5 sats by default), and closes armed sessions after a few idle minutes; it
    logs every abandon fee it pays.
 
@@ -999,8 +1000,10 @@ being used. We therefore layer several limits, from free and always on to priced
 abandon fee of 2 sats. A typical confidential chat on its cheapest models costs 0.1 to 1 sat of inference
 (25 msat for a short exchange in our test), so the fee would dominate the price of a completed request if
 it were charged there; instead only waste is priced. A paying user pays exactly the inference; an idle
-pre-warmed session costs 2 sats; and a client opening sessions it does not use is limited to three at a
-time per address, each costing 2 sats. We measured both cases on the live node: a completed request was
+pre-warmed session costs 2 sats; and a client opening sessions it does not use is limited to twelve at a
+time per address, each costing 2 sats. (The limit was three at first; parallel coding agents, whose
+subagents each open a session per turn, ran into it, and every session is already backed by a funded
+worst-case reservation, so money rather than the count is the main brake.) We measured both cases on the live node: a completed request was
 charged 25 msat, an abandoned session 2000 msat. Separately, each request reserves the model's
 worst-case prompt for its duration (about 157 sats for a model with a 1M-token context at these rates)
 and releases what it does not use, so a credential needs that much balance to start a session even

@@ -104,7 +104,7 @@ and costs about 22 MB of download and 1.2 MB of upload to prepare. Tune or disab
 
 ```json
 "confidentialUpstream": {
-  "prewarm": { "enabled": true, "activityWindowMinutes": 10, "maxPerKey": 2, "maxTotal": 2, "maxAgeSeconds": 480 }
+  "prewarm": { "enabled": true, "activityWindowMinutes": 10, "maxPerKey": 6, "maxTotal": 6, "maxArmedWithFee": 6, "maxAgeSeconds": 480 }
 }
 ```
 
@@ -116,13 +116,15 @@ that is set up and then ends without a request reaching the provider, for exampl
 is never used. The client accepts both fees from the signed offer, checks every receipt against usage × the
 signed rates + the session fee (a provider refusal, 4xx/503, may cost the session fee only), and sizes its
 deposit to include the larger fee, which the node reserves. With an abandon fee, an armed session that is
-never used costs you that fee, so routstrd arms at most **one** session for such a node, and none if the
+never used costs you that fee, so routstrd arms at most `prewarm.maxArmedWithFee` (default 6) sessions for
+such a node, and none if the
 abandon fee is above `prewarm.maxSessionFeeMsat` (default 5000 msat = 5 sat; `0` never pre-warms a node
 that charges one). Abandon fees paid for unused armed sessions are logged (`[confidential-prewarm] …
 abandon fee … paid`). Most nodes charge no fees; then nothing changes.
 
-Nodes refuse more than 3 unused sessions per client address by default (see section 2), so keep
-`maxTotal` at 2 or lower; a client behind a shared address (NAT, Tor) shares that limit with others.
+Nodes refuse more than 12 unused sessions per client address by default (see section 2), so keep
+`maxTotal` well below that (6 by default); a client behind a shared address (NAT, Tor) shares that limit
+with others.
 A request uses an armed session only if its model and `max_tokens` match exactly (they are pinned at
 setup) and its body fits the armed length; otherwise it runs cold. Responses carry
 `x-routstr-confidential-prewarmed: 1` when they used one. A pre-warmed request reaches its first token in
@@ -174,7 +176,7 @@ podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=...
 ```
 
 **Denial-of-service limit.** The node refuses a new confidential session (HTTP 429, WebSocket close
-1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 3, 0 disables)
+1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
 unused sessions: set up but with no credential record written yet. Pre-warmed sessions count. The limit is
 only as good as the node's idea of the client address, which depends on how the node is reached:
 
