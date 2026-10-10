@@ -1,0 +1,27 @@
+# cu-sidecar: the node's side of confidential mode, as a container.
+#
+#   podman build -f crypto/Containerfile.sidecar -t cu-sidecar crypto
+#
+# Run it next to the routstr node (same container network, no published
+# port), with the provider key in the environment:
+#
+#   podman run -d --name cu-sidecar -e UPSTREAM_API_KEY=... cu-sidecar \
+#     --listen 0.0.0.0:7444 --upstream api.venice.ai:443 --key-env UPSTREAM_API_KEY \
+#     --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
+#
+# and point the node at it: CONFIDENTIAL_SIDECAR_URL=http://cu-sidecar:7444
+FROM docker.io/library/rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake clang \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p cu-sidecar \
+    && cp zkbench/target/release/cu-sidecar /cu-sidecar
+
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* && mkdir -p /etc/cu-sidecar /runs && chown 65534:65534 /runs
+COPY --from=build /cu-sidecar /usr/local/bin/cu-sidecar
+COPY relay/offer.venice.json /etc/cu-sidecar/offer.json
+USER 65534:65534
+ENTRYPOINT ["/usr/local/bin/cu-sidecar"]

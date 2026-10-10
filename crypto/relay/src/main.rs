@@ -91,10 +91,18 @@ fn default_max_tokens_cap() -> u64 {
     4096
 }
 
-fn default_head_template_for(host: &str) -> String {
+fn default_head_template_for(host: &str, key_len: usize) -> String {
     format!(
-        "POST /api/v1/chat/completions HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {{KEY:42}}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {{LEN}}\r\n\r\n"
+        "POST /api/v1/chat/completions HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {{KEY:{key_len}}}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {{LEN}}\r\n\r\n"
     )
+}
+
+/// Point the template's `{KEY:N}` token at the loaded key's real length.
+fn with_key_length(template: &str, key_len: usize) -> String {
+    match (template.find("{KEY:"), template.find("{KEY:").and_then(|i| template[i..].find('}').map(|j| i + j))) {
+        (Some(start), Some(end)) => format!("{}{{KEY:{key_len}}}{}", &template[..start], &template[end + 1..]),
+        _ => template.to_string(),
+    }
 }
 
 /// Strip the port (if any) from an `host:port` upstream spec.
@@ -264,8 +272,14 @@ async fn main() -> Result<()> {
 
     let raw_key = std::env::var(&key_env).with_context(|| format!("{key_env} is not set"))?;
     let key = Zeroizing::new(raw_key.into_bytes());
-    if key.len() != 42 {
-        bail!("unexpected key length {} (expected 42)", key.len());
+    // The key length is a proof parameter (the head template's `{KEY:L}`), and
+    // π_N/π_NK prove membership in one fixed alphabet; a key outside either
+    // cannot be proven, so refuse to start (never printing the key).
+    if !(16..=256).contains(&key.len()) {
+        bail!("unexpected key length {} (expected 16..=256)", key.len());
+    }
+    if !key.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-') {
+        bail!("the upstream key has characters outside [A-Za-z0-9_-]; π_N cannot prove it");
     }
     info!(key_len = key.len(), "loaded upstream API key");
 
@@ -283,9 +297,9 @@ async fn main() -> Result<()> {
             price_list: serde_json::json!({
                 "mistral-small-3-2-24b-instruct": {"in": 0.0, "cached_in": 0.0, "out": 0.0}
             }),
-            head_template: default_head_template_for(&host),
+            head_template: default_head_template_for(&host, key.len()),
             key_alphabet: default_key_alphabet(),
-            key_length: 42,
+            key_length: key.len(),
             suffix_keys: vec![
                 "model".into(),
                 "max_tokens".into(),
@@ -313,8 +327,9 @@ async fn main() -> Result<()> {
         offer.upstream_host = host.clone();
     }
     if offer.head_template.is_empty() {
-        offer.head_template = default_head_template_for(&offer.upstream_host);
+        offer.head_template = default_head_template_for(&offer.upstream_host, key.len());
     }
+    offer.head_template = with_key_length(&offer.head_template, key.len());
     if offer.suffix_keys.is_empty() {
         offer.suffix_keys = vec![
             "model".into(),

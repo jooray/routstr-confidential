@@ -1,0 +1,5 @@
+zkbench/target
+client/node_modules
+client/vendor
+runs
+**/.git
