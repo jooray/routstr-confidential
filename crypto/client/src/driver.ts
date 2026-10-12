@@ -382,8 +382,6 @@ class Session {
         len: body.length,
         armed: ARM,
       }
-      // v2: the suffix proof also pins the final record's content type.
-      if (PROTO === 2) setup.suffix_type = true
       setup.auth = this.token ?? ''
       if (OFFER_SIG) setup.offer_sig = OFFER_SIG
       // Accept the signed offer's fees (the node refuses a setup that does

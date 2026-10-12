@@ -423,8 +423,7 @@ is billed. A client therefore cannot run a different model or a larger cap than 
   offsets, the suffix;
 - *statement*: $\mathrm{SHA256}(c_{ap,1}) = h_1$; derive $K_1$, $IV_1$; CTR-decrypt the window; its end
   equals the suffix followed by the record's inner content type (`0x17`, application data). The verifier
-  decodes one bit. (Older clients prove the suffix alone, which N's length accounting makes equally
-  sound; see P3 in section 5.)
+  decodes one bit.
 
 Because the anchor is a hash of the secret that the 2PC itself output to both parties, the statement
 does not recompute the key schedule: it costs 7 SHA-256 compressions and 15 AES blocks for the 230-byte

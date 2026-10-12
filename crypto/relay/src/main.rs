@@ -528,11 +528,6 @@ enum ClientMsg {
         /// escrow (or account reservation) is supplied by the later `claim`.
         #[serde(default)]
         armed: bool,
-        /// The client proves the suffix *and* the record's inner content type
-        /// (0x17) in π_C2S. Older clients omit it and prove the suffix only,
-        /// which is equally sound through the body-length accounting.
-        #[serde(default)]
-        suffix_type: bool,
     },
     HsSecrets {
         /// The handshake secret itself. Only accepted in the loopback
@@ -1035,8 +1030,6 @@ struct Session {
     /// The record completing the body, withheld from the upstream until π_C2.
     held: Option<Vec<u8>>,
     sent: Vec<u8>,
-    /// π_C2S also pins the final record's inner content type (setup flag).
-    suffix_type: bool,
     /// Setup values the suffix must pin.
     model: String,
     max_tokens: u64,
@@ -1086,7 +1079,7 @@ fn handle_setup(
     let send = |v: serde_json::Value| {
         let _ = to_client.send(Message::Text(v.to_string().into()));
     };
-    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed, suffix_type } = msg else {
+    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed } = msg else {
         bail!("expected a setup frame");
     };
     if st.sid.is_some() || st.state != SessionState::Handshake {
@@ -1126,7 +1119,6 @@ fn handle_setup(
     let sid = hex::encode(cu_crypto::transcript::hash(&h));
     st.sid = Some(sid.clone());
     st.body_len = len;
-    st.suffix_type = suffix_type;
     st.model = model.clone();
     st.max_tokens = max_tokens;
     let (head, _) = placeholder_head(&app.offer.head_template, app.key.len(), len)?;
@@ -1313,13 +1305,11 @@ async fn handle_control(
             let ct_window = last.payload[off..off + w].to_vec();
             let params = if st.v2 {
                 let ap = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?;
-                // With `suffix_type` the compared range runs through the inner
-                // content type byte, so the statement alone shows the record
-                // is application data ending in the suffix.
+                // The compared range runs through the inner content type byte,
+                // so the statement alone shows the record is application data
+                // ending in the suffix.
                 let mut expected = suffix;
-                if st.suffix_type {
-                    expected.push(CT_APPLICATION_DATA);
-                }
+                expected.push(CT_APPLICATION_DATA);
                 Params::PiC2S(zkbench::statements::PiC2S {
                     h1: ap.h1, seq, ct_window, off, w, sel_start, sel_len: expected.len(), expected,
                 })
