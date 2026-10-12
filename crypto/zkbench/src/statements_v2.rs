@@ -32,7 +32,7 @@ use mpz_vm_core::{
 
 use crate::Role;
 use crate::gadgets::{
-    aes_block, alphabet_circuit, concat, ctr_block, decrypt_record_content, decrypt_window,
+    aes_block, alphabet_circuit, concat, ctr_block, decrypt_record_tail, decrypt_window,
     eq_bytes, expand_label, public_bytes, record_keys_keyed, secret_bytes, select, sha256_bytes,
     splice_circuit, xor_bytes,
 };
@@ -181,9 +181,12 @@ pub fn build_pi_c3s<VM: Vm<Binary>>(
     }
     let (anchor, k, iv) = anchored_keys_after_updates(vm, role, "h2", &p.h2, witness, p.key_updates)?;
     let mut contents = Vec::with_capacity(p.records.len());
-    for r in &p.records {
+    for (i, r) in p.records.iter().enumerate() {
+        if i > 0 && r.off != 0 {
+            anyhow::bail!("π_C3S: only the first record may start at an offset");
+        }
         let ct = public_bytes(vm, &r.ct)?;
-        contents.push(decrypt_record_content(vm, &k, &iv, r.seq, &ct)?);
+        contents.push(decrypt_record_tail(vm, &k, &iv, r.seq, &ct, r.off)?);
     }
     let all = concat(vm, &contents)?;
     let start = all

@@ -142,7 +142,18 @@ pub type PiC2 = Window;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TailRecord {
     pub seq: u64,
+    /// The record's ciphertext (tag excluded) from inner-plaintext offset
+    /// `off` to its end.
     pub ct: Vec<u8>,
+    /// Block-aligned offset of `ct` in the record (v2 π_C3S: only the first
+    /// covered record may start later than 0, so the proof decrypts only the
+    /// bytes it needs). Omitted on the wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub off: usize,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 /// π_C3 = usage disclosure across the final server records.
@@ -381,6 +392,9 @@ fn build_pi_c3<VM: Vm<Binary>>(
     let mut contents = Vec::with_capacity(p.records.len());
     for r in &p.records {
         let ct = public_bytes(vm, &r.ct)?;
+        if r.off != 0 {
+            anyhow::bail!("π_C3: record offsets are a v2 (π_C3S) feature");
+        }
         contents.push(crate::gadgets::decrypt_record_content(vm, &k, &iv, r.seq, &ct)?);
     }
     let all = concat(vm, &contents)?;

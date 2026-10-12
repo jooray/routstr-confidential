@@ -117,7 +117,7 @@ pub fn pi_c3() -> (Params, Witness) {
     (
         Params::PiC3(PiC3Params {
             session: session(),
-            records: vec![TailRecord { seq: 0, ct }],
+            records: vec![TailRecord { seq: 0, ct, off: 0 }],
             expected: r,
             skip: 0,
         }),
@@ -285,7 +285,7 @@ pub fn pi_c3s_after_updates(updates: u32) -> (Params, Witness) {
     (
         Params::PiC3S(PiC3S {
             h2: v.h2(),
-            records: vec![TailRecord { seq, ct }],
+            records: vec![TailRecord { seq, ct, off: 0 }],
             expected: p.expected,
             skip: 0,
             key_updates: updates,

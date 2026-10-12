@@ -507,14 +507,32 @@ pub fn decrypt_record_content<VM: Vm<Binary>>(
     seq: u64,
     ct: &Vector<U8>,
 ) -> anyhow::Result<Vector<U8>> {
+    decrypt_record_tail(vm, key, iv, seq, ct, 0)
+}
+
+/// Decrypt the tail of a record, from block-aligned inner-plaintext offset
+/// `off` to its end (`ct` is that tail's ciphertext), and return its content
+/// (minus the trailing content-type byte).
+pub fn decrypt_record_tail<VM: Vm<Binary>>(
+    vm: &mut VM,
+    key: &Array<U8, 16>,
+    iv: &Array<U8, 12>,
+    seq: u64,
+    ct: &Vector<U8>,
+    off: usize,
+) -> anyhow::Result<Vector<U8>> {
     if ct.len() < 2 {
-        anyhow::bail!("decrypt_record_content: record has no content");
+        anyhow::bail!("decrypt_record_tail: record has no content");
     }
+    if off % 16 != 0 {
+        anyhow::bail!("decrypt_record_tail: offset {off} is not block-aligned");
+    }
+    let first = off / 16;
     let nblocks = ct.len().div_ceil(16);
     let mut ks_blocks: Vec<Vector<U8>> = Vec::with_capacity(nblocks);
     for j in 1..=nblocks {
-        // keystream block `j` has counter field `j + 1`.
-        let ctr = ctr_block(vm, iv, seq, (j + 1) as u32)?;
+        // keystream block `first + j` has counter field `first + j + 1`.
+        let ctr = ctr_block(vm, iv, seq, (first + j + 1) as u32)?;
         ks_blocks.push(aes_block(vm, key, &ctr)?.into());
     }
     let ks_all = concat(vm, &ks_blocks)?;

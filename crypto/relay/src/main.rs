@@ -1417,11 +1417,27 @@ async fn handle_control(
             if total < need {
                 bail!("disclosed records ({total}) do not cover R + skip ({need})");
             }
+            // v2: the proof decrypts the first covered record only from the
+            // last block boundary that still covers R + skip, so its cost
+            // follows the disclosure, not the size of the provider's records.
+            let first_content = chosen.first().map(|(_, rec)| rec.payload.len().saturating_sub(16 + 1)).unwrap_or(0);
+            let first_off = if st.v2 {
+                let rest = total - first_content;
+                let needed_first = need.saturating_sub(rest);
+                (first_content - needed_first) / 16 * 16
+            } else {
+                0
+            };
             let records: Vec<zkbench::statements::TailRecord> = chosen
                 .iter()
-                .map(|(idx, rec)| zkbench::statements::TailRecord {
-                    seq: (*idx - epoch_start) as u64,
-                    ct: rec.payload[..rec.payload.len() - 16].to_vec(),
+                .enumerate()
+                .map(|(i, (idx, rec))| {
+                    let off = if i == 0 { first_off } else { 0 };
+                    zkbench::statements::TailRecord {
+                        seq: (*idx - epoch_start) as u64,
+                        ct: rec.payload[off..rec.payload.len() - 16].to_vec(),
+                        off,
+                    }
                 })
                 .collect();
             info!(
@@ -1953,6 +1969,18 @@ fn validate_error_head(r: &[u8]) -> Result<serde_json::Value> {
 fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
     let mut off = 0usize;
     let mut data = Vec::new();
+    // R starts either at a chunk-size line, or at an SSE line inside a chunk:
+    // a raw "\n" then "data: ". Raw LF (and CR) never occur inside JSON
+    // strings, so that LF ends a previous line of the event stream, and the
+    // chunk's data runs to the first CRLF (SSE data carries no CR).
+    if r.starts_with(b"\ndata: ") {
+        let end = r
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| anyhow!("R: chunk data not terminated"))?;
+        data.extend_from_slice(&r[1..end]);
+        off = end + 2;
+    }
     loop {
         let nl = r[off..]
             .windows(2)
@@ -2138,5 +2166,24 @@ mod disclosure_tests {
         assert!(validate_r(&chunked(&format!("x\n\ndata: {usage}\n\ndata: [DONE]\n\n"))).is_ok());
         // "data: " inside a line is not an event start.
         assert!(validate_r(&chunked(&format!("xdata: {usage}\n\ndata: [DONE]\n\n"))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod disclosure_line_start_tests {
+    use super::validate_r;
+
+    #[test]
+    fn r_may_start_at_an_event_line_inside_a_chunk() {
+        let usage = r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2},"model":"m"}"#;
+        // The usage event and [DONE] in the middle of one big chunk.
+        let r = format!("\ndata: {usage}\n\ndata: [DONE]\n\n\r\n0\r\n\r\n").into_bytes();
+        assert!(validate_r(&r).is_ok());
+        // Split across a chunk boundary after the event.
+        let r = format!("\ndata: {usage}\n\n\r\ne\r\ndata: [DONE]\n\n\r\n0\r\n\r\n").into_bytes();
+        assert!(validate_r(&r).is_ok());
+        // Without the leading LF, a "data: " could be inside a JSON string.
+        let r = format!("data: {usage}\n\ndata: [DONE]\n\n\r\n0\r\n\r\n").into_bytes();
+        assert!(validate_r(&r).is_err());
     }
 }

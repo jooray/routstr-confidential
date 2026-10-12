@@ -683,7 +683,7 @@ class Session {
     const attMsg = await Promise.race([
       this.bus.wait('attestation'),
       this.errP,
-      timeout(60000, 'attestation'),
+      timeout(600000, 'attestation'), // the node attests when the response ends: long answers take minutes
     ])
     const attJson: string = attMsg.a_json ?? JSON.stringify(attMsg.a)
     this.attJson = attMsg.a_json
@@ -946,6 +946,22 @@ function endsWithUsageEvent(joined: Uint8Array): boolean {
   }
 }
 
+/** SSE data of an R that starts at "\ndata: " inside a chunk (data runs to the first CRLF). */
+function dechunkLineStart(r: Uint8Array): Uint8Array | null {
+  if (Buffer.from(r.subarray(0, 7)).toString('latin1') !== '\ndata: ') return null
+  let end = -1
+  for (let i = 0; i + 1 < r.length; i++) {
+    if (r[i] === 13 && r[i + 1] === 10) {
+      end = i
+      break
+    }
+  }
+  if (end < 0) return null
+  const rest = parseChunks(r.subarray(end + 2))
+  if (!rest) return null
+  return concat(r.subarray(1, end), ...rest.map((c) => c.data))
+}
+
 function extractR(b: Uint8Array): Uint8Array | null {
   let bodyStart = 0
   for (let i = 0; i + 3 < b.length; i++) {
@@ -957,6 +973,16 @@ function extractR(b: Uint8Array): Uint8Array | null {
   const body = b.subarray(bodyStart)
   const all = parseChunks(body)
   if (!all) return null
+  // Prefer R starting at the usage event's own line ("\ndata: " inside a
+  // chunk), so the proof's work follows the event, not the chunk size.
+  for (let i = body.length - 7; i >= 0 && body.length - i <= 1 << 16; i--) {
+    if (body[i] !== 10 || body[i + 1] !== 100) continue
+    const r = body.subarray(i)
+    const joined = dechunkLineStart(r)
+    if (!joined || !endsWithUsageEvent(joined)) continue
+    const text = Buffer.from(joined).toString('utf8')
+    if (text.startsWith('data: ') && text.indexOf('\n\ndata: ') === text.lastIndexOf('\n\ndata: ')) return r
+  }
   for (let i = all.length - 1; i >= 0; i--) {
     const r = body.subarray(all[i].start)
     const chunks = parseChunks(r)

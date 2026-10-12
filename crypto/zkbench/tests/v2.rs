@@ -192,6 +192,35 @@ async fn c3s_after_server_key_updates() {
     assert!(!serde_json::to_string(&p).unwrap().contains("key_updates"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c3s_first_record_from_an_offset() {
+    // Only the record's tail is decrypted: from a block-aligned offset that
+    // still covers R. Fewer AES blocks, same statement about the end.
+    let (params, witness) = fixtures::pi_c3s_after_updates(0);
+    let Params::PiC3S(full) = params else { unreachable!() };
+    let r_len = full.expected.len();
+    let content = full.records[0].ct.len() - 1;
+    let off = (content - r_len) / 16 * 16;
+    let mut p = full.clone();
+    p.records[0].ct = full.records[0].ct[off..].to_vec();
+    p.records[0].off = off;
+    assert!(passed(&run_pair_ideal(&Params::PiC3S(p.clone()), &witness).await), "tail from {off}");
+    // A wrong offset decrypts with the wrong counters: no equality.
+    let mut wrong = p.clone();
+    wrong.records[0].off = off - 16;
+    assert!(!run_pair_ideal(&Params::PiC3S(wrong), &witness).await.unwrap().last().unwrap().ok);
+    // Not block-aligned, or a later record with an offset: refused.
+    let mut odd = p.clone();
+    odd.records[0].off = off + 1;
+    assert!(run_pair_ideal(&Params::PiC3S(odd), &witness).await.is_err());
+    // Too far: the tail no longer covers R.
+    let mut short = full.clone();
+    let late = off + 16;
+    short.records[0].ct = full.records[0].ct[late..].to_vec();
+    short.records[0].off = late;
+    assert!(run_pair_ideal(&Params::PiC3S(short), &witness).await.is_err());
+}
+
 // --- π_NK soundness -------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
