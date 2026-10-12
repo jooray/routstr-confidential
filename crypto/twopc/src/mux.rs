@@ -65,10 +65,17 @@ pub(crate) struct Mux {
 impl Mux {
     /// Starts the mux tasks (requires a tokio runtime) and returns the local
     /// end of each of the `n` channels.
-    pub fn start<IO>(io: IO, n: usize, bulk: &[usize]) -> (Mux, Vec<DuplexStream>)
+    ///
+    /// `inbound_caps[ch]` bounds the payload bytes the peer may send on channel
+    /// `ch` over the mux's lifetime; a frame past it is a protocol violation and
+    /// tears the mux down. Without a cap a peer could fill a channel nobody is
+    /// reading (`CHAN_BUF` per channel) and hold that memory for the session.
+    pub fn start<IO>(io: IO, n: usize, bulk: &[usize], inbound_caps: &[u64]) -> (Mux, Vec<DuplexStream>)
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        assert_eq!(inbound_caps.len(), n, "one inbound cap per channel");
+        let inbound_caps = inbound_caps.to_vec();
         let counters = Arc::new(Counters {
             ch_recv: (0..n).map(|_| AtomicU64::new(0)).collect(),
             ..Counters::default()
@@ -150,6 +157,9 @@ impl Mux {
                 if ch >= remotes_w.len() || len > MAX_MUX_FRAME {
                     break; // protocol violation: tear everything down
                 }
+                if c_r.ch_recv[ch].load(Ordering::Relaxed) + len as u64 > inbound_caps[ch] {
+                    break; // more than an honest peer sends on this channel
+                }
                 let mut data = vec![0u8; len];
                 if rd.read_exact(&mut data).await.is_err() {
                     break;
@@ -200,6 +210,8 @@ impl Drop for Mux {
 /// Length-prefixed message framing on top of a mux channel.
 pub(crate) struct FrameChan {
     io: DuplexStream,
+    /// Largest message accepted from the peer (allocated before it is read).
+    max_msg: usize,
 }
 
 /// Largest single protocol message (a garbled table is ~11 MB).
@@ -207,7 +219,12 @@ pub(crate) const MAX_MSG: usize = 64 << 20;
 
 impl FrameChan {
     pub fn new(io: DuplexStream) -> Self {
-        Self { io }
+        Self { io, max_msg: MAX_MSG }
+    }
+
+    /// A channel whose incoming messages are all small (N's view of C→N).
+    pub fn with_max_msg(io: DuplexStream, max_msg: usize) -> Self {
+        Self { io, max_msg }
     }
 
     pub async fn send(&mut self, data: &[u8]) -> std::io::Result<()> {
@@ -220,7 +237,7 @@ impl FrameChan {
         let mut len = [0u8; 4];
         self.io.read_exact(&mut len).await?;
         let len = u32::from_be_bytes(len) as usize;
-        if len > MAX_MSG {
+        if len > self.max_msg {
             return Err(std::io::Error::other("message too large"));
         }
         let mut buf = vec![0u8; len];

@@ -85,6 +85,11 @@ struct Offer {
     /// image parts as well, so the shipped offer leaves it empty.
     #[serde(default, alias = "text_only_ok", deserialize_with = "de_model_allowlist")]
     model_allowlist: Vec<String>,
+    /// Set from `--node-settles` when served: the sidecar hands the verified
+    /// usage to the node instead of signing a stub receipt. A node in front of
+    /// a sidecar without it would charge every session its full reservation.
+    #[serde(default)]
+    node_settles: bool,
 }
 
 /// `["id", …]`, or the legacy `{"id": true, …}` map (entries marked true).
@@ -201,6 +206,11 @@ const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Largest TLS 1.3 record on the wire: header + 2^14 plaintext + 256 expansion.
 const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
+/// Limits on a π_C3S disclosure (the verifier decrypts every covered record in
+/// the circuit): trailing records, bytes of R, and undisclosed bytes after it.
+const MAX_DISCLOSE_RECORDS: usize = 64;
+const MAX_DISCLOSE_R: usize = 64 << 10;
+const MAX_DISCLOSE_SKIP: usize = 1 << 20;
 
 /// Most client bytes a v2 session buffers before relaying them (during the 2PC
 /// preprocessing and until the credential record is written): the ClientHello,
@@ -375,8 +385,13 @@ async fn main() -> Result<()> {
             max_tokens_cap: default_max_tokens_cap(),
             notary_pubkey: String::new(),
             model_allowlist: Vec::new(),
+            node_settles: false,
         }
     };
+    offer.node_settles = node_settles;
+    if !node_settles {
+        warn!("running WITHOUT --node-settles: the stub settlement signs its own receipts; a node in front of this sidecar would charge every session its full reservation");
+    }
     match arg("--protocol").as_deref() {
         None => {}
         Some("1") => offer.v = 1,
@@ -513,6 +528,11 @@ enum ClientMsg {
         /// escrow (or account reservation) is supplied by the later `claim`.
         #[serde(default)]
         armed: bool,
+        /// The client proves the suffix *and* the record's inner content type
+        /// (0x17) in π_C2S. Older clients omit it and prove the suffix only,
+        /// which is equally sound through the body-length accounting.
+        #[serde(default)]
+        suffix_type: bool,
     },
     HsSecrets {
         /// The handshake secret itself. Only accepted in the loopback
@@ -541,6 +561,13 @@ enum ClientMsg {
         /// head and `skip` is the undisclosed body length after it.
         #[serde(default)]
         skip: usize,
+        /// Server KeyUpdates before the covered records (they are under
+        /// `s_ap_k`), and the index, among the response's application-data
+        /// records, of the first record of that epoch (its sequence 0).
+        #[serde(default)]
+        key_updates: u32,
+        #[serde(default)]
+        epoch_start: usize,
     },
     Ku1 {
         record: String,
@@ -800,6 +827,15 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                     }
                     Ev::TcpClosed => {
                         info!("upstream closed the connection");
+                        // Before the final body record was released the upstream
+                        // never had a complete request: end the session here, so
+                        // the node releases the reservation. Letting it go on
+                        // would let a later π_C2S send `body_released` for a
+                        // record that can no longer be written, and the node
+                        // would charge the full reservation for nothing.
+                        if !st.c2_ok {
+                            bail!("upstream closed the connection before the request was complete (nothing billed)");
+                        }
                         let mut att_chain: Option<String> = None;
                         if let (Some(sid), Some(hs)) = (st.sid.as_ref(), st.handshake.as_ref()) {
                             let a = serde_json::json!({
@@ -999,6 +1035,8 @@ struct Session {
     /// The record completing the body, withheld from the upstream until π_C2.
     held: Option<Vec<u8>>,
     sent: Vec<u8>,
+    /// π_C2S also pins the final record's inner content type (setup flag).
+    suffix_type: bool,
     /// Setup values the suffix must pin.
     model: String,
     max_tokens: u64,
@@ -1048,7 +1086,7 @@ fn handle_setup(
     let send = |v: serde_json::Value| {
         let _ = to_client.send(Message::Text(v.to_string().into()));
     };
-    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed } = msg else {
+    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed, suffix_type } = msg else {
         bail!("expected a setup frame");
     };
     if st.sid.is_some() || st.state != SessionState::Handshake {
@@ -1088,6 +1126,7 @@ fn handle_setup(
     let sid = hex::encode(cu_crypto::transcript::hash(&h));
     st.sid = Some(sid.clone());
     st.body_len = len;
+    st.suffix_type = suffix_type;
     st.model = model.clone();
     st.max_tokens = max_tokens;
     let (head, _) = placeholder_head(&app.offer.head_template, app.key.len(), len)?;
@@ -1274,8 +1313,15 @@ async fn handle_control(
             let ct_window = last.payload[off..off + w].to_vec();
             let params = if st.v2 {
                 let ap = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?;
+                // With `suffix_type` the compared range runs through the inner
+                // content type byte, so the statement alone shows the record
+                // is application data ending in the suffix.
+                let mut expected = suffix;
+                if st.suffix_type {
+                    expected.push(CT_APPLICATION_DATA);
+                }
                 Params::PiC2S(zkbench::statements::PiC2S {
-                    h1: ap.h1, seq, ct_window, off, w, sel_start, sel_len: suffix.len(), expected: suffix,
+                    h1: ap.h1, seq, ct_window, off, w, sel_start, sel_len: expected.len(), expected,
                 })
             } else {
                 Params::PiC2(zkbench::statements::PiC2 {
@@ -1286,14 +1332,35 @@ async fn handle_control(
             shared.params.lock().unwrap().insert(name.into(), params.clone());
             send(serde_json::json!({"type":"zk_params","proof":name,"params":params}));
         }
-        ClientMsg::Disclose { r, tail_lens, skip } => {
+        ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start } => {
             // Only once, and only after the upstream closed: the anchor is the
             // end of the final transcript.
             if st.state != SessionState::Attested || st.disclosed {
                 bail!("disclose out of order or repeated");
             }
             st.disclosed = true;
+            // Bound the verifier's work: π_C3S decrypts every covered record in
+            // the circuit. An honest disclosure is the last one or two records
+            // (usage event) or a short error head plus its body in `skip`.
+            if tail_lens.len() > MAX_DISCLOSE_RECORDS {
+                bail!("disclosure covers {} records (limit {MAX_DISCLOSE_RECORDS})", tail_lens.len());
+            }
+            if r.len() > 2 * MAX_DISCLOSE_R {
+                bail!("disclosed R is too long");
+            }
+            if skip > MAX_DISCLOSE_SKIP {
+                bail!("skip {skip} exceeds {MAX_DISCLOSE_SKIP}");
+            }
+            if key_updates > zkbench::statements_v2::MAX_SERVER_KEY_UPDATES {
+                bail!("{key_updates} server KeyUpdates (limit {})", zkbench::statements_v2::MAX_SERVER_KEY_UPDATES);
+            }
+            if (key_updates == 0) != (epoch_start == 0) || (key_updates > 0 && !st.v2) {
+                bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
+            }
             let r = hex::decode(&r)?;
+            if r.len() > MAX_DISCLOSE_R {
+                bail!("disclosed R is {} bytes (limit {MAX_DISCLOSE_R})", r.len());
+            }
             // Either the terminal usage event of a successful stream (anchored
             // at the end of the transcript), or, for an upstream error, only the
             // response head: its status decides the charge, the body stays
@@ -1346,6 +1413,12 @@ async fn handle_control(
             }
             let mut chosen = chosen_rev;
             chosen.reverse();
+            // Covered records are in the last epoch: sequence numbers restart
+            // at its first record. (A wrong claim only makes the proof fail:
+            // the records then decrypt to noise under the derived key.)
+            if chosen.first().is_some_and(|(idx, _)| *idx < epoch_start) {
+                bail!("covered records start before the claimed key epoch");
+            }
             let total: usize = chosen
                 .iter()
                 .map(|(_, rec)| rec.payload.len().saturating_sub(16 + 1))
@@ -1357,7 +1430,7 @@ async fn handle_control(
             let records: Vec<zkbench::statements::TailRecord> = chosen
                 .iter()
                 .map(|(idx, rec)| zkbench::statements::TailRecord {
-                    seq: *idx as u64,
+                    seq: (*idx - epoch_start) as u64,
                     ct: rec.payload[..rec.payload.len() - 16].to_vec(),
                 })
                 .collect();
@@ -1369,7 +1442,7 @@ async fn handle_control(
             );
             let params = if st.v2 {
                 let ap = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?;
-                Params::PiC3S(zkbench::statements::PiC3S { h2: ap.h2, records, expected: r, skip })
+                Params::PiC3S(zkbench::statements::PiC3S { h2: ap.h2, records, expected: r, skip, key_updates })
             } else {
                 Params::PiC3(zkbench::statements::PiC3 { session: session_of(st)?, records, expected: r, skip })
             };
@@ -1598,8 +1671,10 @@ where
     Ok(())
 }
 
-fn fill_head_now(app: &Arc<AppState>, st: &Session) -> Result<(Vec<u8>, Vec<usize>)> {
-    let (mut head, offsets) = placeholder_head(&app.offer.head_template, app.key.len(), st.body_len)?;
+/// The head with the API key spliced in; zeroized when dropped.
+fn fill_head_now(app: &Arc<AppState>, st: &Session) -> Result<(Zeroizing<Vec<u8>>, Vec<usize>)> {
+    let (head, offsets) = placeholder_head(&app.offer.head_template, app.key.len(), st.body_len)?;
+    let mut head = Zeroizing::new(head);
     for (i, off) in offsets.iter().enumerate() {
         head[*off] = app.key[i];
     }
@@ -1614,7 +1689,7 @@ fn assemble(app: &Arc<AppState>, st: &Session, _log: &RelayLog) -> Result<Assemb
     };
     let (http_head, _) = fill_head_now(app, st)?;
     // TLS 1.3 inner plaintext ends with the application_data content type.
-    let mut plain = http_head.clone();
+    let mut plain = Zeroizing::new(http_head.to_vec());
     plain.push(0x17);
     if plain.len() != p.head_len {
         bail!(
@@ -1921,7 +1996,13 @@ fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
         bail!("R: dechunked tail does not end with data: [DONE]");
     }
     let before = &text[..text.len() - "data: [DONE]\n\n".len()];
-    let start = before.rfind("data: ").map(|i| i + 6).unwrap_or(0);
+    // The last event starts at a line start: after the previous event's blank
+    // line, or at the start of R (which begins at an event boundary).
+    let start = match before.rfind("\ndata: ") {
+        Some(i) => i + 7,
+        None if before.starts_with("data: ") => 6,
+        None => bail!("R: no data event before the terminator"),
+    };
     let ev = before[start..].trim();
     let v: serde_json::Value = serde_json::from_str(ev).context("R: usage event not JSON")?;
     let empty_choices = v
@@ -2048,5 +2129,24 @@ mod suffix_tests {
     fn proof_fixtures_use_the_production_suffix() {
         let s = super::canonical_suffix("mistral-small-3-2-24b-instruct", 12);
         assert_eq!(s.as_bytes(), zkbench::fixtures::SUFFIX);
+    }
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::validate_r;
+
+    fn chunked(body: &str) -> Vec<u8> {
+        format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).into_bytes()
+    }
+
+    #[test]
+    fn usage_event_must_start_a_line() {
+        let usage = r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2},"model":"m"}"#;
+        // At the start of R, or after the previous event's blank line.
+        assert!(validate_r(&chunked(&format!("data: {usage}\n\ndata: [DONE]\n\n"))).is_ok());
+        assert!(validate_r(&chunked(&format!("x\n\ndata: {usage}\n\ndata: [DONE]\n\n"))).is_ok());
+        // "data: " inside a line is not an event start.
+        assert!(validate_r(&chunked(&format!("xdata: {usage}\n\ndata: [DONE]\n\n"))).is_err());
     }
 }

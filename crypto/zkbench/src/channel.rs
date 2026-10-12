@@ -473,7 +473,16 @@ impl ZkChannel {
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let t0 = Instant::now();
-        let (mux, mut chans) = Mux::start(io, 3);
+        // Inbound caps per channel (control, nk chain, cp chain). The node is
+        // the exposed party: a client's honest traffic is a few hundred bytes of
+        // control and a few MB per chain (preprocessing ~3 MB in all, each
+        // proof ~1.5 MB), so 32 MiB per chain is more than ten times that.
+        const MIB: u64 = 1 << 20;
+        let caps: [u64; 3] = match party {
+            Party::Node => [MIB, 32 * MIB, 32 * MIB],
+            Party::Client => [u64::MAX; 3],
+        };
+        let (mux, mut chans) = Mux::start(io, 3, &caps);
         let counters = mux.counters.clone();
         let cp_io = chans.pop().expect("3 channels");
         let nk_io = chans.pop().expect("3 channels");

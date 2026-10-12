@@ -52,10 +52,18 @@ pub struct Mux {
 impl Mux {
     /// Starts the mux tasks (requires a tokio runtime) and returns the local
     /// end of each of the `n` channels.
-    pub fn start<IO>(io: IO, n: usize) -> (Mux, Vec<DuplexStream>)
+    ///
+    /// `inbound_caps[ch]` bounds the payload bytes the peer may send on channel
+    /// `ch` over the mux's lifetime; a frame past it is a protocol violation and
+    /// tears the mux down (otherwise a peer could fill a channel nobody is
+    /// reading, `CHAN_BUF` per channel, and hold that memory for the session).
+    pub fn start<IO>(io: IO, n: usize, inbound_caps: &[u64]) -> (Mux, Vec<DuplexStream>)
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        assert_eq!(inbound_caps.len(), n, "one inbound cap per channel");
+        let inbound_caps = inbound_caps.to_vec();
+        let mut ch_recv = vec![0u64; n];
         let counters = Arc::new(Counters::default());
         let (mut rd, mut wr) = io.split();
         let (tx, mut rx) = mpsc::channel::<(u8, Vec<u8>)>(256);
@@ -117,6 +125,10 @@ impl Mux {
                 if ch >= remotes_w.len() || len > MAX_MUX_FRAME {
                     break; // protocol violation: tear everything down
                 }
+                if ch_recv[ch] + len as u64 > inbound_caps[ch] {
+                    break; // more than an honest peer sends on this channel
+                }
+                ch_recv[ch] += len as u64;
                 let mut data = vec![0u8; len];
                 if rd.read_exact(&mut data).await.is_err() {
                     break;

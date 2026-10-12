@@ -115,7 +115,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use sha2::{Digest, Sha256};
 use tokio_util::compat::TokioAsyncReadCompatExt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub use mux::Counters;
 use mux::{FrameChan, Mux};
@@ -509,7 +509,17 @@ impl Party {
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let (mux, mut chans) = Mux::start(io, N_CH, &[CH_TAB]);
+        // What the peer may send per channel. N (the node) is the exposed
+        // party: C's honest upload is ~1.2 MB in all (Ferret on CH_COTB), a
+        // few KB of KOS/ECtF traffic and well under 4 KB of protocol messages;
+        // N→C-only channels accept nothing from C. C's own machine is not a
+        // DoS target, so it only refuses traffic on its outbound-only channel.
+        const MIB: u64 = 1 << 20;
+        let caps: [u64; N_CH] = match role {
+            Role::N => [8 * MIB, 16 * MIB, 4 * MIB, 0, MIB, 0],
+            Role::C => [u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0, u64::MAX],
+        };
+        let (mux, mut chans) = Mux::start(io, N_CH, &[CH_TAB], &caps);
         let counters = mux.counters.clone();
         let mut take = |i: usize| std::mem::replace(&mut chans[i], tokio::io::duplex(1).0);
         let ctx_a = Context::new_single_threaded(take(CH_COTA).compat());
@@ -517,7 +527,11 @@ impl Party {
         let ctx_sc = Context::new_single_threaded(take(CH_SC).compat());
         let n2c = FrameChan::new(take(CH_N2C));
         let tab = FrameChan::new(take(CH_TAB));
-        let c2n = FrameChan::new(take(CH_C2N));
+        // N never receives a protocol message over a few hundred bytes on C→N.
+        let c2n = match role {
+            Role::N => FrameChan::with_max_msg(take(CH_C2N), 1 << 16),
+            Role::C => FrameChan::new(take(CH_C2N)),
+        };
 
         let mut rng = os_rng();
         let mut delta = Block::random(&mut rng);
@@ -1214,7 +1228,7 @@ impl Party {
         let mut x_le: [u8; 32] = share.into();
 
         let mut r_mask: [u8; 32] = self.rng.random();
-        let mut own = Vec::with_capacity(64);
+        let mut own = Zeroizing::new(Vec::with_capacity(64));
         own.extend_from_slice(&x_le);
         own.extend_from_slice(&r_mask);
         x_le.zeroize();
@@ -1259,9 +1273,9 @@ impl Party {
             Role::C => 64,
             Role::N => 28,
         };
-        let mut mask = vec![0u8; mask_len];
+        let mut mask = Zeroizing::new(vec![0u8; mask_len]);
         self.rng.fill(&mut mask[..]);
-        let mut own = Vec::with_capacity(32 + mask_len);
+        let mut own = Zeroizing::new(Vec::with_capacity(32 + mask_len));
         own.extend_from_slice(&self.ms_share);
         own.extend_from_slice(&mask);
         self.ms_share.zeroize();
@@ -1320,7 +1334,7 @@ impl Party {
     }
 
     /// One phase. Returns the decoded output bytes (only after the checks).
-    async fn run_phase(&mut self, phase: usize, own: Vec<u8>, th: [u8; 32]) -> Result<Vec<u8>> {
+    async fn run_phase(&mut self, phase: usize, own: Zeroizing<Vec<u8>>, th: [u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
         let name = ["phase_a", "phase_b"][phase];
         let m = self.mark();
         let r = match self.role {
@@ -1331,11 +1345,11 @@ impl Party {
         r
     }
 
-    async fn phase_n(&mut self, phase: usize, own: Vec<u8>, th: [u8; 32]) -> Result<Vec<u8>> {
+    async fn phase_n(&mut self, phase: usize, own: Zeroizing<Vec<u8>>, th: [u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
         let s = spec(phase);
-        let own_bits = to_bits(&own);
+        let own_bits = Zeroizing::new(to_bits(&own));
         if own_bits.len() != s.n_bits {
             return Err(Error::Input("input length".into()));
         }
@@ -1353,7 +1367,7 @@ impl Party {
 
         // Own and transcript-hash labels, sent at once.
         let mut labels = Vec::with_capacity(s.n_bits + s.th_bits);
-        for (w, b) in s.n_range().zip(&own_bits) {
+        for (w, b) in s.n_range().zip(own_bits.iter()) {
             labels.push(st.k[w] ^ sel(*b, delta));
         }
         for (w, b) in s.th_range().zip(&th_bits) {
@@ -1395,14 +1409,16 @@ impl Party {
         if hd[..] != msg[msg.len() - 32..] {
             return Err(Error::Abort("output labels do not authenticate".into()));
         }
-        Ok(from_bits(&v))
+        let out = Zeroizing::new(from_bits(&v));
+        v.zeroize();
+        Ok(out)
     }
 
-    async fn phase_c(&mut self, phase: usize, own: Vec<u8>, th: [u8; 32]) -> Result<Vec<u8>> {
+    async fn phase_c(&mut self, phase: usize, own: Zeroizing<Vec<u8>>, th: [u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
         let s = spec(phase);
-        let own_bits = to_bits(&own);
+        let own_bits = Zeroizing::new(to_bits(&own));
         if own_bits.len() != s.c_bits {
             return Err(Error::Input("input length".into()));
         }
@@ -1462,7 +1478,7 @@ impl Party {
             }));
         }
         // Decode with the authenticated masks; then report to N.
-        let v: Vec<bool> = out_labels.iter().zip(&lam_out).map(|(l, m)| l.lsb() ^ m).collect();
+        let mut v: Vec<bool> = out_labels.iter().zip(&lam_out).map(|(l, m)| l.lsb() ^ m).collect();
         #[allow(unused_mut)]
         let mut pbits: Vec<bool> = out_labels.iter().map(|l| l.lsb()).collect();
         let mut h = Sha256::new();
@@ -1480,7 +1496,9 @@ impl Party {
         msg.extend_from_slice(&from_bits(&pbits));
         msg.extend_from_slice(&hd);
         self.c2n.send(&msg).await?;
-        Ok(from_bits(&v))
+        let out = Zeroizing::new(from_bits(&v));
+        v.zeroize();
+        Ok(out)
     }
 }
 

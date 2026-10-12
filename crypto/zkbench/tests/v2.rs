@@ -173,6 +173,25 @@ async fn c3s_usage_mismatch_and_error_head_skip() {
     assert!(!res.last().unwrap().ok);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c3s_after_server_key_updates() {
+    // Records under s_ap_2 verify with key_updates = 2, and with nothing else.
+    let (params, witness) = fixtures::pi_c3s_after_updates(2);
+    let res = run_pair_ideal(&params, &witness).await;
+    assert!(passed(&res), "{res:?}");
+    let Params::PiC3S(mut p) = params else { unreachable!() };
+    for wrong in [0, 1, 3] {
+        p.key_updates = wrong;
+        let res = run_pair_ideal(&Params::PiC3S(p.clone()), &witness).await.unwrap();
+        assert!(!res.last().unwrap().ok, "key_updates {wrong} must not verify");
+    }
+    // Bounded, and omitted from the wire when 0 (older peers parse it).
+    p.key_updates = zkbench::statements_v2::MAX_SERVER_KEY_UPDATES + 1;
+    assert!(run_pair_ideal(&Params::PiC3S(p.clone()), &witness).await.is_err());
+    p.key_updates = 0;
+    assert!(!serde_json::to_string(&p).unwrap().contains("key_updates"));
+}
+
 // --- π_NK soundness -------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

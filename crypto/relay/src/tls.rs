@@ -220,7 +220,7 @@ pub fn verify_handshake(
     let sf_key = hkdf::finished_key(s_hs.as_bytes());
     let sf_body = &sfin.1[4..];
     let expect = hkdf::verify_data(&sf_key, &th_cv);
-    if sf_body != expect {
+    if !ct_eq(sf_body, &expect) {
         bail!("server Finished verify_data mismatch");
     }
 
@@ -303,7 +303,7 @@ pub fn verify_handshake(
         .ok_or_else(|| anyhow!("no client Finished"))?;
     let cf_key = hkdf::finished_key(c_hs.as_bytes());
     let expect = hkdf::verify_data(&cf_key, &th_sf);
-    if cfin.1[4..] != expect {
+    if !ct_eq(&cfin.1[4..], &expect) {
         bail!("client Finished verify_data mismatch");
     }
 
@@ -378,7 +378,8 @@ fn verify_certificate_verify(cert: &EndEntityCert, body: &[u8], th_cv: &[u8; 32]
         0x0805 => webpki::aws_lc_rs::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
         0x0806 => webpki::aws_lc_rs::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
         0x0807 => webpki::aws_lc_rs::ED25519,
-        0x0401 => webpki::aws_lc_rs::RSA_PKCS1_2048_8192_SHA256,
+        // RSASSA-PKCS1-v1_5 is not allowed in a TLS 1.3 CertificateVerify
+        // (RFC 8446 §4.4.3), so 0x0401 falls through to the refusal.
         other => bail!("unsupported CertificateVerify scheme {other:#06x}"),
     };
     cert.verify_signature(alg, &msg, sig)
@@ -407,4 +408,19 @@ pub fn aad_for(ct_len: usize) -> [u8; 5] {
 /// Convenience: hex of a byte slice.
 pub fn hx(b: &[u8]) -> String {
     hex::encode(b)
+}
+
+/// Constant-time byte comparison (the lengths are public).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(test)]
+mod ct_eq_tests {
+    #[test]
+    fn ct_eq_compares_length_and_bytes() {
+        assert!(super::ct_eq(b"abc", b"abc"));
+        assert!(!super::ct_eq(b"abc", b"abd"));
+        assert!(!super::ct_eq(b"abc", b"ab"));
+    }
 }

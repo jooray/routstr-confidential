@@ -37,7 +37,7 @@ import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
 
 import { concat, epoch1Material, fromHex, hex, sha256 } from './advice.ts'
 import { runZk } from './zkbridge.ts'
-import { checkPiC1Params, checkPiC2Params, checkPiC2SParams, checkPiC3Params, checkPiC3SParams } from './params.ts'
+import { checkHeadTemplate, checkPiC1Params, checkPiC2Params, checkPiC2SParams, checkPiC3Params, checkPiC3SParams } from './params.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
 import { ZkChan } from './zkchan.ts'
 
@@ -216,6 +216,12 @@ class Session {
   responseBytes = new Uint8Array(0)
   responseRecordCount = 0
   serverRecords: Uint8Array[] = []
+  // Encrypted server records after the handshake, and server KeyUpdates among
+  // them (π_C3S derives the epoch's key and counts seqs from its start).
+  postHandshake = false
+  serverPostRecords = 0
+  serverKeyUpdates = 0
+  serverEpochStart = 0
   serverPending: Uint8Array = new Uint8Array(0)
   epoch2 = false
   bodyRecords: Uint8Array[] = []
@@ -318,7 +324,14 @@ class Session {
           if (this.epoch2) this.bodyRecords.push(record)
           this.sendBytes(record)
         },
-        onRead: () => {},
+        onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
+          if (!this.postHandshake || ctx?.type !== 'ciphertext') return
+          const index = this.serverPostRecords++
+          if (ctx.contentType === 'HANDSHAKE' && containsKeyUpdate(rec.content)) {
+            this.serverKeyUpdates += 1
+            this.serverEpochStart = index + 1
+          }
+        },
         onApplicationData: (rec: Uint8Array) => {
           if (!this.ttft) this.ttft = Date.now()
           this.responseChunks.push(rec)
@@ -328,7 +341,10 @@ class Session {
         onTlsEnd: () => {
           this.tlsEnded = true
         },
-        onHandshake: () => this.handshakeDone(),
+        onHandshake: () => {
+          this.postHandshake = true
+          this.handshakeDone()
+        },
         logger: { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } as any,
       })
   }
@@ -366,6 +382,8 @@ class Session {
         len: body.length,
         armed: ARM,
       }
+      // v2: the suffix proof also pins the final record's content type.
+      if (PROTO === 2) setup.suffix_type = true
       setup.auth = this.token ?? ''
       if (OFFER_SIG) setup.offer_sig = OFFER_SIG
       // Accept the signed offer's fees (the node refuses a setup that does
@@ -719,11 +737,24 @@ class Session {
       tailLens.push(this.responseChunks[i]!.length + 1)
       acc += this.responseChunks[i]!.length
     }
-    this.sendText({ type: 'disclose', r: hex(r), tail_lens: tailLens, skip })
+    const disclose: any = { type: 'disclose', r: hex(r), tail_lens: tailLens, skip }
+    if (PROTO === 2 && this.serverKeyUpdates > 0) {
+      disclose.key_updates = this.serverKeyUpdates
+      disclose.epoch_start = this.serverEpochStart
+    }
+    this.sendText(disclose)
 
     const c3 = await this.waitT('zk_params', 30000)
     if (PROTO === 2) {
-      checkPiC3SParams(c3.params, { h2: this.ap!.h2, serverRecords: this.serverRecords, r, skip })
+      const handshakeRecords = this.serverRecords.length - this.serverPostRecords
+      checkPiC3SParams(c3.params, {
+        h2: this.ap!.h2,
+        serverRecords: this.serverRecords,
+        r,
+        skip,
+        keyUpdates: this.serverKeyUpdates,
+        epochBase: handshakeRecords >= 0 ? handshakeRecords + this.serverEpochStart : undefined,
+      })
     } else {
       checkPiC3Params(c3.params, { session: this.sessionValues(), serverRecords: this.serverRecords, r, skip })
     }
@@ -1024,6 +1055,7 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
   const alphabet: string = offer?.key_alphabet ?? '[A-Za-z0-9_-]'
   const token = `{KEY:${keyLen}}`
   if (!tpl.includes(token)) throw new Error('π_NK: template lacks key token')
+  checkHeadTemplate(tpl, offer?.upstream_host ?? '')
   if ((p.key_alphabet ?? alphabet) !== alphabet) throw new Error('π_NK: key alphabet differs from the offer')
   const filled = new TextEncoder().encode(tpl.replace(token, '\u0000'.repeat(keyLen)).replace('{LEN}', String(bodyLen)))
   const offs: number[] = []
@@ -1150,3 +1182,13 @@ main().catch((e) => {
   console.error('[client] FAILED:', e)
   process.exit(1)
 })
+
+/** Whether a decrypted handshake record carries a KeyUpdate message (type 24). */
+function containsKeyUpdate(content: Uint8Array): boolean {
+  let i = 0
+  while (i + 4 <= content.length) {
+    if (content[i] === 24) return true
+    i += 4 + ((content[i + 1]! << 16) | (content[i + 2]! << 8) | content[i + 3]!)
+  }
+  return false
+}

@@ -260,6 +260,35 @@ pub fn pi_c3s() -> (Params, Witness) {
             records: p.records,
             expected: p.expected,
             skip: p.skip,
+            key_updates: 0,
+        }),
+        Witness::Secret(v.s_ap_0),
+    )
+}
+
+/// π_C3S after `updates` server KeyUpdates: the usage disclosure on a record
+/// under `s_ap_k` at sequence 2 of that epoch.
+pub fn pi_c3s_after_updates(updates: u32) -> (Params, Witness) {
+    let (p, _) = pi_c3();
+    let Params::PiC3(p) = p else { unreachable!() };
+    let v = v2_secrets();
+    let mut secret = cu_crypto::keyschedule::Secret::new(v.s_ap_0);
+    for _ in 0..updates {
+        secret = cu_crypto::keyschedule::traffic_update(&secret);
+    }
+    let seq = 2u64;
+    let mut inner = vec![b'y'; 300];
+    inner.extend_from_slice(&p.expected);
+    inner.push(0x17);
+    let stream = aesgcm::ctr_keystream(&secret.key(), &secret.iv(), seq, inner.len());
+    let ct = xor(&inner, &stream);
+    (
+        Params::PiC3S(PiC3S {
+            h2: v.h2(),
+            records: vec![TailRecord { seq, ct }],
+            expected: p.expected,
+            skip: 0,
+            key_updates: updates,
         }),
         Witness::Secret(v.s_ap_0),
     )

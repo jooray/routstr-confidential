@@ -33,7 +33,7 @@ use mpz_vm_core::{
 use crate::Role;
 use crate::gadgets::{
     aes_block, alphabet_circuit, concat, ctr_block, decrypt_record_content, decrypt_window,
-    eq_bytes, public_bytes, record_keys_keyed, secret_bytes, select, sha256_bytes,
+    eq_bytes, expand_label, public_bytes, record_keys_keyed, secret_bytes, select, sha256_bytes,
     splice_circuit, xor_bytes,
 };
 use crate::statements::{Check, SUPPORTED_KEY_ALPHABET, TailRecord, Witness, default_key_alphabet};
@@ -70,6 +70,19 @@ pub struct PiC3S {
     /// Content bytes after `R` up to the end of the records.
     #[serde(default)]
     pub skip: usize,
+    /// Server KeyUpdates before the covered records: they are encrypted under
+    /// `s_ap_k`, `k` "traffic upd" steps from the anchored `s_ap_0`, and their
+    /// sequence numbers count from the start of that epoch. 0 (and omitted on
+    /// the wire) when the server never rotated its keys.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_updates: u32,
+}
+
+/// Most server KeyUpdates a π_C3S may step through (each costs 4 compressions).
+pub const MAX_SERVER_KEY_UPDATES: u32 = 16;
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// π_NK public parameters: v1 π_N with the public keystream `s` replaced by
@@ -110,13 +123,30 @@ fn anchored_keys<VM: Vm<Binary>>(
     anchor: &[u8; 32],
     witness: Option<&Witness>,
 ) -> anyhow::Result<(Check, Array<U8, 16>, Array<U8, 12>)> {
+    anchored_keys_after_updates(vm, role, label, anchor, witness, 0)
+}
+
+/// [`anchored_keys`] for the traffic secret `updates` KeyUpdates after the
+/// anchored one (RFC 8446 §7.2: `HKDF-Expand-Label(s, "traffic upd", "", 32)`).
+fn anchored_keys_after_updates<VM: Vm<Binary>>(
+    vm: &mut VM,
+    role: Role,
+    label: &str,
+    anchor: &[u8; 32],
+    witness: Option<&Witness>,
+    updates: u32,
+) -> anyhow::Result<(Check, Array<U8, 16>, Array<U8, 12>)> {
     let secret = secret_of(witness);
     if role == Role::Prover && secret.is_none() {
         anyhow::bail!("{label}: the prover needs a Secret witness");
     }
     let s = secret_bytes(vm, role, 32, secret.map(|s| s.as_slice()))?;
     let digest: Vector<U8> = sha256_bytes(vm, &s)?.into();
-    let (k, iv) = record_keys_keyed(vm, &s)?;
+    let mut cur = s;
+    for _ in 0..updates {
+        cur = expand_label(vm, &cur, "traffic upd", &[], 32)?;
+    }
+    let (k, iv) = record_keys_keyed(vm, &cur)?;
     Ok((Check::full(label, digest, anchor.to_vec()), k, iv))
 }
 
@@ -146,7 +176,10 @@ pub fn build_pi_c3s<VM: Vm<Binary>>(
     if p.records.is_empty() || p.expected.is_empty() {
         anyhow::bail!("π_C3S: no records or empty R");
     }
-    let (anchor, k, iv) = anchored_keys(vm, role, "h2", &p.h2, witness)?;
+    if p.key_updates > MAX_SERVER_KEY_UPDATES {
+        anyhow::bail!("π_C3S: {} server KeyUpdates (limit {MAX_SERVER_KEY_UPDATES})", p.key_updates);
+    }
+    let (anchor, k, iv) = anchored_keys_after_updates(vm, role, "h2", &p.h2, witness, p.key_updates)?;
     let mut contents = Vec::with_capacity(p.records.len());
     for r in &p.records {
         let ct = public_bytes(vm, &r.ct)?;
