@@ -4,6 +4,23 @@
 //! memory allocations and circuit calls on the prover and the verifier side.
 //! The two sides differ only in how inputs are marked (private/blind) and in
 //! who assigns values.
+//!
+//! # What the circuits do not check
+//!
+//! The record statements (π_C2/π_C3 here, π_C2S/π_C3S in
+//! [`crate::statements_v2`]) prove AES-CTR decryption of public ciphertext
+//! only; none of them recomputes the GCM tag (π_N/π_NK likewise bind only the
+//! CTR ciphertext they commit to). They are sound because the
+//! verifier never takes record ciphertext from the prover: the sidecar builds
+//! these parameters from its own relay transcript (the client's final body
+//! record it holds and then forwards; the server records it read from its own
+//! connection to the provider), and the client checks the node's parameters
+//! against the records it sent or received. A tag would add nothing on top:
+//! for the server records the client holds the traffic secret and could
+//! compute a valid tag itself, and the body record's tag is checked by the
+//! provider, which rejects the record otherwise. Whoever calls these
+//! statements with ciphertext it did not observe itself gets no assurance
+//! that the record was ever sent.
 
 use mpz_vm_core::{
     Call, CallableExt, Vm,
@@ -28,6 +45,12 @@ use crate::gadgets::{
 /// alphabet explicitly: a statement built for another alphabet is rejected
 /// instead of silently proving membership in the wrong set.
 pub const SUPPORTED_KEY_ALPHABET: &str = "[A-Za-z0-9_-]";
+
+/// An upper bound on a TLS 1.3 record's inner plaintext (content, content
+/// type and padding): the 2^14 + 256-byte ciphertext limit of RFC 8446 §5.2,
+/// which also covers the 2^14 + 1-byte plaintext limit. Record-shaped public
+/// parameters beyond it are rejected before any circuit is built.
+pub const MAX_INNER_PLAINTEXT: usize = (1 << 14) + 256;
 
 /// The four proofs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +346,9 @@ fn build_pi_c1<VM: Vm<Binary>>(
     p: &PiC1,
     witness: Option<&Witness>,
 ) -> anyhow::Result<Vec<Check>> {
+    if p.head_len == 0 || p.head_len > MAX_INNER_PLAINTEXT || p.s.len() != p.head_len {
+        anyhow::bail!("π_C1: keystream of {} bytes for a {}-byte record", p.s.len(), p.head_len);
+    }
     let d = derive_session(vm, role, &p.session, hs_of(witness))?;
     let c_ap_1 = expand_label(vm, &d.c_ap_0, "traffic upd", &[], 32)?;
     let (k1, iv1) = record_keys(vm, &c_ap_1)?;
@@ -425,12 +451,31 @@ fn build_pi_n<VM: Vm<Binary>>(
             SUPPORTED_KEY_ALPHABET
         );
     }
+    if p.head_len == 0
+        || p.head_len >= MAX_INNER_PLAINTEXT
+        || p.template.len() != p.head_len
+        || p.s.len() != p.head_len + 1
+        || p.key_offsets.len() != p.key_len
+        || p.key_len == 0
+        || p.key_offsets.iter().any(|&o| o >= p.head_len)
+    {
+        anyhow::bail!("π_N: inconsistent template/keystream/key offsets");
+    }
+    let mut sorted = p.key_offsets.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != p.key_offsets.len() {
+        anyhow::bail!("π_N: duplicate key offsets");
+    }
     let key_bytes = match witness {
         Some(Witness::Key(k)) => Some(k.as_slice()),
         _ => None,
     };
     if role == Role::Prover {
-        assert_eq!(key_bytes.expect("prover must supply key").len(), p.key_len);
+        let k = key_bytes.ok_or_else(|| anyhow::anyhow!("π_N: the prover needs a Key witness"))?;
+        if k.len() != p.key_len {
+            anyhow::bail!("π_N: key is {} bytes, statement says {}", k.len(), p.key_len);
+        }
     }
 
     let template = public_bytes(vm, &p.template)?;

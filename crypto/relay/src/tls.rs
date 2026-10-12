@@ -183,11 +183,7 @@ pub fn verify_handshake(
             let pt = aesgcm::gcm_open(&sk, &siv, server_seq, &r.header, &r.payload)
                 .ok_or_else(|| anyhow!("server handshake record {server_seq}: bad GCM tag"))?;
             server_seq += 1;
-            // strip the inner content type byte
-            let Some((_, inner)) = pt.split_last() else {
-                bail!("empty encrypted handshake record");
-            };
-            plaintext_stream.extend_from_slice(inner);
+            plaintext_stream.extend_from_slice(handshake_inner(&pt)?);
         }
     }
 
@@ -290,10 +286,7 @@ pub fn verify_handshake(
             let pt = aesgcm::gcm_open(&ck, &civ, client_seq, &r.header, &r.payload)
                 .ok_or_else(|| anyhow!("client handshake record {client_seq}: bad GCM tag"))?;
             client_seq += 1;
-            let Some((_, inner)) = pt.split_last() else {
-                bail!("empty encrypted handshake record");
-            };
-            client_handshake_plain.extend_from_slice(inner);
+            client_handshake_plain.extend_from_slice(handshake_inner(&pt)?);
         }
     }
     let cmsgs = parse_handshake_messages(&client_handshake_plain);
@@ -319,6 +312,16 @@ pub fn verify_handshake(
         server_handshake_records: server_seq as usize,
         client_handshake_records: client_seq as usize,
     })
+}
+
+/// The content of a decrypted handshake-epoch record (RFC 8446 §5.4): strip
+/// the zero padding, then require the inner content type to be handshake.
+pub fn handshake_inner(pt: &[u8]) -> Result<&[u8]> {
+    let end = pt.iter().rposition(|b| *b != 0).ok_or_else(|| anyhow!("empty encrypted handshake record"))?;
+    if pt[end] != CT_HANDSHAKE {
+        bail!("encrypted handshake record has inner content type {}", pt[end]);
+    }
+    Ok(&pt[..end])
 }
 
 /// Extract the DER certificates from a Certificate handshake message body.
@@ -422,5 +425,19 @@ mod ct_eq_tests {
         assert!(super::ct_eq(b"abc", b"abc"));
         assert!(!super::ct_eq(b"abc", b"abd"));
         assert!(!super::ct_eq(b"abc", b"ab"));
+    }
+}
+
+#[cfg(test)]
+mod inner_type_tests {
+    use super::{handshake_inner, CT_HANDSHAKE};
+
+    #[test]
+    fn padding_is_stripped_and_the_type_checked() {
+        assert_eq!(handshake_inner(&[1, 2, CT_HANDSHAKE]).unwrap(), &[1, 2]);
+        assert_eq!(handshake_inner(&[1, 2, CT_HANDSHAKE, 0, 0]).unwrap(), &[1, 2]);
+        assert!(handshake_inner(&[1, 2, 0x17]).is_err());
+        assert!(handshake_inner(&[0, 0]).is_err());
+        assert!(handshake_inner(&[]).is_err());
     }
 }

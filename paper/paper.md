@@ -601,7 +601,10 @@ length accounting (every record counts as body bytes, the request completes only
 length is reached, nothing is relayed after it) makes padding and non-data records equally useless.
 
 **P4 (accounting).** The billed usage is a substring of the authenticated response, proven under the
-session's server secret and anchored to the end of the transcript. The anchors $h_1$, $h_2$ are outputs
+session's server secret and anchored to the end of the transcript. The proofs check AES-CTR decryption,
+not the GCM tag: N takes the ciphertexts from its own transcript (the body record it holds, the server
+records it read from U), never from C, and a tag check would add nothing, since C holds $s_{ap,0}$ and
+could compute server tags itself (residual risk 9). The anchors $h_1$, $h_2$ are outputs
 of the same 2PC that produced the keys, and N accepts them only through C's authenticated output report,
 so C cannot prove against a secret of its choosing without a SHA-256 preimage. N computes the suffix from the setup values, accepts only that
 suffix, and lets U see the complete request only after $\pi_{C2S}$ has verified, so U runs exactly the
@@ -924,7 +927,7 @@ It worked and was deployed, but each party had to garble 656,179 AND gates and s
 background upload for every pre-warmed session. Node-only garbling removes that upload. Dual execution
 remains a sound alternative: it is simpler, it rests on better-studied constructions (half-gates
 garbling and the dual-execution equality check), it leaks less (about 1.6 bits per session against
-about 2.3), it is faster on fast symmetric links, and it needs no Ferret. It is kept as the tag
+about 2.6), it is faster on fast symmetric links, and it needs no Ferret. It is kept as the tag
 `v2-symmetric` in the three repositories (routstr-confidential `0876b5e`, routstr-core `dd9e51a5`,
 routstr-sdk `b5d16f0`).
 

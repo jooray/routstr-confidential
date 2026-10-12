@@ -39,7 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
 use zkbench::proofs::{PairOutcome, run_io, run_pair_transport, stats};
-use zkbench::statements::{Params, Witness};
+use zkbench::statements::{Params, Proof, Witness};
 use zkbench::{Role, fixtures};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,6 +132,11 @@ async fn run_stdio(args: &[String]) -> Result<()> {
         serde_json::from_str(&std::fs::read_to_string(&path)?)
             .with_context(|| format!("parsing {path}"))?
     };
+    // The job names its proof; the params must be that proof's, or the
+    // process would run (and report under the name) a different statement.
+    if Proof::from_name(&pf.proof) != Some(pf.params.proof()) {
+        anyhow::bail!("the job is for {}, its params are for {}", pf.proof, pf.params.proof().name());
+    }
     eprintln!(
         "cu-prover: proof={} role={:?} params_ok=true",
         pf.proof, role
@@ -293,6 +298,11 @@ async fn channel_loop(
             }
             let params: Params = serde_json::from_value(cmd.get("params").cloned().unwrap_or_default())
                 .map_err(|e| anyhow::anyhow!("bad params: {e}"))?;
+            // Refused here, before anything reaches the channel: a mismatch
+            // must not consume the proof's single run or poison the channel.
+            if params.proof().name() != proof {
+                anyhow::bail!("{proof}: the params are for {}", params.proof().name());
+            }
             // Never echo the witness parser's message: it may quote the value.
             let witness: Option<Witness> = match cmd.get("witness") {
                 Some(w) if !w.is_null() => Some(serde_json::from_value(w.clone()).map_err(|_| anyhow::anyhow!("bad witness"))?),

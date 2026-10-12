@@ -371,6 +371,17 @@ async fn cu_prover_channel_mode() {
         .unwrap();
     let r = next_ctl(&mut ctl_rx).await;
     assert_eq!((r["id"].as_i64(), r["ok"].as_bool()), (Some(0), Some(false)), "{r}");
+    // So are params for another proof than the one named; the channel stays
+    // usable for every proof afterwards.
+    for bad in [
+        serde_json::json!({"cmd":"verify","id":-1,"proof":"pi_nk","params":s.c2s.0}),
+        serde_json::json!({"cmd":"prove","id":-2,"proof":"pi_c2s","params":s.c3s.0,"witness":s.c3s.1}),
+    ] {
+        to_child_tx.send(frame(1, bad.to_string().as_bytes())).unwrap();
+        let r = next_ctl(&mut ctl_rx).await;
+        assert_eq!((r["id"].clone(), r["ok"].as_bool()), (bad["id"].clone(), Some(false)), "{r}");
+        assert!(r["err"].as_str().unwrap().contains("params are for"), "{r}");
+    }
     for c in cmds {
         to_child_tx.send(frame(1, c.to_string().as_bytes())).unwrap();
         let r = next_ctl(&mut ctl_rx).await;

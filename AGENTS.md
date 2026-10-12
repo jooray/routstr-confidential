@@ -242,7 +242,7 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
   - v1's P1 rests on the client never seeing the N→U ciphertext; v2 removes
     that assumption. v2's 2PC costs ~22 MB node→client and ~1.2 MB
     client→node per request (cold ~7.4 s on a 2/50 Mbit/s link), and a
-    cheating node can learn ≤ log2 5 ≈ 2.3 bits per session about fresh,
+    cheating node can learn ≤ log2 6 ≈ 2.6 bits per session about fresh,
     single-use values. The garbler-only variant has no published proof and
     needs external review (`docs/TWOPC-DESIGN.md`, "Security model").
   - Pre-warming (SDK `client/confidential/prewarm.ts`, routstrd

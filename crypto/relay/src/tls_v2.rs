@@ -224,8 +224,7 @@ pub fn th_sf(ch: &[u8], sh: &[u8], server_bytes: &[u8], s_hs: &[u8; 32]) -> Resu
                 let pt = aesgcm::gcm_open(&key, &iv, seq, &r.header, &r.payload)
                     .ok_or_else(|| anyhow!("server handshake record {seq}: bad GCM tag"))?;
                 seq += 1;
-                let Some((_, inner)) = pt.split_last() else { bail!("empty handshake record") };
-                plain.extend_from_slice(inner);
+                plain.extend_from_slice(crate::tls::handshake_inner(&pt)?);
             }
             _ => {}
         }

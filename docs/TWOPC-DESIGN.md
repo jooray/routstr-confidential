@@ -71,6 +71,9 @@ C sends nothing in epoch 0. There is no π_C1 and no KU0/KU1 from C.
     public h1; derive K_1, IV_1; decrypt the window; one-bit equality with the suffix.
 11. **Response** under s_ap_0; **π_C3S**: witness s_ap_0, public h2; otherwise as v1's π_C3 (records from
     the end, `skip`, one-bit equality).
+    The circuits check AES-CTR decryption only, not GCM tags: π_C2S and π_C3S are sound because N takes the
+    ciphertexts from its own relay transcript (the body record it holds, the server records it read from U),
+    never from C. A tag check would not help, since C holds s_ap_0 and can compute valid server tags itself.
 12. Attestation, settlement and receipt as in v1. When U closes the connection, N's relay signs (with a
     per-process Ed25519 key) an attestation binding the sid, the certificate-chain hash, both handshake
     transcript hashes, the record count and the SHA-256 of all bytes in each direction, `c_commit` (a

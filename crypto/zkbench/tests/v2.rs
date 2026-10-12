@@ -383,3 +383,45 @@ fn cu_prover_job_stdin_runs_v2_proofs() {
     p.h1[3] ^= 1;
     assert!(!run_cu_prover_pair("pi_c2s", &Params::PiC2S(p), &witness));
 }
+
+/// A job whose params are for another proof than the one it names is refused
+/// before any protocol byte, on either role.
+#[test]
+fn cu_prover_job_refuses_params_for_another_proof() {
+    let (params, witness) = fixtures::pi_c3s();
+    for (role, w) in [("prover", Some(&witness)), ("verifier", None)] {
+        let v = serde_json::json!({ "proof": "pi_c2s", "params": params, "witness": w });
+        let body = serde_json::to_vec(&v).unwrap();
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cu-prover"))
+            .args(["--job-stdin", "--role", role])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Keep stdin open: a refusal must not depend on the peer going away.
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&frame).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("{role}: a mismatched job was not refused");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(stdin);
+        let mut out = Vec::new();
+        child.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+        let mut err = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+        assert!(!status.success(), "{role}");
+        assert!(out.is_empty(), "{role}: wrote protocol bytes");
+        assert!(err.contains("its params are for pi_c3s"), "{role}: {err}");
+    }
+}

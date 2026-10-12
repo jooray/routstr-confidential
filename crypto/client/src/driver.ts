@@ -37,7 +37,7 @@ import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
 
 import { concat, epoch1Material, fromHex, hex, sha256 } from './advice.ts'
 import { runZk } from './zkbridge.ts'
-import { checkHeadTemplate, checkPiC1Params, checkPiC2Params, checkPiC2SParams, checkPiC3Params, checkPiC3SParams } from './params.ts'
+import { checkHeadTemplate, checkPiC1Params, checkPiC2Params, checkPiC2SParams, checkPiC3Params, checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from './params.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
 import { ZkChan } from './zkchan.ts'
 
@@ -216,12 +216,10 @@ class Session {
   responseBytes = new Uint8Array(0)
   responseRecordCount = 0
   serverRecords: Uint8Array[] = []
-  // Encrypted server records after the handshake, and server KeyUpdates among
-  // them (π_C3S derives the epoch's key and counts seqs from its start).
+  // Encrypted server records after the handshake (π_C3S derives the covered
+  // records' key epoch and counts seqs from its start).
   postHandshake = false
-  serverPostRecords = 0
-  serverKeyUpdates = 0
-  serverEpochStart = 0
+  serverPost: ServerPostRecord[] = []
   serverPending: Uint8Array = new Uint8Array(0)
   epoch2 = false
   bodyRecords: Uint8Array[] = []
@@ -326,11 +324,10 @@ class Session {
         },
         onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
           if (!this.postHandshake || ctx?.type !== 'ciphertext') return
-          const index = this.serverPostRecords++
-          if (ctx.contentType === 'HANDSHAKE' && containsKeyUpdate(rec.content)) {
-            this.serverKeyUpdates += 1
-            this.serverEpochStart = index + 1
-          }
+          this.serverPost.push({
+            data: ctx.contentType === 'APPLICATION_DATA',
+            keyUpdates: ctx.contentType === 'HANDSHAKE' ? countKeyUpdates(rec.content) : 0,
+          })
         },
         onApplicationData: (rec: Uint8Array) => {
           if (!this.ttft) this.ttft = Date.now()
@@ -735,26 +732,29 @@ class Session {
       tailLens.push(this.responseChunks[i]!.length + 1)
       acc += this.responseChunks[i]!.length
     }
-    const disclose: any = { type: 'disclose', r: hex(r), tail_lens: tailLens, skip }
-    if (PROTO === 2 && this.serverKeyUpdates > 0) {
-      disclose.key_updates = this.serverKeyUpdates
-      disclose.epoch_start = this.serverEpochStart
+    const epoch = serverTailEpoch(this.serverPost, tailLens.length)
+    if (PROTO !== 2 && epoch.keyUpdates > 0) throw new Error('the server changed keys before the usage event (v1 cannot prove that)')
+    const disclose: any = { type: 'disclose', r: hex(r), tail_lens: tailLens, skip, trailing: epoch.trailing }
+    if (epoch.keyUpdates > 0) {
+      disclose.key_updates = epoch.keyUpdates
+      disclose.epoch_start = epoch.epochStart
     }
     this.sendText(disclose)
 
     const c3 = await this.waitT('zk_params', 30000)
     if (PROTO === 2) {
-      const handshakeRecords = this.serverRecords.length - this.serverPostRecords
+      const handshakeRecords = this.serverRecords.length - this.serverPost.length
       checkPiC3SParams(c3.params, {
         h2: this.ap!.h2,
         serverRecords: this.serverRecords,
         r,
         skip,
-        keyUpdates: this.serverKeyUpdates,
-        epochBase: handshakeRecords >= 0 ? handshakeRecords + this.serverEpochStart : undefined,
+        keyUpdates: epoch.keyUpdates,
+        epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
+        trailing: epoch.trailing,
       })
     } else {
-      checkPiC3Params(c3.params, { session: this.sessionValues(), serverRecords: this.serverRecords, r, skip })
+      checkPiC3Params(c3.params, { session: this.sessionValues(), serverRecords: this.serverRecords, r, skip, trailing: epoch.trailing })
     }
     const c3Name = PROTO === 2 ? 'pi_c3s' : 'pi_c3'
     if (PROTO === 2) {
@@ -1207,12 +1207,13 @@ main().catch((e) => {
   process.exit(1)
 })
 
-/** Whether a decrypted handshake record carries a KeyUpdate message (type 24). */
-function containsKeyUpdate(content: Uint8Array): boolean {
+/** KeyUpdate messages (type 24) in a decrypted handshake record. */
+function countKeyUpdates(content: Uint8Array): number {
+  let n = 0
   let i = 0
   while (i + 4 <= content.length) {
-    if (content[i] === 24) return true
+    if (content[i] === 24) n++
     i += 4 + ((content[i + 1]! << 16) | (content[i + 2]! << 8) | content[i + 3]!)
   }
-  return false
+  return n
 }

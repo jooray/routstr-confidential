@@ -288,8 +288,12 @@ pub fn secret_bytes<VM: Vm<Binary>>(
     let v: Vector<U8> = vm.alloc_vec(len)?;
     match role {
         Role::Prover => {
+            let data = data.ok_or_else(|| anyhow::anyhow!("the prover needs a witness for this statement"))?;
+            if data.len() != len {
+                anyhow::bail!("witness is {} bytes, the statement needs {len}", data.len());
+            }
             vm.mark_private(v)?;
-            vm.assign(v, data.expect("prover must supply the witness").to_vec())?;
+            vm.assign(v, data.to_vec())?;
             vm.commit(v)?;
         }
         Role::Verifier => {
@@ -306,7 +310,9 @@ pub fn xor_bytes<VM: Vm<Binary>>(
     a: &Vector<U8>,
     b: &Vector<U8>,
 ) -> anyhow::Result<Vector<U8>> {
-    assert_eq!(a.len(), b.len());
+    if a.len() != b.len() {
+        anyhow::bail!("xor_bytes: lengths {} and {} differ", a.len(), b.len());
+    }
     let circ = xor_circuit(a.len() * 8);
     let call = Call::builder(circ)
         .arg(a.to_raw())
@@ -478,7 +484,12 @@ pub fn decrypt_window<VM: Vm<Binary>>(
     sel_start: usize,
     sel_len: usize,
 ) -> anyhow::Result<Vector<U8>> {
-    if ct_window.len() != w || w == 0 || sel_len == 0 || sel_start + sel_len > w {
+    if ct_window.len() != w
+        || w == 0
+        || sel_len == 0
+        || sel_start.checked_add(sel_len).is_none_or(|end| end > w)
+        || off.checked_add(w).is_none_or(|end| end > crate::statements::MAX_INNER_PLAINTEXT)
+    {
         anyhow::bail!("decrypt_window: inconsistent window (w={w}, sel={sel_start}+{sel_len})");
     }
     let block_start = off / 16;
@@ -523,6 +534,9 @@ pub fn decrypt_record_tail<VM: Vm<Binary>>(
 ) -> anyhow::Result<Vector<U8>> {
     if ct.len() < 2 {
         anyhow::bail!("decrypt_record_tail: record has no content");
+    }
+    if off.checked_add(ct.len()).is_none_or(|end| end > crate::statements::MAX_INNER_PLAINTEXT) {
+        anyhow::bail!("decrypt_record_tail: {} bytes at offset {off} exceed a record", ct.len());
     }
     if off % 16 != 0 {
         anyhow::bail!("decrypt_record_tail: offset {off} is not block-aligned");

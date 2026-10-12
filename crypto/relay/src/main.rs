@@ -211,6 +211,9 @@ const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
 const MAX_DISCLOSE_RECORDS: usize = 64;
 const MAX_DISCLOSE_R: usize = 64 << 10;
 const MAX_DISCLOSE_SKIP: usize = 1 << 20;
+/// Largest server record that may follow the covered ones: a KeyUpdate
+/// (4-byte header + request_update, inner type, 16-byte tag).
+const MAX_TRAILING_RECORD: usize = 4 + 1 + 1 + 16;
 
 /// Most client bytes a v2 session buffers before relaying them (during the 2PC
 /// preprocessing and until the credential record is written): the ClientHello,
@@ -226,6 +229,30 @@ fn buffer_client(buf: &mut Vec<u8>, data: &[u8], body_len: usize) -> Result<()> 
         bail!("client sent more than {} bytes before they could be relayed", client_buffer_cap(body_len));
     }
     buf.extend_from_slice(data);
+    Ok(())
+}
+
+/// Dialing the upstream, and each write to it, must finish within these.
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const UPSTREAM_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Most bytes one session accepts from the upstream. A response is bounded by
+/// `max_tokens_cap`; the records are kept for the usage proof.
+const MAX_SERVER_BYTES: usize = 64 << 20;
+/// Most upstream bytes queued for a client that reads slowly: the upstream
+/// reader stops reading until the client catches up.
+const TO_CLIENT_BUDGET: usize = 4 << 20;
+/// Limits on the proof connections (`/zk`): a proof waits this long for the
+/// session's proof lock, then has as long to run; and a session has at most
+/// this many open (2PC, proof channel, and per-proof fallbacks).
+const PROOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_ZK_CONNS_PER_SESSION: usize = 6;
+
+/// Write to the upstream within `UPSTREAM_WRITE_TIMEOUT`: an upstream that
+/// stops reading must not hold the session past its deadline.
+async fn write_upstream(tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf, data: &[u8]) -> Result<()> {
+    tokio::time::timeout(UPSTREAM_WRITE_TIMEOUT, tcp_tx.write_all(data))
+        .await
+        .map_err(|_| anyhow!("upstream did not accept {} bytes within {}s", data.len(), UPSTREAM_WRITE_TIMEOUT.as_secs()))??;
     Ok(())
 }
 
@@ -283,17 +310,75 @@ struct SessionShared {
     zk_lock: tokio::sync::Mutex<()>,
     /// v2: the session's proof channel (`/zk?proof=zkchan`) was opened.
     zkchan_taken: std::sync::atomic::AtomicBool,
+    /// Open `/zk` connections of this session (`MAX_ZK_CONNS_PER_SESSION`).
+    zk_conns: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One open `/zk` connection, counted against its session's limit.
+struct ZkConnSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ZkConnSlot {
+    fn take(count: &Arc<std::sync::atomic::AtomicUsize>) -> Result<Self> {
+        use std::sync::atomic::Ordering;
+        let mut cur = count.load(Ordering::SeqCst);
+        loop {
+            if cur >= MAX_ZK_CONNS_PER_SESSION {
+                bail!("too many proof connections for this session (limit {MAX_ZK_CONNS_PER_SESSION})");
+            }
+            match count.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Ok(Self(count.clone())),
+                Err(now) => cur = now,
+            }
+        }
+    }
+}
+
+impl Drop for ZkConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Recorded relay state needed for the proofs.
 #[derive(Default)]
 struct RelayLog {
+    /// The raw streams up to the handshake verification (it and the 2PC need
+    /// them); later bytes are only hashed and counted.
     client_raw: Vec<u8>,
     server_raw: Vec<u8>,
+    /// SHA-256 and length of every byte received from the upstream.
+    recv: cu_crypto::transcript::Transcript,
+    recv_len: usize,
     /// Client application-data records in wire order (KU0, KU1, body...).
     client_app: Vec<Record>,
     /// Server records (handshake + response) in wire order.
     server_all: Vec<Record>,
+}
+
+impl RelayLog {
+    /// Client bytes before the handshake is verified, capped like the
+    /// pre-relay buffers (an honest client sends only its handshake flight and
+    /// the body by then).
+    fn client_bytes(&mut self, data: &[u8], handshake_verified: bool, body_len: usize) -> Result<()> {
+        if handshake_verified {
+            return Ok(());
+        }
+        buffer_client(&mut self.client_raw, data, body_len)
+    }
+
+    /// Upstream bytes: hashed and counted for the attestation, kept raw until
+    /// the handshake is verified, and refused past `MAX_SERVER_BYTES`.
+    fn server_bytes(&mut self, data: &[u8], handshake_verified: bool) -> Result<()> {
+        if self.recv_len + data.len() > MAX_SERVER_BYTES {
+            bail!("upstream sent more than {MAX_SERVER_BYTES} bytes");
+        }
+        self.recv_len += data.len();
+        self.recv.update(data);
+        if !handshake_verified {
+            self.server_raw.extend_from_slice(data);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +648,11 @@ enum ClientMsg {
         key_updates: u32,
         #[serde(default)]
         epoch_start: usize,
+        /// Server records after the covered ones that carry no response
+        /// bytes: KeyUpdates and a close_notify. Each is at most a KeyUpdate's
+        /// size. Absent: one trailing close_notify-sized record may be skipped.
+        #[serde(default)]
+        trailing: Option<usize>,
     },
     Ku1 {
         record: String,
@@ -613,13 +703,20 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         insecure: app.insecure,
         zk_lock: tokio::sync::Mutex::new(()),
         zkchan_taken: std::sync::atomic::AtomicBool::new(false),
+        zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
+    // Upstream bytes in flight to the client (queued or being sent) hold
+    // permits of this budget; they are returned once the bytes are sent.
+    let budget = Arc::new(tokio::sync::Semaphore::new(TO_CLIENT_BUDGET));
+    let send_budget = budget.clone();
     let send_task = tokio::spawn(async move {
         while let Some(m) = from_client.recv().await {
+            let n = if let Message::Binary(b) = &m { b.len() } else { 0 };
             if ws_tx.send(m).await.is_err() {
                 break;
             }
+            send_budget.add_permits(n);
         }
     });
 
@@ -670,7 +767,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 msg = ws_rx.next() => match msg {
                     Some(Ok(Message::Binary(data))) => {
                         buffer_client(&mut client_pending, &data, st.body_len)?;
-                        log.client_raw.extend_from_slice(&data);
+                        log.client_bytes(&data, false, st.body_len)?;
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => bail!("client left before the handshake"),
                     Some(Ok(Message::Text(_))) => bail!("unexpected control message during 2PC preprocessing"),
@@ -680,12 +777,17 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         }
     }
 
-    let tcp = TcpStream::connect(&app.upstream)
+    // The session deadline covers dialing the upstream too.
+    let deadline = tokio::time::sleep(SESSION_TIMEOUT);
+    tokio::pin!(deadline);
+    let tcp = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(&app.upstream))
         .await
+        .map_err(|_| anyhow!("connecting to {} timed out after {}s", app.upstream, UPSTREAM_CONNECT_TIMEOUT.as_secs()))?
         .with_context(|| format!("connecting to {}", app.upstream))?;
     let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
     {
         let evt = evt_tx.clone();
+        let budget = budget.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -695,7 +797,15 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         break;
                     }
                     Ok(n) => {
-                        let _ = evt.send(Ev::ServerBytes(buf[..n].to_vec()));
+                        // Wait while the client is behind; the budget is
+                        // closed when the session ends.
+                        match budget.acquire_many(n as u32).await {
+                            Ok(p) => p.forget(),
+                            Err(_) => break,
+                        }
+                        if evt.send(Ev::ServerBytes(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -706,8 +816,6 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
     }
 
-    let deadline = tokio::time::sleep(SESSION_TIMEOUT);
-    tokio::pin!(deadline);
         loop {
             tokio::select! {
                 _ = &mut deadline => bail!("session time limit ({}s) reached", SESSION_TIMEOUT.as_secs()),
@@ -730,7 +838,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         if st.sid.is_none() {
                             bail!("TLS bytes before setup");
                         }
-                        log.client_raw.extend_from_slice(&data);
+                        log.client_bytes(&data, st.handshake.is_some(), st.body_len)?;
                         match st.state {
                             SessionState::Handshake => {
                                 buffer_client(&mut client_pending, &data, st.body_len)?;
@@ -751,21 +859,22 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 if st.sid.is_none() {
                                     bail!("TLS bytes before setup");
                                 }
-                                tcp_tx.write_all(&data).await?;
-                                st.sent.extend_from_slice(&data);
-                                log.client_raw.extend_from_slice(&data);
+                                // Capped before it is relayed: the client's
+                                // handshake flight is all that may come now.
+                                log.client_bytes(&data, st.handshake.is_some(), st.body_len)?;
+                                write_upstream(&mut tcp_tx, &data).await?;
+                                st.sent.update(&data);
                             }
                             SessionState::AwaitKu0 => {
                                 client_pending.extend_from_slice(&data);
-                                log.client_raw.extend_from_slice(&data);
                                 let (recs, used) = parse_records(&client_pending);
                                 if recs.len() == 1 && used == client_pending.len() {
                                     let r = recs[0].clone();
                                     if !(r.ctype == CT_APPLICATION_DATA && r.payload.len() == 22) {
                                         bail!("epoch-0 client record is not a 22-byte KeyUpdate");
                                     }
-                                    tcp_tx.write_all(&r.bytes()).await?;
-                                    st.sent.extend_from_slice(&r.bytes());
+                                    write_upstream(&mut tcp_tx, &r.bytes()).await?;
+                                    st.sent.update(&r.bytes());
                                     log.client_app.push(r);
                                     client_pending.clear();
                                     info!("KU0 forwarded");
@@ -776,7 +885,6 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                             }
                             SessionState::Body => {
                                 client_pending.extend_from_slice(&data);
-                                log.client_raw.extend_from_slice(&data);
                                 relay_body(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                             }
                             _ => bail!("unexpected client record in state {:?}", st.state),
@@ -790,8 +898,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 let Some(ev) = ev else { break };
                 match ev {
                     Ev::ServerBytes(bytes) => {
+                        log.server_bytes(&bytes, st.handshake.is_some())?;
                         server_pending.extend_from_slice(&bytes);
-                        log.server_raw.extend_from_slice(&bytes);
                         let (recs, used) = parse_records(&server_pending);
                         for r in recs { log.server_all.push(r); }
                         server_pending.drain(..used);
@@ -838,8 +946,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 "cert_chain_hash": hex::encode(hs.cert_chain_hash),
                                 "th_sh": hex::encode(hs.th_sh),
                                 "th_sf": hex::encode(hs.th_sf),
-                                "sha256_sent": hex::encode(cu_crypto::transcript::hash(&st.sent)),
-                                "sha256_recv": hex::encode(cu_crypto::transcript::hash(&log.server_raw)),
+                                "sha256_sent": hex::encode(st.sent.hash()),
+                                "sha256_recv": hex::encode(log.recv.hash()),
                                 "client_records": log.client_app.len(),
                                 "server_records": log.server_all.len(),
                                 "c_commit": st.c_commit.map(hex::encode),
@@ -896,6 +1004,18 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 st.assembled = Some(asm);
                                 info!("pi_c1 assembled; c_commit + pi_n params sent");
                             }
+                            "pi_n" | "pi_nk" => {
+                                // Only a run on the session's own parameters
+                                // lets the credential record be written.
+                                let same = match (&proven, shared.params.lock().unwrap().get(proof.as_str())) {
+                                    (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
+                                    _ => false,
+                                };
+                                if same && (proof == "pi_nk") == st.v2 {
+                                    st.head_proof_ok = true;
+                                    write_head(&mut st, &mut log, &to_client, &mut tcp_tx).await?;
+                                }
+                            }
                             "pi_c2" | "pi_c2s" => {
                                 let same = match (&proven, shared.params.lock().unwrap().get(proof.as_str())) {
                                     (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
@@ -912,8 +1032,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                     let _ = to_client.send(Message::Text(
                                         serde_json::json!({"type":"body_released"}).to_string().into(),
                                     ));
-                                    tcp_tx.write_all(&held).await?;
-                                    st.sent.extend_from_slice(&held);
+                                    write_upstream(&mut tcp_tx, &held).await?;
+                                    st.sent.update(&held);
                                     info!("π_C2 verified; final body record released to the upstream");
                                     side(&mut st, "pi_c2 verified; final body record released".into());
                                 }
@@ -990,6 +1110,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     if let Some(dir) = &st.run_dir {
         let _ = std::fs::write(dir.join("sidecar.jsonl"), st.side_log.join("\n") + "\n");
     }
+    // Release an upstream reader waiting for the client to catch up.
+    budget.close();
     // The session is over: its proofs can no longer run.
     if let Some(sid) = &st.sid {
         app.sessions.lock().unwrap().remove(sid);
@@ -1017,6 +1139,11 @@ struct Session {
     held_client: Vec<u8>,
     /// v2: the KeyUpdate record N writes after the credential record.
     ku_record: Option<Vec<u8>>,
+    /// π_N (v1) / π_NK (v2) ran to completion on the session's parameters.
+    head_proof_ok: bool,
+    /// The client asked for the credential record (`ku1` / `release_head`):
+    /// the KeyUpdate record to write right after it.
+    head_release: Option<Vec<u8>>,
     sid: Option<String>,
     body_len: usize,
     head_len: usize,
@@ -1029,7 +1156,8 @@ struct Session {
     hs: Option<[u8; 32]>,
     /// The record completing the body, withheld from the upstream until π_C2.
     held: Option<Vec<u8>>,
-    sent: Vec<u8>,
+    /// SHA-256 of every byte written to the upstream (for the attestation).
+    sent: cu_crypto::transcript::Transcript,
     /// Setup values the suffix must pin.
     model: String,
     max_tokens: u64,
@@ -1224,6 +1352,7 @@ async fn handle_control(
                 let (mut head, _offsets) = placeholder_head(&app.offer.head_template, app.key.len(), st.body_len)?;
                 head.push(0x17);
                 st.assembled = Some(asm);
+                st.head_proof_ok = true;
                 send(serde_json::json!({
                     "type":"c_commit","c_commit":hex::encode(c_commit),
                     "template_head": hex::encode(head), "header": hex::encode(header),
@@ -1236,45 +1365,27 @@ async fn handle_control(
             let bytes = hex::decode(&record)?;
             // Full epoch-1 KeyUpdate record: 5-byte header + 22-byte ciphertext
             // (a KeyUpdate handshake message: 5-byte body + 1 inner type + 16 tag).
-            if bytes.len() != 27 || bytes[0] != 0x17 || bytes[5] == 0 {
-                bail!("KU1 record must be 27 bytes (header + 22-byte KeyUpdate), got {}", bytes.len());
+            if !is_ku1_record(&bytes) {
+                bail!("KU1 must be one 27-byte application-data record (header + 22-byte KeyUpdate), got {} bytes", bytes.len());
             }
-            if st.state != SessionState::AwaitC1 {
+            if st.state != SessionState::AwaitC1 || st.head_release.is_some() {
                 bail!("ku1 out of order");
             }
-            let a = st.assembled.as_ref().ok_or_else(|| anyhow!("credential record not assembled (π_C1 not verified)"))?;
-            // Atomic write: credential record then KU1.
-            tcp_tx.write_all(&a.record).await?;
-            tcp_tx.write_all(&bytes).await?;
-            st.sent.extend_from_slice(&a.record);
-            st.sent.extend_from_slice(&bytes);
-            st.state = SessionState::Body;
-            info!(record_len = a.record.len(), "credential record + KU1 written to upstream");
-            side(st, format!("credential_written len={} c_commit={}", a.record.len(), hex::encode(a.c_commit)));
-            send(serde_json::json!({"type":"head_written"}));
+            if st.assembled.is_none() {
+                bail!("credential record not assembled (π_C1 not verified)");
+            }
+            st.head_release = Some(bytes);
+            write_head(st, log, to_client, tcp_tx).await?;
         }
         ClientMsg::ReleaseHead {} => {
-            if !st.v2 || st.state != SessionState::AwaitHead {
+            if !st.v2 || st.state != SessionState::AwaitHead || st.head_release.is_some() {
                 bail!("release_head out of order");
             }
-            let a = st.assembled.as_ref().ok_or_else(|| anyhow!("credential record not assembled"))?;
-            let ku = st.ku_record.clone().ok_or_else(|| anyhow!("no KeyUpdate record"))?;
-            // Atomic write: epoch-0 seq 0 (credential) then seq 1 (KeyUpdate).
-            let mut out = a.record.clone();
-            out.extend_from_slice(&ku);
-            tcp_tx.write_all(&out).await?;
-            st.sent.extend_from_slice(&out);
-            let (len, commit) = (a.record.len(), hex::encode(a.c_commit));
-            st.state = SessionState::Body;
-            info!(record_len = len, "credential record + KeyUpdate written to upstream (epoch 0)");
-            side(st, format!("credential_written len={len} c_commit={commit}"));
-            send(serde_json::json!({"type":"head_written"}));
-            let mut held = std::mem::take(&mut st.held_client);
-            relay_body(st, log, &mut held, tcp_tx).await?;
-            if !held.is_empty() {
-                st.held_client = held;
-                bail!("partial client record buffered across the head write");
+            if st.assembled.is_none() {
+                bail!("credential record not assembled");
             }
+            st.head_release = Some(st.ku_record.clone().ok_or_else(|| anyhow!("no KeyUpdate record"))?);
+            write_head(st, log, to_client, tcp_tx).await?;
         }
         ClientMsg::BodySuffix { suffix } => {
             if st.state != SessionState::Body && st.state != SessionState::Attested {
@@ -1322,7 +1433,7 @@ async fn handle_control(
             shared.params.lock().unwrap().insert(name.into(), params.clone());
             send(serde_json::json!({"type":"zk_params","proof":name,"params":params}));
         }
-        ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start } => {
+        ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing } => {
             // Only once, and only after the upstream closed: the anchor is the
             // end of the final transcript.
             if st.state != SessionState::Attested || st.disclosed {
@@ -1376,33 +1487,11 @@ async fn handle_control(
                 .filter(|x| x.ctype == CT_APPLICATION_DATA)
                 .collect();
             let first_response = info.server_handshake_records;
-            // The covered records are the final contiguous application records.
-            // Only one trailing record of alert size (2 + 1 + 16 = 19 bytes, i.e.
-            // a close_notify) may be skipped; nothing in the middle.
-            let mut chosen_rev: Vec<(usize, &Record)> = Vec::new();
-            let mut j: isize = response.len() as isize - 1;
-            if let Some(first_want) = tail_lens.first() {
-                if j >= first_response as isize
-                    && response[j as usize].payload.len() == 19
-                    && response[j as usize].payload.len().saturating_sub(16) != *first_want
-                {
-                    j -= 1;
-                }
-            }
-            for want in &tail_lens {
-                if j >= first_response as isize
-                    && response[j as usize].payload.len().saturating_sub(16) != *want
-                {
-                    bail!("tail record lengths do not match the end of the transcript");
-                }
-                if j < first_response as isize {
-                    bail!("could not locate tail record of ciphertext length {want}");
-                }
-                chosen_rev.push((j as usize - first_response, response[j as usize]));
-                j -= 1;
-            }
-            let mut chosen = chosen_rev;
-            chosen.reverse();
+            let lens: Vec<usize> = response.iter().map(|x| x.payload.len()).collect();
+            let chosen: Vec<(usize, &Record)> = locate_tail(&lens, first_response, &tail_lens, trailing)?
+                .into_iter()
+                .map(|i| (i - first_response, response[i]))
+                .collect();
             // Covered records are in the last epoch: sequence numbers restart
             // at its first record. (A wrong claim only makes the proof fail:
             // the records then decrypt to noise under the derived key.)
@@ -1420,14 +1509,13 @@ async fn handle_control(
             // v2: the proof decrypts the first covered record only from the
             // last block boundary that still covers R + skip, so its cost
             // follows the disclosure, not the size of the provider's records.
+            // The proof decrypts at least one content byte of every covered
+            // record: an empty one cannot be proven.
+            if chosen.iter().any(|(_, rec)| rec.payload.len() < 16 + 2) {
+                bail!("a covered record has no content");
+            }
             let first_content = chosen.first().map(|(_, rec)| rec.payload.len().saturating_sub(16 + 1)).unwrap_or(0);
-            let first_off = if st.v2 {
-                let rest = total - first_content;
-                let needed_first = need.saturating_sub(rest);
-                (first_content - needed_first) / 16 * 16
-            } else {
-                0
-            };
+            let first_off = if st.v2 { first_tail_offset(first_content, total - first_content, need) } else { 0 };
             let records: Vec<zkbench::statements::TailRecord> = chosen
                 .iter()
                 .enumerate()
@@ -1458,6 +1546,61 @@ async fn handle_control(
         }
     }
     Ok(())
+}
+
+/// The block-aligned offset into the first covered record (`first_content`
+/// content bytes; the later ones hold `rest`) from which the usage proof
+/// decrypts it: the last block boundary that still covers `need` bytes, and
+/// never past its last content byte, which the proof always decrypts (also
+/// when the later records alone cover `need`).
+fn first_tail_offset(first_content: usize, rest: usize, need: usize) -> usize {
+    let needed_first = need.saturating_sub(rest).clamp(1, first_content.max(1));
+    (first_content - needed_first.min(first_content)) / 16 * 16
+}
+
+/// Indices (into the response's application-data records, ascending) of the
+/// records that cover a disclosure: the final contiguous ones, matched from
+/// the end by `tail_lens` (content length + 1, last record first). Only
+/// records too short to carry response bytes may follow them: the server's
+/// KeyUpdates (4 + 1 + 1 + 16 = 22 bytes) and a close_notify (2 + 1 + 16 =
+/// 19). R ends in the terminal chunk, so nothing of the response can sit
+/// after it anyway. Without `trailing`, one close_notify-sized record may be
+/// skipped.
+fn locate_tail(lens: &[usize], first_response: usize, tail_lens: &[usize], trailing: Option<usize>) -> Result<Vec<usize>> {
+    let mut j: isize = lens.len() as isize - 1;
+    match trailing {
+        Some(n) => {
+            if n > zkbench::statements_v2::MAX_SERVER_KEY_UPDATES as usize + 1 {
+                bail!("{n} trailing records (limit {})", zkbench::statements_v2::MAX_SERVER_KEY_UPDATES + 1);
+            }
+            for _ in 0..n {
+                if j < first_response as isize || lens[j as usize] > MAX_TRAILING_RECORD {
+                    bail!("trailing records are not KeyUpdates or a close_notify");
+                }
+                j -= 1;
+            }
+        }
+        None => {
+            if let Some(first_want) = tail_lens.first() {
+                if j >= first_response as isize && lens[j as usize] == 19 && lens[j as usize] - 16 != *first_want {
+                    j -= 1;
+                }
+            }
+        }
+    }
+    let mut chosen = Vec::with_capacity(tail_lens.len());
+    for want in tail_lens {
+        if j < first_response as isize {
+            bail!("could not locate tail record of ciphertext length {want}");
+        }
+        if lens[j as usize].saturating_sub(16) != *want {
+            bail!("tail record lengths do not match the end of the transcript");
+        }
+        chosen.push(j as usize);
+        j -= 1;
+    }
+    chosen.reverse();
+    Ok(chosen)
 }
 
 /// The public JSON suffix that pins every cost-relevant parameter (paper
@@ -1520,12 +1663,57 @@ async fn relay_body(
             st.held = Some(r.bytes());
             info!("final body record held until π_C2 verifies");
         } else {
-            tcp_tx.write_all(&r.bytes()).await?;
-            st.sent.extend_from_slice(&r.bytes());
+            write_upstream(tcp_tx, &r.bytes()).await?;
+            st.sent.update(&r.bytes());
         }
         log.client_app.push(r);
     }
     buf.drain(..used);
+    Ok(())
+}
+
+/// A client KU1 record as v1 expects it: the header of a 22-byte
+/// application-data record (a KeyUpdate: 4 + 1 bytes, inner type, tag).
+fn is_ku1_record(bytes: &[u8]) -> bool {
+    bytes.len() == 27 && bytes[..5] == [CT_APPLICATION_DATA, 0x03, 0x03, 0x00, 22]
+}
+
+/// Write the credential record and the KeyUpdate after it in one write, once
+/// the client asked for it and the proof that the record matches the
+/// published template (π_N / π_NK) has run; whichever comes last triggers it.
+async fn write_head(
+    st: &mut Session,
+    log: &mut RelayLog,
+    to_client: &mpsc::UnboundedSender<Message>,
+    tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    if !st.head_proof_ok || st.head_release.is_none() {
+        return Ok(());
+    }
+    let want = if st.v2 { SessionState::AwaitHead } else { SessionState::AwaitC1 };
+    if st.state != want {
+        bail!("credential record requested in state {:?}", st.state);
+    }
+    let ku = st.head_release.take().unwrap_or_default();
+    let a = st.assembled.as_ref().ok_or_else(|| anyhow!("credential record not assembled"))?;
+    // Atomic write: the credential record (seq 0) then the KeyUpdate (seq 1).
+    let mut out = a.record.clone();
+    out.extend_from_slice(&ku);
+    write_upstream(tcp_tx, &out).await?;
+    st.sent.update(&out);
+    let (len, commit) = (a.record.len(), hex::encode(a.c_commit));
+    st.state = SessionState::Body;
+    info!(record_len = len, v2 = st.v2, "credential record + KeyUpdate written to upstream");
+    side(st, format!("credential_written len={len} c_commit={commit}"));
+    let _ = to_client.send(Message::Text(serde_json::json!({"type":"head_written"}).to_string().into()));
+    if st.v2 {
+        let mut held = std::mem::take(&mut st.held_client);
+        relay_body(st, log, &mut held, tcp_tx).await?;
+        if !held.is_empty() {
+            st.held_client = held;
+            bail!("partial client record buffered across the head write");
+        }
+    }
     Ok(())
 }
 
@@ -1566,8 +1754,8 @@ async fn v2_pump_client(
         } else {
             bail!("unexpected client record type {} during the v2 handshake", r.ctype);
         }
-        tcp_tx.write_all(&pending[..n]).await?;
-        st.sent.extend_from_slice(&pending[..n]);
+        write_upstream(tcp_tx, &pending[..n]).await?;
+        st.sent.update(&pending[..n]);
         pending.drain(..n);
         if st.state == SessionState::AwaitHead {
             st.held_client.append(pending);
@@ -1584,6 +1772,11 @@ async fn v2_progress(
     st: &mut Session,
     log: &mut RelayLog,
 ) -> Result<()> {
+    // Done once the credential record is assembled (and the raw logs stop
+    // growing once the handshake is verified).
+    if st.assembled.is_some() {
+        return Ok(());
+    }
     let Some((ch, sh)) = tls_v2::hellos(&log.client_raw, &log.server_raw) else { return Ok(()) };
     if !st.ch_checked {
         return Ok(());
@@ -1780,6 +1973,7 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
     let started = std::time::Instant::now();
     info!(proof, sid, "zk start");
     let shared = app.sessions.lock().unwrap().get(sid).cloned().ok_or_else(|| anyhow!("unknown sid"))?;
+    let _conn = ZkConnSlot::take(&shared.zk_conns)?;
     if proof == "twopc" {
         let rx = shared.twopc_rx.lock().unwrap().take().ok_or_else(|| anyhow!("2PC not available for this session"))?;
         let (io, bridge) = ws_duplex(socket);
@@ -1811,19 +2005,17 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
     let params = shared.params.lock().unwrap().get(proof).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
     let (role, witness) = node_side(proof, &shared)?;
     let (io, bridge) = ws_duplex(socket);
-    // One proof at a time per session (see SessionShared::zk_lock).
-    let _guard = shared.zk_lock.lock().await;
-    let result = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        zkbench::proofs::run_io(io, role, &params, witness.as_ref()),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => {
-            warn!(proof, "zk proof timed out (30s)");
-            Err(anyhow!("zk proof timed out after 30s"))
-        }
+    // One proof at a time per session (see SessionShared::zk_lock), waiting
+    // for it at most PROOF_TIMEOUT.
+    let result = match tokio::time::timeout(PROOF_TIMEOUT, shared.zk_lock.lock()).await {
+        Err(_) => Err(anyhow!("zk proof waited {}s for the session's previous proof", PROOF_TIMEOUT.as_secs())),
+        Ok(_guard) => match tokio::time::timeout(PROOF_TIMEOUT, zkbench::proofs::run_io(io, role, &params, witness.as_ref())).await {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(proof, "zk proof timed out ({}s)", PROOF_TIMEOUT.as_secs());
+                Err(anyhow!("zk proof timed out after {}s", PROOF_TIMEOUT.as_secs()))
+            }
+        },
     };
     // `run_io` dropped its endpoint; drain the outbound pump into the socket
     // before the handler returns and the WebSocket closes, or the verifier's
@@ -1889,8 +2081,11 @@ where
             }
             let params = shared.params.lock().unwrap().get(proof.as_str()).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
             let (_, witness) = node_side(&proof, shared)?;
-            let _guard = shared.zk_lock.lock().await;
-            let r = match tokio::time::timeout(std::time::Duration::from_secs(30), ch.serve(&proof, &params, witness.as_ref())).await {
+            let Ok(_guard) = tokio::time::timeout(PROOF_TIMEOUT, shared.zk_lock.lock()).await else {
+                ch.poison();
+                bail!("{proof} waited {}s for the session's previous proof", PROOF_TIMEOUT.as_secs());
+            };
+            let r = match tokio::time::timeout(PROOF_TIMEOUT, ch.serve(&proof, &params, witness.as_ref())).await {
                 Ok(r) => r,
                 Err(_) => {
                     ch.poison();
@@ -2031,7 +2226,9 @@ fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
     if !empty_choices {
         bail!("R: usage event has non-empty choices");
     }
-    if v.pointer("/usage/prompt_tokens").is_none() || v.pointer("/usage/completion_tokens").is_none() {
+    if v.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()).is_none()
+        || v.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).is_none()
+    {
         bail!("R: usage event missing token counts");
     }
     Ok(v)
@@ -2185,5 +2382,200 @@ mod disclosure_line_start_tests {
         // Without the leading LF, a "data: " could be inside a JSON string.
         let r = format!("data: {usage}\n\ndata: [DONE]\n\n\r\n0\r\n\r\n").into_bytes();
         assert!(validate_r(&r).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tail_offset_tests {
+    use super::first_tail_offset;
+    use cu_crypto::aesgcm;
+    use zkbench::fixtures;
+    use zkbench::proofs::run_pair_ideal;
+    use zkbench::statements::{Params, PiC3S, TailRecord, Witness};
+
+    #[test]
+    fn the_first_record_keeps_a_content_byte() {
+        // R + skip reaches into the first record: the last block boundary
+        // that still covers it.
+        assert_eq!(first_tail_offset(100, 10, 30), 80);
+        assert_eq!(first_tail_offset(100, 10, 110), 0);
+        assert_eq!(first_tail_offset(32, 10, 11), 16);
+        // The later records alone cover R + skip: the proof still decrypts
+        // the first record's last content byte (a tail of >= 2 bytes).
+        for content in 1..100 {
+            let off = first_tail_offset(content, 50, 40);
+            assert_eq!(off % 16, 0);
+            assert!(content + 1 - off >= 2, "content {content}: tail from {off}");
+        }
+        assert_eq!(first_tail_offset(32, 50, 40), 16);
+    }
+
+    fn sealed(secret: &cu_crypto::keyschedule::Secret, seq: u64, content: &[u8]) -> Vec<u8> {
+        let mut inner = content.to_vec();
+        inner.push(0x17);
+        let ks = aesgcm::ctr_keystream(&secret.key(), &secret.iv(), seq, inner.len());
+        inner.iter().zip(ks).map(|(a, b)| a ^ b).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disclosure_with_an_unneeded_first_record_proves() {
+        // Two covered records; the second alone holds R, the first has 32
+        // content bytes (a multiple of 16).
+        let v = fixtures::v2_secrets();
+        let secret = cu_crypto::keyschedule::Secret::new(v.s_ap_0);
+        let Params::PiC3S(base) = fixtures::pi_c3s().0 else { unreachable!() };
+        let r = base.expected.clone();
+        let first = sealed(&secret, 4, &[b'y'; 32]);
+        let second = sealed(&secret, 5, &r);
+        let params = |off: usize| {
+            Params::PiC3S(PiC3S {
+                h2: v.h2(),
+                records: vec![
+                    TailRecord { seq: 4, ct: first[off..].to_vec(), off },
+                    TailRecord { seq: 5, ct: second.clone(), off: 0 },
+                ],
+                expected: r.clone(),
+                skip: 0,
+                key_updates: 0,
+            })
+        };
+        let witness = Witness::Secret(v.s_ap_0);
+        // Starting at the end of its content leaves a 1-byte tail: unprovable.
+        assert!(run_pair_ideal(&params(32), &witness).await.is_err());
+        let off = first_tail_offset(32, r.len(), r.len());
+        let res = run_pair_ideal(&params(off), &witness).await.unwrap();
+        assert!(res.iter().all(|c| c.ok), "tail from {off}");
+    }
+}
+
+#[cfg(test)]
+mod relay_log_tests {
+    use super::{client_buffer_cap, RelayLog, ZkConnSlot, MAX_SERVER_BYTES, MAX_ZK_CONNS_PER_SESSION};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn raw_logs_stop_at_the_handshake_and_hashes_cover_everything() {
+        let mut log = RelayLog::default();
+        log.server_bytes(b"hello ", false).unwrap();
+        log.server_bytes(b"world", true).unwrap();
+        assert_eq!(log.server_raw, b"hello ");
+        assert_eq!(log.recv_len, 11);
+        assert_eq!(log.recv.hash(), cu_crypto::transcript::hash(b"hello world"));
+
+        log.client_bytes(b"ch", false, 100).unwrap();
+        log.client_bytes(b"body", true, 100).unwrap();
+        assert_eq!(log.client_raw, b"ch");
+    }
+
+    #[test]
+    fn unverified_client_bytes_and_server_bytes_are_capped() {
+        let mut log = RelayLog::default();
+        let big = vec![0u8; client_buffer_cap(100) + 1];
+        assert!(log.client_bytes(&big, false, 100).is_err());
+        // After the handshake they are not kept, so not capped here (the
+        // body accounting bounds them).
+        assert!(log.client_bytes(&big, true, 100).is_ok());
+
+        let chunk = vec![0u8; 1 << 20];
+        for _ in 0..MAX_SERVER_BYTES >> 20 {
+            log.server_bytes(&chunk, true).unwrap();
+        }
+        assert!(log.server_bytes(b"x", true).is_err());
+    }
+
+    #[test]
+    fn proof_connections_are_counted() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let slots: Vec<_> = (0..MAX_ZK_CONNS_PER_SESSION).map(|_| ZkConnSlot::take(&count).unwrap()).collect();
+        assert!(ZkConnSlot::take(&count).is_err());
+        drop(slots);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(ZkConnSlot::take(&count).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod head_release_tests {
+    use super::{is_ku1_record, write_head, Assembled, RelayLog, Session, SessionState};
+    use axum::extract::ws::Message;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn ku1_record_shape() {
+        let mut rec = vec![0x17, 0x03, 0x03, 0x00, 22];
+        rec.extend_from_slice(&[0u8; 22]); // the first ciphertext byte may be 0
+        assert!(is_ku1_record(&rec));
+        let mut bad = rec.clone();
+        bad[0] = 0x16;
+        assert!(!is_ku1_record(&bad));
+        bad = rec.clone();
+        bad[4] = 21;
+        assert!(!is_ku1_record(&bad));
+        assert!(!is_ku1_record(&rec[..26]));
+    }
+
+    async fn pair() -> (tokio::net::tcp::OwnedWriteHalf, tokio::net::TcpStream) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (c, s) = tokio::join!(tokio::net::TcpStream::connect(addr), l.accept());
+        (c.unwrap().into_split().1, s.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn the_head_waits_for_both_the_request_and_the_proof() {
+        for v2 in [true, false] {
+            let (mut tx, mut peer) = pair().await;
+            let (to_client, mut from) = mpsc::unbounded_channel::<Message>();
+            let mut log = RelayLog::default();
+            let mut st = Session {
+                v2,
+                state: if v2 { SessionState::AwaitHead } else { SessionState::AwaitC1 },
+                assembled: Some(Assembled { record: b"HEAD".to_vec(), c_commit: [0; 32], header: [0; 5] }),
+                ..Session::default()
+            };
+            // Requested, proof not yet run: nothing is written.
+            st.head_release = Some(b"KU".to_vec());
+            write_head(&mut st, &mut log, &to_client, &mut tx).await.unwrap();
+            assert!(st.head_release.is_some() && from.try_recv().is_err());
+            // The proof completes: the record and the KeyUpdate go out at once.
+            st.head_proof_ok = true;
+            write_head(&mut st, &mut log, &to_client, &mut tx).await.unwrap();
+            assert_eq!(st.state, SessionState::Body);
+            assert!(matches!(from.try_recv(), Ok(Message::Text(t)) if t.contains("head_written")));
+            drop(tx);
+            let mut got = Vec::new();
+            peer.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, b"HEADKU");
+            // Proof done but not requested: nothing happens.
+            let (mut tx, _peer) = pair().await;
+            let mut st2 = Session { v2, head_proof_ok: true, state: SessionState::AwaitHead, ..Session::default() };
+            write_head(&mut st2, &mut log, &to_client, &mut tx).await.unwrap();
+            assert_eq!(st2.state, SessionState::AwaitHead);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tail_locator_tests {
+    use super::locate_tail;
+
+    #[test]
+    fn records_after_the_usage_event_are_skipped_only_when_tiny() {
+        // Two handshake records, then the response: 80, 70, a KeyUpdate (22)
+        // and a close_notify (19).
+        let lens = [100, 100, 80, 70, 22, 19];
+        assert_eq!(locate_tail(&lens, 2, &[54, 64], Some(2)).unwrap(), vec![2, 3]);
+        // The legacy form skips only a close_notify.
+        assert!(locate_tail(&lens, 2, &[54, 64], None).is_err());
+        assert_eq!(locate_tail(&lens[..5], 2, &[6], None).unwrap(), vec![4]);
+        assert_eq!(locate_tail(&lens[..4], 2, &[54], None).unwrap(), vec![3]);
+        // Skipping a record that can carry response bytes is refused.
+        assert!(locate_tail(&lens, 2, &[64], Some(3)).is_err());
+        assert!(locate_tail(&[100, 80, 70, 23], 1, &[54], Some(1)).is_err());
+        // Nor may the skip reach into the handshake flight.
+        assert!(locate_tail(&[19, 19], 1, &[3], Some(2)).is_err());
+        assert!(locate_tail(&lens, 2, &[54, 64], Some(99)).is_err());
     }
 }

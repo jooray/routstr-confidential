@@ -21,6 +21,10 @@
 //!
 //! The anchor digests are decoded (they equal public values); every
 //! plaintext comparison is a one-bit in-circuit equality (`eq_bytes`).
+//!
+//! As in v1, the circuits decrypt with AES-CTR and do not check GCM tags; the
+//! ciphertexts must come from the verifier's own transcript (see the
+//! `statements` module docs).
 
 use mpz_vm_core::{
     Call, CallableExt, Vm,
@@ -36,7 +40,9 @@ use crate::gadgets::{
     eq_bytes, expand_label, public_bytes, record_keys_keyed, secret_bytes, select, sha256_bytes,
     splice_circuit, xor_bytes,
 };
-use crate::statements::{Check, SUPPORTED_KEY_ALPHABET, TailRecord, Witness, default_key_alphabet};
+use crate::statements::{
+    Check, MAX_INNER_PLAINTEXT, SUPPORTED_KEY_ALPHABET, TailRecord, Witness, default_key_alphabet,
+};
 
 /// π_C2S public parameters: the v1 π_C2 window, anchored by `h1` instead of
 /// the session's handshake values.
@@ -214,6 +220,7 @@ pub fn build_pi_nk<VM: Vm<Binary>>(
         );
     }
     if p.template.len() != p.head_len
+        || p.head_len >= MAX_INNER_PLAINTEXT
         || p.key_offsets.len() != p.key_len
         || p.key_len == 0
         || p.key_offsets.iter().any(|&o| o >= p.head_len)

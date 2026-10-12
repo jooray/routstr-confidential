@@ -73,8 +73,10 @@
 //!   transcript hash are pinned by the pointer checks against opened masks;
 //!   outputs decode with authenticated masks). What N can still do is a
 //!   *selective failure*: make C abort depending on C's private values. Per
-//!   phase N observes one of {abort, labels rejected, success} and the session
-//!   ends at the first failure: ≤ log2 5 ≈ 2.3 bits per session.
+//!   phase N observes one of {abort, labels rejected, success}, the session
+//!   ends at the first failure, and a deviation in ECtF adds one outcome (the
+//!   server Finished failing between the phases): six outcomes, ≤ log2 6 ≈ 2.6
+//!   bits per session.
 //! * **Malicious C.** C is the evaluator; it sees the tables, active labels
 //!   and pointer bits, the opened masks (its inputs, the public transcript
 //!   hash, the outputs), check rows padded by hashes of inactive labels, and
