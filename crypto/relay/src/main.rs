@@ -30,8 +30,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
-use axum::response::IntoResponse;
+use axum::extract::{Query, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use ed25519_dalek::{Signer, SigningKey};
@@ -187,6 +189,10 @@ struct AppState {
     slots: Arc<tokio::sync::Semaphore>,
     /// Largest request body (`setup.len`) a session may declare.
     max_body: usize,
+    /// SHA-256 of the node's shared token (`--token-env`); `None` = no check.
+    /// The sidecar does not check client credentials (the node does, before
+    /// it dials), so anyone who reaches it spends the provider key.
+    token_hash: Option<[u8; 32]>,
 }
 
 /// A session must send its `setup` this soon after connecting.
@@ -303,6 +309,7 @@ async fn main() -> Result<()> {
     let listen = arg("--listen").unwrap_or_else(|| "127.0.0.1:7443".into());
     let upstream = arg("--upstream").unwrap_or_else(|| "api.venice.ai:443".into());
     let key_env = arg("--key-env").unwrap_or_else(|| "VENICE_API_KEY".into());
+    let token_env = arg("--token-env").unwrap_or_else(|| "CU_SIDECAR_TOKEN".into());
     let insecure = args.iter().any(|a| a == "--insecure-no-proofs");
     let node_settles = args.iter().any(|a| a == "--node-settles");
     let host = arg("--host").unwrap_or_else(|| host_of(&upstream));
@@ -327,9 +334,24 @@ async fn main() -> Result<()> {
     }
     info!(key_len = key.len(), "loaded upstream API key");
 
-    if insecure && !(listen.starts_with("127.0.0.1") || listen.starts_with("localhost")) {
-        bail!("--insecure-no-proofs may only be used when listening on 127.0.0.1");
+    if insecure && !is_loopback(&listen) {
+        bail!("--insecure-no-proofs may only be used when listening on loopback");
     }
+    // The node's credential. Required off loopback: any peer that reaches the
+    // sidecar gets sessions on the provider key without the node's billing.
+    let token_hash = match std::env::var(&token_env) {
+        Ok(t) if !t.is_empty() => {
+            if t.len() < 16 {
+                bail!("{token_env} is too short (at least 16 characters)");
+            }
+            Some(cu_crypto::transcript::hash(t.as_bytes()))
+        }
+        _ if is_loopback(&listen) => None,
+        _ => bail!(
+            "{token_env} is not set; a sidecar listening on {listen} (not loopback) needs the \
+             node's token (CONFIDENTIAL_SIDECAR_TOKEN on the node)"
+        ),
+    };
 
     let mut offer = if let Some(path) = arg("--offer") {
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
@@ -412,18 +434,47 @@ async fn main() -> Result<()> {
         sessions: StdMutex::new(HashMap::new()),
         slots: Arc::new(tokio::sync::Semaphore::new(max_sessions)),
         max_body,
+        token_hash,
     });
 
     let app = Router::new()
         .route("/offer", get(offer_http))
         .route("/session", get(session_ws))
         .route("/zk", get(zk_ws))
+        .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    info!(%listen, insecure, "cu-sidecar listening");
+    info!(%listen, insecure, token = state.token_hash.is_some(), "cu-sidecar listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// `--listen` names a loopback address (127.0.0.0/8, ::1 or localhost).
+fn is_loopback(listen: &str) -> bool {
+    if let Ok(addr) = listen.parse::<std::net::SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+    listen.rsplit_once(':').is_some_and(|(host, _)| host == "localhost")
+}
+
+/// Every route needs `Authorization: Bearer <token>` when a token is set.
+/// Compared as SHA-256 digests, in constant time.
+async fn require_token(State(app): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    if let Some(want) = &app.token_hash {
+        let got = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| cu_crypto::transcript::hash(t.as_bytes()));
+        let ok = got.is_some_and(|g| g.iter().zip(want).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0);
+        if !ok {
+            warn!(path = %req.uri().path(), "rejected a request without the node's token");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+    next.run(req).await
 }
 
 fn os_random_32() -> [u8; 32] {

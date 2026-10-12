@@ -3,13 +3,15 @@
 #   podman build -f crypto/Containerfile.sidecar -t cu-sidecar crypto
 #
 # Run it next to the routstr node (same container network, no published
-# port), with the provider key in the environment:
+# port), with the provider key and the token shared with the node in the
+# environment (a non-loopback --listen refuses to start without the token):
 #
-#   podman run -d --name cu-sidecar -e UPSTREAM_API_KEY=... cu-sidecar \
+#   podman run -d --name cu-sidecar -e UPSTREAM_API_KEY=... -e CU_SIDECAR_TOKEN=... cu-sidecar \
 #     --listen 0.0.0.0:7444 --upstream api.venice.ai:443 --key-env UPSTREAM_API_KEY \
 #     --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
 #
-# and point the node at it: CONFIDENTIAL_SIDECAR_URL=http://cu-sidecar:7444
+# and point the node at it: CONFIDENTIAL_SIDECAR_URL=http://cu-sidecar:7444,
+# CONFIDENTIAL_SIDECAR_TOKEN=<same token>
 FROM docker.io/library/rust:1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang \
     && rm -rf /var/lib/apt/lists/*

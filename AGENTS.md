@@ -7,7 +7,7 @@ only relays TLS records and writes one record containing its API key. Zero-
 knowledge proofs pin what each side may write, and billing uses the usage the
 provider itself reported. No trusted hardware, no MPC over the payload.
 
-Start with `paper/paper.md` §4 (protocol) and §7 (how it plugs into routstr),
+Start with `paper/paper.md` §4 (protocol) and §8 (how it plugs into routstr),
 then this file's "Wiring" section.
 
 ## Layout
@@ -120,7 +120,7 @@ response steps use π_C2 and π_C3, anchored on the handshake values.
 | ZK statements / circuits (one-bit equality `eq_bytes`) | `crypto/zkbench/src/statements.rs`, `gadgets.rs`, `bin/cu-prover.rs` (`--job-stdin`); tests `tests/disclosure.rs` |
 | node offer, model→provider candidate, billing glue | `routstr-core/routstr/confidential.py` |
 | node relay + interception | `routstr-core/routstr/confidential_ws.py` |
-| node hooks | `core/main.py` (routes), `core/settings.py` (`CONFIDENTIAL_SIDECAR_URL`), `payment/models.py` (`confidential_upstream` field) |
+| node hooks | `core/main.py` (routes), `core/settings.py` (`CONFIDENTIAL_SIDECAR_URL`, `CONFIDENTIAL_SIDECAR_TOKEN`), `payment/models.py` (`confidential_upstream` field) |
 | SDK transport + session | `routstr-sdk/client/confidential/{transport,session,offer,suffix,receipt,hosts}.ts`, vendored TLS fork in `tls-fork/` (MIT, see `FORK-NOTES.md`) |
 | SDK hooks | `client/RoutstrClient.ts` (`confidential` param, transport branch, `finalize` awaits settlement, `setConfidentialTransport` registry on `globalThis`), `client/resolveRequestContext.ts` (`requireConfidential` filter), `core/types.ts`, `bun.ts`/`node.ts` (register the transport) |
 | routstrd hooks | `src/utils/config.ts` (`confidentialUpstream`), `src/daemon/index.ts`, `src/daemon/http/index.ts` (opt-in header → `routeRequests`) |
@@ -138,6 +138,8 @@ cd $P/crypto && cargo build --release -p cu-sidecar -p zkbench
 ./zkbench/target/release/cu-sidecar --listen 127.0.0.1:7444 --upstream api.venice.ai:443 \
   --key-env VENICE_API_KEY --offer relay/offer.venice.json --node-settles &
 #   (limits: --max-sessions 32, --max-body 8388608; 15 s setup / 600 s session timeouts)
+#   (on loopback no token is needed; off loopback it requires CU_SIDECAR_TOKEN, and the
+#    node sends the same value as CONFIDENTIAL_SIDECAR_TOKEN)
 # node: RELAYS points nowhere so nothing is published to Nostr
 cd $P/routstr-core && DATABASE_URL=sqlite+aiosqlite:////tmp/node.db NSEC=<test nsec> \
   CONFIDENTIAL_SIDECAR_URL=http://127.0.0.1:7444 CASHU_MINTS=http://127.0.0.1:3338 \
@@ -209,6 +211,11 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
 
 - **Never log or commit `VENICE_API_KEY`**, node nsecs or Cashu tokens. Scan
   diffs before committing.
+- **The sidecar trusts its peer to be the node.** It does not check client
+  credentials (the node does, before dialing it), so whoever reaches it spends
+  the provider key. Off loopback it requires the node's token
+  (`CU_SIDECAR_TOKEN` / `--token-env` on the sidecar, `CONFIDENTIAL_SIDECAR_TOKEN`
+  on the node, env-only); never publish its port.
 - **Never let a test node announce itself.** Set `RELAYS` to an unreachable
   relay, and stop test nodes when done (a forgotten node without `RELAYS`
   keeps re-announcing). The listing code now skips loopback/private URLs (the

@@ -169,13 +169,22 @@ podman build -f crypto/Containerfile.sidecar -t cu-sidecar crypto   # or docker
 ```
 
 Run it in the same container network as the node, with no published port. It needs the provider API key
-(the same one the node uses):
+(the same one the node uses) and a token it shares with the node:
 
 ```sh
-podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=... cu-sidecar \
+openssl rand -hex 32    # the shared token: CU_SIDECAR_TOKEN here, CONFIDENTIAL_SIDECAR_TOKEN on the node
+podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=... -e CU_SIDECAR_TOKEN=... cu-sidecar \
   --listen 0.0.0.0:7444 --upstream api.venice.ai:443 --key-env UPSTREAM_API_KEY \
   --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
 ```
+
+**The token.** The sidecar does not check client credentials: the node checks them and reserves the payment
+before it connects to the sidecar. Anyone who reaches the sidecar directly could therefore run sessions on
+your provider key without paying. So the sidecar requires `Authorization: Bearer <token>` on every request
+(the token is read from the environment variable named by `--token-env`, default `CU_SIDECAR_TOKEN`, at least
+16 characters) and refuses to start on a non-loopback `--listen` without one. A sidecar on `127.0.0.1` may run
+without a token, but then every local user on that host can reach it; set one anyway if the host is shared.
+Keep the port unpublished in any case. To rotate the token, change it on both sides and restart both.
 
 **Denial-of-service limit.** The node refuses a new confidential session (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
@@ -229,10 +238,12 @@ and set
 
 ```sh
 CONFIDENTIAL_SIDECAR_URL=http://cu-sidecar:7444
+CONFIDENTIAL_SIDECAR_TOKEN=<the sidecar's CU_SIDECAR_TOKEN>
 ```
 
-routstr-core persists settings in its database: if the node has run before, set it once through
-`PATCH /admin/api/settings` as well. The node then serves `GET /v1/confidential/offer` (signed with its Nostr
+routstr-core persists settings in its database: if the node has run before, set the URL once through
+`PATCH /admin/api/settings` as well. The token is read only from the environment (never stored in the
+database, shown as `[REDACTED]` by the admin API). The node then serves `GET /v1/confidential/offer` (signed with its Nostr
 key) and marks the offered models in `/v1/models` with `confidential_upstream`. Its reverse proxy must pass
 WebSockets for `/v1/confidential/ws` and `/v1/confidential/zk` (`Upgrade`/`Connection` headers, read timeout
 of a few minutes). Run the node's server with a long WebSocket ping timeout, e.g.
