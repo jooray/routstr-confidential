@@ -220,6 +220,11 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
   relay, and stop test nodes when done (a forgotten node without `RELAYS`
   keeps re-announcing). The listing code now skips loopback/private URLs (the
   `fix/no-announce-unroutable-urls` branch).
+- **Client and node trust the same roots.** The TLS fork's
+  `utils/mozilla-root-cas.js` (SDK, `crypto/client/vendor/tls`, web library)
+  is generated from the sidecar's pinned `webpki-roots` by
+  `crypto/tools/gen-client-roots.py`; re-run it on all three copies after a
+  `webpki-roots` bump.
 - **Rebuild after SDK changes.** routstrd uses the SDK via a
   `node_modules/@routstr/sdk` symlink to `../routstr-sdk`, which loads
   `dist/`, so rebuild it (`npm run build`).
