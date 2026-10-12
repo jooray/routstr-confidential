@@ -42,8 +42,9 @@ authors' working documents and are not published:
 >   authenticates with its ordinary node credential (API key or Cashu token)
 >   and names the signed offer it verified. The node freezes that offer's rates
 >   and reserves `max(min_request_msat, ⌈(prompt_limit·in + max_tokens·out)/1000⌉)`,
->   where `prompt_limit` is the model's full context minus its completion limit:
->   the opaque prompt is never discounted. It charges exactly the frozen-rate
+>   where `prompt_limit` is the model's full context length: the opaque prompt
+>   is never discounted (and never reduced by the model's own completion
+>   limit, which the pinned cap rarely reaches). It charges exactly the frozen-rate
 >   cost of the π_C3-verified usage. It releases the reservation if the provider
 >   never received the complete request or answered a 4xx/503, and charges the
 >   reservation for another 5xx or if the client withholds its disclosure.
@@ -495,8 +496,11 @@ The prompt is opaque to the node, so the reservation never discounts it
 - `reserved = max(min_request_msat, ⌈(prompt_limit · in + max_tokens · out) / 1000⌉)`
   msats, at the per-1k rates of the signed offer the client verified (frozen
   for the session by `offer_sig`). `prompt_limit` is the model's context
-  length minus its completion limit (`prompt_token_limit`, the same rule as the
-  node's normal max-cost helper). Without a known context length the node
+  length (`prompt_token_limit`). It is deliberately *not* the visible-body
+  helper's "context minus the model's completion limit": the pinned cap is
+  usually far below that limit, so the provider accepts a prompt of up to
+  context − cap tokens, and the capped charge would leave the difference
+  unbilled. Without a known context length the node
   reserves the model's undiscounted maximum cost; fixed-pricing deployments
   keep their per-request reservation.
 - Example (2026-10-10, `deepseek-v4-flash`): `prompt_limit` 104,858 tokens at

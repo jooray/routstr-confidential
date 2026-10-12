@@ -128,7 +128,8 @@ session. There is one version; nothing is negotiated.
   information about C. The test `check_rows_bound_to_session_salt` covers this.
 - *Leakage: selective failure only.* N can make C abort depending on C's private values: corrupted tables,
   rows or OT correlations make the abort a predicate of C's inputs. Per phase N observes one of {C aborted, C's
-  output labels rejected, success}, and the session ends at the first failure. That is at most log2 5 ≈ 2.3
+  output labels rejected, success}, and the session ends at the first failure; a deviation in ECtF adds one
+  more observable outcome (the server Finished failing between the phases). That is at most log2 6 ≈ 2.6
   bits per session about fresh, single-use values (the ECDHE share, the MS share, the masks). Dual execution
   leaked log2 3 ≈ 1.6. Removing this leakage needs evaluator-shared masks (WRK17/KRRW18-style triples), which
   cost more than dual execution's bandwidth.
@@ -151,8 +152,9 @@ uses fresh ephemeral scalars, shares, masks, labels, Δ_A and Δ_B.
 | QuickSilver product check, IT-MAC openings | standard (QuickSilver/Wolverine soundness), GF(2^128) |
 | three-halves garbling privacy and authenticity | Rosulek–Roy proof, under their hash assumption (instantiated, as in mpz2, with fixed-key-AES TCCR) |
 | AND-gate consistency check with garbler-held masks, 64-bit projection, salt | argued above; **no published proof** for this garbler-only variant |
-| leakage bound (≤ log2 5 bits per session) | counting argument above |
-| Ferret/KOS against a malicious receiver (N), KOS consistency-check leakage of a few Δ bits with negligible probability | assumed from mpz2 |
+| leakage bound (≤ log2 6 bits per session) | counting argument above |
+| Ferret/KOS against a malicious receiver (N), KOS consistency-check leakage of a few Δ bits with negligible probability (Δ_B for the MAC COTs, where C is the sender; Δ_A for C's input labels, where C is the KOS receiver and N the sender: harmless, since an inactive label needs all 128 bits) | assumed from mpz2 |
+| Ferret/KOS against a malicious sender (N is the RCOT sender for C's proofs π_C2S/π_C3S, so their zero knowledge relies on it; the SPCOT consistency check is in the pinned mpz2) | assumed from mpz2 |
 | ECtF | semi-honest only, as before |
 | external review | **none yet** |
 

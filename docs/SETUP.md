@@ -63,7 +63,9 @@ or `routstrd receive <sats>` for Lightning). Then add to `~/.routstrd/config.jso
 - `trusted_hosts`: the provider hostnames whose TLS certificate you accept. This is what you trust instead of
   an enclave: your client checks the provider's certificate itself.
 - `node_pubkeys`: nodes whose signed offers you accept (for routstr.cypherpunk.today:
-  `2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7`).
+  `2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7`). Optional: without it, routstrd
+  accepts an offer signed by the key that announced that node's URL on Nostr, for https and onion
+  nodes only. Set it to pin specific nodes; set `"pin_from_announcement": false` to require it.
 - `cu-2pc` is found next to `cu-prover` (or set `CU_2PC`).
 
 **Use it.** Start the daemon (`routstrd start`, optionally `--provider https://<node>` to pin one node) and
@@ -79,7 +81,8 @@ curl http://127.0.0.1:8008/v1/chat/completions \
 Any OpenAI-compatible client works if it can add that header (OpenAI Python:
 `default_headers={"x-routstr-verify": "confidential"}`). With the header, a request is either confidential or
 refused: it is never silently sent in the clear. Only `POST /v1/chat/completions` is supported, `max_tokens`
-is required (it is pinned and reserved for), and only models the node lists in its confidential offer are
+is required (it is pinned and reserved for; a value above the node's cap is lowered to the cap, and the
+response then carries `x-routstr-confidential-max-tokens: <cap>; requested=<yours>`), and only models the node lists in its confidential offer are
 used (`GET https://<node>/v1/confidential/offer`).
 
 What to expect: each request first runs a two-party computation with the node, in which the client

@@ -68,7 +68,7 @@ covers only the key schedule, a fixed workload of 31 SHA-256 compressions, never
    response run under keys only the client holds. The handshake key schedule runs as a two-party
    computation secure against a malicious peer, in which only the node garbles and the client checks
    every gate against masks the node has authenticated to it. Neither party ever reveals its inputs;
-   a cheating node can learn at most $\log_2 5 \approx 2.3$ bits per session about values used only in
+   a cheating node can learn at most $\log_2 6 \approx 2.6$ bits per session about values used only in
    that session, and the client uploads 1.2 MB (section 4.4).
 2. A request-integrity construction: the client proves that its request body ends in an agreed public
    JSON suffix that pins every cost-relevant parameter, and the provider sees the complete request only
@@ -119,8 +119,9 @@ Adversaries: either C or N may deviate arbitrarily from the protocol (they are m
 other); U follows TLS and its own API, and is trusted with the prompt and the API key as it is today.
 Assumptions: the standard hardness of ECDH over P-256, SHA-256, HMAC and AES-GCM; fixed-key AES as a
 correlation-robust hash (the usual assumption of free-XOR garbling); security of oblivious transfer and
-correlated-OT extension (KOS, Ferret) against a malicious party, and of VOLE-based zero knowledge; the
-WebPKI. No trusted hardware.
+correlated-OT extension (KOS, Ferret) against a malicious party in either role (the 2PC relies on
+security against a malicious receiver, the proofs on security against a malicious sender), and of
+VOLE-based zero knowledge; the WebPKI. No trusted hardware.
 
 # 3. Preliminaries and the provider profile
 
@@ -312,7 +313,8 @@ authenticates to C the mask of every circuit input and every AND output (the *ba
 AND gate $k$ with inputs $i, j$, the product $t_k = \lambda_i \lambda_j$: about 1.3 million IT-MACs. The
 masks of all other wires follow by linearity. N sends its tables and these commitments first; only then
 does C send a 32-byte seed, from which both derive a challenge $\chi$ and a per-session salt. N then
-proves all products $t_k$ with one QuickSilver-style check, opens the masks of C's input wires, of the
+proves all products $t_k$ of both phases with one QuickSilver-style check (the second phase's powers of
+$\chi$ are scaled by a constant so that no coefficient cancels), opens the masks of C's input wires, of the
 transcript-hash wires and of every output wire (the bits and one hash of their MACs), and sends one
 check row per base wire and a value $Y_N$.
 
@@ -343,15 +345,16 @@ product or an opened bit, corrupt check rows, or run the oblivious transfer for 
 correlation. Each of these either fails the product check, the openings, the pointer checks or the
 consistency check, or leaves C's outputs correct (section 5). What N can still do is make an abort depend
 on C's private values (selective failure). In each phase it observes one of three outcomes (C aborted,
-C's output labels were rejected, success), and the session ends at the first failure, so there are at
-most five outcomes per session: N learns at most $\log_2 5 \approx 2.3$ bits. A cheating C, the
+C's output labels were rejected, success), the session ends at the first failure, and a deviation in
+ECtF (below) shows as one more outcome, an abort between the phases when the server Finished fails, so
+there are at most six outcomes per session: N learns at most $\log_2 6 \approx 2.6$ bits. A cheating C, the
 evaluator, sees the tables, its active labels, uniformly random pointer bits, the opened masks of values
 it already knows or decodes (its inputs, the public transcript hash, its outputs), check rows padded by
 hashes of labels it does not hold, and $Y_N$, which it can compute itself. It learns nothing beyond its
 outputs and can only choose its own inputs, as in any 2PC. A party that feeds different MS shares or
 masks to phase B than phase A gave it only obtains keys nobody knows, which U rejects. ECtF uses
-semi-honest conversions; a deviation there only shifts Z, which the server Finished check catches, or
-causes a selective failure that is already counted above.
+semi-honest conversions; a deviation there only shifts Z, which the server Finished check catches. N
+can make that shift depend on C's share, which is the sixth outcome counted above.
 
 **Why the leakage cannot accumulate.** The bits N can learn are about C's inputs to that session: its
 ECDHE scalar share, its MS share and its masks. The protocol keeps one invariant: **no 2PC input and no
@@ -419,7 +422,9 @@ is billed. A client therefore cannot run a different model or a larger cap than 
 - *public*: $h_1$, the record's sequence number, a ciphertext window of the final record and its
   offsets, the suffix;
 - *statement*: $\mathrm{SHA256}(c_{ap,1}) = h_1$; derive $K_1$, $IV_1$; CTR-decrypt the window; its end
-  equals the suffix. The verifier decodes one bit.
+  equals the suffix followed by the record's inner content type (`0x17`, application data). The verifier
+  decodes one bit. (Older clients prove the suffix alone, which N's length accounting makes equally
+  sound; see P3 in section 5.)
 
 Because the anchor is a hash of the secret that the 2PC itself output to both parties, the statement
 does not recompute the key schedule: it costs 7 SHA-256 compressions and 15 AES blocks for the 230-byte
@@ -434,10 +439,13 @@ the expected value; the anchors must equal C's own 2PC outputs. N therefore cann
 one-bit result, at other plaintext.
 
 **Reservation.** The prompt is opaque to N, so the reservation never discounts it: it is
-$\max(m, \lceil (L \cdot r_{in} + T \cdot r_{out}) / 1000 \rceil)$ msat, where $L$ is the model's prompt
-limit (context length minus its completion limit), $T$ the pinned token cap, $r_{in}, r_{out}$ the
-per-1k rates of the frozen offer and $m$ the node's minimum charge. For the case study
-(`deepseek-v4-flash`, $L$ = 104,858, $T$ = 40) this reserves 2,282 msat; the session cost 63.
+$\max(m, \lceil (L \cdot r_{in} + T \cdot r_{out}) / 1000 \rceil)$ msat, where $L$ is the model's context
+length, $T$ the pinned token cap, $r_{in}, r_{out}$ the per-1k rates of the frozen offer and $m$ the
+node's minimum charge. $L$ must be the whole context, not the context minus the model's own completion
+limit: the pinned cap $T$ is usually far below that limit, the provider accepts a prompt of up to
+$L - T$ tokens, and since the charge is capped at the reservation, any prompt tokens beyond the
+reserved bound would be free. (The sessions measured in section 6 reserved with the smaller bound; for
+the case study, `deepseek-v4-flash` with $T$ = 40, that was 2,282 msat for a session that cost 63.)
 
 ## 4.7 Response and usage disclosure ($\pi_{C3S}$)
 
@@ -455,11 +463,16 @@ stream terminator, with its chunk framing, anchored at the end of the transcript
 **$\pi_{C3S}$ (C to N).**
 
 - *private*: $s_{ap,0}$;
-- *public*: $h_2$, the final records' ciphertexts and sequence numbers, R, and a count `skip` of
-  undisclosed bytes after R;
-- *statement*: $\mathrm{SHA256}(s_{ap,0}) = h_2$; derive the server key and IV; CTR-decrypt the covered
-  records; R ends `skip` bytes before the end of the response; in-circuit equality with R, decoded as
-  one bit. For a usage disclosure `skip` is 0.
+- *public*: $h_2$, the final records' ciphertexts and sequence numbers, R, a count `skip` of
+  undisclosed bytes after R, and the number $k$ of server KeyUpdates before the covered records;
+- *statement*: $\mathrm{SHA256}(s_{ap,0}) = h_2$; derive $s_{ap,k}$ by $k$ "traffic upd" steps and its
+  key and IV; CTR-decrypt the covered records; R ends `skip` bytes before the end of the response;
+  in-circuit equality with R, decoded as one bit. For a usage disclosure `skip` is 0.
+
+U may rotate its keys mid-response (a KeyUpdate inside the encrypted stream, which only C can see). C
+then reports $k$ and the record where that epoch starts, whose sequence numbers restart at 0; a wrong
+report only makes the records decrypt to noise, which cannot equal a well-formed R. Each step costs
+four compressions; $k$ is at most 16, and U normally sends none.
 
 The choice of R is unambiguous: JSON strings cannot contain raw CR/LF, so event boundaries and HTTP
 chunk framing cannot be forged from model output. We checked this by prompting the model to emit fake
@@ -489,7 +502,10 @@ Confidential sessions use the node's ordinary billing; nothing about money is sp
    on the credential and is withdrawn through the node's normal refund endpoint.
 
 If C does not disclose after U received the request, N charges the full reservation, which is why
-disclosure is always in C's interest.
+disclosure is always in C's interest. The same holds for a response that has no terminal usage event
+although its status is 200: a stream U cut short, or one that ends in an error event instead of usage.
+C cannot prove usage that U never reported, and N cannot tell such a response from a withheld
+disclosure, so it is charged like one (residual risk 11).
 
 **Upstream errors.** An HTTP-level error from U (for example 503, 429, or a 400 for a request U rejects)
 carries no usage event. C then discloses only the response *head*: the status line, the header lines and
@@ -545,7 +561,7 @@ U are not compromised.
 only to C, masked with C's mask. N's outputs ($c_{hs}$, $s_{hs}$, $K_0$, $IV_0$, the anchors) are not
 ancestors of either. A cheating N that garbles a wrong circuit, for example one that outputs C's keys in
 a form N can read, is caught by C's consistency check before C uses any key, except with probability
-about $2^{-62}$ per session (below), and learns at most $\log_2 5 \approx 2.3$ bits about C's fresh,
+about $2^{-62}$ per session (below), and learns at most $\log_2 6 \approx 2.6$ bits about C's fresh,
 single-use inputs. The proofs that decrypt under C's keys ($\pi_{C2S}$, $\pi_{C3S}$) output one
 equality bit, on parameters C has checked against its own records, so N cannot use them as a decryption
 oracle. What N learns in plaintext is public by design: the suffix, the usage event, or on an error the
@@ -578,6 +594,12 @@ the check sound against one that does.
 **P3 (integrity).** C's body records are authenticated under a key only C has. N holds $K_0$ and can
 write any epoch-0 records (below), but none of them carries C's data. The suffix is proven to be the
 body's tail, so the effective parameters are exactly the agreed ones; response tags are verified by C.
+One subtlety: N cannot see inner content types, so C could hide a KeyUpdate of its own among the body
+records; $\pi_{C2S}$ then proves the final record under $c_{ap,1}$ while U decrypts it under
+$c_{ap,2}$. That does not help C: U's view of that record is the suffix XORed with two keystreams C
+cannot choose, a pseudorandom string that is not valid JSON, so U rejects the request. The sidecar's
+length accounting (every record counts as body bytes, the request completes only when the declared
+length is reached, nothing is relayed after it) makes padding and non-data records equally useless.
 
 **P4 (accounting).** The billed usage is a substring of the authenticated response, proven under the
 session's server secret and anchored to the end of the transcript. The anchors $h_1$, $h_2$ are outputs
@@ -612,7 +634,7 @@ salt are fresh per session.
    are secure against a malicious receiver (here N). ECtF is semi-honest, as in TLSNotary. The
    dual-execution version (section 6.6) rests on a simpler, better-studied construction, and the
    single-party variant (section 7) avoids the 2PC altogether.
-3. *Selective failure.* Each 2PC session can leak at most $\log_2 5 \approx 2.3$ bits about the client's
+3. *Selective failure.* Each 2PC session can leak at most $\log_2 6 \approx 2.6$ bits about the client's
    ECDHE share, MS share and masks through the abort pattern. No 2PC input or garbling key is reused
    across sessions, so the bits never accumulate on any secret, and the API key is not a 2PC input. A node
    that aborts sessions on purpose is visible to its clients.
@@ -671,8 +693,10 @@ The implementation consists of:
 
 C's TLS stack is a fork of an MIT-licensed TLS 1.3 client with two hooks: an external key share, and
 traffic secrets injected from the 2PC instead of computed locally. It accepts only the version, suite and
-group it offered, validates certificate paths per RFC 5280 and hostnames per RFC 6125, and uses the full
-64-bit sequence number in the nonce.
+group it offered, requires the server's flight in RFC 8446 order with each message once and a
+CertificateVerify over the validated chain before it accepts the Finished, validates certificate paths
+per RFC 5280 and hostnames per RFC 6125 against the same Mozilla root set as N's relay (generated from
+the relay's pinned copy), and uses the full 64-bit sequence number in the nonce.
 
 ## 6.2 Component costs
 
@@ -958,7 +982,9 @@ else stays the deployment's own code. Negotiation is per request and stateless:
    old clients ignore it.
 3. **Opt-in.** A client opts in per request, for `POST /v1/chat/completions` only. It routes only to nodes
    that advertise the field for the model, and requires that the offer signature verifies with a pinned
-   node key (not just the key the offer names), that the upstream hostname is on its trusted hostname
+   node key (not just the key the offer names): one the user configured, or else the key that announced
+   the node's URL on Nostr, for an https or onion URL only, where fetching the offer authenticates the
+   server. It also requires that the upstream hostname is on its trusted hostname
    list (an empty list refuses every host), and that its prover is available. It rebuilds every public
    input of $\pi_{NK}$ from the signed offer.
 4. **Billing** is the node's ordinary billing (section 4.8). The client's credential, reservation,
@@ -1057,7 +1083,7 @@ both directions, than garbling twice, and the compressed preprocessing of DILO a
 (block correlated OT or subfield VOLE with many keys) that `mpz2` does not provide. We keep the masks
 with the garbler and authenticate them to the evaluator. That needs only correlated OT and a
 QuickSilver-style product check, and its batched per-wire check follows CWYY's, but it accepts a
-selective-failure leakage of at most 2.3 bits per session. Its soundness argument is our own (section
+selective-failure leakage of at most 2.6 bits per session. Its soundness argument is our own (section
 5). Three-halves garbling (Rosulek and Roy 2021) cuts N's tables by about a quarter against half-gates.
 
 **DiStefano** (Celi et al., 2023) runs the TLS 1.3 handshake as a 2PC with fully authenticated garbling,
@@ -1114,7 +1140,7 @@ provider 5 ms after a pre-warmed request is claimed, plus a 0.10 s suffix proof.
 of precomputable tables and check data sent to the client and 1.2 MB sent back per request, because
 only the node garbles and the client checks the garbling instead of garbling a second copy; a cold
 two-party computation takes about 7 s on a home link with a 2 Mbit/s uplink. The price of that
-asymmetry is a selective-failure leakage of at most 2.3 bits per session about values that are never
+asymmetry is a selective-failure leakage of at most 2.6 bits per session about values that are never
 reused. The single-party variant needs under a quarter of the bandwidth where the node can keep its
 egress private.
 

@@ -232,7 +232,9 @@ Inconsistent MS shares across phases yield a key nobody knows, as in v2.
 **Not covered:**
 - ECtF stays semi-honest, unchanged.
 - No external review yet.
-- KOS's documented consistency-check leakage applies to the MAC-COT layer. It is negligible and only C's concern.
+- KOS's documented consistency-check leakage applies to the MAC-COT layer (Δ_B, only C's concern) and to the
+  KOS run for C's input labels (Δ_A, where C is the receiver). Both are negligible: forging with Δ_A needs all
+  128 bits, and the leak is a few bits with correspondingly small probability.
 
 **Tests** (all pass):
 
