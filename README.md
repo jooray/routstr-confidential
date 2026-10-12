@@ -12,6 +12,8 @@ It needs only standard TLS 1.3, a two-party computation of the handshake key sch
 The client is the TLS 1.3 client of the provider *through* the node. Client and node compute the TLS keys jointly, so the node alone gets the key for the one record that carries its API key and the client alone gets the keys for the prompt and the response. The node relays the other encrypted records. Zero-knowledge proofs pin what each side may write. A simpler single-party variant (v1, no two-party computation) is also supported; the paper explains the trade-off.
 
 - **Introduction (blog post):** [Confidential inference on Routstr without trusted hardware](https://juraj.bednar.io/en/blog-en/2026/10/10/confidential-inference-on-routstr-without-trusted-hardware/).
+- **Programmer's guide (book):** [How routstr confidential mode works](https://juraj.bednar.io/wp-content/uploads/2026/10/routstr-confidential-for-programmers.pdf) (PDF, 72 pages; in Slovak: [Ako funguje dôverný režim routstr](https://juraj.bednar.io/wp-content/uploads/2026/10/routstr-confidential-pre-programatorov.pdf)).
+- **The protocol as a magic show (blog post):** [Seven magic tricks inside one AI request](https://juraj.bednar.io/en/blog-en/2026/10/12/seven-magic-tricks-inside-one-ai-request/), with an illustrated video (in Slovak: [Sedem kúzelníckych trikov v jednej AI požiadavke](https://juraj.bednar.io/blog/2026/10/12/sedem-kuzelnickych-trikov-v-jednej-ai-poziadavke/)).
 - **Paper:** [`paper/paper.pdf`](paper/paper.pdf).
 - **User-facing summary:** [`docs/ONE-PAGER.pdf`](docs/ONE-PAGER.pdf).
 - **New here (human or agent)?** Read [`AGENTS.md`](AGENTS.md).
