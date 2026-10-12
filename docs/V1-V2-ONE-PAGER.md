@@ -5,6 +5,8 @@ fontsize: 9pt
 documentclass: extarticle
 ---
 
+*Protocol v1 is retired: the implementation now speaks only v2 (v1 is kept on the `v1-poc` branch). This page remains as the historical comparison.*
+
 **The short version.** Both versions hide prompts and answers from the node, pin the model and token cap, and
 bill from the usage the provider reports. They differ in one thing: **v1** keeps the node's provider API key
 from the client only as long as the client never sees the node's own encrypted traffic to the provider. **v2**

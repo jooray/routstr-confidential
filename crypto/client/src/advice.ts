@@ -130,20 +130,3 @@ export function xor(a: Uint8Array, b: Uint8Array): Uint8Array {
   for (let i = 0; i < a.length; i++) out[i] = a[i] ^ b[i]
   return out
 }
-
-/** Record material for the epoch-1 credential record slot (seq 0). */
-export function epoch1Material(handshakeSecret: Uint8Array, thSH: Uint8Array, thSF: Uint8Array, headLen: number) {
-  const cHs = expandLabel(handshakeSecret, 'c hs traffic', thSH, 32)
-  const sHs = expandLabel(handshakeSecret, 's hs traffic', thSH, 32)
-  const derived = expandLabel(handshakeSecret, 'derived', sha256(new Uint8Array(0)), 32)
-  const ms = hkdfExtract(derived, new Uint8Array(32))
-  const cAp0 = expandLabel(ms, 'c ap traffic', thSF, 32)
-  const cAp1 = trafficUpdate(cAp0)
-  const cAp2 = trafficUpdate(cAp1)
-  const k1 = expandLabel(cAp1, 'key', new Uint8Array(0), 16)
-  const iv1 = expandLabel(cAp1, 'iv', new Uint8Array(0), 12)
-  const s = ctrKeystream(k1, iv1, 0n, headLen)
-  const h1 = ghashKey(k1)
-  const t0 = aesEcbBlock(k1, j0(iv1, 0n))
-  return { cHs, sHs, ms, cAp0, cAp1, cAp2, k1, iv1, s, h1, t0 }
-}

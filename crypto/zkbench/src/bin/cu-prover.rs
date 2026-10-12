@@ -26,8 +26,8 @@
 //!   ```
 //!
 //!   Witnesses arrive on stdin only and are never written anywhere.
-//! * **bench**: runs every statement (v1, then v2; `--v2` for v2 only) over
-//!   the `local` and `wan` (25 ms one-way = 50 ms RTT, 100 Mbit/s) transports.
+//! * **bench**: runs every statement over the `local` and `wan` (25 ms
+//!   one-way = 50 ms RTT, 100 Mbit/s) transports.
 //!
 //! stdout carries *only* mpz bytes in stdio mode; all logging goes to stderr.
 
@@ -209,13 +209,7 @@ async fn bench_one(name: &str, params: &Params, witness: &Witness, wan: bool) ->
 async fn run_bench(args: &[String]) -> Result<()> {
     let out_path = arg_value(args, "--json").unwrap_or_else(|| "bench.json".into());
     let mut rows = Vec::new();
-    let v2_only = args.iter().any(|a| a == "--v2");
-    let set: Vec<_> = if v2_only {
-        fixtures::all_v2()
-    } else {
-        fixtures::all().into_iter().chain(fixtures::all_v2()).collect()
-    };
-    for (name, params, witness) in set {
+    for (name, params, witness) in fixtures::all() {
         for wan in [false, true] {
             eprintln!("bench: {name} {}", if wan { "wan" } else { "local" });
             let row = bench_one(name, &params, &witness, wan).await?;

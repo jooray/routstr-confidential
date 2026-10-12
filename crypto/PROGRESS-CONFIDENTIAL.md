@@ -9,6 +9,14 @@ The prototype (all four ZK proofs against real Venice) is unchanged and still
 green. This phase adds the node integration, a config-file/offer mode for the
 sidecar, real Cashu escrow, and the arm/pool pre-warm path.
 
+> **Note (2026-10-12): protocol v1 is retired.** This log describes the v1
+> prototype (π_C1, π_N, π_C2, π_C3, the client-alone X25519 handshake, KU1,
+> `--insecure-no-proofs`). That code now lives only on the `v1-poc` branch;
+> this branch implements protocol v2 alone (π_NK, π_C2S, π_C3S over the
+> two-party key schedule). The sidecar refuses `--protocol 1` and an offer
+> naming v1, and still accepts `--protocol 2`. The commands below are kept as
+> the historical record.
+
 ## Phase status
 
 | Phase | What | Status |

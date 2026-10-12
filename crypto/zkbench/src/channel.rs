@@ -439,10 +439,6 @@ fn params_name(params: &Params) -> &'static str {
         Params::PiNK(_) => "pi_nk",
         Params::PiC2S(_) => "pi_c2s",
         Params::PiC3S(_) => "pi_c3s",
-        Params::PiC1(_) => "pi_c1",
-        Params::PiN(_) => "pi_n",
-        Params::PiC2(_) => "pi_c2",
-        Params::PiC3(_) => "pi_c3",
     }
 }
 

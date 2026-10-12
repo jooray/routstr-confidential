@@ -49,6 +49,12 @@ Assumptions (paper section 3.1):
       (200, usage event for the pinned model, [DONE], terminal chunk) and then
       closes the connection itself (``Connection: close`` honoured; our side of
       the pipe stays open, so the close is the server's)
+  A12 the event stream is framed the way the usage proof parses it: LF-only
+      line endings (no CR anywhere in the dechunked body), every event a single
+      ``data: `` line of JSON followed by a blank line, and the stream
+      ending in exactly ``data: [DONE]\n\n``. The sidecar and the client
+      locate the usage event by a raw ``\ndata: `` and end each chunk's data
+      at the first CRLF, so CRLF events or multi-line JSON would break them
 
 A real session sends two client KeyUpdates (KU0 after the handshake, KU1
 before the credential record); A11 sends one, mid-body, which is the same
@@ -516,6 +522,35 @@ def a7_usage_event() -> None:
     )
 
 
+def a12_sse_framing() -> None:
+    r = request(BASE, "A12")
+    text = r.text
+    problems = []
+    if "\r" in text:
+        problems.append("CR in the event stream")
+    if not text.endswith("data: [DONE]\n\n"):
+        problems.append(f"does not end in data: [DONE]\\n\\n ({snip(text[-24:], 24)})")
+    blocks = text.split("\n\n")
+    if blocks and blocks[-1] == "":
+        blocks.pop()
+    for b in blocks:
+        if "\n" in b or not b.startswith("data: "):
+            problems.append(f"event is not one data: line {snip(b, 40)}")
+            break
+        if b == "data: [DONE]":
+            continue
+        try:
+            json.loads(b[6:])
+        except json.JSONDecodeError:
+            problems.append(f"event is not JSON {snip(b, 40)}")
+            break
+    check(
+        "A12 SSE framing: LF-only, one data: line per event",
+        stream_ok(r, CHEAP) and not problems,
+        f"-> {r.status}, {len(blocks)} events" + (f", {problems[0]}" if problems else ", LF-only"),
+    )
+
+
 def a8_text_only_rejects_images() -> None:
     text = '{"type":"text","text":"Describe."}'
     img = '{"type":"image_url","image_url":{"url":"https://www.gstatic.com/webp/gallery/1.jpg"}}'
@@ -648,6 +683,7 @@ CHECKS = [
     a5_malformed_rejected,
     a6_cap_includes_reasoning,
     a7_usage_event,
+    a12_sse_framing,
     a8_text_only_rejects_images,
     a10_price_fields,
 ]
@@ -701,10 +737,12 @@ class MockProvider:
 
     def __init__(self, status: int | None = None, lenient: bool = False, cipher: str = SUITE,
                  hs_refuse: bool = False, timeout: bool = False, early: bool = False,
-                 no_close: bool = False, no_ku: bool = False) -> None:
+                 no_close: bool = False, no_ku: bool = False, crlf: bool = False,
+                 pretty: bool = False) -> None:
         self.status, self.lenient, self.cipher = status, lenient, cipher
         self.hs_refuse, self.timeout, self.early = hs_refuse, timeout, early
         self.no_close, self.no_ku = no_close, no_ku
+        self.crlf, self.pretty = crlf, pretty
 
     def _answer(self, body: str) -> Resp:
         if self.timeout:
@@ -729,7 +767,10 @@ class MockProvider:
         cap = min(d.get("max_completion_tokens") or 10**6, d.get("max_tokens") or 10**6)
         ct = min(cap, 10)
         u = {"model": d["model"], "choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": ct}}
-        text = 'data: {"model":"%s","choices":[{"delta":{"content":"hi"}}]}\n\ndata: %s\n\ndata: [DONE]\n\n' % (d["model"], json.dumps(u))
+        usage = json.dumps(u, indent=1) if self.pretty else json.dumps(u, separators=(",", ":"))
+        text = 'data: {"model":"%s","choices":[{"delta":{"content":"hi"}}]}\n\ndata: %s\n\ndata: [DONE]\n\n' % (d["model"], usage)
+        if self.crlf:
+            text = text.replace("\n", "\r\n")
         return Resp(200, text, {"x-venice-version": "mock"})
 
     def http(self, body: str) -> Resp:
@@ -776,7 +817,7 @@ def self_test() -> int:
         ("healthy provider passes", MockProvider(),
          lambda v, rc: rc == 0 and all(x == "PASS" for x in v.values())),
         ("outage: 503 everywhere is never PASS", MockProvider(status=503),
-         lambda v, rc: rc != 0 and all(v.get(k) == "INCONCLUSIVE" for k in rejection + ["A1", "A6", "A7", "A11"])),
+         lambda v, rc: rc != 0 and all(v.get(k) == "INCONCLUSIVE" for k in rejection + ["A1", "A6", "A7", "A11", "A12"])),
         ("rate limit: 429 everywhere is never PASS", MockProvider(status=429),
          lambda v, rc: rc != 0 and not any(v.get(k) == "PASS" for k in rejection)),
         ("timeouts are inconclusive, gate closed", MockProvider(timeout=True),
@@ -795,6 +836,10 @@ def self_test() -> int:
          lambda v, rc: rc == 1 and v.get("A11") == "FAIL"),
         ("KeyUpdate not sent fails A11", MockProvider(no_ku=True),
          lambda v, rc: rc == 1 and v.get("A11") == "FAIL"),
+        ("CRLF event stream fails A12", MockProvider(crlf=True),
+         lambda v, rc: rc == 1 and v.get("A12") == "FAIL"),
+        ("multi-line (pretty-printed) usage event fails A12", MockProvider(pretty=True),
+         lambda v, rc: rc == 1 and v.get("A12") == "FAIL"),
     ]
     bad = 0
     try:

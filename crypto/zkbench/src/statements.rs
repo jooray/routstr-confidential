@@ -1,4 +1,24 @@
-//! The four ZK statements (π_C1, π_N, π_C2, π_C3).
+//! The three ZK statements of a session (`docs/TWOPC-DESIGN.md`).
+//!
+//! Nobody knows `HS`. The two-party key schedule hands the client `c_ap_1`
+//! and `s_ap_0`, the node `K_0`/`IV_0`, and both sides the public anchors
+//!
+//! ```text
+//! h1 = SHA256(c_ap_1)   h2 = SHA256(s_ap_0)   hk = SHA256(K_0 ‖ IV_0)
+//! ```
+//!
+//! so each statement is anchored by a hash of its own secret:
+//!
+//! * **π_C2S** (client proves): the final body record (epoch 1, under
+//!   `c_ap_1`) decrypts, at the public window, to the pinned suffix.
+//! * **π_C3S** (client proves): the tail server records (under `s_ap_0`)
+//!   end with the disclosed `R` (plus `skip` undisclosed bytes).
+//! * **π_NK** (node proves): the credential record (epoch 0, seq 0, under
+//!   `K_0`/`IV_0`) is the published template with alphabet-constrained key
+//!   bytes; the ciphertext is bound by `c_commit = SHA256(header ‖ C_1)`.
+//!
+//! The anchor digests are decoded (they equal public values); every
+//! plaintext comparison is a one-bit in-circuit equality (`eq_bytes`).
 //!
 //! Each statement is built exactly once per proof, with the *same* sequence of
 //! memory allocations and circuit calls on the prover and the verifier side.
@@ -7,10 +27,9 @@
 //!
 //! # What the circuits do not check
 //!
-//! The record statements (π_C2/π_C3 here, π_C2S/π_C3S in
-//! [`crate::statements_v2`]) prove AES-CTR decryption of public ciphertext
-//! only; none of them recomputes the GCM tag (π_N/π_NK likewise bind only the
-//! CTR ciphertext they commit to). They are sound because the
+//! The record statements (π_C2S/π_C3S) prove AES-CTR decryption of public
+//! ciphertext only; none of them recomputes the GCM tag (π_NK likewise binds
+//! only the CTR ciphertext it commits to). They are sound because the
 //! verifier never takes record ciphertext from the prover: the sidecar builds
 //! these parameters from its own relay transcript (the client's final body
 //! record it holds and then forwards; the server records it read from its own
@@ -25,23 +44,22 @@
 use mpz_vm_core::{
     Call, CallableExt, Vm,
     memory::{
-        Array, MemoryExt, ToRaw, Vector, ViewExt,
+        Array, ToRaw, Vector,
         binary::{Binary, U8},
     },
 };
-use mpz_hash::sha256::Sha256;
 
 use crate::Role;
-pub use crate::statements_v2::{PiC2S, PiC3S, PiNK};
 use crate::gadgets::{
-    aes_block, alphabet_circuit, concat, ctr_block, expand_label, hmac_sha256, public_bytes,
-    eq_bytes, record_keys, secret_bytes, select, splice_circuit, xor_bytes,
+    aes_block, alphabet_circuit, concat, ctr_block, decrypt_record_tail, decrypt_window,
+    eq_bytes, expand_label, public_bytes, record_keys_keyed, secret_bytes, select, sha256_bytes,
+    splice_circuit, xor_bytes,
 };
 
-/// The one key alphabet the fixed-size π_N membership circuit implements.
+/// The one key alphabet the fixed-size π_NK membership circuit implements.
 ///
 /// `alphabet_circuit` is a fixed-size membership check over exactly this set.
-/// The offer's `key_alphabet` is carried through [`PiN`] so both sides bind the
+/// The offer's `key_alphabet` is carried through [`PiNK`] so both sides bind the
 /// alphabet explicitly: a statement built for another alphabet is rejected
 /// instead of silently proving membership in the wrong set.
 pub const SUPPORTED_KEY_ALPHABET: &str = "[A-Za-z0-9_-]";
@@ -52,28 +70,20 @@ pub const SUPPORTED_KEY_ALPHABET: &str = "[A-Za-z0-9_-]";
 /// parameters beyond it are rejected before any circuit is built.
 pub const MAX_INNER_PLAINTEXT: usize = (1 << 14) + 256;
 
-/// The four proofs.
+/// The three proofs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proof {
-    PiC1,
-    PiN,
-    PiC2,
-    PiC3,
-    /// v2: head template under K_0 (N proves; anchored by `hk`).
+    /// Head template under K_0 (N proves; anchored by `hk`).
     PiNK,
-    /// v2: body suffix under c_ap_1 (anchored by `h1`).
+    /// Body suffix under c_ap_1 (anchored by `h1`).
     PiC2S,
-    /// v2: usage disclosure under s_ap_0 (anchored by `h2`).
+    /// Usage disclosure under s_ap_0 (anchored by `h2`).
     PiC3S,
 }
 
 impl Proof {
     pub fn name(&self) -> &'static str {
         match self {
-            Proof::PiC1 => "pi_c1",
-            Proof::PiN => "pi_n",
-            Proof::PiC2 => "pi_c2",
-            Proof::PiC3 => "pi_c3",
             Proof::PiNK => "pi_nk",
             Proof::PiC2S => "pi_c2s",
             Proof::PiC3S => "pi_c3s",
@@ -81,10 +91,6 @@ impl Proof {
     }
     pub fn from_name(s: &str) -> Option<Self> {
         match s {
-            "pi_c1" => Some(Proof::PiC1),
-            "pi_n" => Some(Proof::PiN),
-            "pi_c2" => Some(Proof::PiC2),
-            "pi_c3" => Some(Proof::PiC3),
             "pi_nk" => Some(Proof::PiNK),
             "pi_c2s" => Some(Proof::PiC2S),
             "pi_c3s" => Some(Proof::PiC3S),
@@ -93,33 +99,85 @@ impl Proof {
     }
     /// True when the client (prover side process) is the prover.
     pub fn client_proves(&self) -> bool {
-        !matches!(self, Proof::PiN | Proof::PiNK)
+        !matches!(self, Proof::PiNK)
     }
 }
 
-/// Public session values binding every proof to the relayed handshake.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SessionPublic {
-    pub client_hs: [u8; 32],
-    pub server_hs: [u8; 32],
-    pub th_sh: [u8; 32],
-    pub th_sf: [u8; 32],
+pub(crate) fn default_key_alphabet() -> String {
+    SUPPORTED_KEY_ALPHABET.to_string()
 }
 
-/// π_C1 public parameters.
+/// One tail server record for π_C3S (ciphertext to the record's end).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PiC1 {
-    pub session: SessionPublic,
-    pub head_len: usize,
-    /// The record-material keystream `S` (|head| bytes).
-    pub s: Vec<u8>,
-    pub h1: [u8; 16],
-    pub t0: [u8; 16],
+pub struct TailRecord {
+    pub seq: u64,
+    /// The record's ciphertext (tag excluded) from inner-plaintext offset
+    /// `off` to its end.
+    pub ct: Vec<u8>,
+    /// Block-aligned offset of `ct` in the record (only the first covered
+    /// record may start later than 0, so the proof decrypts only the bytes it
+    /// needs). Omitted on the wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub off: usize,
 }
 
-/// π_N public parameters.
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+/// π_C2S public parameters: a window of the final body record, anchored by
+/// `h1`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PiN {
+pub struct PiC2S {
+    /// `SHA256(c_ap_1)`, output publicly by the 2PC.
+    pub h1: [u8; 32],
+    /// Record sequence number within epoch 1 (the body starts at 0).
+    pub seq: u64,
+    /// Public ciphertext window `ct[off .. off+w]`.
+    pub ct_window: Vec<u8>,
+    /// Inner-plaintext offset of the window start.
+    pub off: usize,
+    pub w: usize,
+    /// Sub-range inside the window that must match `expected`.
+    pub sel_start: usize,
+    pub sel_len: usize,
+    /// The pinned suffix (compared inside the circuit; one bit is revealed).
+    pub expected: Vec<u8>,
+}
+
+/// π_C3S public parameters: the tail server records, anchored by `h2`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PiC3S {
+    /// `SHA256(s_ap_0)`, output publicly by the 2PC.
+    pub h2: [u8; 32],
+    /// Tail records in wire order (earliest first).
+    pub records: Vec<TailRecord>,
+    /// The disclosed plaintext `R` (compared inside the circuit).
+    pub expected: Vec<u8>,
+    /// Content bytes after `R` up to the end of the records.
+    #[serde(default)]
+    pub skip: usize,
+    /// Server KeyUpdates before the covered records: they are encrypted under
+    /// `s_ap_k`, `k` "traffic upd" steps from the anchored `s_ap_0`, and their
+    /// sequence numbers count from the start of that epoch. 0 (and omitted on
+    /// the wire) when the server never rotated its keys.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_updates: u32,
+}
+
+/// Most server KeyUpdates a π_C3S may step through (each costs 4 compressions).
+pub const MAX_SERVER_KEY_UPDATES: u32 = 16;
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// π_NK public parameters: the head template, anchored by `hk` (the keystream
+/// is computed in-circuit from `K_0`/`IV_0`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PiNK {
+    /// `SHA256(K_0 ‖ IV_0)` (28 bytes hashed), output publicly by the 2PC.
+    pub hk: [u8; 32],
     pub head_len: usize,
     pub key_len: usize,
     /// The key alphabet the statement is bound to. Must equal
@@ -131,78 +189,17 @@ pub struct PiN {
     pub key_offsets: Vec<usize>,
     /// Head template with placeholders (0x00) at `key_offsets`.
     pub template: Vec<u8>,
-    pub s: Vec<u8>,
+    /// `SHA256(header ‖ C_1)` where `C_1` is the
+    /// `head_len + 1`-byte ciphertext (tag excluded) of `head ‖ 0x17` under
+    /// `K_0`, nonce `IV_0 xor 0`, counter from 2.
     pub c_commit: [u8; 32],
+    /// The record header (`record_header(head_len + 1)`).
     pub header: [u8; 5],
-}
-
-pub(crate) fn default_key_alphabet() -> String {
-    SUPPORTED_KEY_ALPHABET.to_string()
-}
-
-/// A tail-window decryption statement (shared by π_C2 and π_C3).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Window {
-    pub session: SessionPublic,
-    pub seq: u64,
-    /// Public ciphertext window `ct[off .. off+w]`.
-    pub ct_window: Vec<u8>,
-    /// Inner-plaintext offset of the window start.
-    pub off: usize,
-    pub w: usize,
-    /// Sub-range inside the window that must match `expected`.
-    pub sel_start: usize,
-    pub sel_len: usize,
-    /// The expected bytes (the pinned suffix). Compared inside the circuit:
-    /// the verifier learns one bit, never the decrypted window.
-    pub expected: Vec<u8>,
-}
-
-/// π_C2 = body suffix on the last epoch-2 record.
-pub type PiC2 = Window;
-
-/// One tail server record for π_C3 (full ciphertext, inner-plaintext length).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TailRecord {
-    pub seq: u64,
-    /// The record's ciphertext (tag excluded) from inner-plaintext offset
-    /// `off` to its end.
-    pub ct: Vec<u8>,
-    /// Block-aligned offset of `ct` in the record (v2 π_C3S: only the first
-    /// covered record may start later than 0, so the proof decrypts only the
-    /// bytes it needs). Omitted on the wire when 0.
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
-    pub off: usize,
-}
-
-fn is_zero_usize(n: &usize) -> bool {
-    *n == 0
-}
-
-/// π_C3 = usage disclosure across the final server records.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PiC3 {
-    pub session: SessionPublic,
-    /// Tail records in wire order (earliest first); each contributes its
-    /// content (inner plaintext minus the trailing content-type byte).
-    pub records: Vec<TailRecord>,
-    /// The disclosed plaintext `R`. Compared inside the circuit: the verifier
-    /// learns one bit, never the decrypted records.
-    pub expected: Vec<u8>,
-    /// Content bytes after `R` up to the end of the records. 0 for the usage
-    /// event (R ends the transcript); for an upstream error R is the response
-    /// head and `skip` is the (undisclosed) body length that follows it.
-    #[serde(default)]
-    pub skip: usize,
 }
 
 /// Proof parameters (prover and verifier share the same value).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Params {
-    PiC1(PiC1),
-    PiN(PiN),
-    PiC2(PiC2),
-    PiC3(PiC3),
     PiNK(PiNK),
     PiC2S(PiC2S),
     PiC3S(PiC3S),
@@ -211,10 +208,6 @@ pub enum Params {
 impl Params {
     pub fn proof(&self) -> Proof {
         match self {
-            Params::PiC1(_) => Proof::PiC1,
-            Params::PiN(_) => Proof::PiN,
-            Params::PiC2(_) => Proof::PiC2,
-            Params::PiC3(_) => Proof::PiC3,
             Params::PiNK(_) => Proof::PiNK,
             Params::PiC2S(_) => Proof::PiC2S,
             Params::PiC3S(_) => Proof::PiC3S,
@@ -225,13 +218,9 @@ impl Params {
 /// Private witness (only the prover holds this).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Witness {
-    /// π_C1/π_C2/π_C3: the TLS 1.3 handshake secret `HS`.
-    Hs([u8; 32]),
-    /// π_N: the API key bytes.
-    Key(Vec<u8>),
-    /// π_C2S/π_C3S (v2): a 32-byte traffic secret (c_ap_1 or s_ap_0).
+    /// π_C2S/π_C3S: a 32-byte traffic secret (c_ap_1 or s_ap_0).
     Secret([u8; 32]),
-    /// π_NK (v2): the epoch-0 AES key and IV and the API key bytes.
+    /// π_NK: the epoch-0 AES key and IV and the API key bytes.
     NodeKey {
         k0: [u8; 16],
         iv0: [u8; 12],
@@ -258,61 +247,6 @@ impl Check {
             compare_len: None,
         }
     }
-    fn prefix(label: impl Into<String>, value: Vector<U8>, expected: Vec<u8>, len: usize) -> Self {
-        Self {
-            label: label.into(),
-            value,
-            expected,
-            compare_len: Some(len),
-        }
-    }
-}
-
-struct SessionDerived {
-    c_hs: Vector<U8>,
-    s_hs: Vector<U8>,
-    c_ap_0: Vector<U8>,
-    s_ap_0: Vector<U8>,
-}
-
-/// The common key-schedule prefix: binds `HS` to the session's public traffic
-/// secrets. This is what makes every proof session-specific (invariants I3/I6).
-fn derive_session<VM: Vm<Binary>>(
-    vm: &mut VM,
-    role: Role,
-    s: &SessionPublic,
-    hs: Option<&[u8; 32]>,
-) -> anyhow::Result<SessionDerived> {
-    let hs32 = secret_bytes(vm, role, 32, hs.map(|h| h.as_slice()))?;
-
-    let c_hs = expand_label(vm, &hs32, "c hs traffic", &s.th_sh, 32)?;
-    let s_hs = expand_label(vm, &hs32, "s hs traffic", &s.th_sh, 32)?;
-    let derived = expand_label(vm, &hs32, "derived", &cu_crypto::transcript::EMPTY_HASH, 32)?;
-
-    // MS = HKDF-Extract(salt = derived, IKM = 0^32)
-    let zeros = public_bytes(vm, &[0u8; 32])?;
-    let ms: Vector<U8> = hmac_sha256(vm, &derived, &zeros)?.into();
-
-    let c_ap_0 = expand_label(vm, &ms, "c ap traffic", &s.th_sf, 32)?;
-    let s_ap_0 = expand_label(vm, &ms, "s ap traffic", &s.th_sf, 32)?;
-
-    Ok(SessionDerived {
-        c_hs,
-        s_hs,
-        c_ap_0,
-        s_ap_0,
-    })
-}
-
-fn key_schedule_check<VM: Vm<Binary>>(
-    vm: &mut VM,
-    d: &SessionDerived,
-    s: &SessionPublic,
-) -> anyhow::Result<Check> {
-    let joined = concat(vm, &[d.c_hs, d.s_hs])?;
-    let mut expected = s.client_hs.to_vec();
-    expected.extend_from_slice(&s.server_hs);
-    Ok(Check::full("key_schedule", joined, expected))
 }
 
 /// Build the circuit for `params` on one side. Returns the checks to verify.
@@ -323,165 +257,159 @@ pub fn build<VM: Vm<Binary>>(
     witness: Option<&Witness>,
 ) -> anyhow::Result<Vec<Check>> {
     match params {
-        Params::PiC1(p) => build_pi_c1(vm, role, p, witness),
-        Params::PiN(p) => build_pi_n(vm, role, p, witness),
-        Params::PiC2(p) => build_pi_c2(vm, role, p, witness),
-        Params::PiC3(p) => build_pi_c3(vm, role, p, witness),
-        Params::PiNK(p) => crate::statements_v2::build_pi_nk(vm, role, p, witness),
-        Params::PiC2S(p) => crate::statements_v2::build_pi_c2s(vm, role, p, witness),
-        Params::PiC3S(p) => crate::statements_v2::build_pi_c3s(vm, role, p, witness),
+        Params::PiNK(p) => build_pi_nk(vm, role, p, witness),
+        Params::PiC2S(p) => build_pi_c2s(vm, role, p, witness),
+        Params::PiC3S(p) => build_pi_c3s(vm, role, p, witness),
     }
 }
 
-fn hs_of(w: Option<&Witness>) -> Option<&[u8; 32]> {
+fn secret_of(w: Option<&Witness>) -> Option<&[u8; 32]> {
     match w {
-        Some(Witness::Hs(h)) => Some(h),
+        Some(Witness::Secret(s)) => Some(s),
         _ => None,
     }
 }
 
-fn build_pi_c1<VM: Vm<Binary>>(
+/// Allocate the 32-byte traffic secret, check its hash against the anchor and
+/// derive `(K, IV)`.
+fn anchored_keys<VM: Vm<Binary>>(
     vm: &mut VM,
     role: Role,
-    p: &PiC1,
+    label: &str,
+    anchor: &[u8; 32],
     witness: Option<&Witness>,
-) -> anyhow::Result<Vec<Check>> {
-    if p.head_len == 0 || p.head_len > MAX_INNER_PLAINTEXT || p.s.len() != p.head_len {
-        anyhow::bail!("π_C1: keystream of {} bytes for a {}-byte record", p.s.len(), p.head_len);
-    }
-    let d = derive_session(vm, role, &p.session, hs_of(witness))?;
-    let c_ap_1 = expand_label(vm, &d.c_ap_0, "traffic upd", &[], 32)?;
-    let (k1, iv1) = record_keys(vm, &c_ap_1)?;
-
-    let mut checks = vec![key_schedule_check(vm, &d, &p.session)?];
-
-    // Keystream blocks: S[i*16 ..] = AES_K1(J0 + (i+1)), i.e. counter field i+2.
-    let nblocks = p.head_len.div_ceil(16);
-    for i in 0..nblocks {
-        let ctr = ctr_block(vm, &iv1, 0, (i + 2) as u32)?;
-        let ks: Vector<U8> = aes_block(vm, &k1, &ctr)?.into();
-        let take = (p.head_len - i * 16).min(16);
-        let expected = p.s[i * 16..i * 16 + take].to_vec();
-        checks.push(Check::prefix(format!("S[{i}]"), ks, expected, take));
-    }
-
-    // H1 = AES_K1(0^128)
-    let zero = public_bytes(vm, &[0u8; 16])?;
-    let zero_arr: Array<U8, 16> = zero.try_into().expect("16 bytes");
-    let h1: Vector<U8> = aes_block(vm, &k1, &zero_arr)?.into();
-    checks.push(Check::full("H1", h1, p.h1.to_vec()));
-
-    // T0 = AES_K1(J0)  (counter field 1)
-    let j0 = ctr_block(vm, &iv1, 0, 1)?;
-    let t0: Vector<U8> = aes_block(vm, &k1, &j0)?.into();
-    checks.push(Check::full("T0", t0, p.t0.to_vec()));
-
-    Ok(checks)
+) -> anyhow::Result<(Check, Array<U8, 16>, Array<U8, 12>)> {
+    anchored_keys_after_updates(vm, role, label, anchor, witness, 0)
 }
 
-fn build_pi_c2<VM: Vm<Binary>>(
+/// [`anchored_keys`] for the traffic secret `updates` KeyUpdates after the
+/// anchored one (RFC 8446 §7.2: `HKDF-Expand-Label(s, "traffic upd", "", 32)`).
+fn anchored_keys_after_updates<VM: Vm<Binary>>(
     vm: &mut VM,
     role: Role,
-    p: &Window,
+    label: &str,
+    anchor: &[u8; 32],
+    witness: Option<&Witness>,
+    updates: u32,
+) -> anyhow::Result<(Check, Array<U8, 16>, Array<U8, 12>)> {
+    let secret = secret_of(witness);
+    if role == Role::Prover && secret.is_none() {
+        anyhow::bail!("{label}: the prover needs a Secret witness");
+    }
+    let s = secret_bytes(vm, role, 32, secret.map(|s| s.as_slice()))?;
+    let digest: Vector<U8> = sha256_bytes(vm, &s)?.into();
+    let mut cur = s;
+    for _ in 0..updates {
+        cur = expand_label(vm, &cur, "traffic upd", &[], 32)?;
+    }
+    let (k, iv) = record_keys_keyed(vm, &cur)?;
+    Ok((Check::full(label, digest, anchor.to_vec()), k, iv))
+}
+
+pub fn build_pi_c2s<VM: Vm<Binary>>(
+    vm: &mut VM,
+    role: Role,
+    p: &PiC2S,
     witness: Option<&Witness>,
 ) -> anyhow::Result<Vec<Check>> {
-    let d = derive_session(vm, role, &p.session, hs_of(witness))?;
-    // c_ap_2 = traffic_update(traffic_update(c_ap_0))
-    let a = expand_label(vm, &d.c_ap_0, "traffic upd", &[], 32)?;
-    let secret = expand_label(vm, &a, "traffic upd", &[], 32)?;
-    let (k, iv) = record_keys(vm, &secret)?;
-
-    let mut checks = vec![key_schedule_check(vm, &d, &p.session)?];
-    let ct = public_bytes(vm, &p.ct_window)?;
     if p.sel_len != p.expected.len() {
-        anyhow::bail!("π_C2: sel_len {} != |expected| {}", p.sel_len, p.expected.len());
+        anyhow::bail!("π_C2S: sel_len {} != |expected| {}", p.sel_len, p.expected.len());
     }
-    let out = crate::gadgets::decrypt_window(
-        vm, &k, &iv, p.seq, &ct, p.off, p.w, p.sel_start, p.sel_len,
-    )?;
+    let (anchor, k, iv) = anchored_keys(vm, role, "h1", &p.h1, witness)?;
+    let ct = public_bytes(vm, &p.ct_window)?;
+    let out = decrypt_window(vm, &k, &iv, p.seq, &ct, p.off, p.w, p.sel_start, p.sel_len)?;
     let expected = public_bytes(vm, &p.expected)?;
     let eq = eq_bytes(vm, &out, &expected)?;
-    checks.push(Check::full("suffix", eq, vec![1u8]));
-    Ok(checks)
+    Ok(vec![anchor, Check::full("suffix", eq, vec![1u8])])
 }
 
-fn build_pi_c3<VM: Vm<Binary>>(
+pub fn build_pi_c3s<VM: Vm<Binary>>(
     vm: &mut VM,
     role: Role,
-    p: &PiC3,
+    p: &PiC3S,
     witness: Option<&Witness>,
 ) -> anyhow::Result<Vec<Check>> {
-    let d = derive_session(vm, role, &p.session, hs_of(witness))?;
-    let (k, iv) = record_keys(vm, &d.s_ap_0)?;
-
-    let mut checks = vec![key_schedule_check(vm, &d, &p.session)?];
+    if p.records.is_empty() || p.expected.is_empty() {
+        anyhow::bail!("π_C3S: no records or empty R");
+    }
+    if p.key_updates > MAX_SERVER_KEY_UPDATES {
+        anyhow::bail!("π_C3S: {} server KeyUpdates (limit {MAX_SERVER_KEY_UPDATES})", p.key_updates);
+    }
+    let (anchor, k, iv) = anchored_keys_after_updates(vm, role, "h2", &p.h2, witness, p.key_updates)?;
     let mut contents = Vec::with_capacity(p.records.len());
-    for r in &p.records {
-        let ct = public_bytes(vm, &r.ct)?;
-        if r.off != 0 {
-            anyhow::bail!("π_C3: record offsets are a v2 (π_C3S) feature");
+    for (i, r) in p.records.iter().enumerate() {
+        if i > 0 && r.off != 0 {
+            anyhow::bail!("π_C3S: only the first record may start at an offset");
         }
-        contents.push(crate::gadgets::decrypt_record_content(vm, &k, &iv, r.seq, &ct)?);
+        let ct = public_bytes(vm, &r.ct)?;
+        contents.push(decrypt_record_tail(vm, &k, &iv, r.seq, &ct, r.off)?);
     }
     let all = concat(vm, &contents)?;
     let start = all
         .len()
         .checked_sub(p.expected.len())
         .and_then(|x| x.checked_sub(p.skip))
-        .ok_or_else(|| anyhow::anyhow!("π_C3: records do not cover R plus skip"))?;
+        .ok_or_else(|| anyhow::anyhow!("π_C3S: records do not cover R plus skip"))?;
     let out = select(vm, &all, start, p.expected.len())?;
     let expected = public_bytes(vm, &p.expected)?;
     let eq = eq_bytes(vm, &out, &expected)?;
-    checks.push(Check::full("disclosure", eq, vec![1u8]));
-    Ok(checks)
+    Ok(vec![anchor, Check::full("disclosure", eq, vec![1u8])])
 }
 
-fn build_pi_n<VM: Vm<Binary>>(
+pub fn build_pi_nk<VM: Vm<Binary>>(
     vm: &mut VM,
     role: Role,
-    p: &PiN,
+    p: &PiNK,
     witness: Option<&Witness>,
 ) -> anyhow::Result<Vec<Check>> {
-    // The circuit is a fixed-size membership check over SUPPORTED_KEY_ALPHABET.
-    // Fail loud rather than prove membership in an alphabet we did not build.
     if p.key_alphabet != SUPPORTED_KEY_ALPHABET {
         anyhow::bail!(
-            "unsupported key alphabet {:?}: the π_N circuit is fixed to {:?}",
+            "unsupported key alphabet {:?}: the π_NK circuit is fixed to {:?}",
             p.key_alphabet,
             SUPPORTED_KEY_ALPHABET
         );
     }
-    if p.head_len == 0
+    if p.template.len() != p.head_len
         || p.head_len >= MAX_INNER_PLAINTEXT
-        || p.template.len() != p.head_len
-        || p.s.len() != p.head_len + 1
         || p.key_offsets.len() != p.key_len
         || p.key_len == 0
         || p.key_offsets.iter().any(|&o| o >= p.head_len)
     {
-        anyhow::bail!("π_N: inconsistent template/keystream/key offsets");
+        anyhow::bail!("π_NK: inconsistent template/key offsets");
     }
     let mut sorted = p.key_offsets.clone();
     sorted.sort_unstable();
     sorted.dedup();
     if sorted.len() != p.key_offsets.len() {
-        anyhow::bail!("π_N: duplicate key offsets");
+        anyhow::bail!("π_NK: duplicate key offsets");
     }
-    let key_bytes = match witness {
-        Some(Witness::Key(k)) => Some(k.as_slice()),
-        _ => None,
+
+    // Witness: K_0 ‖ IV_0 (28 bytes) and the API key.
+    let (kiv_bytes, key_bytes) = match witness {
+        Some(Witness::NodeKey { k0, iv0, key }) => {
+            let mut kiv = k0.to_vec();
+            kiv.extend_from_slice(iv0);
+            (Some(kiv), Some(key.as_slice()))
+        }
+        _ => (None, None),
     };
     if role == Role::Prover {
-        let k = key_bytes.ok_or_else(|| anyhow::anyhow!("π_N: the prover needs a Key witness"))?;
+        let k = key_bytes.ok_or_else(|| anyhow::anyhow!("π_NK: the prover needs a NodeKey witness"))?;
         if k.len() != p.key_len {
-            anyhow::bail!("π_N: key is {} bytes, statement says {}", k.len(), p.key_len);
+            anyhow::bail!("π_NK: key is {} bytes, statement says {}", k.len(), p.key_len);
         }
     }
 
-    let template = public_bytes(vm, &p.template)?;
+    let kiv = secret_bytes(vm, role, 28, kiv_bytes.as_deref())?;
     let key = secret_bytes(vm, role, p.key_len, key_bytes)?;
+    let template = public_bytes(vm, &p.template)?;
 
-    // P := template with key bytes spliced in.
+    // hk = SHA256(K_0 ‖ IV_0)
+    let hk: Vector<U8> = sha256_bytes(vm, &kiv)?.into();
+    let k0: Array<U8, 16> = select(vm, &kiv, 0, 16)?.try_into().expect("16 bytes");
+    let iv0: Array<U8, 12> = select(vm, &kiv, 16, 12)?.try_into().expect("12 bytes");
+
+    // P := template with key bytes spliced in, then || 0x17.
     let circ = splice_circuit(p.head_len, &p.key_offsets);
     let call = Call::builder(circ)
         .arg(template.to_raw())
@@ -489,32 +417,33 @@ fn build_pi_n<VM: Vm<Binary>>(
         .build()
         .expect("splice input length");
     let head: Vector<U8> = vm.call(call)?;
-
-    // TLS 1.3 inner plaintext = content || content_type(0x17).
     let ct_byte = public_bytes(vm, &[0x17])?;
     let plaintext = concat(vm, &[head, ct_byte])?;
 
-    // C1 = P XOR S
-    let s = public_bytes(vm, &p.s)?;
-    let c1 = xor_bytes(vm, &plaintext, &s)?;
+    // C_1 = P XOR AES-CTR(K_0, IV_0 xor 0, counter 2..)
+    let n = plaintext.len();
+    let mut blocks = Vec::with_capacity(n.div_ceil(16));
+    for i in 0..n.div_ceil(16) {
+        let ctr = ctr_block(vm, &iv0, 0, (i + 2) as u32)?;
+        blocks.push(aes_block(vm, &k0, &ctr)?.into());
+    }
+    let ks_all = concat(vm, &blocks)?;
+    let ks = select(vm, &ks_all, 0, n)?;
+    let c1 = xor_bytes(vm, &plaintext, &ks)?;
 
     let mut checks = Vec::new();
 
-    // Key alphabet membership, AND-reduced: must be 0x01. The circuit folds the
-    // seven constant-zero trailer outputs away, so the decoded value is one
-    // byte; `check_results` requires an exact-length match for `full` checks.
     let alph = alphabet_circuit(p.key_len);
     let call = Call::builder(alph).arg(key.to_raw()).build().unwrap();
     let ok: Vector<U8> = vm.call(call)?;
     checks.push(Check::full("key_alphabet", ok, vec![1u8]));
 
-    // SHA256(header || C1) == C_commit
+    // c_commit = SHA256(header ‖ C_1)
     let header = public_bytes(vm, &p.header)?;
-    let mut h = Sha256::new();
-    h.update(&header);
-    h.update(&c1);
-    let digest: Array<U8, 32> = h.finalize(vm)?;
-    checks.push(Check::full("c_commit", digest.into(), p.c_commit.to_vec()));
+    let rec = concat(vm, &[header, c1])?;
+    let digest: Vector<U8> = sha256_bytes(vm, &rec)?.into();
+    checks.push(Check::full("c_commit", digest, p.c_commit.to_vec()));
 
+    checks.push(Check::full("hk", hk, p.hk.to_vec()));
     Ok(checks)
 }

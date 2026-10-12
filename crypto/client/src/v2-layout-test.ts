@@ -8,7 +8,8 @@
 // writes the body in epoch 1 (c_ap_1, from seq 0) with the suffix as its own
 // final record, and the response is read under s_ap_0.
 //
-// Also runs a plain v1-style handshake (X25519, no hooks) as a regression check.
+// First lists the provider's text models over a plain handshake (X25519, no
+// hooks), which also checks that the fork's default path still works.
 //
 //   VENICE_API_KEY=… node --experimental-strip-types src/v2-layout-test.ts [--model m] [--max-tokens n]
 //
@@ -109,9 +110,9 @@ function parseHttp(raw: Uint8Array): { status: string; headers: string; body: st
 }
 
 // ---------------------------------------------------------------------------
-// v1 regression: plain X25519 handshake, GET /api/v1/models
+// Plain X25519 handshake (the fork's default path), GET /api/v1/models
 // ---------------------------------------------------------------------------
-async function runV1(): Promise<string[]> {
+async function listModels(): Promise<string[]> {
   const t0 = Date.now()
   const sock = await open()
   let resp = new Uint8Array(0)
@@ -135,8 +136,6 @@ async function runV1(): Promise<string[]> {
       },
       onHandshake: async () => {
         tHs = Date.now()
-        const hs = tls.getHandshakeSecrets()
-        if (!hs?.masterSecret || hs.clientSecret.length !== 32) rej(new Error('v1: handshake secrets missing'))
         await tls.write(
           enc.encode(
             `GET /api/v1/models?type=text HTTP/1.1\r\nHost: ${HOST}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n`,
@@ -152,12 +151,12 @@ async function runV1(): Promise<string[]> {
     sock.on('close', () => chain.then(() => res()))
     tls.startHandshake().catch(rej)
   })
-  await Promise.race([done, new Promise((_, rej) => setTimeout(() => rej(new Error('v1 timeout')), 20000))])
+  await Promise.race([done, new Promise((_, rej) => setTimeout(() => rej(new Error('plain handshake timeout')), 20000))])
   sock.destroy()
   const p = parseHttp(resp)
-  if (!p) throw new Error('v1: no HTTP response')
+  if (!p) throw new Error('plain handshake: no HTTP response')
   const ids: string[] = JSON.parse(p.body).data.map((m: any) => m.id)
-  console.log(`[v1] X25519 handshake ${tHs - t0} ms, total ${Date.now() - t0} ms; ${p.status}; ${ids.length} text models`)
+  console.log(`[plain] X25519 handshake ${tHs - t0} ms, total ${Date.now() - t0} ms; ${p.status}; ${ids.length} text models`)
   return ids
 }
 
@@ -342,7 +341,7 @@ function describeClientHello(ch: Uint8Array) {
 }
 
 async function main() {
-  const ids = await runV1()
+  const ids = await listModels()
   const pref = arg('--model') ?? ['llama-3.2-3b', 'qwen3-4b', 'venice-uncensored'].find((m) => ids.includes(m)) ?? ids[0]
   console.log(`[v2] model ${pref}, max_tokens ${MAX_TOKENS}`)
   const ok = await runV2(pref)

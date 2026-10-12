@@ -2,7 +2,7 @@
 
 Confidential mode lets a Routstr node serve your LLM request without seeing the prompt or the answer, and
 (protocol v2) without you ever being able to recover the node's provider API key. How it works:
-[`paper/paper.pdf`](../paper/paper.pdf); trade-offs between v1 and v2: [`V1-V2-ONE-PAGER.pdf`](V1-V2-ONE-PAGER.pdf).
+[`paper/paper.pdf`](../paper/paper.pdf); trade-offs between the retired protocol v1 and v2: [`V1-V2-ONE-PAGER.pdf`](V1-V2-ONE-PAGER.pdf).
 
 This is **experimental**: the code lives on branches, not in Routstr releases yet, and the two-party
 computation is not externally reviewed. Use small amounts.
@@ -14,7 +14,7 @@ computation is not externally reviewed. Use small amounts.
 | [jooray/routstrd](https://github.com/jooray/routstrd/tree/confidential-upstream) | `confidential-upstream` | the daemon (opt-in header, config) |
 | [jooray/routstr-core](https://github.com/jooray/routstr-core/tree/confidential-2pc) | `confidential-2pc` | the node |
 
-You need: git, Rust (stable), Bun (≥ 1.4 only for protocol v1 sessions, whose handshake uses WebCrypto X25519), Node.js/npm (to build the SDK).
+You need: git, Rust (stable), Bun, Node.js/npm (to build the SDK).
 
 ## 1. Client only (use an existing node)
 
@@ -229,7 +229,8 @@ they are persisted in the node's database after the first start (change them wit
 node; the session fee and the surcharge price the work of a request that is used. See
 `routstr-core/docs/confidential-upstream.md` for the exact rules.
 
-`--protocol 2` selects the two-party handshake (`1` is the single-party variant). Limits: `--max-sessions`
+The sidecar speaks only protocol v2, the two-party handshake (`--protocol 2` is optional; protocol v1 is
+retired and `--protocol 1` is refused; it remains on the `v1-poc` branch). Limits: `--max-sessions`
 (32) and `--max-body` (8 MiB). The sidecar gives an armed session 600 s from its setup to send the
 ClientHello and then a fresh 600 s; the node ends every session 600 s after accepting its WebSocket, so in
 practice the node's limit is the one that applies. Client bytes held before the credential

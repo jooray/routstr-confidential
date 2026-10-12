@@ -1,7 +1,8 @@
 //! TLS 1.3 record framing and fail-closed handshake verification.
 //!
-//! The sidecar never speaks TLS itself: it relays records and, once the client
-//! discloses the handshake traffic secrets, verifies the relayed handshake
+//! The sidecar never speaks TLS itself: it relays records and, once the
+//! two-party key schedule has output the handshake traffic secrets, verifies
+//! the relayed handshake
 //! (certificate chain to the Mozilla roots, hostname, CertificateVerify and
 //! both Finished messages) using `cu-crypto` for the key schedule.
 
@@ -84,7 +85,7 @@ pub fn parse_handshake_messages(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
     out
 }
 
-/// Disclosed handshake traffic secrets from the client.
+/// The handshake traffic secrets (public outputs of the two-party key schedule).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct HsSecrets {
     pub client_hs: [u8; 32],
@@ -102,8 +103,6 @@ pub struct HandshakeInfo {
     pub leaf_der: Vec<u8>,
     /// Number of server APPLICATION_DATA records consumed by the handshake.
     pub server_handshake_records: usize,
-    /// Number of client APPLICATION_DATA records consumed by the handshake.
-    pub client_handshake_records: usize,
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -310,7 +309,6 @@ pub fn verify_handshake(
         cert_chain_hash,
         leaf_der,
         server_handshake_records: server_seq as usize,
-        client_handshake_records: client_seq as usize,
     })
 }
 

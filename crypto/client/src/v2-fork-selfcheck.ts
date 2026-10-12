@@ -6,7 +6,7 @@
 // supported_groups = [secp256r1], one suite, TLS 1.3 only, no PSK /
 // early_data / psk_key_exchange_modes); HelloRetryRequest and a non-P-256
 // server share are rejected before any hook runs; bad options are refused;
-// the v1 ClientHello is unchanged in shape.
+// the fork's default (non-external) ClientHello is unchanged in shape.
 
 import { p256 } from '@noble/curves/p256'
 
@@ -143,7 +143,7 @@ async function main() {
     check('external: ALPN http/1.1', h.exts.has(0x0010))
   }
 
-  // 2. v1 ClientHello unchanged in shape
+  // 2. default (non-external) ClientHello unchanged in shape
   {
     const writes: Uint8Array[] = []
     const tls = makeTLSClient({
@@ -160,7 +160,7 @@ async function main() {
     await tls.startHandshake()
     const h = parseClientHello(writes[0])
     const ks = h.exts.get(0x0033)!
-    check('v1: X25519 key share, psk_key_exchange_modes kept',
+    check('default: X25519 key share, psk_key_exchange_modes kept',
       hex(h.exts.get(0x000a)!) === '0002001d' && hex(ks.slice(2, 4)) === '001d' && h.exts.has(0x002d))
   }
 

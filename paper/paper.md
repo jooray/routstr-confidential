@@ -933,8 +933,10 @@ routstr-sdk `b5d16f0`).
 
 # 7. v1: the single-party variant
 
-The protocol has a simpler variant, which we call v1, without any 2PC. A node runs one version and
-announces it in its signed offer; clients follow the offer.
+The protocol had a simpler variant, which we call v1, without any 2PC. It was implemented and measured
+(section 6) and is now retired: the current implementation speaks only v2, and a client refuses an offer
+that does not name v2. v1 remains on the `v1-poc` branch of routstr-confidential and the
+`confidential-upstream` branches of routstr-core and routstr-sdk.
 
 **How it works.** C runs the TLS handshake alone, with an ordinary X25519 key share, and discloses only
 $c_{hs}$ and $s_{hs}$ to N, which verifies the handshake as in v2. C then sends a KeyUpdate in epoch 0,
@@ -949,7 +951,7 @@ the public handshake values, so each recomputes the key schedule (28 to 36 compr
 
 **What it gives up.** C holds the whole epoch-1 key $K_1$: it needs it to seal its own KeyUpdate at
 sequence 1. The API key is therefore exactly $C_1 \oplus S$, and P1 holds only as long as C never sees
-$C_1$. The implementation never sends it to C, but anyone on N's egress path who colludes with C (a
+$C_1$. The v1 implementation never sent it to C, but anyone on N's egress path who colludes with C (a
 shared cloud network, a TLS-inspecting middlebox, the hosting provider, a CDN edge) can recover the key,
 and one leak exposes it until it is rotated. Short-lived keys with spend caps limit the loss without
 removing the assumption. In v1 P1 is an operational assumption; in v2 it is a cryptographic property.
@@ -1150,8 +1152,8 @@ egress private.
 
 # Appendix A. Case study: the provider profile in practice
 
-**A.1 Verified behaviours** (live gate `crypto/tools/provider-profile-check.py`, checks A1-A11, 11/11 on
-2026-10-10; rate limits, 5xx and timeouts count as inconclusive, never as a pass, and each rejection
+**A.1 Verified behaviours** (live gate `crypto/tools/provider-profile-check.py`, checks A1-A12, 12/12 on
+2026-10-12; rate limits, 5xx and timeouts count as inconclusive, never as a pass, and each rejection
 check asserts the exact status and error text against a valid control).
 
 - **Transport:** a client offering only TLS 1.3 with `TLS_AES_128_GCM_SHA256` is served; a client
@@ -1177,6 +1179,9 @@ check asserts the exact status and error text against a valid control).
   (`crypto/tools/regression-modality.py`, 8/8).
 - **Usage event:** the terminal event carries usage, cost and model with empty `choices`, followed by
   `[DONE]`.
+- **Event framing:** the dechunked stream uses LF line endings only, and every event is one
+  `data:` line of JSON followed by a blank line, ending in `data: [DONE]`: the framing the usage proof
+  parses.
 - **Fake usage events:** a prompt instructing the model to emit them produced none. Every imitation was
   escaped inside a JSON string, and the raw stream contained no CR/LF inside events.
 

@@ -251,58 +251,26 @@ pub struct Stats {
 
 /// Count SHA-256 compressions and AES blocks a statement performs.
 pub fn stats(params: &Params) -> Stats {
-    // Each HKDF-Expand-Label is one HMAC = 4 compressions; HKDF-Extract is one
-    // HMAC = 4 compressions.
-    let hmacs = match params {
-        // c hs, s hs, derived, extract, c ap traffic, traffic upd, key, iv
-        Params::PiC1(_) => 8,
-        // ... plus one more traffic upd
-        Params::PiC2(_) => 9,
-        // c hs, s hs, derived, extract, s ap traffic, key, iv
-        Params::PiC3(_) => 7,
-        // SHA256(header || C1) = 4 compressions
-        Params::PiN(_) => 1,
-        // v2: SHA256(secret) + keyed ipad/opad + key + iv = 1 + 2 + 2 + 2 = 7
-        // compressions; counted separately below.
-        Params::PiC2S(_) | Params::PiC3S(_) | Params::PiNK(_) => 0,
-    };
-    let mut sha256_compressions = hmacs * 4;
+    // π_C2S/π_C3S: SHA256(secret) + keyed ipad/opad + key + iv = 1 + 2 + 2 + 2
+    // = 7 compressions.
     let mut aes_blocks = 0usize;
-
-    match params {
-        Params::PiC1(p) => {
-            aes_blocks += p.head_len.div_ceil(16); // keystream S
-            aes_blocks += 2; // H1, T0
-        }
-        Params::PiN(_) => {}
-        Params::PiC2(p) => {
-            let prefix = p.off % 16;
-            aes_blocks += (prefix + p.w).div_ceil(16);
-        }
-        Params::PiC3(p) => {
-            for r in &p.records {
-                aes_blocks += r.ct.len().div_ceil(16);
-            }
-        }
+    let sha256_compressions = match params {
         Params::PiC2S(p) => {
-            sha256_compressions = 7;
             aes_blocks += (p.off % 16 + p.w).div_ceil(16);
+            7
         }
         Params::PiC3S(p) => {
-            sha256_compressions = 7;
             for r in &p.records {
                 aes_blocks += r.ct.len().div_ceil(16);
             }
+            7
         }
         Params::PiNK(p) => {
             // hk (28 bytes, one block) + SHA256(header || C_1).
-            sha256_compressions = 1 + sha256_blocks(5 + p.head_len + 1);
             aes_blocks += (p.head_len + 1).div_ceil(16);
+            1 + sha256_blocks(5 + p.head_len + 1)
         }
-    }
-    if matches!(params, Params::PiN(_)) {
-        sha256_compressions = 4;
-    }
+    };
     Stats {
         sha256_compressions,
         aes_blocks,
@@ -359,7 +327,7 @@ mod tests {
     #[test]
     fn full_check_is_exact_length() {
         // Exact-length: a value longer than expected must fail even when the
-        // expected bytes are a prefix of the proven value (the π_N prefix bug).
+        // expected bytes are a prefix of the proven value (a prefix bug once found here).
         assert!(check_ok(b"ab", None, b"ab"));
         assert!(!check_ok(b"ab", None, b"abc"), "longer value must fail");
         assert!(!check_ok(b"ab", None, b"a"), "shorter value must fail");

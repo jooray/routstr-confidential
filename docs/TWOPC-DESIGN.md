@@ -1,8 +1,8 @@
 # Protocol v2: two-party handshake (closes P1)
 
 Status: implemented on the `twopc-v2` branch (and `confidential-2pc` in routstr-core and routstr-sdk), verified end to end
-against api.venice.ai. v1 (paper §4) stays as is; a sidecar runs one version (`--protocol 2`) and clients take it from
-the signed offer's `v`. Trade-offs and measurements: `docs/V1-V2-ONE-PAGER.md`; component benchmarks:
+against api.venice.ai. v1 is retired: the sidecar, the node and the clients speak only v2 (the signed offer
+names `v = 2`), and v1 remains on the `v1-poc` branch. Trade-offs and measurements: `docs/V1-V2-ONE-PAGER.md`; component benchmarks:
 `crypto/twopc/BENCH.md`, `crypto/zkbench/BENCH-v2.md`.
 
 ## Goal

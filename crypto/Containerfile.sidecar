@@ -8,7 +8,7 @@
 #
 #   podman run -d --name cu-sidecar -e UPSTREAM_API_KEY=... -e CU_SIDECAR_TOKEN=... cu-sidecar \
 #     --listen 0.0.0.0:7444 --upstream api.venice.ai:443 --key-env UPSTREAM_API_KEY \
-#     --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
+#     --offer /etc/cu-sidecar/offer.json --node-settles --runs-dir /runs
 #
 # and point the node at it: CONFIDENTIAL_SIDECAR_URL=http://cu-sidecar:7444,
 # CONFIDENTIAL_SIDECAR_TOKEN=<same token>

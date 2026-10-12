@@ -30,14 +30,14 @@ fn names_and_roles() {
     }
     assert!(!Proof::PiNK.client_proves());
     assert!(Proof::PiC2S.client_proves() && Proof::PiC3S.client_proves());
-    for (name, params, _) in fixtures::all_v2() {
+    for (name, params, _) in fixtures::all() {
         assert_eq!(params.proof().name(), name);
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn honest_v2_proofs_verify_ideal() {
-    for (name, params, witness) in fixtures::all_v2() {
+    for (name, params, witness) in fixtures::all() {
         let res = run_pair_ideal(&params, &witness).await;
         assert!(passed(&res), "{name}: {res:?}");
     }
@@ -45,7 +45,7 @@ async fn honest_v2_proofs_verify_ideal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn honest_v2_proofs_verify_real_ot() {
-    for (name, params, witness) in fixtures::all_v2() {
+    for (name, params, witness) in fixtures::all() {
         let out = run_pair_transport(Duration::ZERO, f64::INFINITY, &params, &witness)
             .await
             .unwrap_or_else(|e| panic!("{name}: {e:#}"));
@@ -65,7 +65,7 @@ async fn honest_bits_are_one() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_anchor_fails() {
-    for (name, mut params, witness) in fixtures::all_v2() {
+    for (name, mut params, witness) in fixtures::all() {
         let label = match &mut params {
             Params::PiC2S(p) => {
                 p.h1[0] ^= 1;
@@ -106,7 +106,7 @@ async fn wrong_secret_fails() {
     assert!(!passed(&res));
 }
 
-// --- one-bit disclosure (mirrors tests/disclosure.rs) ---------------------
+// --- one-bit disclosure ---------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn suffix_mismatch_gives_zero_bit() {
@@ -186,7 +186,7 @@ async fn c3s_after_server_key_updates() {
         assert!(!res.last().unwrap().ok, "key_updates {wrong} must not verify");
     }
     // Bounded, and omitted from the wire when 0 (older peers parse it).
-    p.key_updates = zkbench::statements_v2::MAX_SERVER_KEY_UPDATES + 1;
+    p.key_updates = zkbench::statements::MAX_SERVER_KEY_UPDATES + 1;
     assert!(run_pair_ideal(&Params::PiC3S(p.clone()), &witness).await.is_err());
     p.key_updates = 0;
     assert!(!serde_json::to_string(&p).unwrap().contains("key_updates"));
@@ -288,7 +288,7 @@ async fn nk_rejects_unsupported_alphabet_and_bad_shapes() {
 
 #[test]
 fn v2_stats() {
-    for (name, params, _) in fixtures::all_v2() {
+    for (name, params, _) in fixtures::all() {
         let s = zkbench::stats(&params);
         assert!(s.aes_blocks >= 2, "{name}");
         match params {
@@ -374,7 +374,7 @@ fn run_cu_prover_pair(name: &str, params: &Params, witness: &Witness) -> bool {
 
 #[test]
 fn cu_prover_job_stdin_runs_v2_proofs() {
-    for (name, params, witness) in fixtures::all_v2() {
+    for (name, params, witness) in fixtures::all() {
         assert!(run_cu_prover_pair(name, &params, &witness), "{name}: honest job failed");
     }
     // A wrong anchor makes the verifier process fail.

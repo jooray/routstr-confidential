@@ -18,10 +18,10 @@ Each has `origin` = Routstr upstream and `fork` = `jooray/<repo>`.
 
 | Path | Git | What |
 |---|---|---|
-| `routstr-core/` | **`confidential-2pc`** (v2, deployed on routstr.cypherpunk.today); `confidential-upstream` (v1); `fix/no-announce-unroutable-urls` → PR [#823](https://github.com/Routstr/routstr-core/pull/823) | the node (Python/FastAPI) |
-| `routstr-sdk/` | **`confidential-2pc`** (v2 + pre-warming); `confidential-upstream` (v1) | client SDK (TypeScript) |
-| `routstrd/` | **`confidential-upstream`** (works with either SDK branch; pre-warm config) | client daemon (TypeScript/Bun) |
-| `crypto/` | this repo | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (v2 two-party key schedule + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK circuits: v2 π_NK, π_C2S, π_C3S; v1 π_C1, π_N, π_C2, π_C3; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (test scripts), `runs/` (session evidence) |
+| `routstr-core/` | **`confidential-2pc`** (v2, the only protocol; deployed on routstr.cypherpunk.today); `confidential-upstream` (retired v1, reference only); `fix/no-announce-unroutable-urls` → PR [#823](https://github.com/Routstr/routstr-core/pull/823) | the node (Python/FastAPI) |
+| `routstr-sdk/` | **`confidential-2pc`** (v2 + pre-warming); `confidential-upstream` (retired v1, reference only) | client SDK (TypeScript) |
+| `routstrd/` | **`confidential-upstream`** (uses the SDK's `confidential-2pc` build; pre-warm config) | client daemon (TypeScript/Bun) |
+| `crypto/` | this repo | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (v2 two-party key schedule + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK circuits π_NK, π_C2S, π_C3S; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (test scripts), `runs/` (session evidence) |
 | `paper/` | — | the paper (`paper.md` → `build.sh` → `paper.pdf`) |
 | `docs/` | — | engineering docs and research (below) |
 
@@ -41,7 +41,7 @@ them.
 | `docs/REVIEW-2026-10-09.md` | every bug found and fixed (numbered findings), measurements, the plug-in refactor (§8) |
 | `docs/TWOPC-DESIGN.md` | protocol v2: the two-party handshake, epochs, session flow, the 2PC security model |
 | `docs/TWOPC-NODE-GARBLING.md` | the node-only authenticated garbling: construction, security argument, the download cuts (64-bit salted rows, three-halves; why h1/h2/hk stay SHA-256) |
-| `docs/V1-V2-ONE-PAGER.md` / `.pdf` | v1 vs v2 trade-offs (data, speed, security) |
+| `docs/V1-V2-ONE-PAGER.md` / `.pdf` | v1 vs v2 trade-offs (data, speed, security); historical, v1 is retired |
 | `docs/original/*` | **local only, not published** (git-ignored). The rows below describe what is in it |
 | `docs/original/SPEC-confidential-upstream.md` | the original protocol spec (frames, epochs, proofs); the code has since moved on (see REVIEW) |
 | `docs/original/PLAN-…`, `WIRE-UP-…` | original implementation plan and routstr wiring spec |
@@ -65,7 +65,7 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
                                                          Venice (api.venice.ai)
 ```
 
-**One session (protocol v2, the deployed default).**
+**One session (protocol v2, the only protocol).**
 1. *Setup.* The client sends its ordinary node credential (`sk-` key or Cashu
    token) in `setup.auth` and the signature of the offer it verified in
    `setup.offer_sig`. The node validates the setup and the credential
@@ -106,18 +106,20 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
 8. *Abort.* Before the final body record is released: release (less any
    abandon fee). After it, with no disclosure: charge the reservation.
 
-**v1 variant** (`--protocol 1`; branch `v1-poc` here, `confidential-upstream` in routstr-core and routstr-sdk): the client does the TLS
-handshake alone (X25519) and discloses only the handshake traffic secrets.
-After KeyUpdate, π_C1 proves the one-shot record material, the sidecar writes
-the head record, π_N proves it against the template, then KU1. The body and
-response steps use π_C2 and π_C3, anchored on the handshake values.
+**Protocol v1 is retired.** The earlier design (the client ran the TLS
+handshake alone with X25519; proofs π_C1, π_N, π_C2, π_C3; the client's KU1)
+is no longer in the code here, in routstr-core or in routstr-sdk. It lives on
+the `v1-poc` branch here and the `confidential-upstream` branches of
+routstr-core and routstr-sdk. The sidecar refuses `--protocol 1`, the node
+offers only `v = 2` and closes a `v=1` session socket, and the SDK refuses an
+offer without v2 (`offer_unsupported_version`).
 
 **Where the code is.**
 
 | Concern | File |
 |---|---|
 | sidecar state machine, setup gate and limits, record hold, tail anchoring, error-head disclosure | `crypto/relay/src/main.rs` (`handle_setup`, `handle_control`, `validate_error_head`; + `tls.rs` handshake verification) |
-| ZK statements / circuits (one-bit equality `eq_bytes`) | `crypto/zkbench/src/statements.rs`, `gadgets.rs`, `bin/cu-prover.rs` (`--job-stdin`); tests `tests/disclosure.rs` |
+| ZK statements / circuits (one-bit equality `eq_bytes`) | `crypto/zkbench/src/statements.rs`, `gadgets.rs`, `bin/cu-prover.rs` (`--job-stdin`); tests `tests/v2.rs`, `tests/malformed.rs` |
 | node offer, model→provider candidate, billing glue | `routstr-core/routstr/confidential.py` |
 | node relay + interception | `routstr-core/routstr/confidential_ws.py` |
 | node hooks | `core/main.py` (routes), `core/settings.py` (`CONFIDENTIAL_SIDECAR_URL`, `CONFIDENTIAL_SIDECAR_TOKEN`), `payment/models.py` (`confidential_upstream` field) |
@@ -152,12 +154,12 @@ cd $P/crypto/client && CU_PROVER=../zkbench/target/release/cu-prover node --expe
 ```
 
 For routstrd, use a scratch `ROUTSTRD_DIR` and add a `confidentialUpstream`
-block (`routstrd/docs/confidential-upstream.md`). Run it with Bun (≥ 1.4 for v1 nodes) and send
+block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 `x-routstr-verify: confidential`.
 
 **Checks.**
-- `crypto/tools/provider-profile-check.py`: the provider assumptions A1–A11,
-  live (11/11); `--self-test` proves the negative controls.
+- `crypto/tools/provider-profile-check.py`: the provider assumptions A1–A12,
+  live (12/12; A12 = the LF-only SSE framing the usage proof parses); `--self-test` proves the negative controls.
 - `crypto/tools/regression-modality.py`: image/data-URI rejection per model (only relevant if you restrict models with the sidecar offer's `model_allowlist`; the shipped offer leaves it empty, since the node reserves a full-context prompt).
 - `crypto/tools/adversarial-model-swap.sh` (with `AUTH=… CU_NODE=…
   NODE_LOG=routstr-core/logs/app_<date>.log` on a dedicated node): the
@@ -183,12 +185,12 @@ wire masks are authenticated to C by IT-MACs from Ferret COTs, C runs a
 salted 64-bit consistency check of every AND gate before using any output;
 `cu-2pc` binary for the client; construction, security argument and cuts in
 `docs/TWOPC-NODE-GARBLING.md`, measurements in `crypto/twopc/BENCH.md`),
-`zkbench` v2 statements
-(`pi_nk`, `pi_c2s`, `pi_c3s`), sidecar `--protocol 2` (`relay/src/tls_v2.rs`
-checks the ClientHello carries exactly the joint P-256 share), the TLS fork's
-`external` hooks, and the v2 paths in `driver.ts` / the SDK `session.ts`.
-Run a v2 stack like the v1 one with `--protocol 2` on the sidecar; the client
-needs `cu-2pc` next to `cu-prover` (or `CU_2PC`). The sidecar dials the provider
+`zkbench` statements
+(`pi_nk`, `pi_c2s`, `pi_c3s`), the sidecar (`relay/src/tls_v2.rs`
+checks the ClientHello carries exactly the joint P-256 share; `--protocol 2`
+is accepted but optional), the TLS fork's `external` hooks, `driver.ts` and
+the SDK `session.ts`. The client needs `cu-2pc` next to `cu-prover` (or
+`CU_2PC`). The sidecar dials the provider
 only when the ClientHello arrives, so pre-warmed (armed) sessions hold no
 provider connection. The node's uvicorn needs `--ws-ping-timeout 300`
 (docs/SETUP.md). This branch (`twopc-v2`) is the repo's default branch; the
@@ -231,22 +233,18 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
 - **Each SDK entrypoint is its own bundle.** The confidential transport is
   registered on a `globalThis` symbol by the Bun/Node entrypoints; the
   browser-safe bundle never imports it.
-- **Bun < 1.4 lacks WebCrypto X25519.** This matters only for v1 sessions
-  (v2 uses P-256, and the SDK probes X25519 only for v1). A v1 session fails fast with a clear
-  error.
 - **routstrd needs Nostr discovery to fetch a node's models.** It only fetches
   models for discovered nodes, so a private, unannounced node must be in its
   provider list. This is a pre-existing limitation, not confidential-specific.
 - **`crypto/` builds into `zkbench/target`** (see `crypto/.cargo/config.toml`).
 - **Open items.**
-  - v1's P1 rests on the client never seeing the N→U ciphertext; v2 removes
-    that assumption. v2's 2PC costs ~22 MB node→client and ~1.2 MB
+  - v2's 2PC costs ~22 MB node→client and ~1.2 MB
     client→node per request (cold ~7.4 s on a 2/50 Mbit/s link), and a
     cheating node can learn ≤ log2 6 ≈ 2.6 bits per session about fresh,
     single-use values. The garbler-only variant has no published proof and
     needs external review (`docs/TWOPC-DESIGN.md`, "Security model").
   - Pre-warming (SDK `client/confidential/prewarm.ts`, routstrd
-    `confidentialUpstream.prewarm`) arms v2 sessions up to the joint key share
+    `confidentialUpstream.prewarm`) arms sessions up to the joint key share
     only while there is traffic, plus one pre-warmed proof channel per
     session (`/zk?proof=zkchan`, `cu-prover --channel`,
     `zkbench/src/channel.rs`) holding the OT/VOLE correlations for π_NK,

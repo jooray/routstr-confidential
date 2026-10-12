@@ -21,20 +21,31 @@ authors' working documents and are not published:
   (the sidecar, N's TLS relay: `handle_setup`, the `Session` struct,
   `canonical_suffix`, the `ClientMsg::BodySuffix` and `ClientMsg::Disclose`
   handlers, `validate_r`, `validate_error_head`), `crypto/zkbench/src/statements.rs`
-  (`build_pi_c1`, `build_pi_n`, `build_pi_c2`, `build_pi_c3`),
+  (`build_pi_nk`, `build_pi_c2s`, `build_pi_c3s`; v1's `build_pi_c1`,
+  `build_pi_n`, `build_pi_c2`, `build_pi_c3` and `main.rs` `assemble` are on
+  the `v1-poc` branch),
   `routstr-core/routstr/confidential.py` (`reserve`, `settle`,
   `frozen_cost_msats`, `prompt_token_limit`),
   `routstr-core/routstr/confidential_ws.py` (`_apply_settlement`), and the
   clients' parameter checks in `routstr-sdk/client/confidential/params.ts` and
   `crypto/client/src/params.ts`.
 
+> **Protocol v1 is retired.** This review was written against protocol v1;
+> the implementation now speaks only protocol v2 (two-party handshake,
+> `TWOPC-DESIGN.md`), and v1 lives on the `v1-poc` branch. Read v1's proofs
+> as their v2 counterparts: π_N → π_NK, π_C2 → π_C2S, π_C3 → π_C3S. v2 has no
+> π_C1 and no client KeyUpdates: the KU0 → credential record → KU1 dance is
+> replaced by the node writing epoch 0 (credential record + KeyUpdate) under
+> `K_0`, which the client never learns. The model-binding, transferability and
+> reservation arguments carry over unchanged.
+>
 > **Current state (integration branches, 2026-10-10).** GAP-1, GAP-2 and GAP-3
 > are **closed**; the prototype analysis that found them is kept in
 > Appendix C for the record.
 >
 > - **Q1, model binding.** The sidecar (N's TLS relay) builds the canonical
 >   suffix from the setup values and accepts no other. It holds the record that
->   completes the body until π_C2 proves the suffix, so the provider never sees
+>   completes the body until π_C2S proves the suffix, so the provider never sees
 >   a complete request with another model or cap. The disclosed usage must name
 >   the setup model, checked in the sidecar and again by the node before it
 >   charges.
@@ -45,17 +56,17 @@ authors' working documents and are not published:
 >   where `prompt_limit` is the model's full context length: the opaque prompt
 >   is never discounted (and never reduced by the model's own completion
 >   limit, which the pinned cap rarely reaches). It charges exactly the frozen-rate
->   cost of the π_C3-verified usage. It releases the reservation if the provider
+>   cost of the π_C3S-verified usage. It releases the reservation if the provider
 >   never received the complete request or answered a 4xx/503, and charges the
 >   reservation for another 5xx or if the client withholds its disclosure.
-> - **Q3, the prompt.** The node sees only ciphertext. π_C2 and π_C3 compare
+> - **Q3, the prompt.** The node sees only ciphertext. π_C2S and π_C3S compare
 >   inside the circuit and reveal one bit; the client validates their
 >   parameters, so the node cannot aim them at other plaintext. On an upstream
 >   error the client discloses only the response head.
 >
 > The provider assumptions are re-checked live by
-> `crypto/tools/provider-profile-check.py` (A1–A11, 11/11 for Venice on
-> 2026-10-10). "Escrow" in SPEC and in Appendix C means what is now the node's
+> `crypto/tools/provider-profile-check.py` (A1–A12, 12/12 for Venice on
+> 2026-10-12). "Escrow" in SPEC and in Appendix C means what is now the node's
 > reservation.
 
 ---
@@ -598,9 +609,9 @@ reservation priced: `(setup model, full context, max_tokens, pinned params)`.
 
 - Model choice & reservation: SPEC §5.0–5.1; `confidential.py` `reserve`; `main.rs` `handle_setup`
 - Suffix semantics & last-duplicate-key: SPEC §5.5; VENICE-TESTS; provider-profile A2–A5; `main.rs` `canonical_suffix`
-- π_C2 statement/public inputs: `statements.rs` `Window`, `build_pi_c2`, `eq_bytes` (in-circuit equality); `main.rs` `BodySuffix` handler; client checks in `params.ts`
-- π_C3, `R` validation, settlement: `statements.rs` `PiC3`, `build_pi_c3`; `main.rs` `Disclose` handler, `validate_r`, `validate_error_head`; `confidential_ws.py` `_apply_settlement`; `confidential.py` `settle`, `frozen_cost_msats`
-- Head template / π_N / endpoint pinning: SPEC §5.4; `main.rs` `default_head_template_for`, `placeholder_head`, `assemble`; `statements.rs` `build_pi_n`
+- π_C2S statement/public inputs: `statements.rs` `PiC2S`, `build_pi_c2s`, `gadgets.rs` `eq_bytes` (in-circuit equality); `main.rs` `BodySuffix` handler; client checks in `params.ts`
+- π_C3S, `R` validation, settlement: `statements.rs` `PiC3S`, `build_pi_c3s`; `main.rs` `Disclose` handler, `validate_r`, `validate_error_head`; `confidential_ws.py` `_apply_settlement`; `confidential.py` `settle`, `frozen_cost_msats`
+- Head template / π_NK / endpoint pinning: SPEC §5.4; `main.rs` `default_head_template_for`, `placeholder_head`; `statements.rs` `build_pi_nk`
 - Aborts & non-disclosure: SPEC §5.8; `confidential_ws.py` `_finalize`, `_finalize_unsettled`
 - Provider requirements & fallback: SPEC §7, §9; `crypto/tools/provider-profile-check.py`
 - Benchmarks: paper §6.2

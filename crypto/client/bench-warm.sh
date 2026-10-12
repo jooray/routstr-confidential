@@ -70,10 +70,10 @@ const out = {
   model: (cold[0]||warm[0]||{}).model || process.env.CU_MODEL,
   baseline: { ttft_ms: bT, total_ms: base.total_median_ms },
   cold: { ttft_ms: med(pick(cold,'ttft_ms')), ttft_body_ms: med(pick(cold,'ttft_body_ms')), total_ms: med(pick(cold,'total_ms')),
-          pi_c1_ms: med(cold.map(r=>r.phases.pi_c1_ms)), claim_to_body_ms: med(cold.map(r=>r.phases.claim_to_body_ms)),
+          pi_nk_ms: med(cold.map(r=>r.phases.pi_nk_ms)), claim_to_body_ms: med(cold.map(r=>r.phases.claim_to_body_ms)),
           handshake_ms: med(cold.map(r=>r.phases.handshake_ms)), upstream_ttft_ms: med(cold.map(r=>r.phases.upstream_ttft_ms)) },
   warm: { ttft_ms: med(pick(warm,'ttft_ms')), ttft_body_ms: med(pick(warm,'ttft_body_ms')), total_ms: med(pick(warm,'total_ms')),
-          pi_c1_ms: med(warm.map(r=>r.phases.pi_c1_ms)), claim_to_body_ms: med(warm.map(r=>r.phases.claim_to_body_ms)),
+          pi_nk_ms: med(warm.map(r=>r.phases.pi_nk_ms)), claim_to_body_ms: med(warm.map(r=>r.phases.claim_to_body_ms)),
           arm_ms: med(pick(warm,'arm_ms')), upstream_ttft_ms: med(warm.map(r=>r.phases.upstream_ttft_ms)) },
 }
 out.added = {

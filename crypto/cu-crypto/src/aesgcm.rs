@@ -1,8 +1,8 @@
 //! AES-128-GCM record math for TLS 1.3 (RFC 8446 §5.3 + NIST SP 800-38D).
 //!
 //! This module deliberately exposes the pieces separately (`ctr_keystream`,
-//! `ghash`, `j0`) because the ZK proofs (π_C1, π_C2, π_C3) prove statements
-//! about exactly those pieces, not about a black-box AEAD.
+//! `ghash`, `j0`) because the ZK proofs (π_NK, π_C2S, π_C3S) prove statements
+//! about the CTR keystream, not about a black-box AEAD.
 
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
@@ -37,7 +37,7 @@ fn inc32(block: &mut [u8; 16]) {
 }
 
 /// The GCM CTR keystream `S = AES_K(J0+1) || AES_K(J0+2) || ...` truncated to
-/// `len` bytes. This is what π_C1 proves about the credential record.
+/// `len` bytes. π_NK computes it in-circuit for the credential record.
 pub fn ctr_keystream(key: &[u8; 16], iv: &[u8; 12], seq: u64, len: usize) -> Vec<u8> {
     let cipher = Aes128::new(key.into());
     let mut ctr = j0(iv, seq);

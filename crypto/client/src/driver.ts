@@ -1,7 +1,10 @@
-// Session driver: C side of the confidential-upstream protocol.
+// Session driver: C side of the confidential-upstream protocol (v2,
+// docs/TWOPC-DESIGN.md).
 //
-// C is the TLS 1.3 client of the upstream session and holds the only copy of
-// the application traffic secrets. It never sees the credential record.
+// C is the TLS 1.3 client of the upstream session. It runs the key schedule
+// with the node as a two-party computation and gets c_ap_1 and s_ap_0; the
+// node gets only K_0/IV_0, the key of the credential record, which C never
+// holds.
 //
 // Two deployments:
 //   * direct  (--sidecar http://127.0.0.1:7443): the prototype layout, C talks
@@ -11,11 +14,11 @@
 //     the model's max cost on the bearer (--auth: sk- key or Cashu token),
 //     settles the verified usage on it and signs with its Nostr key (schnorr).
 //
-// Pre-warm: --arm performs everything up to and including KU0 (TLS handshake,
-// node handshake verification, epoch-0 KeyUpdate, c_ap_1/K1/IV1/H1/T0 derived)
-// and then waits for a claim; --pool N keeps N armed sessions ready.
+// Pre-warm: --arm performs everything up to π_NK (setup, 2PC, TLS handshake,
+// node handshake verification, π_NK on the credential record) and then waits
+// for a claim; --pool N keeps N armed sessions ready.
 //
-// See SPEC §5, PLAN §4 and docs/APPROACH.md.
+// See docs/TWOPC-DESIGN.md and docs/APPROACH.md.
 
 import { createHash, createPublicKey, randomUUID, verify as cryptoVerify } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -35,9 +38,9 @@ import { makeTLSClient } from '../vendor/tls/lib/index.js'
 import { setCryptoImplementation } from '../vendor/tls/lib/crypto/index.js'
 import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
 
-import { concat, epoch1Material, fromHex, hex, sha256 } from './advice.ts'
+import { concat, hex, sha256 } from './advice.ts'
 import { runZk } from './zkbridge.ts'
-import { checkHeadTemplate, checkPiC1Params, checkPiC2Params, checkPiC2SParams, checkPiC3Params, checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from './params.ts'
+import { checkHeadTemplate, checkPiC2SParams, checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from './params.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
 import { ZkChan } from './zkchan.ts'
 
@@ -59,30 +62,29 @@ const DECOY = arg('--decoy-model')
 // canonical suffix — the sidecar must reject it.
 const ADV_SUFFIX_MODEL = arg('--adv-suffix-model')
 // Never declare the body suffix at all; harvest whatever response the sidecar
-// forwards, to measure the residual exposure of a client that withholds π_C2.
+// forwards, to measure the residual exposure of a client that withholds π_C2S.
 const ADV_NO_SUFFIX = argv.includes('--adv-no-suffix')
 // Claim the node's canonical suffix in `body_suffix` while the body actually
-// ends with ADV_SUFFIX_MODEL's suffix: π_C2 itself must then fail.
+// ends with ADV_SUFFIX_MODEL's suffix: π_C2S itself must then fail.
 const ADV_CLAIM_CANONICAL = argv.includes('--adv-claim-canonical')
-const INSECURE = argv.includes('--insecure-no-proofs')
-// v2 adversarial probe: put our own P-256 key share in the ClientHello instead
+// Adversarial probe: put our own P-256 key share in the ClientHello instead
 // of the joint one (we would then hold the whole ECDHE secret). The node must
 // refuse to relay it.
 const ADV_OWN_SHARE = argv.includes('--adv-own-keyshare')
-// Protocol version: 2 = two-party handshake (docs/TWOPC-DESIGN.md). Taken from
-// the offer; `--v2` forces it (direct sidecar mode).
-let PROTO = argv.includes('--v2') ? 2 : 1
+// The only protocol version: 2 = two-party handshake (docs/TWOPC-DESIGN.md).
+// Protocol v1 is retired (branch v1-poc); an offer naming it is refused.
+const PROTO = 2
 const ARM = argv.includes('--arm')
 // Arm one session (setup, 2PC preprocessing, proof channel) and close it
 // unused: with an abandon fee, the node charges exactly that fee.
 const ABANDON = argv.includes('--abandon')
 // Behave like a client that does not know about session fees (no echo).
 const NO_ACCEPT_FEE = argv.includes('--no-accept-fee')
-// π_C2 and π_C3 both run in one session. Serial (default) waits for π_C2 before
-// starting π_C3; `--parallel-proofs` lets them overlap, for the stall study.
+// π_C2S and π_C3S both run in one session. Serial (default) waits for π_C2S
+// before starting π_C3S; `--parallel-proofs` lets them overlap, for the stall study.
 const SERIAL_PROOFS = !argv.includes('--parallel-proofs')
 const POOL = Number(arg('--pool', '0'))
-// v2: run π_NK/π_C2S/π_C3S over the session's pre-warmed proof channel
+// Run π_NK/π_C2S/π_C3S over the session's pre-warmed proof channel
 // (`zkchan`, OT/VOLE set up while arming). `--no-zkchan` forces the per-proof
 // path (fresh OT per proof), e.g. for before/after measurements.
 const ZKCHAN = !argv.includes('--no-zkchan')
@@ -221,13 +223,10 @@ class Session {
   postHandshake = false
   serverPost: ServerPostRecord[] = []
   serverPending: Uint8Array = new Uint8Array(0)
-  epoch2 = false
+  // Set once the body is written: its records are kept for the π_C2S check.
+  inBody = false
   bodyRecords: Uint8Array[] = []
   attJson: string | undefined
-
-  sessionValues() {
-    return { clientHs: this.clientHs, serverHs: this.serverHs, thSH: this.thSH, thSF: this.thSF }
-  }
 
   trackServerRecords(bytes: Uint8Array): void {
     let buf = concat(this.serverPending, bytes)
@@ -304,22 +303,22 @@ class Session {
         .then(() => this.tls.handleReceivedBytes(bytes))
         .catch((e) => console.error(`[client ${this.label}] handleReceivedBytes:`, e))
     }
-    if (PROTO === 1) this.makeTls()
     return this.wsReady
   }
 
-  makeTls(external?: any): void {
+  /** The TLS client; `external` hands its key schedule to the 2PC. */
+  makeTls(external: any): void {
       this.tls = makeTLSClient({
-        ...(external ? { external } : {}),
+        external,
         host: 'api.venice.ai',
         verifyServerCertificate: true,
         cipherSuites: ['TLS_AES_128_GCM_SHA256'],
         supportedProtocolVersions: ['TLS1_3'],
-        namedCurves: external ? ['SECP256R1'] : ['X25519'],
+        namedCurves: ['SECP256R1'],
         applicationLayerProtocols: ['http/1.1'],
         write: (packet: { header: Uint8Array; content: Uint8Array }) => {
           const record = concat(packet.header, packet.content)
-          if (this.epoch2) this.bodyRecords.push(record)
+          if (this.inBody) this.bodyRecords.push(record)
           this.sendBytes(record)
         },
         onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
@@ -366,7 +365,7 @@ class Session {
     }
   }
 
-  /** setup → ready → TLS handshake → hs_verified → KU0. Leaves the session armed. */
+  /** setup → ready → 2PC → TLS handshake → hs_verified. Leaves the session armed. */
   async arm(): Promise<void> {
     await this.wsReady
     const nonceC = hex(cryptoRandom(32))
@@ -401,45 +400,6 @@ class Session {
     this.tReady = Date.now()
     console.log(`[client ${this.label}] sid=${this.sid} head_len=${this.ready.head_len}`)
 
-    if (PROTO === 2) return this.armV2()
-    this.handshakeP = new Promise<void>((res) => (this.handshakeDone = res))
-    await this.tls.startHandshake()
-    await Promise.race([this.handshakeP, timeout(15000, 'handshake')])
-
-    const hsKeys = this.tls.getHandshakeSecrets()
-    if (!hsKeys) throw new Error('fork did not expose handshake secrets')
-    const msgs = this.tls.getHandshakeMessages()
-    const thSH = sha256(msgs[0], msgs[1])
-    const finIdx = msgs.findIndex((m) => m[0] === 20)
-    const thSF = sha256(...msgs.slice(0, finIdx + 1))
-    const hs = new Uint8Array(hsKeys.masterSecret)
-    this.hs = hs
-    this.thSH = thSH
-    this.thSF = thSF
-    this.clientHs = new Uint8Array(hsKeys.clientSecret)
-    this.serverHs = new Uint8Array(hsKeys.serverSecret)
-
-    // HS stays with the client: MS and every application secret derive from
-    // it. Only the handshake traffic secrets are disclosed (paper §4.2); the
-    // insecure loopback test mode is the sole exception.
-    this.sendText({
-      type: 'hs_secrets',
-      ...(INSECURE ? { hs: hex(hs) } : {}),
-      client_hs: hex(this.clientHs),
-      server_hs: hex(this.serverHs),
-    })
-    await this.waitT('hs_verified', 30000)
-    this.log({ ev: 'hs_verified' })
-    this.tHs = Date.now()
-
-    // Epoch 0 -> 1: the KeyUpdate is relayed to the upstream.
-    await this.tls.updateTrafficKeys(false)
-    this.tKu0 = Date.now()
-    this.log({ ev: 'ku0_sent' })
-  }
-
-  /** v2: the 2PC with the node, then a TLS handshake with no local ECDHE. */
-  async armV2(): Promise<void> {
     if (this.ready.v !== 2) throw new Error('node did not start a v2 session')
     this.twopc = new TwoPc()
     this.twopc.start(this.zkUrl('twopc', this.sid))
@@ -456,6 +416,8 @@ class Session {
     }
     this.tKeyShare = Date.now()
     this.log({ ev: 'twopc_key_share', ms: this.tKeyShare - t2pc })
+    // A TLS handshake with no local ECDHE: the fork hands the key schedule to
+    // the 2PC.
     this.makeTls({
       keyShare,
       onServerHello: async (serverShare: Uint8Array, thSH: Uint8Array) => {
@@ -463,8 +425,6 @@ class Session {
         const t = Date.now()
         const out = await this.twopc!.handshake(serverShare, thSH)
         this.tPhaseA = Date.now() - t
-        this.clientHs = out.clientHs
-        this.serverHs = out.serverHs
         return out
       },
       onServerFinished: async (thSF: Uint8Array) => {
@@ -489,7 +449,7 @@ class Session {
   ap: ApOut | undefined
 
   /**
-   * v2: one proof, over the pre-warmed channel when it is usable, else the
+   * One proof, over the pre-warmed channel when it is usable, else the
    * per-proof path. Fallback only while no proof has started on the channel:
    * once one has, a channel failure ends the session (the node aborts it).
    */
@@ -511,16 +471,11 @@ class Session {
   tPhaseA = 0
   tPhaseB = 0
 
-  hs!: Uint8Array
   thSH!: Uint8Array
   thSF!: Uint8Array
-  clientHs!: Uint8Array
-  serverHs!: Uint8Array
   tReady = 0
   tHs = 0
-  tKu0 = 0
-  tC1Sent = 0
-  tCommit = 0
+  tNkStart = 0
   tProofsReady = 0
   tRecordStart = 0
   tHeadWritten = 0
@@ -529,94 +484,40 @@ class Session {
   runDir = ''
   logLines: string[] = []
 
-  /** Phase 1, safe to run while arming: π_C1 advice + proof + π_N. */
+  /** Phase 1, safe to run while arming: π_NK on the credential record. */
   async prepareProofs(): Promise<void> {
     if (this.prepared) return
     this.runDir = `${RUNS}/${this.sid}`
     mkdirSync(this.runDir, { recursive: true })
     this.log = (o: unknown) => this.logLines.push(JSON.stringify(o))
 
-    if (PROTO === 2) {
-      // π_NK: the node's head record under K_0 is the published template with
-      // an alphabet key, and K_0 is the one the 2PC anchored (hk).
-      this.tC1Sent = Date.now()
-      const commit = await this.waitT('c_commit', 60000)
-      checkPiNKParams(commit.params, OFFER, this.ap!, body.length)
-      await this.proofV2('pi_nk', 'verify', commit.params)
-      this.log({ ev: 'pi_nk_ok' })
-      this.tProofsReady = Date.now()
-      this.prepared = true
-      return
-    }
-    const mat = epoch1Material(this.hs, this.thSH, this.thSF, this.ready.head_len + 1)
-    const cur = this.tls.getKeys()
-    const cAp1 = new Uint8Array(cur!.clientSecret)
-    if (hex(cAp1) !== hex(mat.cAp1)) {
-      throw new Error(`fork/native key-schedule mismatch: ${hex(cAp1)} != ${hex(mat.cAp1)}`)
-    }
-    this.log({ ev: 'advice_ok', S_len: mat.s.length })
-
-    this.sendText({ type: 'c1_material', s: hex(mat.s), h1: hex(mat.h1), t0: hex(mat.t0) })
-    this.tC1Sent = Date.now()
-    let commit: any
-    if (INSECURE) {
-      commit = await this.waitT('c_commit', 30000)
-      // Insecure mode: no π_N; the node no longer sends the filled head (it
-      // is the API key in the clear), so the commitment is taken on trust.
-      if (!commit.c_commit) throw new Error('insecure: no c_commit')
-    } else {
-      const ack = await this.waitT('zk_ack', 30000)
-      checkPiC1Params(ack.params, {
-        session: this.sessionValues(),
-        headLen: this.ready.head_len + 1,
-        s: mat.s,
-        h1: mat.h1,
-        t0: mat.t0,
-      })
-      await runZk(this.zkUrl('pi_c1', this.sid), {
-        proof: 'pi_c1',
-        role: 'prover',
-        params: ack.params,
-        witness: { Hs: Array.from(this.hs) },
-      })
-      this.log({ ev: 'pi_c1_ok' })
-      commit = await this.waitT('c_commit', 60000)
-      // Rebuilt from the offer we fetched, never from the relayed ready frame.
-      checkPiNParams(commit.params, { offer: OFFER }, mat.s, body.length)
-      await runZk(this.zkUrl('pi_n', this.sid), {
-        proof: 'pi_n',
-        role: 'verifier',
-        params: commit.params,
-      })
-      this.log({ ev: 'pi_n_ok' })
-    }
+    // π_NK: the node's head record under K_0 is the published template with
+    // an alphabet key, and K_0 is the one the 2PC anchored (hk).
+    this.tNkStart = Date.now()
+    const commit = await this.waitT('c_commit', 60000)
+    checkPiNKParams(commit.params, OFFER, this.ap!, body.length)
+    await this.proofV2('pi_nk', 'verify', commit.params)
+    this.log({ ev: 'pi_nk_ok' })
     this.tProofsReady = Date.now()
     this.prepared = true
   }
 
-  /** Phase 2, request-bound: KU1 + credential record, body, response, settle. */
+  /** Phase 2, request-bound: credential record, body, response, settle. */
   async finish(tClaim: number): Promise<any> {
     const runDir = this.runDir
     const logLines = this.logLines
 
     this.tRecordStart = Date.now()
-    if (PROTO === 2) {
-      // The node writes epoch 0 (credential + KeyUpdate); we start epoch 1.
-      this.sendText({ type: 'release_head' })
-    } else {
-      // Epoch 1: the client's KeyUpdate is seq 1 (seq 0 is the node's record).
-      this.tls.skipSendSequence(1)
-      const ku1 = await this.tls.updateTrafficKeysSilently(false)
-      this.sendText({ type: 'ku1', record: hex(concat(ku1.header, ku1.content)) })
-    }
+    // The node writes epoch 0 (credential + KeyUpdate); we start epoch 1.
+    this.sendText({ type: 'release_head' })
     await this.waitT('head_written', 30000)
     this.tHeadWritten = Date.now()
     this.log({ ev: 'head_written' })
 
     const tBodyWrite = Date.now()
     this.tBodyWrite = tBodyWrite
-    // The pinned suffix in its own final record (held by the node until π_C2).
-    this.epoch2 = true
+    // The pinned suffix in its own final record (held by the node until π_C2S).
+    this.inBody = true
     await this.tls.write(body.subarray(0, body.length - suffixBytes.length))
     await this.tls.write(suffixBytes)
     this.log({ ev: 'body_sent', len: body.length })
@@ -643,7 +544,7 @@ class Session {
       return { adv: 'no-suffix', response_bytes: this.responseBytes.length, has_model_output: hasContent, sid: this.sid }
     }
 
-    // π_C2 runs concurrently with generation and does not gate settlement on
+    // π_C2S runs concurrently with generation and does not gate settlement on
     // the client side; a failure is logged but never stalls the receipt.
     // (A malicious client ignores the node's canonical suffix — ADV_* probes.)
     if (!ADV_SUFFIX_MODEL && this.ready.suffix !== undefined && this.ready.suffix !== suffix) {
@@ -654,26 +555,9 @@ class Session {
     const c2params = await this.waitT('zk_params', 30000)
     const lastBody = this.bodyRecords[this.bodyRecords.length - 1] ?? new Uint8Array(0)
     if (!ADV_SUFFIX_MODEL && !ADV_CLAIM_CANONICAL) {
-      if (PROTO === 2) {
-        checkPiC2SParams(c2params.params, { h1: this.ap!.h1, seq: this.bodyRecords.length - 1, record: lastBody, suffix: suffixBytes })
-      } else {
-        checkPiC2Params(c2params.params, {
-          session: this.sessionValues(),
-          seq: this.bodyRecords.length - 1,
-          record: lastBody,
-          suffix: suffixBytes,
-        })
-      }
+      checkPiC2SParams(c2params.params, { h1: this.ap!.h1, seq: this.bodyRecords.length - 1, record: lastBody, suffix: suffixBytes })
     }
-    const c2Name = PROTO === 2 ? 'pi_c2s' : 'pi_c2'
-    const c2Promise = (PROTO === 2
-      ? this.proofV2(c2Name, 'prove', c2params.params, { Secret: Array.from(this.ap!.clientAp1) })
-      : runZk(this.zkUrl(c2Name, this.sid), {
-          proof: c2Name,
-          role: 'prover',
-          params: c2params.params,
-          witness: { Hs: Array.from(this.hs) },
-        }))
+    const c2Promise = this.proofV2('pi_c2s', 'prove', c2params.params, { Secret: Array.from(this.ap!.clientAp1) })
       .then(() => this.log({ ev: 'pi_c2_ok' }))
       .catch((e) => this.log({ ev: 'pi_c2_fail', err: String(e) }))
 
@@ -697,18 +581,18 @@ class Session {
     }
 
     await settleFlush(this)
-    // Serial mode (default): finish π_C2 before starting π_C3. The node refuses
-    // to settle without a verified π_C2, so a failure here is fatal. The stall
+    // Serial mode (default): finish π_C2S before starting π_C3S. The node
+    // refuses to settle without a verified π_C2S, so a failure here is fatal. The stall
     // study's `--parallel-proofs` skips this to test proof overlap.
     if (SERIAL_PROOFS) {
       await c2Promise
       if (this.logLines.some((l) => l.includes('"pi_c2_fail"'))) {
-        throw new Error('π_C2 failed; the node will not settle without it')
+        throw new Error('π_C2S failed; the node will not settle without it')
       }
     }
 
     // An upstream HTTP error carries no usage event: disclose only its head
-    // (status line + headers); π_C3 proves where it sits and the body stays
+    // (status line + headers); π_C3S proves where it sits and the body stays
     // private (the node settles 4xx/503 at zero cost).
     const statusLine = Buffer.from(this.responseBytes.subarray(0, 64)).toString('latin1')
     const upstreamStatus = Number(/^HTTP\/1\.\d (\d{3})/.exec(statusLine)?.[1] ?? 0)
@@ -733,7 +617,6 @@ class Session {
       acc += this.responseChunks[i]!.length
     }
     const epoch = serverTailEpoch(this.serverPost, tailLens.length)
-    if (PROTO !== 2 && epoch.keyUpdates > 0) throw new Error('the server changed keys before the usage event (v1 cannot prove that)')
     const disclose: any = { type: 'disclose', r: hex(r), tail_lens: tailLens, skip, trailing: epoch.trailing }
     if (epoch.keyUpdates > 0) {
       disclose.key_updates = epoch.keyUpdates
@@ -742,31 +625,17 @@ class Session {
     this.sendText(disclose)
 
     const c3 = await this.waitT('zk_params', 30000)
-    if (PROTO === 2) {
-      const handshakeRecords = this.serverRecords.length - this.serverPost.length
-      checkPiC3SParams(c3.params, {
-        h2: this.ap!.h2,
-        serverRecords: this.serverRecords,
-        r,
-        skip,
-        keyUpdates: epoch.keyUpdates,
-        epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
-        trailing: epoch.trailing,
-      })
-    } else {
-      checkPiC3Params(c3.params, { session: this.sessionValues(), serverRecords: this.serverRecords, r, skip, trailing: epoch.trailing })
-    }
-    const c3Name = PROTO === 2 ? 'pi_c3s' : 'pi_c3'
-    if (PROTO === 2) {
-      await this.proofV2(c3Name, 'prove', c3.params, { Secret: Array.from(this.ap!.serverAp0) })
-    } else {
-      await runZk(this.zkUrl(c3Name, this.sid), {
-        proof: c3Name,
-        role: 'prover',
-        params: c3.params,
-        witness: { Hs: Array.from(this.hs) },
-      })
-    }
+    const handshakeRecords = this.serverRecords.length - this.serverPost.length
+    checkPiC3SParams(c3.params, {
+      h2: this.ap!.h2,
+      serverRecords: this.serverRecords,
+      r,
+      skip,
+      keyUpdates: epoch.keyUpdates,
+      epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
+      trailing: epoch.trailing,
+    })
+    await this.proofV2('pi_c3s', 'prove', c3.params, { Secret: Array.from(this.ap!.serverAp0) })
     this.twopc?.close()
     this.zkchan?.close()
     this.log({ ev: 'pi_c3_ok' })
@@ -862,19 +731,15 @@ class Session {
     const phases = {
       ready_ms: Math.max(0, this.tReady - tClaim),
       handshake_ms: Math.max(0, this.tHs - this.tReady),
-      ku0_ms: Math.max(0, this.tKu0 - this.tHs),
-      pi_c1_ms: this.tProofsReady - this.tC1Sent,
-      ...(PROTO === 2
-        ? { twopc_key_share_ms: this.tKeyShare - this.tReady, twopc_phase_a_ms: this.tPhaseA, twopc_phase_b_ms: this.tPhaseB, twopc: this.twopc?.timings }
-        : {}),
-      record_ku1_ms: this.tHeadWritten - this.tRecordStart,
-      ...(PROTO === 2
-        ? {
-            zk: this.zkTimes,
-            zkchan_ready_ms: this.zkchan?.tReady ? this.zkchan.tReady - this.zkchan.tStart : undefined,
-            zkchan_setup: this.zkchan?.readyInfo?.timings,
-          }
-        : {}),
+      pi_nk_ms: this.tProofsReady - this.tNkStart,
+      twopc_key_share_ms: this.tKeyShare - this.tReady,
+      twopc_phase_a_ms: this.tPhaseA,
+      twopc_phase_b_ms: this.tPhaseB,
+      twopc: this.twopc?.timings,
+      record_ms: this.tHeadWritten - this.tRecordStart,
+      zk: this.zkTimes,
+      zkchan_ready_ms: this.zkchan?.tReady ? this.zkchan.tReady - this.zkchan.tStart : undefined,
+      zkchan_setup: this.zkchan?.readyInfo?.timings,
       claim_to_body_ms: tBodyWrite - tClaim,
       upstream_ttft_ms: ttftAbs - tBodyWrite,
     }
@@ -894,7 +759,7 @@ class Session {
       balance_msats: receipt.balance_msats,
       phases,
       protocol: PROTO,
-      proofs: PROTO === 2 ? ['twopc', 'pi_nk', 'pi_c2s', 'pi_c3s'] : ['pi_c1', 'pi_n', 'pi_c2', 'pi_c3'],
+      proofs: ['twopc', 'pi_nk', 'pi_c2s', 'pi_c3s'],
     }
   }
 }
@@ -1031,43 +896,7 @@ function waitForGo(): Promise<void> {
 }
 
 /**
- * π_N proves whatever public statement the node hands us, so rebuild that
- * statement from what *we* know: the published head template, our own body
- * length and the keystream we sent. A node must not be able to prove a
- * different path/headers, a different S or key offsets over non-key bytes.
- */
-function checkPiNParams(params: any, ready: any, s: Uint8Array, bodyLen: number): void {
-  const p = params?.PiN
-  if (!p) throw new Error('π_N params missing')
-  const tpl: string = ready.offer?.head_template ?? ''
-  const keyLen: number = ready.offer?.key_length ?? p.key_len
-  const alphabet: string = ready.offer?.key_alphabet ?? '[A-Za-z0-9_-]'
-  const token = `{KEY:${keyLen}}`
-  if (!tpl.includes(token)) throw new Error('π_N: template lacks key token')
-  if (p.key_alphabet !== undefined && p.key_alphabet !== alphabet) {
-    // The node must prove membership in the alphabet the signed offer pins.
-    throw new Error('π_N: key alphabet differs from the offer')
-  }
-  const filled = new TextEncoder().encode(
-    tpl.replace(token, '\u0000'.repeat(keyLen)).replace('{LEN}', String(bodyLen)),
-  )
-  const offs: number[] = []
-  filled.forEach((b, i) => b === 0 && offs.push(i))
-  const eq = (a: ArrayLike<number>, b: ArrayLike<number>) =>
-    a.length === b.length && Array.from(a).every((x, i) => x === b[i])
-  if (p.key_len !== keyLen || offs.length !== keyLen) throw new Error('π_N: key length mismatch')
-  if (!eq(p.template, filled)) throw new Error('π_N: template differs from the published one')
-  if (!eq(p.key_offsets, offs)) throw new Error('π_N: key offsets differ from the template')
-  if (p.head_len !== filled.length) throw new Error('π_N: head_len mismatch')
-  if (!eq(p.s, s)) throw new Error('π_N: keystream differs from the one we sent')
-  const n = filled.length + 1
-  if (!eq(p.header, [0x17, 0x03, 0x03, (n + 16) >> 8, (n + 16) & 0xff])) {
-    throw new Error('π_N: record header mismatch')
-  }
-}
-
-/**
- * π_NK (v2): rebuild the statement from the signed offer, our body length and
+ * π_NK: rebuild the statement from the signed offer, our body length and
  * the anchor hk our own 2PC output, so the node cannot prove a different
  * template, key placement or key.
  */
@@ -1094,22 +923,30 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
   if (!eq(p.header, [0x17, 0x03, 0x03, (n + 16) >> 8, (n + 16) & 0xff])) throw new Error('π_NK: record header mismatch')
 }
 
+/** An offer that names another protocol than v2 (v1 is retired) is refused. */
+function checkOfferVersion(offer: any): void {
+  if (offer && offer.v !== undefined && offer.v !== PROTO) {
+    console.error(`[client] the offer is for protocol v${offer.v}; this client speaks only v${PROTO}`)
+    process.exit(4)
+  }
+}
+
 async function verifyOffer(): Promise<void> {
   if (!VERIFY_OFFER) {
     try {
       if (!NODE) {
         // Direct sidecar mode: the sidecar's /offer (template, no price list).
         OFFER = await (await fetch(`${SIDECAR.replace(/\/$/, '')}/offer`)).json()
-        if (OFFER?.v === 2) PROTO = 2
+        checkOfferVersion(OFFER)
         return
       }
       const raw = await (await fetch(`${NODE!.replace(/\/$/, '')}/v1/confidential/offer`)).json()
       OFFER = raw.sig_payload ? JSON.parse(raw.sig_payload) : raw
       OFFER_SIG = raw.sig
-      if (OFFER?.v === 2) PROTO = 2
     } catch (e) {
       console.error('[client] could not fetch the offer:', e)
     }
+    checkOfferVersion(OFFER)
     return
   }
   try {
@@ -1129,7 +966,7 @@ async function verifyOffer(): Promise<void> {
     }
     OFFER_PUBKEY = parsed.notary_pubkey
     OFFER = parsed
-    if (parsed.v === 2) PROTO = 2
+    checkOfferVersion(OFFER)
     OFFER_SIG = offer.sig
     for (const k of ['session_fee_msat', 'abandon_fee_msat']) {
       const v = parsed[k]
@@ -1174,9 +1011,9 @@ async function main() {
     const tArmStart = Date.now()
     await Promise.all(sessions.map((s) => s.connect()))
     await Promise.all(sessions.map((s) => s.arm()))
-    // Run π_C1/π_N while arming: they are bound to the session keys and the
-    // head length, not to the request content, so the claim path is just
-    // KU1 + credential record + body.
+    // Run π_NK while arming: it is bound to the session keys and the head
+    // length, not to the request content, so the claim path is just the
+    // credential record + body.
     await Promise.all(sessions.map((s) => s.prepareProofs()))
     const tArmDone = Date.now()
     console.log(`ARMED pool=${n} sids=${sessions.map((s) => s.sid).join(',')}`)

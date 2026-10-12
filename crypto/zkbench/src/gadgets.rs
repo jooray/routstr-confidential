@@ -435,19 +435,6 @@ pub fn expand_label<VM: Vm<Binary>>(
     }
 }
 
-/// Derive `(K, IV)` from a traffic secret in-circuit.
-pub fn record_keys<VM: Vm<Binary>>(
-    vm: &mut VM,
-    secret: &Vector<U8>,
-) -> anyhow::Result<(Array<U8, 16>, Array<U8, 12>)> {
-    let k = expand_label(vm, secret, "key", &[], 16)?;
-    let iv = expand_label(vm, secret, "iv", &[], 12)?;
-    Ok((
-        k.try_into().expect("16-byte AES key"),
-        iv.try_into().expect("12-byte IV"),
-    ))
-}
-
 /// Build the GCM counter block for `counter` from a 12-byte IV and 8-byte seq.
 pub fn ctr_block<VM: Vm<Binary>>(
     vm: &mut VM,
@@ -509,18 +496,6 @@ pub fn decrypt_window<VM: Vm<Binary>>(
     select(vm, &pt, sel_start, sel_len)
 }
 
-/// Decrypt a whole record from inner-plaintext offset 0 and return its content
-/// (the inner plaintext minus the trailing content-type byte).
-pub fn decrypt_record_content<VM: Vm<Binary>>(
-    vm: &mut VM,
-    key: &Array<U8, 16>,
-    iv: &Array<U8, 12>,
-    seq: u64,
-    ct: &Vector<U8>,
-) -> anyhow::Result<Vector<U8>> {
-    decrypt_record_tail(vm, key, iv, seq, ct, 0)
-}
-
 /// Decrypt the tail of a record, from block-aligned inner-plaintext offset
 /// `off` to its end (`ct` is that tail's ciphertext), and return its content
 /// (minus the trailing content-type byte).
@@ -559,10 +534,6 @@ pub fn decrypt_record_tail<VM: Vm<Binary>>(
 pub fn raw(v: &Vector<U8>) -> Slice {
     v.to_raw()
 }
-
-// ---------------------------------------------------------------------------
-// Protocol v2 helpers (secret-anchored statements)
-// ---------------------------------------------------------------------------
 
 /// SHA-256 of a byte vector computed in-circuit.
 pub fn sha256_bytes<VM: Vm<Binary>>(vm: &mut VM, data: &Vector<U8>) -> anyhow::Result<Array<U8, 32>> {
