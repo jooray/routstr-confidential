@@ -224,6 +224,29 @@ fn three_halves_control_bits_hide_permute_bits() {
 }
 
 #[test]
+fn chi_is_never_zero_and_unchanged_otherwise() {
+    // A non-zero first draw is the plain hash (what earlier builds computed),
+    // so both parties agree across versions except with probability 2^-128.
+    let mut rng = os_rng();
+    for _ in 0..64 {
+        let seed: [u8; 32] = rng.random();
+        let h: [u8; 32] = Sha256::new()
+            .chain_update(TAG_CHI)
+            .chain_update(seed)
+            .chain_update(b"check0")
+            .finalize()
+            .into();
+        assert_eq!(chi(&seed, b"check0"), Block::new(h[..16].try_into().unwrap()));
+    }
+    // A zero draw is re-drawn with the next counter, deterministically.
+    let seed = [7u8; 32];
+    let c = first_nonzero(|ctr| if ctr < 2 { Block::ZERO } else { chi_draw(&seed, b"dvzk", ctr) });
+    assert_eq!(c, chi_draw(&seed, b"dvzk", 2));
+    assert_ne!(c, Block::ZERO);
+    assert_ne!(chi_draw(&seed, b"dvzk", 1), chi_draw(&seed, b"dvzk", 0));
+}
+
+#[test]
 fn tables_roundtrip() {
     let mut rng = os_rng();
     let t: Vec<gc::Gate3> = (0..1001)

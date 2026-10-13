@@ -151,12 +151,16 @@ The protocol is defined for any upstream satisfying:
    provider-computed cost figure, emitted before the response ends.
 8. **No reflection of the request head into the response.** C reads the response, so a provider that
    echoed the `Authorization` header (for example in an error body) would hand C the key.
+9. **Event framing the usage parser expects.** The streamed events use LF line endings only (no CR
+   anywhere in the dechunked body), each event is a single `data:` line of JSON followed by a blank line,
+   and the stream ends in `data: [DONE]`. N's relay and C locate the usage event by this framing, and the
+   argument that R is unambiguous (section 4.7) relies on it.
 
 Items (5) and (6) quantify over every field and input, which no finite test can establish. For the
-case-study provider (Appendix A) a live regression gate tests items 1 to 7 with sampled cases; the
+case-study provider (Appendix A) a live regression gate tests items 1 to 7 and 9 with sampled cases; the
 requirements hold as far as those samples show, and the gate is re-run after provider changes. Item 8
 is a property of the provider's error handling that the gate does not test. Everything except the
-specifics of items 4 to 7 is provider-generic: the epoch structure, the 2PC, the proofs and the record
+specifics of items 4 to 7 and 9 is provider-generic: the epoch structure, the 2PC, the proofs and the record
 assembly do not change per provider; only the offer (template, pinned keys, price list, usage parser)
 does.
 
@@ -438,9 +442,12 @@ the expected value; the anchors must equal C's own 2PC outputs. N therefore cann
 one-bit result, at other plaintext.
 
 **Reservation.** The prompt is opaque to N, so the reservation never discounts it: it is
-$\max(m, \lceil (L \cdot r_{in} + T \cdot r_{out}) / 1000 \rceil)$ msat, where $L$ is the model's context
-length, $T$ the pinned token cap, $r_{in}, r_{out}$ the per-1k rates of the frozen offer and $m$ the
-node's minimum charge. $L$ must be the whole context, not the context minus the model's own completion
+$\max(m, \lceil (L \cdot r_{in} + (T + M) \cdot r_{out}) / 1000 \rceil)$ msat, where $L$ is the model's context
+length, $T$ the pinned token cap, $r_{in}, r_{out}$ the per-1k rates of the frozen offer, $m$ the
+node's minimum charge and $M$ a completion margin (16 tokens by default, an operator setting, published
+in the signed offer as `reserve_margin_tokens` so C can size its balance). The margin exists because a
+provider may bill a few tokens beyond the cap (Appendix A) and the charge is capped at the reservation;
+it only enlarges the hold, and the charge is still the reported usage. Overshoot beyond $M$ is N's loss. $L$ must be the whole context, not the context minus the model's own completion
 limit: the pinned cap $T$ is usually far below that limit, the provider accepts a prompt of up to
 $L - T$ tokens, and since the charge is capped at the reservation, any prompt tokens beyond the
 reserved bound would be free. (The sessions measured in section 6 reserved with the smaller bound; for
@@ -471,10 +478,14 @@ stream terminator, with its chunk framing, anchored at the end of the transcript
 U may rotate its keys mid-response (a KeyUpdate inside the encrypted stream, which only C can see). C
 then reports $k$ and the record where that epoch starts, whose sequence numbers restart at 0; a wrong
 report only makes the records decrypt to noise, which cannot equal a well-formed R. Each step costs
-four compressions; $k$ is at most 16, and U normally sends none.
+four compressions; $k$ is at most 16, and U normally sends none. Two rarer cases make the statement unprovable, so a
+completed request is charged the reservation: a KeyUpdate *between* the covered records (the proof
+uses one epoch for all of them), and a record after the terminal chunk that is longer than a KeyUpdate
+or close_notify (e.g. a late NewSessionTicket). U normally sends neither.
 
-The choice of R is unambiguous: JSON strings cannot contain raw CR/LF, so event boundaries and HTTP
-chunk framing cannot be forged from model output. We checked this by prompting the model to emit fake
+The choice of R is unambiguous: with the provider's LF-only, one-line-per-event framing (section 3.1,
+item 9), and since JSON strings cannot contain raw CR/LF, event boundaries and HTTP chunk framing cannot
+be forged from model output. We checked this by prompting the model to emit fake
 usage events; every imitation stayed escaped inside a string (Appendix A).
 
 ## 4.8 Settlement
@@ -670,8 +681,15 @@ salt are fresh per session.
 11. *Balances after an abort.* If N cuts the stream before the usage event, it charges the reservation,
     and C cannot prove who aborted. This is the trust the existing Routstr design already places in the
     node; in the honest case the cost is computed from upstream-authenticated usage, unbilled errors and
-    sessions that never reached U cost nothing, and the receipt binds all of it. The amount at N's
+    sessions that never reached U cost nothing (or the published abandon fee $f_a$, section 4.8), and the
+    receipt binds all of it. The amount at N's
     discretion is the reservation for the requested model.
+12. *The relay trusts its peer.* N's relay holds the API key but does not check client credentials:
+    N validates the credential and reserves before it connects to the relay. Whoever can reach the relay
+    directly therefore spends the provider key without paying. The relay requires a bearer token shared
+    with N unless it listens on loopback; on loopback without a token every local process on that host
+    can use it. The token travels over plain HTTP, so off the host the N-to-relay link needs a private
+    network or an encrypted tunnel.
 
 # 6. Implementation and evaluation
 
@@ -1025,8 +1043,10 @@ being used. We therefore layer several limits, from free and always on to priced
    after it, so in practice the node's limit is the one that ends a session.) N also refuses a new session
    from a client address that already holds a set number of unused sessions, counted from the WebSocket
    accept, before the setup arrives, until the credential record is written (12 by default; HTTP 429).
-   The address is the TCP peer, or, only for peers configured as trusted reverse proxies, the rightmost `X-Forwarded-For` entry; a client cannot
-   name its own address. Clients behind one address, such as all Tor users of an onion service, share
+   The address is the TCP peer, or, only for peers configured as trusted reverse proxies, the rightmost `X-Forwarded-For` entry, so a remote
+   client cannot name its own address. Loopback is trusted by default (for a reverse proxy on the same
+   host), so a process on N's own host that connects to the node's port directly can set the header and
+   choose its address; an operator who does not trust local users keeps the node's port to the proxy. Clients behind one address, such as all Tor users of an onion service, share
    the limit.
 4. **Fees in the signed offer (section 4.8).** A session fee $f_s$ on completed requests, an abandon fee
    $f_a \ge f_s$ on sessions that end without a completed request, and a rate surcharge, all 0 by
@@ -1170,7 +1190,8 @@ check asserts the exact status and error text against a valid control).
   including a suffix landing in an open object or string. The 400 body for an unknown field quotes the
   field's name, which is why an error disclosure covers only the response head (section 4.8).
 - **Token cap:** `max_completion_tokens` caps output including reasoning, with a small overshoot on tiny
-  caps (3 billed up to 6, 40 billed 39). The reservation covers this easily.
+  caps (3 billed up to 6, 40 billed 39). The reservation's completion margin (16 tokens by default,
+  section 4.6) covers this.
 - **Input bound:** with the pinned `include_venice_system_prompt: false` a 224-byte request billed 6
   prompt tokens. Without the pin the provider injects about 1.6k tokens of system prompt.
 - **Unpinned price fields (sampled):** `service_tier`, `web_search_options` and `prediction` are
@@ -1191,7 +1212,7 @@ with `max_completion_tokens` pinned because it overrides `max_tokens` (a bypass 
 the provider-specific parameters pinned to keep web search and system-prompt injection off the bill.
 
 **A.3 Other providers.** The generic pieces (epochs, 2PC, proofs) port unchanged. The open questions per
-provider are profile items 4 to 6 and 8, plus whether HTTP/1.1, P-256 and a mid-request KeyUpdate are
+provider are profile items 4 to 6, 8 and 9, plus whether HTTP/1.1, P-256 and a mid-request KeyUpdate are
 accepted (some CDNs pin HTTP/2). Where a provider fails, the fallbacks are MPC-TLS for confidentiality or
 the existing integrity-only path. Per-provider assessments are in the project's `docs/ADVERSARIAL-QA.md`.
 

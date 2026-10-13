@@ -86,14 +86,22 @@ pub fn parse_handshake_messages(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
 }
 
 /// The handshake traffic secrets (public outputs of the two-party key schedule).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct HsSecrets {
     pub client_hs: [u8; 32],
     pub server_hs: [u8; 32],
 }
 
-/// Everything the sidecar learned about the handshake.
-#[derive(Debug, Clone)]
+/// Redacted: traffic secrets never reach a log line or an error message.
+impl std::fmt::Debug for HsSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HsSecrets").finish_non_exhaustive()
+    }
+}
+
+/// Everything the sidecar learned about the handshake (no `Debug`: it holds
+/// the handshake traffic secrets).
+#[derive(Clone)]
 pub struct HandshakeInfo {
     pub client_hs: [u8; 32],
     pub server_hs: [u8; 32],

@@ -8,8 +8,9 @@
 //!   connection, up to 600 s) → ClientHello (exactly the joint P-256 share;
 //!   the upstream is dialed now; fresh 600 s deadline) → 2PC handshake and
 //!   application phases → AWAIT_HEAD (client records held) → HS_VERIFIED →
-//!   credential record assembled under K_0, π_NK params → π_NK verified by
-//!   the client → RELEASE_HEAD → [credential record ‖ KeyUpdate] (atomic,
+//!   credential record assembled under K_0, π_NK params → π_NK run (the
+//!   client verifies it; N, the prover, learns no verdict) → RELEASE_HEAD
+//!   (the client's acceptance) → [credential record ‖ KeyUpdate] (atomic,
 //!   epoch 0) → BODY (final suffix record held until π_C2S verifies)
 //!   → CLOSE → ATTESTED → π_C3S → SETTLED.
 //!
@@ -33,7 +34,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use ed25519_dalek::{Signer, SigningKey};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -200,10 +201,15 @@ const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600)
 /// Largest TLS 1.3 record on the wire: header + 2^14 plaintext + 256 expansion.
 const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
 /// Limits on a π_C3S disclosure (the verifier decrypts every covered record in
-/// the circuit): trailing records, bytes of R, and undisclosed bytes after it.
-const MAX_DISCLOSE_RECORDS: usize = 64;
-const MAX_DISCLOSE_R: usize = 64 << 10;
-const MAX_DISCLOSE_SKIP: usize = 1 << 20;
+/// the circuit): covered records, bytes of R, and R plus the undisclosed bytes
+/// after it. They are the proof's own limits (`zkbench::statements`), so a
+/// disclosure the sidecar accepts can be proven.
+const MAX_DISCLOSE_RECORDS: usize = zkbench::statements::MAX_C3S_RECORDS;
+const MAX_DISCLOSE_R: usize = 16 << 10;
+const MAX_DISCLOSE_NEED: usize = zkbench::statements::MAX_C3S_NEED;
+/// Server application-data records kept for a disclosure: the covered ones
+/// and the KeyUpdates and close_notify that may follow them.
+const SERVER_TAIL_RECORDS: usize = MAX_DISCLOSE_RECORDS + zkbench::statements::MAX_SERVER_KEY_UPDATES as usize + 1;
 /// Largest server record that may follow the covered ones: a KeyUpdate
 /// (4-byte header + request_update, inner type, 16-byte tag).
 const MAX_TRAILING_RECORD: usize = 4 + 1 + 1 + 16;
@@ -240,16 +246,23 @@ const TO_CLIENT_BUDGET: usize = 4 << 20;
 const PROOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_ZK_CONNS_PER_SESSION: usize = 6;
 
-/// Write to the upstream within `UPSTREAM_WRITE_TIMEOUT`: an upstream that
-/// stops reading must not hold the session past its deadline.
-async fn write_upstream(tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf, data: &[u8]) -> Result<()> {
-    tokio::time::timeout(UPSTREAM_WRITE_TIMEOUT, tcp_tx.write_all(data))
+/// Write to the upstream within `UPSTREAM_WRITE_TIMEOUT`, and never past the
+/// session `deadline`: an upstream that stops reading must not hold the
+/// session past it (the session loop does not watch its deadline while a
+/// write is in progress).
+async fn write_upstream(
+    tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
+    data: &[u8],
+    deadline: Option<tokio::time::Instant>,
+) -> Result<()> {
+    let limit = tokio::time::Instant::now() + UPSTREAM_WRITE_TIMEOUT;
+    let limit = deadline.map_or(limit, |d| d.min(limit));
+    tokio::time::timeout_at(limit, tcp_tx.write_all(data))
         .await
-        .map_err(|_| anyhow!("upstream did not accept {} bytes within {}s", data.len(), UPSTREAM_WRITE_TIMEOUT.as_secs()))??;
+        .map_err(|_| anyhow!("upstream did not accept {} bytes before the write or session time limit", data.len()))??;
     Ok(())
 }
 
-#[derive(Debug)]
 enum Ev {
     ServerBytes(Vec<u8>),
     /// The joint P-256 key share P = P_C + P_N.
@@ -269,8 +282,22 @@ enum Ev {
     },
 }
 
+/// Names the event only: its payload (relayed bytes, traffic secrets, keys)
+/// never reaches a log line or an error frame.
+impl std::fmt::Debug for Ev {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ev::ServerBytes(b) => write!(f, "ServerBytes({} bytes)", b.len()),
+            Ev::KeyShare(_) => f.write_str("KeyShare"),
+            Ev::Hs(_) => f.write_str("Hs"),
+            Ev::Ap(_) => f.write_str("Ap"),
+            Ev::TcpClosed => f.write_str("TcpClosed"),
+            Ev::ZkDone { proof, ok, .. } => write!(f, "ZkDone({proof}, ok={ok})"),
+        }
+    }
+}
+
 /// N's outputs of the two-party key schedule (K_0/IV_0 never leave N).
-#[derive(Debug)]
 struct ApN {
     k0: Zeroizing<[u8; 16]>,
     iv0: Zeroizing<[u8; 12]>,
@@ -343,8 +370,13 @@ struct RelayLog {
     recv_len: usize,
     /// Client body records in wire order.
     client_app: Vec<Record>,
-    /// Server records (handshake + response) in wire order.
-    server_all: Vec<Record>,
+    /// Server records received (every content type), for the attestation.
+    server_records: usize,
+    /// Server application-data records received (the encrypted handshake
+    /// flight included), and the last `SERVER_TAIL_RECORDS` of them: a
+    /// disclosure covers only records at the end of the response.
+    server_app_records: usize,
+    server_tail: std::collections::VecDeque<Record>,
 }
 
 impl RelayLog {
@@ -356,6 +388,34 @@ impl RelayLog {
             return Ok(());
         }
         buffer_client(&mut self.client_raw, data, body_len)
+    }
+
+    /// A complete server record: counted, and kept while it is among the last
+    /// `SERVER_TAIL_RECORDS` application-data records.
+    fn server_record(&mut self, r: Record) {
+        self.server_records += 1;
+        if r.ctype != CT_APPLICATION_DATA {
+            return;
+        }
+        self.server_app_records += 1;
+        if self.server_tail.len() == SERVER_TAIL_RECORDS {
+            self.server_tail.pop_front();
+        }
+        self.server_tail.push_back(r);
+    }
+
+    /// The records covering a disclosure (`locate_tail`), each with its index
+    /// among the response's application-data records, which start after the
+    /// `first_response` records of the encrypted handshake flight.
+    fn covered_records(&self, first_response: usize, tail_lens: &[usize], trailing: Option<usize>) -> Result<Vec<(usize, &Record)>> {
+        // Only the last records are kept: `base` is the index of the first
+        // kept one among all application-data records.
+        let base = self.server_app_records - self.server_tail.len();
+        let lens: Vec<usize> = self.server_tail.iter().map(|x| x.payload.len()).collect();
+        Ok(locate_tail(&lens, first_response.saturating_sub(base), tail_lens, trailing)?
+            .into_iter()
+            .map(|j| (base + j - first_response, &self.server_tail[j]))
+            .collect())
     }
 
     /// Upstream bytes: hashed and counted for the attestation, kept raw until
@@ -631,8 +691,8 @@ enum ClientMsg {
         #[serde(default)]
         trailing: Option<usize>,
     },
-    /// The client verified π_NK and claims the session; N writes the
-    /// credential record and the KeyUpdate under K_0.
+    /// The client accepts π_NK (it verified it) and claims the session; N
+    /// writes the credential record and the KeyUpdate under K_0.
     ReleaseHead {},
 }
 
@@ -694,8 +754,16 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     let mut log = RelayLog::default();
     let mut client_pending: Vec<u8> = Vec::new();
     let mut server_pending: Vec<u8> = Vec::new();
+    let mut cleanup = SessionCleanup { app: app.clone(), shared: shared.clone(), budget: budget.clone(), reader: None };
 
-    let result: Result<()> = async {
+    let result = std::panic::AssertUnwindSafe(async {
+    // A connection holds a session slot from the start, so connections that
+    // never send a setup are bounded too.
+    let _slot = app
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow!("sidecar at capacity; retry later"))?;
     // Nothing reaches the upstream before a valid setup: an idle or malformed
     // connection costs no provider socket.
     let first = match tokio::time::timeout(SETUP_TIMEOUT, ws_rx.next()).await {
@@ -704,11 +772,6 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         Err(_) => bail!("no setup within {}s", SETUP_TIMEOUT.as_secs()),
     };
     let setup: ClientMsg = serde_json::from_str(&first).map_err(|e| anyhow!("bad setup: {e}"))?;
-    let _slot = app
-        .slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| anyhow!("sidecar at capacity; retry later"))?;
     handle_setup(setup, &app, &shared, &to_client, &mut st)?;
 
     // The 2PC preprocessing (tens of MB over the client's link) runs before
@@ -748,7 +811,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     }
 
     // The session deadline covers dialing the upstream too.
-    let deadline = tokio::time::sleep(SESSION_TIMEOUT);
+    let deadline_at = tokio::time::Instant::now() + SESSION_TIMEOUT;
+    st.deadline = Some(deadline_at);
+    let deadline = tokio::time::sleep_until(deadline_at);
     tokio::pin!(deadline);
     let tcp = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(&app.upstream))
         .await
@@ -758,7 +823,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     {
         let evt = evt_tx.clone();
         let budget = budget.clone();
-        tokio::spawn(async move {
+        cleanup.reader = Some(tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
                 match tcp_rx.read(&mut buf).await {
@@ -779,7 +844,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                     }
                 }
             }
-        });
+        }));
     }
 
     v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
@@ -832,7 +897,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         log.server_bytes(&bytes, st.handshake.is_some())?;
                         server_pending.extend_from_slice(&bytes);
                         let (recs, used) = parse_records(&server_pending);
-                        for r in recs { log.server_all.push(r); }
+                        for r in recs { log.server_record(r); }
                         server_pending.drain(..used);
                         if to_client.send(Message::Binary(bytes.into())).is_err() { break; }
                         v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
@@ -878,7 +943,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 "sha256_sent": hex::encode(st.sent.hash()),
                                 "sha256_recv": hex::encode(log.recv.hash()),
                                 "client_records": log.client_app.len(),
-                                "server_records": log.server_all.len(),
+                                "server_records": log.server_records,
                                 "c_commit": st.c_commit.map(hex::encode),
                                 "time": now_unix(),
                             });
@@ -901,8 +966,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         if !ok { bail!("proof {proof} failed: {err:?}"); }
                         match proof.as_str() {
                             "pi_nk" => {
-                                // Only a run on the session's own parameters
-                                // lets the credential record be written.
+                                // π_NK ran to completion on the session's own
+                                // stored parameters. N is the prover and learns
+                                // no verdict: the client's `release_head` is the
+                                // acceptance, and both are needed for the write.
                                 let same = match (&proven, shared.params.lock().unwrap().get(proof.as_str())) {
                                     (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
                                     _ => false,
@@ -928,7 +995,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                     let _ = to_client.send(Message::Text(
                                         serde_json::json!({"type":"body_released"}).to_string().into(),
                                     ));
-                                    write_upstream(&mut tcp_tx, &held).await?;
+                                    write_upstream(&mut tcp_tx, &held, st.deadline).await?;
                                     st.sent.update(&held);
                                     info!("π_C2S verified; final body record released to the upstream");
                                     side(&mut st, "pi_c2s verified; final body record released".into());
@@ -994,7 +1061,12 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         }
     }
     Ok(())
-    }.await;
+    })
+    .catch_unwind()
+    .await
+    // A bug that panics ends the session like an error: the client still gets
+    // its error frame, the log is written, and `cleanup` runs.
+    .unwrap_or_else(|_| Err(anyhow!("internal error in the session")));
 
     if let Err(e) = &result {
         // Send an explicit error frame so the client fails fast instead of
@@ -1006,12 +1078,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     if let Some(dir) = &st.run_dir {
         let _ = std::fs::write(dir.join("sidecar.jsonl"), st.side_log.join("\n") + "\n");
     }
-    // Release an upstream reader waiting for the client to catch up.
-    budget.close();
-    // The session is over: its proofs can no longer run.
-    if let Some(sid) = &st.sid {
-        app.sessions.lock().unwrap().remove(sid);
-    }
+    drop(cleanup);
     // Close the outbound queue so the sender task drains and flushes any last
     // frame (e.g. the explicit {type:"error"} abort) before the socket goes.
     drop(to_client);
@@ -1019,10 +1086,35 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     result
 }
 
+/// Releases what a session holds however its task ends (error, panic or
+/// cancellation): the upstream reader (which may be parked on a read while
+/// the upstream idles, or on the client budget) with its socket, and the
+/// session's entry in the table, so `/zk` stops admitting it.
+struct SessionCleanup {
+    app: Arc<AppState>,
+    shared: Arc<SessionShared>,
+    budget: Arc<tokio::sync::Semaphore>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        self.budget.close();
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+        let mut sessions = self.app.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.retain(|_, s| !Arc::ptr_eq(s, &self.shared));
+    }
+}
+
 /// Per-session mutable state kept inside the handler task.
 #[derive(Default)]
 struct Session {
     state: SessionState,
+    /// The session deadline (set when the upstream is dialed); upstream
+    /// writes end by it too.
+    deadline: Option<tokio::time::Instant>,
     twopc_tx: Option<mpsc::UnboundedSender<TwoPcCmd>>,
     joint: Option<[u8; 65]>,
     ch_checked: bool,
@@ -1033,7 +1125,9 @@ struct Session {
     held_client: Vec<u8>,
     /// The KeyUpdate record N writes after the credential record.
     ku_record: Option<Vec<u8>>,
-    /// π_NK ran to completion on the session's parameters.
+    /// π_NK ran to completion on the session's stored parameters. Not a
+    /// verdict (N is the prover and never learns the client's); the client's
+    /// `release_head` is its acceptance.
     head_proof_ok: bool,
     /// The client asked for the credential record (`release_head`):
     /// the KeyUpdate record to write right after it.
@@ -1226,8 +1320,8 @@ async fn handle_control(
             if r.len() > 2 * MAX_DISCLOSE_R {
                 bail!("disclosed R is too long");
             }
-            if skip > MAX_DISCLOSE_SKIP {
-                bail!("skip {skip} exceeds {MAX_DISCLOSE_SKIP}");
+            if skip > MAX_DISCLOSE_NEED {
+                bail!("skip {skip} exceeds {MAX_DISCLOSE_NEED}");
             }
             if key_updates > zkbench::statements::MAX_SERVER_KEY_UPDATES {
                 bail!("{key_updates} server KeyUpdates (limit {})", zkbench::statements::MAX_SERVER_KEY_UPDATES);
@@ -1236,9 +1330,7 @@ async fn handle_control(
                 bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
             }
             let r = hex::decode(&r)?;
-            if r.len() > MAX_DISCLOSE_R {
-                bail!("disclosed R is {} bytes (limit {MAX_DISCLOSE_R})", r.len());
-            }
+            check_disclosure_size(r.len(), skip)?;
             // Either the terminal usage event of a successful stream (anchored
             // at the end of the transcript), or, for an upstream error, only the
             // response head: its status decides the charge, the body stays
@@ -1258,17 +1350,7 @@ async fn handle_control(
             };
             st.usage = Some(usage);
             let info = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?;
-            let response: Vec<&Record> = log
-                .server_all
-                .iter()
-                .filter(|x| x.ctype == CT_APPLICATION_DATA)
-                .collect();
-            let first_response = info.server_handshake_records;
-            let lens: Vec<usize> = response.iter().map(|x| x.payload.len()).collect();
-            let chosen: Vec<(usize, &Record)> = locate_tail(&lens, first_response, &tail_lens, trailing)?
-                .into_iter()
-                .map(|i| (i - first_response, response[i]))
-                .collect();
+            let chosen = log.covered_records(info.server_handshake_records, &tail_lens, trailing)?;
             // Covered records are in the last epoch: sequence numbers restart
             // at its first record. (A wrong claim only makes the proof fail:
             // the records then decrypt to noise under the derived key.)
@@ -1305,6 +1387,7 @@ async fn handle_control(
                     }
                 })
                 .collect();
+            check_c3s_records(&records)?;
             info!(
                 seqs = ?records.iter().map(|x| x.seq).collect::<Vec<_>>(),
                 lens = ?records.iter().map(|x| x.ct.len()).collect::<Vec<_>>(),
@@ -1316,6 +1399,34 @@ async fn handle_control(
             shared.params.lock().unwrap().insert("pi_c3s".into(), params.clone());
             send(serde_json::json!({"type":"zk_params","proof":"pi_c3s","params":params}));
         }
+    }
+    Ok(())
+}
+
+/// R and `skip` within what a usage proof can cover: R at most
+/// `MAX_DISCLOSE_R`, and R + skip at most `MAX_DISCLOSE_NEED`, which always
+/// fits the proof's ciphertext limit with the minimal tail.
+fn check_disclosure_size(r_len: usize, skip: usize) -> Result<()> {
+    if r_len > MAX_DISCLOSE_R {
+        bail!("disclosed R is {r_len} bytes (limit {MAX_DISCLOSE_R})");
+    }
+    let need = r_len.checked_add(skip).ok_or_else(|| anyhow!("skip overflow"))?;
+    if need > MAX_DISCLOSE_NEED {
+        bail!("disclosed R + skip is {need} bytes (limit {MAX_DISCLOSE_NEED}): the usage proof cannot cover it");
+    }
+    Ok(())
+}
+
+/// The covered records within the usage proof's limits (count, and summed
+/// ciphertext bytes), so the node never sends parameters that cannot be proven.
+fn check_c3s_records(records: &[zkbench::statements::TailRecord]) -> Result<()> {
+    use zkbench::statements::{MAX_C3S_BYTES, MAX_C3S_RECORDS};
+    if records.len() > MAX_C3S_RECORDS {
+        bail!("disclosure covers {} records (limit {MAX_C3S_RECORDS})", records.len());
+    }
+    let total = records.iter().try_fold(0usize, |acc, r| acc.checked_add(r.ct.len()));
+    if total.is_none_or(|t| t > MAX_C3S_BYTES) {
+        bail!("the covered records exceed {MAX_C3S_BYTES} ciphertext bytes: the usage proof cannot cover them");
     }
     Ok(())
 }
@@ -1424,7 +1535,7 @@ async fn relay_body(
             st.held = Some(r.bytes());
             info!("final body record held until π_C2S verifies");
         } else {
-            write_upstream(tcp_tx, &r.bytes()).await?;
+            write_upstream(tcp_tx, &r.bytes(), st.deadline).await?;
             st.sent.update(&r.bytes());
         }
         log.client_app.push(r);
@@ -1434,8 +1545,10 @@ async fn relay_body(
 }
 
 /// Write the credential record and the KeyUpdate after it in one write, once
-/// the client asked for it and the proof that the record matches the
-/// published template (π_NK) has run; whichever comes last triggers it.
+/// the client accepted (`release_head`) and π_NK (the record matches the
+/// published template) ran to completion on the session's stored parameters;
+/// whichever comes last triggers it. N, the prover, never learns the client's
+/// verdict: `release_head` is the acceptance.
 async fn write_head(
     st: &mut Session,
     log: &mut RelayLog,
@@ -1453,7 +1566,7 @@ async fn write_head(
     // Atomic write: the credential record (seq 0) then the KeyUpdate (seq 1).
     let mut out = a.record.clone();
     out.extend_from_slice(&ku);
-    write_upstream(tcp_tx, &out).await?;
+    write_upstream(tcp_tx, &out, st.deadline).await?;
     st.sent.update(&out);
     let (len, commit) = (a.record.len(), hex::encode(a.c_commit));
     st.state = SessionState::Body;
@@ -1506,7 +1619,7 @@ async fn v2_pump_client(
         } else {
             bail!("unexpected client record type {} during the v2 handshake", r.ctype);
         }
-        write_upstream(tcp_tx, &pending[..n]).await?;
+        write_upstream(tcp_tx, &pending[..n], st.deadline).await?;
         st.sent.update(&pending[..n]);
         pending.drain(..n);
         if st.state == SessionState::AwaitHead {
@@ -1644,28 +1757,39 @@ async fn zk_ws(
     ws.on_upgrade(move |socket| zk_handler(socket, q, app))
 }
 
+/// The proof names a `/zk` connection may carry.
+const ZK_PROOFS: [&str; 5] = ["twopc", "zkchan", "pi_nk", "pi_c2s", "pi_c3s"];
+
 async fn zk_handler(socket: WebSocket, q: HashMap<String, String>, app: Arc<AppState>) {
     let proof = q.get("proof").cloned().unwrap_or_default();
     let sid = q.get("sid").cloned().unwrap_or_default();
+    // Only a proof that actually ran reports its result to the session (and a
+    // failed one ends it); zk_inner sends that report itself. A connection
+    // refused before that (unknown proof name, no parameters yet, a second
+    // 2PC or proof channel, too many connections, the proof lock busy) only
+    // closes, so whoever learns a live sid cannot end the session that way.
+    // A proof channel that fails outside a proof also reports nothing: the
+    // client falls back to the per-proof path.
     if let Err(e) = zk_inner(socket, &proof, &sid, &app).await {
         warn!(proof, error = %e, "zk session failed");
-        // A proof channel that fails outside a proof (setup, idle, transport)
-        // reports nothing: the session goes on and the client falls back to
-        // the per-proof path. A failed proof on it reported its own ZkDone.
-        if proof == "zkchan" {
-            return;
-        }
-        if let Some(s) = app.sessions.lock().unwrap().get(&sid).cloned() {
-            let _ = s.evt.send(Ev::ZkDone { proof, ok: false, err: Some(e.to_string()), params: None });
-        }
     }
+}
+
+/// Admit a `/zk` connection: a proof name the sidecar serves, a live sid,
+/// and a free connection slot of that session. Reports nothing to the session.
+fn zk_admit(app: &AppState, proof: &str, sid: &str) -> Result<(Arc<SessionShared>, ZkConnSlot)> {
+    if !ZK_PROOFS.contains(&proof) {
+        bail!("unknown proof name");
+    }
+    let shared = app.sessions.lock().unwrap().get(sid).cloned().ok_or_else(|| anyhow!("unknown sid"))?;
+    let conn = ZkConnSlot::take(&shared.zk_conns)?;
+    Ok((shared, conn))
 }
 
 async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>) -> Result<()> {
     let started = std::time::Instant::now();
+    let (shared, _conn) = zk_admit(app, proof, sid)?;
     info!(proof, sid, "zk start");
-    let shared = app.sessions.lock().unwrap().get(sid).cloned().ok_or_else(|| anyhow!("unknown sid"))?;
-    let _conn = ZkConnSlot::take(&shared.zk_conns)?;
     if proof == "twopc" {
         let rx = shared.twopc_rx.lock().unwrap().take().ok_or_else(|| anyhow!("2PC not available for this session"))?;
         let (io, bridge) = ws_duplex(socket);
@@ -1692,20 +1816,23 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
         return result;
     }
     let params = shared.params.lock().unwrap().get(proof).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
-    let (role, witness) = node_side(proof, &shared)?;
-    let (io, bridge) = ws_duplex(socket);
     // One proof at a time per session (see SessionShared::zk_lock), waiting
-    // for it at most PROOF_TIMEOUT.
-    let result = match tokio::time::timeout(PROOF_TIMEOUT, shared.zk_lock.lock()).await {
-        Err(_) => Err(anyhow!("zk proof waited {}s for the session's previous proof", PROOF_TIMEOUT.as_secs())),
-        Ok(_guard) => match tokio::time::timeout(PROOF_TIMEOUT, zkbench::proofs::run_io(io, role, &params, witness.as_ref())).await {
-            Ok(r) => r,
-            Err(_) => {
-                warn!(proof, "zk proof timed out ({}s)", PROOF_TIMEOUT.as_secs());
-                Err(anyhow!("zk proof timed out after {}s", PROOF_TIMEOUT.as_secs()))
-            }
-        },
+    // for it at most PROOF_TIMEOUT. A proof that never got the lock did not
+    // run, so it reports nothing.
+    let Ok(_guard) = tokio::time::timeout(PROOF_TIMEOUT, shared.zk_lock.lock()).await else {
+        bail!("zk proof waited {}s for the session's previous proof", PROOF_TIMEOUT.as_secs());
     };
+    let (role, mut witness) = node_side(proof, &shared)?;
+    let (io, bridge) = ws_duplex(socket);
+    let result = match tokio::time::timeout(PROOF_TIMEOUT, zkbench::proofs::run_io(io, role, &params, witness.as_ref())).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!(proof, "zk proof timed out ({}s)", PROOF_TIMEOUT.as_secs());
+            Err(anyhow!("zk proof timed out after {}s", PROOF_TIMEOUT.as_secs()))
+        }
+    };
+    wipe_witness(&mut witness);
+    drop(_guard);
     // `run_io` dropped its endpoint; drain the outbound pump into the socket
     // before the handler returns and the WebSocket closes, or the verifier's
     // final message can be lost and the prover stalls until its timeout.
@@ -1724,12 +1851,27 @@ fn node_side(proof: &str, shared: &SessionShared) -> Result<(Role, Option<Witnes
     Ok(match proof {
         "pi_nk" => {
             let kiv = shared.k0_iv0.lock().unwrap().clone().ok_or_else(|| anyhow!("no K_0 yet"))?;
-            let k0: [u8; 16] = kiv[..16].try_into()?;
-            let iv0: [u8; 12] = kiv[16..28].try_into()?;
-            (Role::Prover, Some(Witness::NodeKey { k0, iv0, key: shared.key.to_vec() }))
+            let witness = Witness::NodeKey {
+                k0: <[u8; 16]>::try_from(&kiv[..16])?,
+                iv0: <[u8; 12]>::try_from(&kiv[16..28])?,
+                key: shared.key.to_vec(),
+            };
+            (Role::Prover, Some(witness))
         }
         _ => (Role::Verifier, None),
     })
+}
+
+/// Overwrite the node's copy of the API key and K_0/IV_0 in a π_NK witness
+/// once the proof is done (the witness owns a plain copy of them).
+fn wipe_witness(witness: &mut Option<Witness>) {
+    use zeroize::Zeroize;
+    if let Some(Witness::NodeKey { k0, iv0, key }) = witness {
+        k0.zeroize();
+        iv0.zeroize();
+        key.zeroize();
+    }
+    *witness = None;
 }
 
 /// The session's long-lived proof channel (`zkbench::channel`). The
@@ -1738,10 +1880,12 @@ fn node_side(proof: &str, shared: &SessionShared) -> Result<(Role, Option<Witnes
 /// each proof by name and the node runs it against *its own* parameters for
 /// that name (exactly like the per-proof path), reporting `Ev::ZkDone`.
 ///
-/// Failure semantics: setup or transport failure outside a proof reports
-/// nothing (the client may fall back to `/zk?proof=pi_*`); a proof that fails
-/// or times out on the channel reports `ZkDone { ok: false }` and the session
-/// aborts, as with the per-proof path. The channel never runs a second proof
+/// Failure semantics: setup or transport failure outside a proof, and a
+/// request the node cannot run (a name it does not serve, no parameters yet,
+/// the proof lock busy), report nothing and close the channel (the client may
+/// fall back to `/zk?proof=pi_*`); a proof that fails or times out on the
+/// channel reports `ZkDone { ok: false }` and the session aborts, as with the
+/// per-proof path. The channel never runs a second proof
 /// after a failure, and each proof at most once.
 async fn run_zkchan<Io>(io: Io, shared: &Arc<SessionShared>) -> Result<()>
 where
@@ -1763,30 +1907,40 @@ where
         let Some(req) = req else { break };
         let proof = req.proof;
         let t = std::time::Instant::now();
-        let run = async {
+        // A request the node cannot run (a name it does not serve, no
+        // parameters yet, the proof lock busy) did not run a proof: it closes
+        // the channel without reporting to the session, which goes on (the
+        // client may fall back to the per-proof path).
+        let ready = async {
             if !matches!(proof.as_str(), "pi_nk" | "pi_c2s" | "pi_c3s") {
                 bail!("{proof} is not served on the proof channel");
             }
             let params = shared.params.lock().unwrap().get(proof.as_str()).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
-            let (_, witness) = node_side(&proof, shared)?;
-            let Ok(_guard) = tokio::time::timeout(PROOF_TIMEOUT, shared.zk_lock.lock()).await else {
-                ch.poison();
+            let Ok(guard) = tokio::time::timeout(PROOF_TIMEOUT, shared.zk_lock.lock()).await else {
                 bail!("{proof} waited {}s for the session's previous proof", PROOF_TIMEOUT.as_secs());
             };
-            let r = match tokio::time::timeout(PROOF_TIMEOUT, ch.serve(&proof, &params, witness.as_ref())).await {
-                Ok(r) => r,
-                Err(_) => {
-                    ch.poison();
-                    Err(anyhow!("zk proof timed out after 30s"))
-                }
-            };
-            Ok((params, r))
+            let (_, witness) = node_side(&proof, shared)?;
+            Ok((params, guard, witness))
         }
         .await;
-        let (params, result) = match run {
-            Ok((p, r)) => (Some(p), r),
-            Err(e) => (None, Err(e)),
+        let (params, guard, mut witness) = match ready {
+            Ok(x) => x,
+            Err(e) => {
+                ch.poison();
+                warn!(error = %e, "proof channel request refused");
+                break;
+            }
         };
+        let result = match tokio::time::timeout(PROOF_TIMEOUT, ch.serve(&proof, &params, witness.as_ref())).await {
+            Ok(r) => r,
+            Err(_) => {
+                ch.poison();
+                Err(anyhow!("zk proof timed out after {}s", PROOF_TIMEOUT.as_secs()))
+            }
+        };
+        wipe_witness(&mut witness);
+        drop(guard);
+        let params = Some(params);
         let (ok, err) = match &result {
             Ok(checks) => (checks.iter().all(|c| c.ok), None),
             Err(e) => (false, Some(e.to_string())),
@@ -1882,11 +2036,13 @@ fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
             }
             break;
         }
-        if r.len() < off + len + 2 {
-            bail!("R: chunk extends past the disclosed range");
-        }
-        data.extend_from_slice(&r[off..off + len]);
-        off += len;
+        // `len` is up to 16 hex digits: the bounds use checked arithmetic.
+        let end = off
+            .checked_add(len)
+            .filter(|e| e.checked_add(2).is_some_and(|t| t <= r.len()))
+            .ok_or_else(|| anyhow!("R: chunk extends past the disclosed range"))?;
+        data.extend_from_slice(&r[off..end]);
+        off = end;
         if &r[off..off + 2] != b"\r\n" {
             bail!("R: chunk data not terminated");
         }
@@ -2248,5 +2404,251 @@ mod tail_locator_tests {
         // Nor may the skip reach into the handshake flight.
         assert!(locate_tail(&[19, 19], 1, &[3], Some(2)).is_err());
         assert!(locate_tail(&lens, 2, &[54, 64], Some(99)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn rec(ctype: u8, len: usize) -> Record {
+        let l = (len as u16).to_be_bytes();
+        Record { ctype, header: [ctype, 3, 3, l[0], l[1]], payload: vec![0; len] }
+    }
+
+    fn app_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            key: Arc::new(Zeroizing::new(b"k".repeat(32))),
+            offer: Arc::new(serde_json::from_str(r#"{"upstream_host": "api.example.com"}"#).unwrap()),
+            host: "api.example.com".into(),
+            upstream: "127.0.0.1:9".into(),
+            signer: Arc::new(SigningKey::from_bytes(&[7; 32])),
+            runs_dir: std::env::temp_dir(),
+            node_settles: true,
+            sessions: StdMutex::new(HashMap::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            max_body: 1 << 20,
+            token_hash: None,
+        })
+    }
+
+    fn shared(app: &AppState) -> (Arc<SessionShared>, mpsc::UnboundedReceiver<Ev>) {
+        let (evt, rx) = mpsc::unbounded_channel();
+        let s = Arc::new(SessionShared {
+            params: StdMutex::new(HashMap::new()),
+            twopc_rx: StdMutex::new(None),
+            k0_iv0: StdMutex::new(None),
+            key: app.key.clone(),
+            evt,
+            zk_lock: tokio::sync::Mutex::new(()),
+            zkchan_taken: std::sync::atomic::AtomicBool::new(false),
+            zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        (s, rx)
+    }
+
+    #[test]
+    fn a_huge_chunk_size_is_an_error_not_a_panic() {
+        // 16 hex digits = usize::MAX: the bounds arithmetic must not wrap.
+        assert!(validate_r(b"ffffffffffffffff\r\nAAAA\r\n0\r\n\r\n").is_err());
+        assert!(validate_r(b"fffffffffffffffe\r\nAAAA\r\n0\r\n\r\n").is_err());
+        assert!(validate_r(b"\ndata: x\r\nffffffffffffffff\r\nAAAA\r\n0\r\n\r\n").is_err());
+        // A chunk ending exactly at the end of R, without its CRLF.
+        assert!(validate_r(b"4\r\nAAAA").is_err());
+    }
+
+    #[test]
+    fn the_first_tail_offset_keeps_what_the_proof_needs() {
+        // For every shape: block-aligned, at least one content byte (plus the
+        // inner type byte) decrypted, and enough of the record to cover the
+        // part of R + skip the later records do not.
+        for first in 1..80usize {
+            for rest in [0usize, 1, 15, 16, 17, 50] {
+                for need in 1..=first + rest {
+                    let off = first_tail_offset(first, rest, need);
+                    assert_eq!(off % 16, 0);
+                    assert!(off < first, "{first} {rest} {need}: off {off}");
+                    assert!(first - off >= need.saturating_sub(rest), "{first} {rest} {need}: off {off}");
+                    // The last boundary that does: one block later fails.
+                    let next = off + 16;
+                    assert!(next >= first || first - next < need.saturating_sub(rest).max(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_response_tail_is_kept_and_indices_stay_absolute() {
+        let mut log = RelayLog::default();
+        // Unencrypted handshake records, 3 encrypted handshake records, then
+        // a long response, a KeyUpdate and a close_notify.
+        log.server_record(rec(tls::CT_HANDSHAKE, 90));
+        log.server_record(rec(tls::CT_CHANGE_CIPHER_SPEC, 1));
+        for _ in 0..3 {
+            log.server_record(rec(CT_APPLICATION_DATA, 500));
+        }
+        let n = 1000;
+        for i in 0..n {
+            log.server_record(rec(CT_APPLICATION_DATA, 100 + i % 7));
+        }
+        log.server_record(rec(CT_APPLICATION_DATA, 22));
+        log.server_record(rec(CT_APPLICATION_DATA, 19));
+        assert_eq!(log.server_records, 2 + 3 + n + 2);
+        assert_eq!(log.server_tail.len(), SERVER_TAIL_RECORDS);
+        // The last two response records (lengths 100 + 998 % 7, 100 + 999 % 7).
+        let want = [100 + 998 % 7 - 16, 100 + 999 % 7 - 16];
+        let got = log.covered_records(3, &[want[1], want[0]], Some(2)).unwrap();
+        let idx: Vec<usize> = got.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idx, vec![n - 2, n - 1]);
+        // The largest disclosure still fits in what is kept.
+        let lens: Vec<usize> = (n + 2 - MAX_DISCLOSE_RECORDS - 2..n).rev().map(|i| 100 + i % 7 - 16).collect();
+        let got = log.covered_records(3, &lens, Some(2)).unwrap();
+        assert_eq!(got.len(), MAX_DISCLOSE_RECORDS);
+        assert_eq!(got[0].0, n - MAX_DISCLOSE_RECORDS);
+        // A short response: the handshake flight is still excluded.
+        let mut log = RelayLog::default();
+        for len in [500, 500, 80, 70] {
+            log.server_record(rec(CT_APPLICATION_DATA, len));
+        }
+        assert_eq!(log.covered_records(2, &[54, 64], Some(0)).unwrap().iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1]);
+        assert!(log.covered_records(2, &[54, 64, 484], Some(0)).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_upstream_write_ends_at_the_session_deadline() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (c, s) = tokio::join!(TcpStream::connect(addr), l.accept());
+        let _peer = s.unwrap().0; // never reads
+        let (_, mut tx) = c.unwrap().into_split();
+        let big = vec![0u8; 64 << 20];
+        let t = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        assert!(write_upstream(&mut tx, &big, Some(deadline)).await.is_err());
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn debug_output_names_events_without_their_bytes() {
+        let hs = HsSecrets { client_hs: [0xab; 32], server_hs: [0xcd; 32] };
+        assert!(!format!("{hs:?}").contains("171"));
+        let ev = Ev::Hs(hs);
+        assert_eq!(format!("{ev:?}"), "Hs");
+        let ap = Ev::Ap(Box::new(ApN {
+            k0: Zeroizing::new([0xab; 16]),
+            iv0: Zeroizing::new([0xab; 12]),
+            h1: [0xab; 32],
+            h2: [0xab; 32],
+            hk: [0xab; 32],
+        }));
+        assert_eq!(format!("{ap:?}"), "Ap");
+        assert_eq!(format!("{:?}", Ev::ServerBytes(vec![0xab; 5])), "ServerBytes(5 bytes)");
+    }
+
+    #[test]
+    fn the_node_witness_is_wiped_after_use() {
+        let app = app_state();
+        let (s, _rx) = shared(&app);
+        let mut kiv = Zeroizing::new(vec![1u8; 16]);
+        kiv.extend_from_slice(&[2u8; 12]);
+        *s.k0_iv0.lock().unwrap() = Some(kiv);
+        let (role, mut w) = node_side("pi_nk", &s).unwrap();
+        assert!(matches!(role, Role::Prover));
+        match &w {
+            Some(Witness::NodeKey { k0, iv0, key }) => {
+                assert_eq!(k0[..], [1u8; 16]);
+                assert_eq!(iv0[..], [2u8; 12]);
+                assert_eq!(key[..], app.key[..]);
+            }
+            _ => panic!("π_NK needs the node's key"),
+        }
+        wipe_witness(&mut w);
+        assert!(w.is_none());
+        assert!(matches!(node_side("pi_c2s", &s).unwrap(), (Role::Verifier, None)));
+    }
+
+    #[tokio::test]
+    async fn zk_refusals_before_a_proof_report_nothing() {
+        let app = app_state();
+        let (s, mut rx) = shared(&app);
+        app.sessions.lock().unwrap().insert("sid".into(), s.clone());
+        assert!(zk_admit(&app, "pi_bogus", "sid").is_err());
+        assert!(zk_admit(&app, "pi_nk", "other").is_err());
+        let held: Vec<_> = (0..MAX_ZK_CONNS_PER_SESSION).map(|_| zk_admit(&app, "pi_c3s", "sid").unwrap()).collect();
+        assert!(zk_admit(&app, "pi_c3s", "sid").is_err());
+        drop(held);
+        assert!(zk_admit(&app, "twopc", "sid").is_ok());
+        // None of these reached the session's event loop.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_cleanup_runs_on_drop() {
+        let app = app_state();
+        let (s, _rx) = shared(&app);
+        let (other, _rx2) = shared(&app);
+        app.sessions.lock().unwrap().insert("a".into(), s.clone());
+        app.sessions.lock().unwrap().insert("b".into(), other);
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        // A reader parked forever (as on an idle upstream socket).
+        let reader = tokio::spawn(std::future::pending::<()>());
+        let abort = reader.abort_handle();
+        let cleanup = SessionCleanup { app: app.clone(), shared: s, budget: budget.clone(), reader: Some(reader) };
+        drop(cleanup);
+        tokio::task::yield_now().await;
+        assert!(budget.is_closed());
+        assert!(abort.is_finished());
+        let sessions = app.sessions.lock().unwrap();
+        assert!(!sessions.contains_key("a") && sessions.contains_key("b"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_session_still_cleans_up() {
+        let app = app_state();
+        let (s, _rx) = shared(&app);
+        app.sessions.lock().unwrap().insert("a".into(), s.clone());
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let app2 = app.clone();
+        let b2 = budget.clone();
+        let task = tokio::spawn(async move {
+            let _cleanup = SessionCleanup { app: app2, shared: s, budget: b2, reader: None };
+            let r: Result<()> = std::panic::AssertUnwindSafe(async {
+                let _ = validate_r(b"0\r\n\r\n");
+                panic!("bug");
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("internal error in the session")));
+            r
+        });
+        assert!(task.await.unwrap().is_err());
+        assert!(budget.is_closed());
+        assert!(app.sessions.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod disclosure_limit_tests {
+    use super::{check_c3s_records, check_disclosure_size, MAX_DISCLOSE_NEED, MAX_DISCLOSE_R};
+    use zkbench::statements::{TailRecord, MAX_C3S_BYTES, MAX_C3S_RECORDS};
+
+    fn rec(len: usize) -> TailRecord {
+        TailRecord { seq: 0, ct: vec![0; len], off: 0 }
+    }
+
+    #[test]
+    fn disclosures_the_proof_cannot_cover_are_refused() {
+        assert!(check_disclosure_size(200, 0).is_ok());
+        assert!(check_disclosure_size(MAX_DISCLOSE_R, MAX_DISCLOSE_NEED - MAX_DISCLOSE_R).is_ok());
+        assert!(check_disclosure_size(MAX_DISCLOSE_R + 1, 0).is_err());
+        assert!(check_disclosure_size(100, MAX_DISCLOSE_NEED - 99).is_err());
+        assert!(check_disclosure_size(100, 1 << 20).is_err());
+        assert!(check_disclosure_size(100, usize::MAX).is_err());
+
+        assert!(check_c3s_records(&[rec(MAX_C3S_BYTES - 100), rec(100)]).is_ok());
+        assert!(check_c3s_records(&[rec(MAX_C3S_BYTES - 100), rec(101)]).is_err());
+        let many: Vec<_> = (0..=MAX_C3S_RECORDS).map(|_| rec(2)).collect();
+        assert!(check_c3s_records(&many).is_err());
+        assert!(check_c3s_records(&many[1..]).is_ok());
     }
 }

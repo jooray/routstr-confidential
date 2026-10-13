@@ -209,7 +209,8 @@ async fn c3s_first_record_from_an_offset() {
     let mut wrong = p.clone();
     wrong.records[0].off = off - 16;
     assert!(!run_pair_ideal(&Params::PiC3S(wrong), &witness).await.unwrap().last().unwrap().ok);
-    // Not block-aligned, or a later record with an offset: refused.
+    // Not block-aligned: refused (a later record with an offset is refused
+    // too, see tests/malformed.rs).
     let mut odd = p.clone();
     odd.records[0].off = off + 1;
     assert!(run_pair_ideal(&Params::PiC3S(odd), &witness).await.is_err());
@@ -219,6 +220,17 @@ async fn c3s_first_record_from_an_offset() {
     short.records[0].ct = full.records[0].ct[late..].to_vec();
     short.records[0].off = late;
     assert!(run_pair_ideal(&Params::PiC3S(short), &witness).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c3s_minimal_tail_as_the_sidecar_builds_it() {
+    // Usage (skip 0) and error head (body in skip), each over several records
+    // with the first one decrypted from an offset.
+    for (total, record_len, r_len, skip) in [(3000, 700, 300, 0), (3000, 700, 300, 900), (3001, 512, 40, 700)] {
+        let (params, witness) = fixtures::pi_c3s_disclosure(total, record_len, r_len, skip);
+        let res = run_pair_ideal(&params, &witness).await;
+        assert!(passed(&res), "{total}/{record_len}/{r_len}/{skip}: {res:?}");
+    }
 }
 
 // --- π_NK soundness -------------------------------------------------------

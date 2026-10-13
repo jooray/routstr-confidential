@@ -114,7 +114,9 @@ and costs about 22 MB of download and 1.2 MB of upload to prepare. Tune or disab
 ```
 
 **What you pay.** A confidential request costs the provider's usage at the rates in the node's signed
-offer, as a normal request does. A node may also charge for its own work (section 2): a percentage
+offer, as a normal request does. To start it, the node reserves the worst case on your credential: a
+full-context prompt plus your `max_tokens` and a small completion margin (`reserve_margin_tokens` in the
+offer, 16 tokens by default), and releases what the usage does not need. A node may also charge for its own work (section 2): a percentage
 surcharge, already included in the offer's rates; a **session fee** added to each completed request
 (`session_fee_msat`); and an **abandon fee** (`abandon_fee_msat`, at least the session fee) for a session
 that is set up and then ends without a request reaching the provider, for example a pre-warmed session that
@@ -161,7 +163,11 @@ The sidecar ships with an offer for Venice (`crypto/relay/offer.venice.json`: ho
 pinned suffix keys); adapt it for another OpenAI-compatible provider. **Models and prices come from the
 node:** every model the node serves through the sidecar's provider host is offered confidentially, at the
 node's normal rates (plus any surcharge). The node reserves a full-context prompt, so image inputs need no
-separate gate. The offer file carries no prices. To restrict the models, list their ids in its
+separate gate. The reservation is `max(MIN_REQUEST_MSAT, ⌈(context_length·in + (max_tokens + margin)·out)/1000⌉)`
+msat plus the larger of the session and abandon fees below, where `margin` is
+`CONFIDENTIAL_RESERVE_MARGIN_TOKENS` (default 16, published in the signed offer as `reserve_margin_tokens`):
+providers may bill a few tokens beyond `max_tokens`, the charge is capped at the reservation, and anything
+beyond the margin is the node's loss. The offer file carries no prices. To restrict the models, list their ids in its
 `model_allowlist` (empty = all), which the sidecar and the node both enforce (the earlier name
 `text_only_ok`, a map `{"id": true}`, is still read).
 
@@ -187,7 +193,11 @@ your provider key without paying. So the sidecar requires `Authorization: Bearer
 (the token is read from the environment variable named by `--token-env`, default `CU_SIDECAR_TOKEN`, at least
 16 characters) and refuses to start on a non-loopback `--listen` without one. A sidecar on `127.0.0.1` may run
 without a token, but then every local user on that host can reach it; set one anyway if the host is shared.
-Keep the port unpublished in any case. To rotate the token, change it on both sides and restart both.
+Keep the port unpublished in any case. The sidecar speaks plain HTTP/WebSocket, so the token crosses the
+node→sidecar link in cleartext: run that link over loopback or a private container network on the same
+host, or through an encrypted tunnel (WireGuard, or a TLS terminator in front of the sidecar with an
+`https://` `CONFIDENTIAL_SIDECAR_URL`), never over a network others can read. To rotate the token, change it
+on both sides and restart both.
 
 **Denial-of-service limit.** The node refuses a new confidential session (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
@@ -198,18 +208,22 @@ only as good as the node's idea of the client address, which depends on how the 
 | Deployment | What to set | Result |
 |---|---|---|
 | Node reached directly (no reverse proxy, no port-forwarding layer that rewrites the source address) | nothing | the TCP peer address is the client |
-| Reverse proxy on the same host (nginx, Caddy, Traefik) connecting to the node over loopback | nothing, if the proxy appends `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) | the rightmost `X-Forwarded-For` entry, the one the proxy added |
+| Reverse proxy on the same host (nginx, Caddy, Traefik) connecting to the node over loopback | `CONFIDENTIAL_TRUSTED_PROXIES=127.0.0.1,::1`, and the proxy must append `X-Forwarded-For` (nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`) | the rightmost `X-Forwarded-For` entry, the one the proxy added |
 | Reverse proxy that reaches the node from another address (another host, a container network) | `CONFIDENTIAL_TRUSTED_PROXIES` = that address | as above |
 | Rootless container with a published port (podman/docker forwarder: the node sees its **own** address for every connection) behind a reverse proxy | `CONFIDENTIAL_TRUSTED_PROXIES=127.0.0.1,::1,self` | as above; `self` means the node's own addresses |
 | Same, **without** a reverse proxy | do not trust `self` (anyone could then set the header); either put a proxy in front, run the container with host networking, or raise/disable the limit | otherwise every client shares one address and one limit |
 | Proxy that puts the client in another header (e.g. Cloudflare's `CF-Connecting-IP`) | `CONFIDENTIAL_CLIENT_IP_HEADER` = that header | used as is |
 | Tor onion service | nothing | all Tor clients arrive from the Tor daemon's address and share one limit |
 
-Only peers in `CONFIDENTIAL_TRUSTED_PROXIES` (default `127.0.0.1,::1`) can name the client by header; for
-any other peer the header is ignored, so a client cannot choose its own address.
+Only peers in `CONFIDENTIAL_TRUSTED_PROXIES` (default: none) can name the client by header; for any other
+peer the header is ignored, so a remote client cannot choose its own address. If you trust loopback, a process
+on the node's own host that connects to the node's port directly can set the header and pick any address; if
+you do not trust local users, keep the node's port reachable only by the proxy (or trust only the proxy's
+address). Never trust an address that something else (a Tor daemon, a port forwarder) also connects from
+without overwriting the header.
 
-**Surcharge and session fees (optional).** Each session costs the node about 22 MB of upload and 0.5 s of
-CPU (below), and a pre-warmed session costs it before any request exists. Three settings, all off (0) by
+**Surcharge and session fees (optional).** Each session costs the node about 22 MB of upload for the
+two-party computation alone (about 24 MB with the proofs, below) and 0.5 s of CPU, and a pre-warmed session costs it before any request exists. Three settings, all off (0) by
 default, let the node charge for that:
 
 | Setting | Effect |
@@ -245,8 +259,9 @@ CONFIDENTIAL_SIDECAR_URL=http://cu-sidecar:7444
 CONFIDENTIAL_SIDECAR_TOKEN=<the sidecar's CU_SIDECAR_TOKEN>
 ```
 
-routstr-core persists settings in its database: if the node has run before, set the URL once through
-`PATCH /admin/api/settings` as well. The token is read only from the environment (never stored in the
+The sidecar URL is read only from the environment (the confidential routes are mounted at startup; it is
+not stored in the database and cannot be changed through the admin API). Run the node as a single worker:
+offers, sessions and `/zk` admission are kept per process. The token is read only from the environment (never stored in the
 database, shown as `[REDACTED]` by the admin API). The node then serves `GET /v1/confidential/offer` (signed with its Nostr
 key) and marks the offered models in `/v1/models` with `confidential_upstream`. Its reverse proxy must pass
 WebSockets for `/v1/confidential/ws` and `/v1/confidential/zk` (`Upgrade`/`Connection` headers, read timeout
@@ -265,8 +280,9 @@ curl -s https://<node>/v1/confidential/offer | jq '{v, upstream_host, models: (.
 `v` must be `2`. Then run one request through routstrd as in section 1. On the node, each session logs the
 2PC, `credential record + KeyUpdate written to upstream (epoch 0)`, the three proofs and the settlement.
 
-**Bandwidth and CPU.** Each confidential request costs the node about 24 MB of upload (the two-party
-computation's garbled circuits cannot be reused) and about 0.5 s of CPU to garble and prepare the checks,
+**Bandwidth and CPU.** Each confidential request costs the node about 24 MB of upload: about 22 MB for the
+two-party computation (its garbled circuits cannot be reused, so an armed session that is never used costs
+this too) and the rest for the proofs, and about 0.5 s of CPU to garble and prepare the checks,
 so budget roughly 0.3 Gbit/s at 100 requests per minute. Normal
 (non-confidential) requests are unaffected.
 

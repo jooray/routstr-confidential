@@ -442,6 +442,11 @@ fn params_name(params: &Params) -> &'static str {
     }
 }
 
+/// How long `open` waits for the peer's hello. Both parties open the channel
+/// together, so an honest peer answers within a round trip; a silent one must
+/// not hold the channel (or the process) open.
+pub const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A session's proof channel. See the module docs.
 pub struct ZkChannel {
     party: Party,
@@ -489,7 +494,10 @@ impl ZkChannel {
 
         let mine = Hello { version: CHANNEL_VERSION, nk: prealloc.nk as u64, cp: prealloc.cp as u64 };
         ctl.io_mut().send(mine).await.context("proof channel hello")?;
-        let peer: Hello = ctl.io_mut().expect_next().await.context("proof channel hello")?;
+        let peer: Hello = tokio::time::timeout(HELLO_TIMEOUT, ctl.io_mut().expect_next())
+            .await
+            .map_err(|_| anyhow::anyhow!("proof channel hello: no reply in {}s", HELLO_TIMEOUT.as_secs()))?
+            .context("proof channel hello")?;
         if peer.version != CHANNEL_VERSION {
             bail!("proof channel version {} != {}", peer.version, CHANNEL_VERSION);
         }

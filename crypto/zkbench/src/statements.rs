@@ -168,6 +168,30 @@ pub struct PiC3S {
 /// Most server KeyUpdates a π_C3S may step through (each costs 4 compressions).
 pub const MAX_SERVER_KEY_UPDATES: u32 = 16;
 
+/// Most tail records a π_C3S may cover (the sidecar's disclosure limit). An
+/// honest disclosure covers one or two: the terminal usage event, or a short
+/// error head and its body.
+pub const MAX_C3S_RECORDS: usize = 64;
+
+/// Most ciphertext bytes, summed over the covered records, that a π_C3S may
+/// decrypt. Proof cost grows with every decrypted byte (about 400
+/// correlations each), so this bounds the work either side can be made to do
+/// to about 10 M correlations (about 5 s with real OT on an M2 Max; a browser
+/// prover is several times slower), well inside the sidecar's 30 s proof
+/// timeout. It covers the largest `R` the sidecar accepts (16 KiB) plus the
+/// first record's block alignment, the content-type bytes and `skip`. Only the
+/// first record's unneeded head is trimmed (`TailRecord::off`), so an honest
+/// minimal tail is at most `|R| + skip` plus 15 alignment bytes and one byte
+/// per record. An honest usage disclosure is a few hundred bytes.
+pub const MAX_C3S_BYTES: usize = (16 << 10) + (8 << 10);
+
+/// The largest `|R| + skip` that always fits [`MAX_C3S_BYTES`] when the
+/// covered records are the minimal tail (the sidecar's choice): the proof
+/// decrypts `|R| + skip`, at most 15 bytes of block alignment in the first
+/// record, and one content-type byte per record. A disclosure source should
+/// refuse anything larger up front.
+pub const MAX_C3S_NEED: usize = MAX_C3S_BYTES - 15 - MAX_C3S_RECORDS;
+
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }
@@ -215,8 +239,9 @@ impl Params {
     }
 }
 
-/// Private witness (only the prover holds this).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Private witness (only the prover holds this). Its bytes are wiped on drop
+/// and `Debug` prints only the variant.
+#[derive(Clone, serde::Serialize, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub enum Witness {
     /// π_C2S/π_C3S: a 32-byte traffic secret (c_ap_1 or s_ap_0).
     Secret([u8; 32]),
@@ -226,6 +251,15 @@ pub enum Witness {
         iv0: [u8; 12],
         key: Vec<u8>,
     },
+}
+
+impl std::fmt::Debug for Witness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Witness::Secret(_) => f.write_str("Witness::Secret(<redacted>)"),
+            Witness::NodeKey { key, .. } => write!(f, "Witness::NodeKey {{ <redacted>, key_len: {} }}", key.len()),
+        }
+    }
 }
 
 /// A single value the verifier must check after decoding.
@@ -335,6 +369,13 @@ pub fn build_pi_c3s<VM: Vm<Binary>>(
     if p.key_updates > MAX_SERVER_KEY_UPDATES {
         anyhow::bail!("π_C3S: {} server KeyUpdates (limit {MAX_SERVER_KEY_UPDATES})", p.key_updates);
     }
+    if p.records.len() > MAX_C3S_RECORDS {
+        anyhow::bail!("π_C3S: {} records (limit {MAX_C3S_RECORDS})", p.records.len());
+    }
+    let total = p.records.iter().try_fold(0usize, |acc, r| acc.checked_add(r.ct.len()));
+    if total.is_none_or(|t| t > MAX_C3S_BYTES) {
+        anyhow::bail!("π_C3S: the records exceed {MAX_C3S_BYTES} ciphertext bytes in all");
+    }
     let (anchor, k, iv) = anchored_keys_after_updates(vm, role, "h2", &p.h2, witness, p.key_updates)?;
     let mut contents = Vec::with_capacity(p.records.len());
     for (i, r) in p.records.iter().enumerate() {
@@ -387,7 +428,8 @@ pub fn build_pi_nk<VM: Vm<Binary>>(
     // Witness: K_0 ‖ IV_0 (28 bytes) and the API key.
     let (kiv_bytes, key_bytes) = match witness {
         Some(Witness::NodeKey { k0, iv0, key }) => {
-            let mut kiv = k0.to_vec();
+            let mut kiv = zeroize::Zeroizing::new(Vec::with_capacity(28));
+            kiv.extend_from_slice(k0);
             kiv.extend_from_slice(iv0);
             (Some(kiv), Some(key.as_slice()))
         }
@@ -400,7 +442,7 @@ pub fn build_pi_nk<VM: Vm<Binary>>(
         }
     }
 
-    let kiv = secret_bytes(vm, role, 28, kiv_bytes.as_deref())?;
+    let kiv = secret_bytes(vm, role, 28, kiv_bytes.as_deref().map(|v| v.as_slice()))?;
     let key = secret_bytes(vm, role, p.key_len, key_bytes)?;
     let template = public_bytes(vm, &p.template)?;
 

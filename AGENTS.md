@@ -197,8 +197,9 @@ provider connection. The node's uvicorn needs `--ws-ping-timeout 300`
 v1 proof of concept is the `v1-poc` branch. The earlier dual-execution 2PC
 (both parties garble, label equality check; ~21 MB upload per session) is
 the tag `v2-symmetric` in this repo, routstr-core and routstr-sdk. Note:
-routstr-core persists
-settings in its DB, so a copied DB keeps the old `confidential_sidecar_url`.
+routstr-core persists most settings in its DB, but `confidential_sidecar_url`
+is env-only (the routes are mounted at startup), and the node must run as a
+single worker (offers, sessions and `/zk` admission are per process).
 
 ## Browser client (separate repos)
 

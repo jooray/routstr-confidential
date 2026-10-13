@@ -160,6 +160,80 @@ pub fn pi_c3s_after_updates(updates: u32) -> (Params, Witness) {
     )
 }
 
+/// π_C3S over several whole tail records (sequence numbers from 0) with the
+/// given content lengths: the usage disclosure ends the last one, every
+/// earlier byte is response filler. Each length must be at least 1, and the
+/// last one at least `|R|`.
+pub fn pi_c3s_records(contents: &[usize]) -> (Params, Witness) {
+    let v = v2_secrets();
+    let secret = cu_crypto::keyschedule::Secret::new(v.s_ap_0);
+    let last = contents.len().checked_sub(1).expect("at least one record");
+    assert!(contents[last] >= USAGE_R.len(), "the last record holds R");
+    let records = contents
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let mut inner = vec![b'y'; n];
+            if i == last {
+                inner[n - USAGE_R.len()..].copy_from_slice(USAGE_R);
+            }
+            inner.push(0x17);
+            let stream = aesgcm::ctr_keystream(&secret.key(), &secret.iv(), i as u64, inner.len());
+            TailRecord { seq: i as u64, ct: xor(&inner, &stream), off: 0 }
+        })
+        .collect();
+    (
+        Params::PiC3S(PiC3S { h2: v.h2(), records, expected: USAGE_R.to_vec(), skip: 0, key_updates: 0 }),
+        Witness::Secret(v.s_ap_0),
+    )
+}
+
+/// π_C3S as the sidecar builds it for an honest disclosure: a response of
+/// `total` content bytes in records of `record_len` (the last one shorter),
+/// `R` the `r_len` bytes ending `skip` bytes before the end, the covered
+/// records the fewest final ones that hold `R` and `skip`, and the first of
+/// them decrypted only from the last block boundary that still covers them.
+pub fn pi_c3s_disclosure(total: usize, record_len: usize, r_len: usize, skip: usize) -> (Params, Witness) {
+    let v = v2_secrets();
+    let secret = cu_crypto::keyschedule::Secret::new(v.s_ap_0);
+    let stream: Vec<u8> = (0..total).map(|i| b'a' + (i % 23) as u8).collect();
+    let lens: Vec<usize> = stream.chunks(record_len).map(|c| c.len()).collect();
+    let need = r_len + skip;
+    let mut first = lens.len();
+    let mut covered = 0;
+    while covered < need {
+        first -= 1;
+        covered += lens[first];
+    }
+    // The sidecar's `first_tail_offset`.
+    let first_content = lens[first];
+    let rest = covered - first_content;
+    let needed_first = need.saturating_sub(rest).clamp(1, first_content.max(1));
+    let first_off = (first_content - needed_first.min(first_content)) / 16 * 16;
+    let records = stream
+        .chunks(record_len)
+        .enumerate()
+        .skip(first)
+        .map(|(i, chunk)| {
+            let mut inner = chunk.to_vec();
+            inner.push(0x17);
+            let ks = aesgcm::ctr_keystream(&secret.key(), &secret.iv(), i as u64, inner.len());
+            let off = if i == first { first_off } else { 0 };
+            TailRecord { seq: i as u64, ct: xor(&inner, &ks)[off..].to_vec(), off }
+        })
+        .collect();
+    (
+        Params::PiC3S(PiC3S {
+            h2: v.h2(),
+            records,
+            expected: stream[total - need..total - skip].to_vec(),
+            skip,
+            key_updates: 0,
+        }),
+        Witness::Secret(v.s_ap_0),
+    )
+}
+
 /// π_NK pieces, so tests can build variants (another key, another template).
 pub struct PiNKParts {
     pub template: Vec<u8>,

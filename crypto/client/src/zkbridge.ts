@@ -61,6 +61,10 @@ export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Prom
         () => reject(new Error(`zk timeout (${timeoutMs}ms) for ${job.proof}`)),
         timeoutMs,
       )
+      // A proof connection the node refuses closes without opening: fail at
+      // once instead of waiting for the timeout.
+      ws.onerror = () => reject(new Error(`zk ws error for ${job.proof}`))
+      ws.onclose = () => reject(new Error(`zk ws closed before the ${job.proof} proof started`))
       ws.onopen = () => {
         prof.ws_open_ms = Date.now() - t0
         wsOpen = true

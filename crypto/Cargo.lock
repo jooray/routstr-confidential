@@ -2544,6 +2544,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-util",
+ "zeroize",
 ]
 
 [[package]]

@@ -22,32 +22,60 @@ use crate::Role;
 /// Which side of the protocol we are building circuits for.
 // Kept in this module so the gadgets can branch on it without a cycle.
 
-fn cache<F>(key: u64, build: F) -> Arc<Circuit>
+/// Most gates the circuit cache holds in all. Several families (`concat`,
+/// `select`, `eq`, `splice`) take their shape from per-session lengths, so a
+/// long-running process would otherwise keep one circuit per distinct
+/// response shape forever.
+pub const CIRCUIT_CACHE_MAX_GATES: usize = 4 << 20;
+/// Most circuits the cache holds.
+pub const CIRCUIT_CACHE_MAX_ENTRIES: usize = 1024;
+
+struct CircuitCache {
+    map: HashMap<(&'static str, Vec<usize>), Arc<Circuit>>,
+    gates: usize,
+}
+
+static CACHE: LazyLock<Mutex<CircuitCache>> =
+    LazyLock::new(|| Mutex::new(CircuitCache { map: HashMap::new(), gates: 0 }));
+
+/// The circuit for family `family` with shape parameters `shape`, built once
+/// while it stays cached.
+///
+/// The cache is keyed by the full `(family, shape)` tuple, so two different
+/// shapes can never share an entry (a hash collision cannot hand a statement
+/// a circuit of the wrong shape). It is bounded by
+/// [`CIRCUIT_CACHE_MAX_GATES`] and [`CIRCUIT_CACHE_MAX_ENTRIES`]: when a new
+/// circuit would exceed either, the cache is emptied first, and a circuit
+/// larger than the whole budget is not cached at all. A circuit is a pure
+/// function of its shape, so eviction only costs a rebuild; prover and
+/// verifier get identical circuits either way.
+fn cache<F>(family: &'static str, shape: &[usize], build: F) -> Arc<Circuit>
 where
     F: FnOnce() -> Circuit,
 {
-    static CACHE: LazyLock<Mutex<HashMap<u64, Arc<Circuit>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let key = (family, shape.to_vec());
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(c) = guard.get(&key) {
+    if let Some(c) = guard.map.get(&key) {
         return c.clone();
     }
     let c = Arc::new(build());
-    guard.insert(key, c.clone());
+    let size = c.gates().len();
+    if size > CIRCUIT_CACHE_MAX_GATES {
+        return c;
+    }
+    if guard.gates + size > CIRCUIT_CACHE_MAX_GATES || guard.map.len() >= CIRCUIT_CACHE_MAX_ENTRIES {
+        guard.map.clear();
+        guard.gates = 0;
+    }
+    guard.gates += size;
+    guard.map.insert(key, c.clone());
     c
 }
 
-/// Cache key for a circuit family `tag` with shape parameters `parts`
-/// (64-bit FNV-1a over the full values, not a lossy bit-packing).
-fn shape_key(tag: u64, parts: &[usize]) -> u64 {
-    let mut k = 0xcbf2_9ce4_8422_2325u64 ^ tag;
-    for p in parts {
-        for b in (*p as u64).to_le_bytes() {
-            k = (k ^ b as u64).wrapping_mul(0x0100_0000_01b3);
-        }
-        k = (k ^ 0xff).wrapping_mul(0x0100_0000_01b3);
-    }
-    k
+/// The circuit cache's current `(entries, gates)`, for tests and diagnostics.
+pub fn circuit_cache_usage() -> (usize, usize) {
+    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    (guard.map.len(), guard.gates)
 }
 
 /// A constant bit as a *real* gate output (never a raw const node, which the
@@ -64,7 +92,8 @@ fn cbit(b: &mut CircuitBuilder, node: mpz_circuits::Node<mpz_circuits::Feed>, bi
 /// `n`-bit XOR of two `n`-bit inputs.
 pub fn xor_circuit(n_bits: usize) -> Arc<Circuit> {
     cache(
-        0xA1_0000_0000 ^ n_bits as u64,
+        "xor",
+        &[n_bits],
         || {
             let mut b = CircuitBuilder::new();
             let a: Vec<_> = (0..n_bits).map(|_| b.add_input()).collect();
@@ -80,7 +109,7 @@ pub fn xor_circuit(n_bits: usize) -> Arc<Circuit> {
 
 /// Key padding for HMAC: 32-byte key -> 64-byte block (`key || 0^32`).
 pub fn pad_key_circuit() -> Arc<Circuit> {
-    cache(0xB2, || {
+    cache("pad_key", &[], || {
         let mut b = CircuitBuilder::new();
         let key: Vec<_> = (0..256).map(|_| b.add_input()).collect();
         for bit in &key {
@@ -97,7 +126,7 @@ pub fn pad_key_circuit() -> Arc<Circuit> {
 
 /// Extract `len` bytes starting at byte `start` from an `in_len`-byte input.
 pub fn select_circuit(in_len: usize, start: usize, len: usize) -> Arc<Circuit> {
-    cache(shape_key(0xC3, &[in_len, start, len]), || {
+    cache("select", &[in_len, start, len], || {
         let mut b = CircuitBuilder::new();
         let inp: Vec<_> = (0..in_len * 8).map(|_| b.add_input()).collect();
         for bit in &inp[start * 8..(start + len) * 8] {
@@ -110,14 +139,7 @@ pub fn select_circuit(in_len: usize, start: usize, len: usize) -> Arc<Circuit> {
 
 /// Concatenate several byte vectors into one contiguous output (pure rewiring).
 pub fn concat_circuit(sizes: &[usize]) -> Arc<Circuit> {
-    let key = {
-        let mut k = 0xD4u64;
-        for s in sizes {
-            k = k.wrapping_mul(1099511628211) ^ (*s as u64);
-        }
-        k
-    };
-    cache(key, || {
+    cache("concat", sizes, || {
         let mut b = CircuitBuilder::new();
         let inputs: Vec<_> = (0..sizes.iter().sum::<usize>() * 8)
             .map(|_| b.add_input())
@@ -135,15 +157,11 @@ pub fn concat_circuit(sizes: &[usize]) -> Arc<Circuit> {
 /// Inputs: template (`head_len` bytes) then key (`L` bytes). Outputs:
 /// `head_len` bytes where each `{KEY}` position takes the next key byte.
 pub fn splice_circuit(head_len: usize, key_offsets: &[usize]) -> Arc<Circuit> {
-    let key = {
-        let mut k = 0xE5u64 ^ head_len as u64;
-        for o in key_offsets {
-            k = k.wrapping_mul(2654435761) ^ (*o as u64);
-        }
-        k
-    };
     let l = key_offsets.len();
-    cache(key, || {
+    let mut shape = Vec::with_capacity(l + 1);
+    shape.push(head_len);
+    shape.extend_from_slice(key_offsets);
+    cache("splice", &shape, || {
         let mut b = CircuitBuilder::new();
         let template: Vec<_> = (0..head_len * 8).map(|_| b.add_input()).collect();
         let keybits: Vec<_> = (0..l * 8).map(|_| b.add_input()).collect();
@@ -164,7 +182,7 @@ pub fn splice_circuit(head_len: usize, key_offsets: &[usize]) -> Arc<Circuit> {
 /// GCM counter block: `out = (iv XOR seq) || counter`, where `iv` is 96 bits,
 /// `seq` 64 bits and `counter` a public 32-bit input.
 pub fn ctr_block_circuit() -> Arc<Circuit> {
-    cache(0xF6, || {
+    cache("ctr_block", &[], || {
         let mut b = CircuitBuilder::new();
         let iv: Vec<_> = (0..96).map(|_| b.add_input()).collect();
         let seq: Vec<_> = (0..64).map(|_| b.add_input()).collect();
@@ -194,7 +212,7 @@ pub fn ctr_block_circuit() -> Arc<Circuit> {
 /// expected public bytes, never the decrypted bytes themselves: a verifier
 /// that chose a window over some other plaintext learns nothing beyond one bit.
 pub fn eq_circuit(len: usize) -> Arc<Circuit> {
-    cache(shape_key(0xE9, &[len]), || {
+    cache("eq", &[len], || {
         let mut b = CircuitBuilder::new();
         let a: Vec<_> = (0..len * 8).map(|_| b.add_input()).collect();
         let c: Vec<_> = (0..len * 8).map(|_| b.add_input()).collect();
@@ -220,7 +238,7 @@ pub fn eq_circuit(len: usize) -> Arc<Circuit> {
 
 /// Membership of every byte in `[A-Za-z0-9_-]`, AND-reduced to one bit.
 pub fn alphabet_circuit(len: usize) -> Arc<Circuit> {
-    cache(0x17_0000_0000 ^ len as u64, || {
+    cache("alphabet", &[len], || {
         const CHARS: &[u8] = b"-_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let mut b = CircuitBuilder::new();
         let data: Vec<_> = (0..len * 8).map(|_| b.add_input()).collect();

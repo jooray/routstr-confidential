@@ -22,8 +22,10 @@ Everything after it (the d bits, the seed, 5.3 MB of check rows) is on the criti
 - What changed: only the comparison is projected. Rows and Y_N travel as their low 64 bits (π, GF(2)-linear),
   and C accepts iff π(Y_N ⊕ Y_C ⊕ K_tot) = 0. MACs, Δ_B, χ and the product check stay in GF(2^128).
 - A wrong evaluation (E ≠ 0) passes only if π(Δ_B·E) hits a value fixed without knowledge of Δ_B. For E ≠ 0
-  this is ≤ 2^-63 per phase (Δ_B has 127 random bits, and Δ ↦ π(Δ·E) is onto). There is nothing to grind,
-  because N learns nothing about Δ_B.
+  this is ≤ 2^-63 per phase (Δ_B has 127 random bits, and Δ ↦ π(Δ·E) is onto). With lsb Δ_B fixed to 1 the
+  image of the admissible Δ_B is all of GF(2)^64 (2^-64) or, for the ~2^-64 fraction of E whose kernel lies in
+  lsb = 0, a 63-dimensional coset (2^-63); 2^-63 is the worst case, ≤ 2^-62 per session. There is nothing to
+  grind, because N learns nothing about Δ_B.
 - E = 0 with some e_k ≠ 0 still needs 2^128 work (χ in GF(2^128), drawn after N's commitments).
 - **What the plain projection did not cover.** With E = 0, a *garbage* label that has the right pointer bit
   changes only the hash term of the check, and with 64-bit rows the hash matches w.p. 2^-64. A garbler

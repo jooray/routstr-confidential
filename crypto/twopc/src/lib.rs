@@ -29,6 +29,11 @@
 //! multiplexer); `close` flushes the transport; `take_timings` returns per-step
 //! wall time and transport bytes.
 //!
+//! The library sets no deadlines: a receive waits until the peer's data or
+//! EOF arrives, so a half-open transport stalls a step. Callers bound each
+//! step themselves (the sidecar and the SDK do; `cu-2pc` has a per-step
+//! watchdog).
+//!
 //! # Protocol
 //!
 //! N garbles both phase circuits once ([`gc`]: three-halves garbling,
@@ -82,6 +87,11 @@
 //!   hash, the outputs), check rows padded by hashes of inactive labels, and
 //!   `Y_N` (a value C can compute itself). It cannot report a wrong output to
 //!   N without an inactive output label (needs Δ_A).
+//! * **Fairness.** C decodes its outputs first and N gets its own only from
+//!   C's final message of each phase, so a malicious C can keep N's outputs
+//!   (`K_0, IV_0`) from it after learning its own. The protocol does not
+//!   prevent this; in the routstr flow it gains C nothing, since without the
+//!   credential record N writes under `K_0` there is no provider request.
 //! * **Inputs are never revealed** by either party (nothing is opened after
 //!   the evaluation). Private outputs are XOR-masked inside the circuit by
 //!   their owner's random mask; MS by both parties' masks.
@@ -122,6 +132,8 @@ use zeroize::{Zeroize, Zeroizing};
 pub use mux::Counters;
 use mux::{FrameChan, Mux};
 use circuits::{Spec, from_bits, spec, to_bits};
+use ectf::SecretFp;
+use gc::SecretBlocks;
 
 /// Errors. `Abort` means a check failed (possible cheating); the session must
 /// be discarded.
@@ -284,8 +296,10 @@ type FerR = ferret::Receiver<KosR>;
 
 /// N's per-phase state.
 struct NPhase {
-    k: Vec<Block>,
-    lam: Vec<bool>,
+    /// Zero-label of every wire (with Δ_A, every label).
+    k: SecretBlocks,
+    /// Wire masks (each reveals a wire value to whoever sees the label).
+    lam: Zeroizing<Vec<bool>>,
 }
 
 /// C's per-phase state.
@@ -306,12 +320,13 @@ enum Pre {
     N {
         ph: Vec<NPhase>,
         /// KOS keys for C's input bits (phase A then B).
-        cot_keys: Vec<Block>,
+        cot_keys: SecretBlocks,
     },
     C {
         ph: Vec<CPhase>,
-        cot_choices: Vec<bool>,
-        cot_msgs: Vec<Block>,
+        /// KOS choice bits and messages (C's inputs are `d ⊕ choice`).
+        cot_choices: Zeroizing<Vec<bool>>,
+        cot_msgs: SecretBlocks,
     },
 }
 
@@ -390,8 +405,14 @@ pub struct Party {
 
 impl Drop for Party {
     fn drop(&mut self) {
+        // Labels, masks, COT keys and MAC keys go with `pre` (their own
+        // `Drop`s); copies inside mpz2's OT/OLE state are out of reach.
         self.ms_share.zeroize();
+        if let Some(a) = self.scalar.as_mut() {
+            a.zeroize();
+        }
         self.scalar = None;
+        self.delta.as_mut().zeroize();
     }
 }
 
@@ -432,14 +453,28 @@ fn sel(bit: bool, b: Block) -> Block {
     Block::SELECT_MASK[bit as usize] & b
 }
 
+/// A challenge derived from C's seed; both parties compute it the same way.
+/// Never zero (χ = 0 would make the checks vacuous): a zero value, which an
+/// honest seed gives with probability 2^-128, is re-drawn deterministically
+/// by appending a counter, so every non-zero first draw is unchanged.
 fn chi(seed: &[u8], what: &[u8]) -> Block {
-    let h: [u8; 32] = Sha256::new()
-        .chain_update(TAG_CHI)
-        .chain_update(seed)
-        .chain_update(what)
-        .finalize()
-        .into();
+    first_nonzero(|ctr| chi_draw(seed, what, ctr))
+}
+
+fn chi_draw(seed: &[u8], what: &[u8], ctr: u32) -> Block {
+    let mut h = Sha256::new().chain_update(TAG_CHI).chain_update(seed).chain_update(what);
+    if ctr > 0 {
+        h.update(ctr.to_be_bytes());
+    }
+    let h: [u8; 32] = h.finalize().into();
     Block::new(h[..16].try_into().unwrap())
+}
+
+fn first_nonzero(mut draw: impl FnMut(u32) -> Block) -> Block {
+    (0u32..)
+        .map(&mut draw)
+        .find(|c| *c != Block::ZERO)
+        .expect("a non-zero draw")
 }
 
 fn parse_point(b: &[u8]) -> Result<ProjectivePoint> {
@@ -477,7 +512,9 @@ fn random_scalar(rng: &mut StdRng) -> Scalar {
 fn fp_from_be(be: &[u8]) -> Result<Fp> {
     let mut le: [u8; 32] = be.try_into().map_err(|_| Error::Protocol("coord".into()))?;
     le.reverse();
-    Fp::try_from(le).map_err(|_| Error::Protocol("non-canonical coordinate".into()))
+    let r = Fp::try_from(le).map_err(|_| Error::Protocol("non-canonical coordinate".into()));
+    le.zeroize();
+    r
 }
 
 fn perr<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> Error {
@@ -700,8 +737,9 @@ impl Party {
             (0..2)
                 .map(|p| {
                     let s = spec(p);
-                    let in_keys: Vec<Block> = (0..s.circ.inputs().len()).map(|_| Block::random(&mut grng)).collect();
-                    gc::garble(&s.circ, delta, &in_keys, p, &mut grng)
+                    let in_keys = SecretBlocks((0..s.circ.inputs().len()).map(|_| Block::random(&mut grng)).collect());
+                    let (k, tables) = gc::garble(&s.circ, delta, &in_keys, p, &mut grng);
+                    (SecretBlocks(k), tables)
                 })
                 .collect::<Vec<_>>()
         });
@@ -790,12 +828,12 @@ impl Party {
         };
         let cot_a_fut = async {
             let keys = rcot_send!(kos_a_s.as_mut().unwrap(), ctx_a, c_bits);
-            Ok::<_, Error>(keys)
+            Ok::<_, Error>(SecretBlocks(keys))
         };
         let cot_b_fut = async {
             let (r, m) = rcot_recv!(mac_r.as_mut().unwrap().as_mut(), ctx_b, n_mac);
             mac_done.store(true, std::sync::atomic::Ordering::Relaxed);
-            Ok::<_, Error>((r, m))
+            Ok::<_, Error>((Zeroizing::new(r), SecretBlocks(m)))
         };
         let sc_fut = sc.preprocess(ctx_sc);
         let (keys, cot_keys, macs, scr) = futures::join!(send_fut, cot_a_fut, cot_b_fut, sc_fut);
@@ -823,7 +861,7 @@ impl Party {
                 let i = s.circ.inputs().len() + s.circ.and_count() / 2;
                 base_lam[i] = !base_lam[i];
             }
-            let base_mac = r_macs[off..off + nb].to_vec();
+            let base_mac = SecretBlocks(r_macs[off..off + nb].to_vec());
             for (i, l) in base_lam.iter().enumerate() {
                 d_bits.push(l ^ r_bits[off + i]);
             }
@@ -842,7 +880,7 @@ impl Party {
                 t_mac.push(r_macs[off + a]);
             }
             off += na;
-            st.push((lam, mac, t_mac));
+            st.push((Zeroizing::new(lam), SecretBlocks(mac), SecretBlocks(t_mac)));
         }
         let mask_bits = &r_bits[off..off + 128];
         let mask_macs = &r_macs[off..off + 128];
@@ -856,8 +894,9 @@ impl Party {
         let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
 
         // Product check, openings, consistency-check material (CPU, blocking).
-        let mask_bits = mask_bits.to_vec();
-        let mask_macs = mask_macs.to_vec();
+        let mask_bits = Zeroizing::new(mask_bits.to_vec());
+        let mask_macs = SecretBlocks(mask_macs.to_vec());
+        drop((r_bits, r_macs));
         let (st, keys, msgs) = tokio::task::spawn_blocking(move || {
             // Check rows and Y_N per phase.
             let rows_of = |p: usize| -> (Vec<u8>, Vec<u8>) {
@@ -967,7 +1006,7 @@ impl Party {
         let ph = st
             .into_iter()
             .zip(keys)
-            .map(|((lam, _, _), k)| NPhase { k, lam })
+            .map(|((lam, _mac, _t_mac), k)| NPhase { k, lam })
             .collect();
         self.pre = Some(Pre::N { ph, cot_keys });
         Ok(())
@@ -1023,18 +1062,21 @@ impl Party {
         let (rcv, cr, kb, scr) = futures::join!(recv_fut, cot_a_fut, cot_b_fut, sc_fut);
         let (tables, d) = rcv?;
         let (cot_choices, cot_msgs) = cr?;
-        let kb = kb?;
+        let kb = SecretBlocks(kb?);
         scr?;
+        let (cot_choices, cot_msgs) = (Zeroizing::new(cot_choices), SecretBlocks(cot_msgs));
         if kb.len() != n_mac || cot_choices.len() != own_bits {
             return Err(Error::Protocol("cot count".into()));
         }
         // Keys of the committed values: K[x] = K[r] ⊕ d·Δ_B.
         // (The last 128 COTs stay random: they mask the product check.)
-        let kfix: Vec<Block> = kb
-            .iter()
-            .enumerate()
-            .map(|(i, k)| if i < d.len() { *k ^ sel(d[i], delta_b) } else { *k })
-            .collect();
+        let kfix = SecretBlocks(
+            kb.iter()
+                .enumerate()
+                .map(|(i, k)| if i < d.len() { *k ^ sel(d[i], delta_b) } else { *k })
+                .collect(),
+        );
+        drop(kb);
         // The χ challenge only after N's tables and commitments are in.
         c2n.send(&seed).await?;
         tr(t0, "C", "seed sent");
@@ -1069,15 +1111,15 @@ impl Party {
                 let s = spec(p);
                 let shape = &SHAPES[p];
                 let nb = shape.base.len();
-                let key = gc::propagate_c(&s.circ, &kfix[off..off + nb], delta_b);
+                let key = SecretBlocks(gc::propagate_c(&s.circ, &kfix[off..off + nb], delta_b));
                 off += nb;
                 let na = shape.ands.len();
-                let t_key = kfix[off..off + na].to_vec();
+                let t_key = &kfix[off..off + na];
                 off += na;
                 let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), na);
-                gc::dvzk_verifier_acc(&shape.ands, &key, &t_key, delta_b, &pw, &mut acc);
+                gc::dvzk_verifier_acc(&shape.ands, &key, t_key, delta_b, &pw, &mut acc);
                 let pw = gc::powers(chi_ck[p], na);
-                let ck = gc::check_keys(&shape.ands, &key, &t_key, &pw);
+                let ck = gc::check_keys(&shape.ands, &key, t_key, &pw);
                 per.push((key, ck));
             }
             let mut k_star = Block::ZERO;
@@ -1156,10 +1198,11 @@ impl Party {
     }
 
     async fn key_share_inner(&mut self) -> Result<[u8; 65]> {
-        let a = random_scalar(&mut self.rng);
+        let mut a = random_scalar(&mut self.rng);
         let p_own = ProjectivePoint::GENERATOR * a;
         let own = encode_point(&p_own);
         self.scalar = Some(a);
+        a.zeroize();
         let joint = match self.role {
             Role::C => {
                 let nonce: [u8; 32] = self.rng.random();
@@ -1218,16 +1261,23 @@ impl Party {
 
     async fn handshake_inner(&mut self, server_share: &[u8], th_sh: [u8; 32]) -> Result<HsSecrets> {
         let s = parse_point(server_share)?;
-        let a = self.scalar.take().ok_or(Error::State("no scalar"))?;
-        let q = (s * a).to_affine();
-        let ep = q.to_encoded_point(false);
-        let x = fp_from_be(ep.x().ok_or_else(|| Error::Protocol("identity".into()))?)?;
-        let y = fp_from_be(ep.y().ok_or_else(|| Error::Protocol("identity".into()))?)?;
+        // This party's ECDHE share a·S and everything derived from it are
+        // overwritten when they go out of scope, error paths included.
+        let a = Zeroizing::new(self.scalar.take().ok_or(Error::State("no scalar"))?);
+        let q = Zeroizing::new((s * *a).to_affine());
+        drop(a);
+        let ep = Zeroizing::new(q.to_encoded_point(false));
+        drop(q);
+        let x = SecretFp(fp_from_be(ep.x().ok_or_else(|| Error::Protocol("identity".into()))?)?);
+        let y = SecretFp(fp_from_be(ep.y().ok_or_else(|| Error::Protocol("identity".into()))?)?);
+        drop(ep);
 
         let m = self.mark();
-        let share = self.sc.point_add_x(&mut self.ctx_sc, x, y).await?;
+        let share = SecretFp(self.sc.point_add_x(&mut self.ctx_sc, x.0, y.0).await?);
+        drop((x, y));
         self.record("ectf", m);
-        let mut x_le: [u8; 32] = share.into();
+        let mut x_le: [u8; 32] = share.0.into();
+        drop(share);
 
         let mut r_mask: [u8; 32] = self.rng.random();
         let mut own = Zeroizing::new(Vec::with_capacity(64));
@@ -1361,11 +1411,17 @@ impl Party {
         let Some(Pre::N { ph, cot_keys }) = self.pre.as_mut() else {
             return Err(Error::State("not preprocessed"));
         };
-        let st = std::mem::replace(&mut ph[phase], NPhase { k: Vec::new(), lam: Vec::new() });
+        let st = std::mem::replace(
+            &mut ph[phase],
+            NPhase {
+                k: SecretBlocks::default(),
+                lam: Zeroizing::new(Vec::new()),
+            },
+        );
         if st.k.is_empty() {
             return Err(Error::State("phase already used"));
         }
-        let cot = cot_keys[c_off..c_off + s.c_bits].to_vec();
+        let cot = SecretBlocks(cot_keys[c_off..c_off + s.c_bits].to_vec());
 
         // Own and transcript-hash labels, sent at once.
         let mut labels = Vec::with_capacity(s.n_bits + s.th_bits);
@@ -1443,14 +1499,15 @@ impl Party {
         let lam_c = ph[phase].lam_c.clone();
         let lam_th = ph[phase].lam_th.clone();
         let lam_out = ph[phase].lam_out.clone();
-        let b = cot_choices[c_off..c_off + s.c_bits].to_vec();
-        let msgs = cot_msgs[c_off..c_off + s.c_bits].to_vec();
+        let b = Zeroizing::new(cot_choices[c_off..c_off + s.c_bits].to_vec());
+        let msgs = SecretBlocks(cot_msgs[c_off..c_off + s.c_bits].to_vec());
 
-        let d: Vec<bool> = own_bits.iter().zip(&b).map(|(x, r)| x ^ r).collect();
+        let d: Vec<bool> = own_bits.iter().zip(b.iter()).map(|(x, r)| x ^ r).collect();
         self.c2n.send(&from_bits(&d)).await?;
         let gl = bytes_to_blocks(&self.n2c.recv_exact(16 * (s.n_bits + s.th_bits)).await?);
         let el = bytes_to_blocks(&self.n2c.recv_exact(16 * s.c_bits).await?);
-        let mut inl = vec![Block::ZERO; s.circ.inputs().len()];
+        // Active labels: with N's zero-labels and Δ_A they give C's inputs.
+        let mut inl = SecretBlocks(vec![Block::ZERO; s.circ.inputs().len()]);
         for (j, w) in s.c_range().enumerate() {
             inl[w] = el[j] ^ msgs[j];
         }
@@ -1463,9 +1520,10 @@ impl Party {
 
         let circ = s.circ.clone();
         let (ok_check, out_labels) = tokio::task::spawn_blocking(move || {
-            let l = gc::evaluate(&circ, &inl, &tables, phase);
+            let l = SecretBlocks(gc::evaluate(&circ, &inl, &tables, phase));
+            drop(inl);
             let ok = gc::run_check(salt, phase, &SHAPES[phase].ands, &SHAPES[phase].base, &l, &st, &rows, y_n, delta_b);
-            let out: Vec<Block> = circ.outputs().map(|w| l[w]).collect();
+            let out = SecretBlocks(circ.outputs().map(|w| l[w]).collect());
             (ok, out)
         })
         .await
@@ -1486,7 +1544,7 @@ impl Party {
         let mut h = Sha256::new();
         h.update(TAG_OUT);
         h.update([phase as u8]);
-        for l in &out_labels {
+        for l in out_labels.iter() {
             h.update(l.as_bytes());
         }
         let hd: [u8; 32] = h.finalize().into();

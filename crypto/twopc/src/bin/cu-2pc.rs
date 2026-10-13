@@ -26,6 +26,21 @@ use twopc::{ApOut, Party, Role};
 
 const MAX_FRAME: usize = 16 << 20;
 
+/// Watchdogs for the protocol steps (the library itself sets no deadlines):
+/// a peer that stops sending without closing must not hang the process.
+/// Generous next to the node's limits (180 s preprocessing) and the SDK's
+/// defaults; waiting for the next control command is not bounded, since a
+/// pre-warmed session waits there for a request.
+const PREPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+const STEP_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn step<T>(what: &str, limit: Duration, f: impl std::future::Future<Output = twopc::Result<T>>) -> Result<T, String> {
+    match tokio::time::timeout(limit, f).await {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => Err(format!("{what}: no progress within {} s", limit.as_secs())),
+    }
+}
+
 type Out = mpsc::UnboundedSender<(u8, Vec<u8>)>;
 
 fn emit(out: &Out, v: Value) {
@@ -62,16 +77,16 @@ async fn next_cmd(ctl: &mut mpsc::UnboundedReceiver<Value>, want: &str) -> Resul
 
 async fn run(out: Out, mut ctl: mpsc::UnboundedReceiver<Value>, io: tokio::io::DuplexStream) -> Result<(), String> {
     let mut p = Party::new(Role::C, io.compat()).await.map_err(|e| e.to_string())?;
-    p.preprocess().await.map_err(|e| e.to_string())?;
+    step("preprocess", PREPROCESS_TIMEOUT, p.preprocess()).await?;
     emit_timings(&out, &mut p);
-    let joint = p.key_share().await.map_err(|e| e.to_string())?;
+    let joint = step("key_share", STEP_TIMEOUT, p.key_share()).await?;
     emit_timings(&out, &mut p);
     emit(&out, json!({"ev":"key_share","p":hex::encode(joint)}));
 
     let cmd = next_cmd(&mut ctl, "handshake").await?;
     let s: [u8; 65] = hex_arr(&cmd, "s")?;
     let th_sh: [u8; 32] = hex_arr(&cmd, "th_sh")?;
-    let hs = p.handshake(&s, th_sh).await.map_err(|e| e.to_string())?;
+    let hs = step("handshake", STEP_TIMEOUT, p.handshake(&s, th_sh)).await?;
     emit_timings(&out, &mut p);
     emit(
         &out,
@@ -80,7 +95,7 @@ async fn run(out: Out, mut ctl: mpsc::UnboundedReceiver<Value>, io: tokio::io::D
 
     let cmd = next_cmd(&mut ctl, "app").await?;
     let th_sf: [u8; 32] = hex_arr(&cmd, "th_sf")?;
-    let ap = p.application(th_sf).await.map_err(|e| e.to_string())?;
+    let ap = step("application", STEP_TIMEOUT, p.application(th_sf)).await?;
     emit_timings(&out, &mut p);
     match &ap {
         ApOut::C {

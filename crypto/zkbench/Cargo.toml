@@ -28,6 +28,7 @@ anyhow = "1"
 itybity = "0.2"
 async-trait = "0.1"
 serio = "0.2"
+zeroize = { version = "1", features = ["derive"] }
 
 [features]
 rayon = ["mpz-zk/rayon"]

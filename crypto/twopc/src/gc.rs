@@ -22,6 +22,7 @@ use mpz_circuits::{Circuit, Gate};
 use mpz_core::Block;
 use mpz_core::aes::{FIXED_KEY_AES, FixedKeyAes};
 use rand::RngExt;
+use zeroize::Zeroize;
 
 /// Tweak base of the garbling hash for a phase (garbling and check rows use
 /// disjoint tweak spaces: bit 127 is set only for check rows).
@@ -65,6 +66,38 @@ fn blk(x: u128) -> Block {
 #[inline]
 pub fn lo64(b: Block) -> u64 {
     u(b) as u64
+}
+
+/// Overwrites secret blocks (Δ, zero-labels, COT keys and messages, MAC keys)
+/// before their memory is released; `Block` has no `Zeroize` impl.
+pub fn wipe_blocks(v: &mut [Block]) {
+    for b in v {
+        b.as_mut().zeroize();
+    }
+}
+
+/// A `Vec<Block>` of secrets, overwritten when dropped (on every path,
+/// errors included), like `Zeroizing` for types that implement `Zeroize`.
+#[derive(Default)]
+pub struct SecretBlocks(pub Vec<Block>);
+
+impl std::ops::Deref for SecretBlocks {
+    type Target = Vec<Block>;
+    fn deref(&self) -> &Vec<Block> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SecretBlocks {
+    fn deref_mut(&mut self) -> &mut Vec<Block> {
+        &mut self.0
+    }
+}
+
+impl Drop for SecretBlocks {
+    fn drop(&mut self) {
+        wipe_blocks(&mut self.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,8 +493,10 @@ pub fn dvzk_verifier_acc(
 /// `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`. The MACs, Δ_B, χ and the whole computation stay
 /// in GF(2^128), only the comparison is projected: a wrong evaluation
 /// (E ≠ 0) passes iff π(Δ_B·E) = π(R) for an R fixed before Δ_B is used, which
-/// has probability ≤ 2^-63 over Δ_B (127 uniform bits) and cannot be ground
-/// offline because N never learns anything about Δ_B.
+/// has probability ≤ 2^-63 over Δ_B (127 uniform bits: lsb Δ_B = 1, so the
+/// image of the admissible Δ_B under Δ ↦ π(Δ·E) has dimension 64, giving
+/// 2^-64, or 63 for the ~2^-64 fraction of E whose kernel lies in lsb = 0)
+/// and cannot be ground offline because N never learns anything about Δ_B.
 pub struct CheckMaterial {
     pub rows: Vec<u64>,
     pub y_n: u64,
@@ -534,6 +569,16 @@ pub fn check_keys(ands: &[(usize, usize, usize)], key: &[Block], t_key: &[Block]
         per_gate.push([c, c.gfmul(key[j]), c.gfmul(key[i])]);
     }
     CheckKeys { stat, per_gate }
+}
+
+impl Drop for CheckKeys {
+    fn drop(&mut self) {
+        // χ^k·K: C's MAC keys (with N's MACs they would give Δ_B).
+        self.stat.as_mut().zeroize();
+        for g in self.per_gate.iter_mut() {
+            wipe_blocks(g);
+        }
+    }
 }
 
 /// C, online: runs the consistency check over the active labels `l`.

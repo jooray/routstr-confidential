@@ -100,6 +100,11 @@ fn stdio_duplex(mut stdin: tokio::io::Stdin) -> (Compat<tokio::io::DuplexStream>
     (a.compat(), StdioBridge { out })
 }
 
+/// How long one proof may run, in either mode (stdio: from the first protocol
+/// byte; channel: from the request). A stalled or malicious peer cannot hold
+/// the process longer.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn parse_role(s: &str) -> Result<Role> {
     match s {
         "prover" => Ok(Role::Prover),
@@ -124,7 +129,8 @@ async fn run_stdio(args: &[String]) -> Result<()> {
         if len > 16 << 20 {
             anyhow::bail!("job of {len} bytes is too large");
         }
-        let mut job = vec![0u8; len];
+        // The job carries the witness: wipe the raw bytes once parsed.
+        let mut job = zeroize::Zeroizing::new(vec![0u8; len]);
         stdin.read_exact(&mut job).await.context("reading the job")?;
         serde_json::from_slice(&job).context("parsing the job")?
     } else {
@@ -145,7 +151,10 @@ async fn run_stdio(args: &[String]) -> Result<()> {
     // `run_io` consumes and drops its endpoint, so once it returns the stdout
     // forwarder can reach EOF. Wait for it before this process exits, or the
     // protocol's final bytes are lost and the peer stalls.
-    let result = run_io(io, role, &pf.params, pf.witness.as_ref()).await;
+    let result = match tokio::time::timeout(PROOF_TIMEOUT, run_io(io, role, &pf.params, pf.witness.as_ref())).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("{}: timed out after {}s", pf.proof, PROOF_TIMEOUT.as_secs())),
+    };
     bridge.finish().await;
     eprintln!("cu-prover: proof={} role={:?} drained", pf.proof, role);
     let results = result?;
@@ -274,9 +283,10 @@ async fn channel_loop(
     let timings = emit_timings(&out, &mut ch);
     let (nk, cp) = ch.available();
     emit(&out, json!({"ev":"ready","timings":timings,"avail":[nk,cp]}));
-    while let Some(cmd) = ctl.recv().await {
+    while let Some(mut cmd) = ctl.recv().await {
         let id = cmd.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let name = cmd.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
+        let name = cmd.get("cmd").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let name = name.as_str();
         if name == "close" {
             break;
         }
@@ -297,15 +307,16 @@ async fn channel_loop(
             if params.proof().name() != proof {
                 anyhow::bail!("{proof}: the params are for {}", params.proof().name());
             }
-            // Never echo the witness parser's message: it may quote the value.
-            let witness: Option<Witness> = match cmd.get("witness") {
-                Some(w) if !w.is_null() => Some(serde_json::from_value(w.clone()).map_err(|_| anyhow::anyhow!("bad witness"))?),
+            // Moved out of the command (not copied), and never echo the
+            // witness parser's message: it may quote the value.
+            let witness: Option<Witness> = match cmd.get_mut("witness").map(serde_json::Value::take) {
+                Some(w) if !w.is_null() => Some(serde_json::from_value(w).map_err(|_| anyhow::anyhow!("bad witness"))?),
                 _ => None,
             };
             if want == Role::Prover && witness.is_none() {
                 anyhow::bail!("{proof}: prove needs a witness");
             }
-            let r = tokio::time::timeout(Duration::from_secs(60), ch.request(&params, witness.as_ref())).await;
+            let r = tokio::time::timeout(PROOF_TIMEOUT, ch.request(&params, witness.as_ref())).await;
             match r {
                 Ok(r) => r,
                 Err(_) => {
@@ -390,7 +401,8 @@ async fn run_channel(args: &[String]) -> Result<()> {
                 }
                 break;
             }
-            let mut data = vec![0u8; len];
+            // Control frames carry witnesses: wipe each frame once handled.
+            let mut data = zeroize::Zeroizing::new(vec![0u8; len]);
             if si.read_exact(&mut data).await.is_err() {
                 break;
             }

@@ -227,6 +227,7 @@ class Session {
   inBody = false
   bodyRecords: Uint8Array[] = []
   attJson: string | undefined
+  cCommitHex: string | undefined
 
   trackServerRecords(bytes: Uint8Array): void {
     let buf = concat(this.serverPending, bytes)
@@ -496,6 +497,10 @@ class Session {
     this.tNkStart = Date.now()
     const commit = await this.waitT('c_commit', 60000)
     checkPiNKParams(commit.params, OFFER, this.ap!, body.length)
+    // The attestation must later name the commitment π_NK proves; the frame
+    // has to carry exactly it.
+    this.cCommitHex = hex(Uint8Array.from(commit.params.PiNK.c_commit))
+    if (commit.c_commit !== this.cCommitHex) throw new Error("c_commit: the frame's commitment is not the one π_NK proves")
     await this.proofV2('pi_nk', 'verify', commit.params)
     this.log({ ev: 'pi_nk_ok' })
     this.tProofsReady = Date.now()
@@ -579,6 +584,9 @@ class Session {
     if (a?.sid !== this.sid || a.th_sh !== hex(this.thSH) || a.th_sf !== hex(this.thSF)) {
       throw new Error('attestation names another session or handshake')
     }
+    if (!this.cCommitHex || a.c_commit !== this.cCommitHex) {
+      throw new Error('attestation names a different head-record commitment')
+    }
 
     await settleFlush(this)
     // Serial mode (default): finish π_C2S before starting π_C3S. The node
@@ -634,6 +642,7 @@ class Session {
       keyUpdates: epoch.keyUpdates,
       epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
       trailing: epoch.trailing,
+      tailLens,
     })
     await this.proofV2('pi_c3s', 'prove', c3.params, { Secret: Array.from(this.ap!.serverAp0) })
     this.twopc?.close()
@@ -677,10 +686,15 @@ class Session {
       throw new Error('receipt names larger fees than the signed offer')
     }
     if (upstreamStatus >= 400) {
-      // A provider refusal (4xx/503) costs at most the session fee.
+      // A provider refusal (4xx/503) costs at most the session fee, any other
+      // error at most the session's reservation.
       const unbilled = upstreamStatus === 503 || upstreamStatus < 500
+      const cost = receipt.cost_msats ?? 0
+      const costBound = unbilled
+        ? SESSION_FEE
+        : Math.max(SESSION_FEE, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
       const errOk =
-        receipt.usage?.error_status === upstreamStatus && (!unbilled || (receipt.cost_msats ?? 0) <= SESSION_FEE)
+        receipt.usage?.error_status === upstreamStatus && typeof cost === 'number' && cost >= 0 && cost <= costBound
       console.log(
         `[client ${this.label}] error receipt: status=${upstreamStatus} cost_msats=${receipt.cost_msats} ok=${errOk} signature_ok=${okSig}`,
       )
@@ -921,6 +935,7 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
   if (!eq(p.hk, ap.hk)) throw new Error('π_NK: hk is not the anchor from our 2PC')
   const n = filled.length + 1
   if (!eq(p.header, [0x17, 0x03, 0x03, (n + 16) >> 8, (n + 16) & 0xff])) throw new Error('π_NK: record header mismatch')
+  if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) throw new Error('π_NK: c_commit missing')
 }
 
 /** An offer that names another protocol than v2 (v1 is retired) is refused. */

@@ -1,8 +1,10 @@
 # zkbench: v2 statements vs v1
 
 Measured 2026-10-10 on an Apple M2 Max, release build, with real OT (Chou-Orlandi, KOS, Ferret). Command:
-`zkbench/target/release/cu-prover --bench` (v1 and v2) or `--bench --v2` (v2 only). Prover and verifier
-run in one process over the emulated transport (`src/transport.rs`):
+`zkbench/target/release/cu-prover --bench` (it runs π_NK, π_C2S and π_C3S). Protocol v1 is retired: its
+rows (π_C1, π_N, π_C2, π_C3) are kept from the same run for comparison only, and its proofs are no longer in
+the code (they live on the `v1-poc` branch). Prover and verifier run in one process over the emulated
+transport (`src/transport.rs`):
 
 - `local`: no delay.
 - `wan`: 25 ms one way (50 ms RTT) and 100 Mbit/s.

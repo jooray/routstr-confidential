@@ -114,26 +114,69 @@ impl Sc {
     }
 
     /// Runs the point-addition conversion for this party's point `(x, y)`
-    /// and returns its additive share of the sum's x-coordinate.
+    /// and returns its additive share of the sum's x-coordinate. The local
+    /// intermediates are overwritten before returning (copies inside mpz2's
+    /// OLE state are out of reach).
     pub async fn point_add_x(&mut self, ctx: &mut Context, x: P256, y: P256) -> Result<P256> {
-        let inputs = match self {
+        let mut inputs = match self {
             Sc::S(_) => [-y, -x],
             Sc::R(_) => [y, x],
         };
-        let m = self.a2m(ctx, &inputs).await?;
+        let r = self.point_add_x_inner(ctx, &inputs, x).await;
+        wipe_fps(&mut inputs);
+        r
+    }
+
+    async fn point_add_x_inner(&mut self, ctx: &mut Context, inputs: &[P256; 2], x: P256) -> Result<P256> {
+        let mut m = self.a2m(ctx, inputs).await?;
         if m.len() != 2 {
+            wipe_fps(&mut m);
             return Err(Error::Protocol("ectf: a2m output length".into()));
         }
-        let inv = m[1]
-            .inverse()
-            .ok_or_else(|| Error::Protocol("ectf: degenerate share".into()))?;
-        let lam = m[0] * inv;
-        let c = lam * lam;
-        let d = self.m2a(ctx, &[c]).await?;
-        if d.len() != 1 {
-            return Err(Error::Protocol("ectf: m2a output length".into()));
-        }
-        Ok(d[0] - x)
+        let Some(mut inv) = m[1].inverse() else {
+            wipe_fps(&mut m);
+            return Err(Error::Protocol("ectf: degenerate share".into()));
+        };
+        let mut lam = m[0] * inv;
+        let mut c = [lam * lam];
+        wipe_fps(&mut m);
+        wipe_fp(&mut inv);
+        wipe_fp(&mut lam);
+        let d = self.m2a(ctx, &c).await;
+        wipe_fps(&mut c);
+        let mut d = d?;
+        let r = if d.len() == 1 {
+            Ok(d[0] - x)
+        } else {
+            Err(Error::Protocol("ectf: m2a output length".into()))
+        };
+        wipe_fps(&mut d);
+        r
+    }
+}
+
+/// Overwrites a secret field element. mpz2's `P256` is `Copy` without a
+/// `Zeroize` impl, so this does what `zeroize` does for such types: a
+/// volatile write the compiler cannot elide, then a fence.
+pub(crate) fn wipe_fp(x: &mut P256) {
+    // SAFETY: `x` is a valid, aligned, exclusive reference, and the value
+    // written is a valid `P256` (which has no drop glue).
+    unsafe { std::ptr::write_volatile(x, P256::zero()) };
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn wipe_fps(v: &mut [P256]) {
+    for x in v {
+        wipe_fp(x);
+    }
+}
+
+/// A secret field element, overwritten when dropped.
+pub(crate) struct SecretFp(pub P256);
+
+impl Drop for SecretFp {
+    fn drop(&mut self) {
+        wipe_fp(&mut self.0);
     }
 }
 
