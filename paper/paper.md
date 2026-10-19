@@ -850,26 +850,25 @@ steps of about 0.48 MB per direction because the OT extension runs in fixed chun
 Live sessions against api.venice.ai (`deepseek-v4-flash`, 40 tokens), client and node on one host,
 medians of 5 sessions each unless noted. The single-party variant (v1, section 7) is measured on the
 same setup. These and the other live end-to-end figures in this section are the author's measurements;
-unlike the component benchmarks, their session logs are not published. In these runs the reference
+the v2 runs of 2026-10-19 (this table and the deployed-node runs below) are in `docs/evidence/measure-2026-10-19/`. In these runs the reference
 client opens the proof channel alongside the 2PC preprocessing, so the proofs on the request path run
 over it.
 
 | | v1 (single-party) | v2 (this protocol) |
 |---|---|---|
-| Cold: request start → body sent | 0.73 s | 1.2 s (2PC preprocessing 0.76 s; $\pi_{NK}$ 0.06 s over the proof channel); one run |
-| Cold: suffix proof held before U starts | 0.45 s ($\pi_{C2}$) | at most 0.16 s ($\pi_{C2S}$; component benchmark, not timed in the live run) |
-| Cold: time to first token | 1.90 s | 2.43 s † |
-| Pre-warmed: arming time per session | 0.71 s | 0.88 s † |
-| Pre-warmed (reference client, armed through $\pi_{NK}$): claim → body sent | 3 ms | 5 ms |
-| Pre-warmed: time to first token | 1.41 s | 0.90 s † |
+| Cold: request start → body sent | 0.73 s | 1.03 s (2PC preprocessing 0.75 s; $\pi_{NK}$ 0.06 s over the proof channel) |
+| Cold: suffix proof held before U starts | 0.45 s ($\pi_{C2}$) | 0.035 s ($\pi_{C2S}$ over the proof channel) |
+| Cold: time to first token | 1.90 s | 1.95 s |
+| Pre-warmed: arming time per session | 0.71 s | 1.03 s (reference client, through $\pi_{NK}$) |
+| Pre-warmed (reference client, armed through $\pi_{NK}$): claim → body sent | 3 ms | 2 ms |
+| Pre-warmed: time to first token | 1.41 s | 1.05 s |
 
-† Measured with the dual-execution 2PC (section 6.6). Its preprocessing took 0.49 s in the live client against
-0.70-0.84 s now, so arming and the cold time to first token are now a few hundred milliseconds
-longer; its online phases took 27 and 33 ms with their checks, against 33 and 40 ms now, so the
-pre-warmed path is essentially unchanged.
+The v2 column was measured on 2026-10-19 with the node-only garbling (2PC phases A and B took 41 and 48 ms,
+$\pi_{C3S}$ 0.04 s). The time to first token is dominated by the provider's own latency, which ranged from
+0.84 to 2.0 s across these runs.
 
-On one host the protocol's own path to U starting work is 1.18 s for v1 and about 1.3-1.4 s for v2 cold,
-and 0.45 s against at most 0.16 s pre-warmed. The time-to-first-token figures are dominated by the provider's own
+On one host the protocol's own path to U starting work is 1.18 s for v1 and about 1.07 s for v2 cold
+(body sent at 1.03 s, then $\pi_{C2S}$), and 0.45 s against 0.035 s pre-warmed. The time-to-first-token figures are dominated by the provider's own
 latency, which varied by several hundred milliseconds during the runs. An earlier interleaved
 comparison of the single-party variant with a direct HTTPS call (60 tokens, n = 8) measured +1.07 s to
 first token cold and about +0.25 s pre-warmed. $\pi_{C3S}$ and settlement run after the client's stream
@@ -906,7 +905,10 @@ pre-warmed, $\pi_{NK}$ took 0.21-0.25 s, $\pi_{C2S}$ 0.04 s and $\pi_{C3S}$ 0.06
 for the first two with per-proof setup. With the dual-execution 2PC, a cold request from that
 connection reached its first token after about 35 s, almost all of it the client uploading its half of
 the preprocessing, and a session armed up to the key share gave a first token after 2.0-3.2 s, most of it
-the provider's own latency.
+the provider's own latency. With the node-only garbling, on 2026-10-19 from a home connection, a cold
+request reached its first token after 6.7 to 21 s (the client's half of the 2PC preprocessing took 4.6 to
+18.8 s, depending on the moment's uplink), and a session armed through $\pi_{NK}$ (5.8 to 6.6 s of
+arming) after 1.1 to 1.5 s; $\pi_{NK}$ took 0.18 s and $\pi_{C2S}$ 0.035 s over the proof channel.
 
 A second set of runs used a poor, download-limited link: a laptop on congested 2.4 GHz Wi-Fi (up to
 about 900 ms to the local router) behind a satellite connection, with only about 2-5 Mbit/s from the
@@ -1162,8 +1164,10 @@ pre-warmed session costs 2 sats; and a client opening sessions it does not use i
 time per address, each costing 2 sats. (The limit was three at first; parallel coding agents, whose
 subagents each open a session per turn, ran into it, and every session is already backed by a funded
 worst-case reservation, so money rather than the count is the main brake.) We measured both cases on the live node: a completed request was
-charged 25 msat, an abandoned session 2000 msat. Separately, each request reserves the model's
-worst-case prompt for its duration (about 157 sats for a model with a 1M-token context at these rates)
+charged 25 msat, an abandoned session 2000 msat (re-measured on 2026-10-19: completed 40-token requests on
+two DeepSeek models were charged 6 to 27 msat, an abandoned session exactly 2000 msat). Separately, each
+request reserves the model's worst-case prompt for its duration (about 157 sats for a model with a
+1M-token context at these rates; 159 to 160 sats on 2026-10-19)
 and releases what it does not use, so a credential needs that much balance to start a session even
 though it is not spent.
 

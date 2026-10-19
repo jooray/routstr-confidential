@@ -14,3 +14,12 @@ the API key.
 
 The chat gate offers X25519 (A9, A11); the P-256 key share that v2 uses is exercised by the live v2
 sessions and, on the image route, by checks I8 and I9.
+
+## measure-2026-10-19/
+
+End-to-end timings of protocol v2 with the node-only garbling, one JSON line per session, from the
+reference client (`crypto/client/src/driver.ts`): `local-cold`/`local-arm` (client, node and sidecar on
+one host, live api.venice.ai, `deepseek-v4-flash`, 40 tokens, 5 sessions each) and
+`deployed-cold`/`deployed-arm` (from a home connection to routstr.cypherpunk.today, 3 each). `arm`
+means the reference client's `--arm` (armed through the handshake and pi_NK, then claimed at once).
+These are the figures in paper §6.3.
