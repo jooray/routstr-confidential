@@ -1216,10 +1216,20 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
   if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) throw new Error('π_NK: c_commit missing')
 }
 
-/** An offer that names another protocol than v2 (v1 is retired) is refused. */
+/** The keys the canonical suffix pins, in order (the sidecar's SUFFIX_KEYS). */
+const SUFFIX_KEYS = ['model', 'max_tokens', 'max_completion_tokens', 'n', 'stream', 'stream_options', 'venice_parameters']
+
+/**
+ * An offer that names another protocol than v2 (v1 is retired), or other
+ * suffix keys than the ones the suffix pins, is refused.
+ */
 function checkOfferVersion(offer: any): void {
   if (offer && offer.v !== undefined && offer.v !== PROTO) {
     console.error(`[client] the offer is for protocol v${offer.v}; this client speaks only v${PROTO}`)
+    process.exit(4)
+  }
+  if (offer && JSON.stringify(offer.suffix_keys) !== JSON.stringify(SUFFIX_KEYS)) {
+    console.error(`[client] the offer's suffix_keys ${JSON.stringify(offer.suffix_keys)} are not the keys the suffix pins`)
     process.exit(4)
   }
 }
