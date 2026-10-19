@@ -156,21 +156,86 @@ const SUFFIX_MODEL = ADV_SUFFIX_MODEL ?? MODEL
 // setup (the body is what the upstream sees; the suffix check is what would
 // catch it, so this matters only when the suffix is withheld).
 const BODY_MAX_TOKENS = Number(arg('--adv-body-max-tokens', String(MAX_TOKENS)))
-const chatSuffix =
-  `,"model":${JSON.stringify(SUFFIX_MODEL)},"max_tokens":${BODY_MAX_TOKENS},` +
-  `"max_completion_tokens":${BODY_MAX_TOKENS},"n":1,"stream":true,` +
-  `"stream_options":{"include_usage":true},` +
-  `"venice_parameters":{"include_venice_system_prompt":false,"enable_web_search":"off"}}`
 let priv = `{"messages":[{"role":"user","content":${JSON.stringify(PROMPT)}}]`
 if (DECOY) priv += `,"model":${JSON.stringify(DECOY)}`
 // Test hook: extra private JSON members (e.g. a field the provider rejects, to
 // exercise the upstream-error path).
 const PRIVATE_EXTRA = arg('--private-extra')
 if (PRIVATE_EXTRA) priv += `,${PRIVATE_EXTRA}`
-let suffix = chatSuffix
-let bodyText = priv + suffix
-let body = new TextEncoder().encode(bodyText)
-let suffixBytes = new TextEncoder().encode(suffix)
+let suffix = ''
+let bodyText = ''
+let body = new Uint8Array(0)
+let suffixBytes = new Uint8Array(0)
+
+/** Compact JSON with object members sorted (the sidecar's serde_json form). */
+function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`
+  if (v !== null && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(',')}}`
+  }
+  return JSON.stringify(v)
+}
+
+/** The chat suffix the offer's `chat` block defines (docs/CHAT-SUFFIX.md). */
+export function renderChatSuffix(chat: any, model: string, maxTokens: number): string {
+  const parts = [`"model":${JSON.stringify(model)}`]
+  for (const k of chat.cap_keys) parts.push(`${JSON.stringify(k)}:${maxTokens}`)
+  for (const [k, v] of chat.fixed_pins) parts.push(`${JSON.stringify(k)}:${canonicalJson(v)}`)
+  return `,${parts.join(',')}}`
+}
+
+const CAP_KEYS = ['max_tokens', 'max_completion_tokens', 'max_output_tokens']
+const PIN_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
+const pinValueOk = (v: unknown): boolean =>
+  typeof v === 'boolean' ||
+  (typeof v === 'number' && Number.isSafeInteger(v)) ||
+  (typeof v === 'string' && /^[\x20-\x7e]*$/.test(v) && !/["\\]/.test(v)) ||
+  (Array.isArray(v) && v.every(pinValueOk)) ||
+  (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.entries(v).every(([k, x]) => PIN_KEY.test(k) && pinValueOk(x)))
+const pinIsOff = (v: unknown): boolean =>
+  v === false || v === 'off' || (Array.isArray(v) && v.length === 0) ||
+  (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.values(v).every(pinIsOff))
+
+/** Why the offer's chat block is outside the policy every client applies, or null. */
+export function chatBlockProblem(offer: any): string | null {
+  const c = offer?.chat
+  if (!c || typeof c !== 'object' || !Array.isArray(c.cap_keys) || !Array.isArray(c.fixed_pins)) return 'no chat block'
+  if (c.cap_keys.length === 0) return 'no cap key'
+  const seen = new Set<string>()
+  for (const k of c.cap_keys) {
+    if (!CAP_KEYS.includes(k) || seen.has(k)) return `cap key ${JSON.stringify(k)}`
+    seen.add(k)
+  }
+  for (const p of c.fixed_pins) {
+    if (!Array.isArray(p) || p.length !== 2 || typeof p[0] !== 'string') return 'a malformed pin'
+    const [k, v] = p
+    if (!PIN_KEY.test(k) || k === 'model' || CAP_KEYS.includes(k) || seen.has(k)) return `pin key ${JSON.stringify(k)}`
+    seen.add(k)
+    if (!pinValueOk(v)) return `pin ${k} outside the grammar`
+    const ok = k === 'stream' ? v === true
+      : k === 'n' ? v === 1
+      : k === 'stream_options' ? v !== null && typeof v === 'object' && !Array.isArray(v) && v.include_usage === true &&
+        Object.entries(v).every(([m, x]) => m === 'include_usage' || pinIsOff(x))
+      : pinIsOff(v)
+    if (!ok) return `pin ${k}=${JSON.stringify(v)} is not allowed`
+  }
+  if (!seen.has('stream') || !seen.has('stream_options')) return 'stream and stream_options must be pinned'
+  const pins = c.fixed_pins.map(([k, v]: [string, unknown]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')
+  if (pins.length > 1024) return 'pins too long'
+  const keys = ['model', ...c.cap_keys, ...c.fixed_pins.map((p: [string, unknown]) => p[0])]
+  if (JSON.stringify(offer.suffix_keys) !== JSON.stringify(keys)) return `suffix_keys ${JSON.stringify(offer.suffix_keys)} are not ${JSON.stringify(keys)}`
+  return null
+}
+
+/** Build the chat body once the offer is known: private messages + pinned suffix. */
+function setupChatBody(): void {
+  if (chatBlockProblem(OFFER)) throw new Error(`the offer's chat block is refused: ${chatBlockProblem(OFFER)}`)
+  suffix = renderChatSuffix(OFFER.chat, SUFFIX_MODEL, BODY_MAX_TOKENS)
+  bodyText = priv + suffix
+  body = new TextEncoder().encode(bodyText)
+  suffixBytes = new TextEncoder().encode(suffix)
+}
 
 /** The offer's images block: the node's signed one, or the sidecar's endpoint. */
 function imagesOffer(): any {
@@ -1224,20 +1289,18 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
   if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) throw new Error('π_NK: c_commit missing')
 }
 
-/** The keys the canonical suffix pins, in order (the sidecar's SUFFIX_KEYS). */
-const SUFFIX_KEYS = ['model', 'max_tokens', 'max_completion_tokens', 'n', 'stream', 'stream_options', 'venice_parameters']
-
 /**
- * An offer that names another protocol than v2 (v1 is retired), or other
- * suffix keys than the ones the suffix pins, is refused.
+ * An offer that names another protocol than v2 (v1 is retired), or a chat
+ * block outside the policy (docs/CHAT-SUFFIX.md), is refused.
  */
 function checkOfferVersion(offer: any): void {
   if (offer && offer.v !== undefined && offer.v !== PROTO) {
     console.error(`[client] the offer is for protocol v${offer.v}; this client speaks only v${PROTO}`)
     process.exit(4)
   }
-  if (offer && JSON.stringify(offer.suffix_keys) !== JSON.stringify(SUFFIX_KEYS)) {
-    console.error(`[client] the offer's suffix_keys ${JSON.stringify(offer.suffix_keys)} are not the keys the suffix pins`)
+  const problem = offer ? chatBlockProblem(offer) : null
+  if (problem) {
+    console.error(`[client] the offer's chat block is refused: ${problem}`)
     process.exit(4)
   }
 }
@@ -1304,6 +1367,8 @@ async function main() {
   if (IMAGE) {
     if (ARM || POOL > 0) throw new Error('image sessions are never armed')
     setupImageBody()
+  } else {
+    setupChatBody()
   }
 
   if (ABANDON) {

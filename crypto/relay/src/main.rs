@@ -65,8 +65,13 @@ struct Offer {
     key_alphabet: String,
     #[serde(default)]
     key_length: usize,
+    /// The keys the chat suffix pins, in order: derived from `chat` (an
+    /// offer file that lists them must list exactly those).
     #[serde(default)]
     suffix_keys: Vec<String>,
+    /// The pinned JSON suffix of a chat request (docs/CHAT-SUFFIX.md).
+    #[serde(default)]
+    chat: ChatSuffix,
     #[serde(default = "default_max_tokens_cap")]
     max_tokens_cap: u64,
     #[serde(default)]
@@ -99,6 +104,150 @@ struct Endpoints {
 impl Endpoints {
     fn is_empty(&self) -> bool {
         self.images.is_none()
+    }
+}
+
+/// The keys a chat suffix may carry the token cap under.
+const CHAT_CAP_KEYS: [&str; 3] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+
+/// The most bytes the fixed pins of a chat suffix may render to.
+const MAX_CHAT_PINS_LEN: usize = 1024;
+
+/// The pinned JSON suffix of a chat request (docs/CHAT-SUFFIX.md): `model`,
+/// the token cap under each of `cap_keys`, then `fixed_pins` in order. The
+/// operator writes it in the offer file; the node signs it into its offer and
+/// clients render the same bytes from there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatSuffix {
+    cap_keys: Vec<String>,
+    #[serde(default)]
+    fixed_pins: Vec<(String, serde_json::Value)>,
+}
+
+impl Default for ChatSuffix {
+    /// Provider-neutral: no provider's own extras (the Venice offer file adds
+    /// `venice_parameters`).
+    fn default() -> Self {
+        ChatSuffix {
+            cap_keys: vec!["max_tokens".into(), "max_completion_tokens".into()],
+            fixed_pins: vec![
+                ("n".into(), serde_json::json!(1)),
+                ("stream".into(), serde_json::json!(true)),
+                ("stream_options".into(), serde_json::json!({"include_usage": true})),
+            ],
+        }
+    }
+}
+
+impl ChatSuffix {
+    /// The keys the suffix pins, in order.
+    fn keys(&self) -> Vec<String> {
+        std::iter::once("model".to_string())
+            .chain(self.cap_keys.iter().cloned())
+            .chain(self.fixed_pins.iter().map(|(k, _)| k.clone()))
+            .collect()
+    }
+
+    /// The suffix for `model` and `max_tokens`, byte for byte as the clients
+    /// render it (compact JSON, object members sorted).
+    fn render(&self, model: &str, max_tokens: u64) -> String {
+        let j = |v: &serde_json::Value| serde_json::to_string(v).unwrap_or_default();
+        let mut parts = vec![format!("\"model\":{}", j(&serde_json::Value::from(model)))];
+        for k in &self.cap_keys {
+            parts.push(format!("{}:{max_tokens}", j(&serde_json::Value::from(k.as_str()))));
+        }
+        if !self.fixed_pins.is_empty() {
+            parts.push(self.render_pins());
+        }
+        format!(",{}}}", parts.join(","))
+    }
+
+    fn render_pins(&self) -> String {
+        let j = |v: &serde_json::Value| serde_json::to_string(v).unwrap_or_default();
+        self.fixed_pins
+            .iter()
+            .map(|(k, v)| format!("{}:{}", j(&serde_json::Value::from(k.as_str())), j(v)))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The policy every client applies to the signed offer (docs/CHAT-SUFFIX.md):
+    /// checked at startup, so an offer clients would refuse never goes out.
+    fn validate(&self) -> Result<()> {
+        if self.cap_keys.is_empty() {
+            bail!("chat cap_keys is empty");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for k in &self.cap_keys {
+            if !CHAT_CAP_KEYS.contains(&k.as_str()) {
+                bail!("chat cap key {k:?} is not one of {CHAT_CAP_KEYS:?}");
+            }
+            if !seen.insert(k.as_str()) {
+                bail!("chat cap key {k:?} is repeated");
+            }
+        }
+        for (k, v) in &self.fixed_pins {
+            if !pin_key_ok(k) || k == "model" || CHAT_CAP_KEYS.contains(&k.as_str()) || !seen.insert(k.as_str()) {
+                bail!("chat pin key {k:?} is malformed, repeated, model or a cap key");
+            }
+            if !pin_value_ok(v) {
+                bail!("chat pin {k:?} has a value outside the pin grammar (booleans, integers, plain ASCII strings, lists, objects)");
+            }
+            let ok = match k.as_str() {
+                "stream" => *v == serde_json::Value::Bool(true),
+                "n" => *v == serde_json::json!(1),
+                "stream_options" => v.as_object().is_some_and(|o| {
+                    o.get("include_usage") == Some(&serde_json::Value::Bool(true))
+                        && o.iter().all(|(m, x)| m == "include_usage" || pin_is_off(x))
+                }),
+                _ => pin_is_off(v),
+            };
+            if !ok {
+                bail!("chat pin {k:?} is not allowed: stream must be true, n 1, stream_options include usage, and every other pin switch something off (false, \"off\", [] or an object of those)");
+            }
+        }
+        for need in ["stream", "stream_options"] {
+            if !self.fixed_pins.iter().any(|(k, _)| k == need) {
+                bail!("chat fixed_pins must pin {need:?} (the usage proof reads the streamed usage event)");
+            }
+        }
+        if self.render_pins().len() > MAX_CHAT_PINS_LEN {
+            bail!("chat fixed_pins render to more than {MAX_CHAT_PINS_LEN} bytes");
+        }
+        Ok(())
+    }
+}
+
+/// A pinned request key: an identifier.
+fn pin_key_ok(k: &str) -> bool {
+    let mut c = k.chars();
+    c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_') && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+}
+
+/// A value every party serializes to the same bytes: booleans, integers below
+/// 2^53, printable ASCII strings without quote or backslash, lists and objects
+/// of those (object keys as for request keys).
+fn pin_value_ok(v: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::Bool(_) => true,
+        Value::Number(n) => n.as_i64().is_some_and(|i| i.unsigned_abs() < 1 << 53),
+        Value::String(s) => s.bytes().all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\'),
+        Value::Array(a) => a.iter().all(pin_value_ok),
+        Value::Object(o) => o.iter().all(|(k, x)| pin_key_ok(k) && pin_value_ok(x)),
+        Value::Null => false,
+    }
+}
+
+/// A pin that switches something off: `false`, `"off"`, `[]`, or an object of those.
+fn pin_is_off(v: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match v {
+        Value::Bool(b) => !b,
+        Value::String(s) => s == "off",
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.values().all(pin_is_off),
+        _ => false,
     }
 }
 
@@ -722,7 +871,8 @@ async fn main() -> Result<()> {
             head_template: default_head_template_for(&host, key.len()),
             key_alphabet: default_key_alphabet(),
             key_length: key.len(),
-            suffix_keys: SUFFIX_KEYS.iter().map(|k| k.to_string()).collect(),
+            suffix_keys: Vec::new(),
+            chat: ChatSuffix::default(),
             max_tokens_cap: default_max_tokens_cap(),
             notary_pubkey: String::new(),
             model_allowlist: Vec::new(),
@@ -751,14 +901,14 @@ async fn main() -> Result<()> {
         offer.head_template = default_head_template_for(&offer.upstream_host, key.len());
     }
     offer.head_template = with_key_length(&offer.head_template, key.len());
-    // The offer advertises the keys the suffix pins; they are the ones
-    // `canonical_suffix` writes, so an offer naming others is refused.
-    if offer.suffix_keys.is_empty() {
-        offer.suffix_keys = SUFFIX_KEYS.iter().map(|k| k.to_string()).collect();
+    // The chat suffix is the offer's `chat` block; `suffix_keys` lists its
+    // keys, so an offer file naming others is refused.
+    offer.chat.validate().context("the offer's chat block")?;
+    let keys = offer.chat.keys();
+    if !offer.suffix_keys.is_empty() && offer.suffix_keys != keys {
+        bail!("the offer's suffix_keys {:?} differ from the keys its chat block pins {keys:?}", offer.suffix_keys);
     }
-    if offer.suffix_keys != SUFFIX_KEYS {
-        bail!("the offer's suffix_keys {:?} differ from the keys the sidecar pins {SUFFIX_KEYS:?}", offer.suffix_keys);
-    }
+    offer.suffix_keys = keys;
     offer.key_length = key.len();
     if let Some(images) = offer.endpoints.images.as_mut() {
         images.head_template = with_key_length(&images.head_template, key.len());
@@ -1418,7 +1568,7 @@ fn handle_setup(
         if model.is_empty() || max_tokens == 0 {
             bail!("setup needs a model and max_tokens >= 1");
         }
-        let canonical = canonical_suffix(&model, max_tokens);
+        let canonical = app.offer.chat.render(&model, max_tokens);
         if suffix.as_deref().is_some_and(|s| s != canonical) || count.is_some() {
             bail!("a chat setup's suffix is the canonical one and it has no count");
         }
@@ -1747,27 +1897,6 @@ fn locate_tail(lens: &[usize], first_response: usize, tail_lens: &[usize], trail
     }
     chosen.reverse();
     Ok(chosen)
-}
-
-/// The keys `canonical_suffix` pins, in order (published in the offer).
-const SUFFIX_KEYS: [&str; 7] = [
-    "model",
-    "max_tokens",
-    "max_completion_tokens",
-    "n",
-    "stream",
-    "stream_options",
-    "venice_parameters",
-];
-
-/// The public JSON suffix that pins every cost-relevant parameter (paper
-/// §4.4 / A.2). Last-wins semantics at the provider make these the effective
-/// values whatever the private prefix carries.
-fn canonical_suffix(model: &str, max_tokens: u64) -> String {
-    let m = serde_json::to_string(model).unwrap_or_else(|_| "\"\"".into());
-    format!(
-        ",\"model\":{m},\"max_tokens\":{max_tokens},\"max_completion_tokens\":{max_tokens},\"n\":1,\"stream\":true,\"stream_options\":{{\"include_usage\":true}},\"venice_parameters\":{{\"include_venice_system_prompt\":false,\"enable_web_search\":\"off\"}}}}"
-    )
 }
 
 /// Whether the parameters a proof ran on are the session's stored ones. Both
@@ -2542,11 +2671,18 @@ mod buffer_tests {
     }
 }
 
+/// The chat block of the shipped Venice offer file.
+#[cfg(test)]
+fn venice_chat() -> ChatSuffix {
+    let v: serde_json::Value = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
+    serde_json::from_value(v["chat"].clone()).unwrap()
+}
+
 #[cfg(test)]
 mod suffix_tests {
     #[test]
     fn proof_fixtures_use_the_production_suffix() {
-        let s = super::canonical_suffix("mistral-small-3-2-24b-instruct", 12);
+        let s = super::venice_chat().render("mistral-small-3-2-24b-instruct", 12);
         assert_eq!(s.as_bytes(), zkbench::fixtures::SUFFIX);
     }
 }
@@ -2929,7 +3065,7 @@ mod hardening_tests {
         assert!(st.head_template.starts_with("POST /api/v1/image/generate "));
         let (st, ready) = run_setup(&app, setup(None, serde_json::json!({"max_tokens": 7}))).unwrap();
         assert_eq!(st.images_count, None);
-        assert_eq!(ready["suffix"], canonical_suffix("m", 7));
+        assert_eq!(ready["suffix"], app.offer.chat.render("m", 7));
         assert!(ready.get("kind").is_none());
         for bad in [
             setup(Some("video"), serde_json::json!({"max_tokens": 7})),
@@ -3014,14 +3150,61 @@ mod hardening_tests {
     }
 
     #[test]
-    fn the_offer_names_the_keys_the_suffix_pins() {
-        let s = canonical_suffix("m", 5);
-        let v: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&format!("{{{}", &s[1..])).unwrap();
-        let mut keys: Vec<&str> = v.keys().map(|k| k.as_str()).collect();
-        let mut want = SUFFIX_KEYS.to_vec();
-        keys.sort();
-        want.sort();
-        assert_eq!(keys, want);
+    fn the_chat_suffix_renders_from_the_offer() {
+        let s = venice_chat().render("m", 5);
+        assert_eq!(
+            s,
+            r#","model":"m","max_tokens":5,"max_completion_tokens":5,"n":1,"stream":true,"stream_options":{"include_usage":true},"venice_parameters":{"enable_web_search":"off","include_venice_system_prompt":false}}"#
+        );
+        let keys: Vec<String> = serde_json::from_str::<Pairs>(&format!("{{{}", &s[1..])).unwrap().0.into_iter().map(|p| p.0).collect();
+        assert_eq!(keys, venice_chat().keys());
+        // Object members render sorted, whatever order the file wrote them in.
+        let mut c = ChatSuffix::default();
+        c.fixed_pins.push(("x".into(), serde_json::from_str(r#"{"b":false,"a":"off"}"#).unwrap()));
+        assert!(c.render("m", 1).ends_with(r#""x":{"a":"off","b":false}}"#));
+        assert!(ChatSuffix::default().validate().is_ok());
+        assert!(venice_chat().validate().is_ok());
+    }
+
+    #[test]
+    fn a_chat_block_clients_would_refuse_is_refused_at_startup() {
+        let with = |k: &str, v: serde_json::Value| {
+            let mut c = ChatSuffix::default();
+            c.fixed_pins.push((k.into(), v));
+            c.validate()
+        };
+        use serde_json::json;
+        for (k, v) in [
+            ("temperature", json!(2)),
+            ("tools", json!([{"type": "function"}])),
+            ("reasoning", json!({"effort": "high"})),
+            ("web_search", json!("on")),
+            ("x", json!(null)),
+            ("x", json!(0.5)),
+            ("x", json!("a\"b")),
+            ("max_output_tokens", json!(false)),
+            ("model", json!(false)),
+            ("n", json!(false)),
+            ("1x", json!(false)),
+            ("stream", json!(false)),
+        ] {
+            assert!(with(k, v.clone()).is_err(), "{k}={v} accepted");
+        }
+        assert!(with("parallel_tool_calls", json!(false)).is_ok());
+        assert!(with("extras", json!({"search": "off", "tags": []})).is_ok());
+        let mut c = ChatSuffix::default();
+        c.fixed_pins.retain(|(k, _)| k != "stream_options");
+        assert!(c.validate().is_err(), "stream_options is required");
+        let mut c = ChatSuffix::default();
+        c.fixed_pins[2].1 = json!({"include_usage": false});
+        assert!(c.validate().is_err());
+        for caps in [vec![], vec!["max_tokens", "max_tokens"], vec!["temperature"]] {
+            let c = ChatSuffix { cap_keys: caps.iter().map(|k| k.to_string()).collect(), ..ChatSuffix::default() };
+            assert!(c.validate().is_err(), "{caps:?} accepted");
+        }
+        let mut c = ChatSuffix::default();
+        c.fixed_pins.push(("big".into(), json!(vec!["off"; 200])));
+        assert!(c.validate().is_err(), "pins past the size limit");
     }
 
     #[test]

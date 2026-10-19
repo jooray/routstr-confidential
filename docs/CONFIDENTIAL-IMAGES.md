@@ -57,7 +57,8 @@ and the PWA.
 9. Variant aspect ratios: Venice tiers are `resolution` (where the model declares them) and
    `aspect_ratio`, which does not change the price, so it stays **private** (in the client's prefix,
    not pinned).
-10. Later phases (not now): an offer-driven suffix for chat, and token-metered image models.
+10. Later phases: an offer-driven suffix for chat (done 2026-10-19, docs/CHAT-SUFFIX.md), and
+    token-metered image models (not planned).
 
 ## 1. What exists today
 

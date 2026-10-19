@@ -174,11 +174,11 @@ the provider's account and API design that no request can test; for the case-stu
 such retrieval or forwarding in its published API on the two routes used. Everything except the
 specifics of items 4 to 7 and 9 is provider-generic: the epoch structure, the 2PC, the proofs and the record
 assembly do not change per provider; the head template, the pinned suffix, the price list and the usage
-parser do. In the current implementation only the head template and the price list come from the offer:
-the suffix and the usage parser are written for the case-study provider in the relay and in the
-clients, so a second provider needs a code change in each (the offer's `suffix_keys` only names the
-pinned keys). Image generation (section 4.10) goes further: its suffix is rendered from the signed
-offer (path, count key, fixed pins, variant pins). A second image provider that has the same shape (a
+parser do. In the current implementation the head template, the pinned suffix and the price list come
+from the signed offer (section 4.6); the usage parser expects an OpenAI-style streamed usage event, so a
+provider with the same streaming shape is a new sidecar offer file plus a profile run, and one with
+another usage format still needs a code change in the relay and the clients. Image generation (section
+4.10) likewise renders its suffix from the signed offer (path, count key, fixed pins, variant pins). A second image provider that has the same shape (a
 per-image price book with resolution and quality tiers, WebP output, and one of the two response
 shapes the clients parse) is a new offer entry; a provider priced per megapixel, keyed on other tier
 parameters, or answering in another shape still needs code in the node and the clients.
@@ -445,9 +445,17 @@ never handed out anything that C must prove correct.
 C writes body = body_private $\Vert$ suffix under $c_{ap,1}$ from sequence 0, with $|body|$ fixed at
 setup. body_private opens the JSON object and may carry messages, tools and other schema-valid fields.
 The suffix is the public string that pins every cost-relevant parameter: model, token caps, `n`,
-streaming, usage reporting and provider feature flags. N's relay builds it from the model and token cap
-declared at setup and accepts no other. The provider resolves the effective values to the suffix
-(section 3.1, item 5).
+streaming, usage reporting and provider feature flags. The signed offer describes it: the request keys
+that carry the token cap, then fixed pins in order. N's relay renders it from that description, the
+model and the token cap declared at setup, and accepts no other; C renders the same bytes from the
+signed offer. Because N chooses the description, C accepts it only within a narrow policy: the cap keys
+are among `max_tokens`, `max_completion_tokens` and `max_output_tokens`; `stream` is pinned on with
+usage reporting (the usage proof needs it) and `n` to 1; every other pin switches something off
+(`false`, `"off"`, an empty list, or an object of those); values are booleans, integers, plain ASCII
+strings, lists and objects, rendered as compact JSON with sorted members. A pin cannot inject content
+into C's request: a key the offer pins that C's caller also set to another value makes C refuse the
+request instead of letting the suffix silently replace it. The provider resolves the effective values
+to the suffix (section 3.1, item 5).
 
 C sends the suffix as its own final record. N forwards the earlier body records but **holds the record
 that completes the body** until $\pi_{C2S}$ verifies. N enforces that the epoch-1 plaintext is exactly
@@ -1141,7 +1149,7 @@ Confidential mode plugs into an existing routing deployment as an alternative *t
 else stays the deployment's own code. Negotiation is per request and stateless:
 
 1. **Offer.** The node publishes a signed offer (protocol version, upstream hostname, key length and
-   alphabet, head template, pinned suffix keys, a signed rate snapshot, attestation key) at a public
+   alphabet, head template, the description of the pinned suffix, a signed rate snapshot, attestation key) at a public
    endpoint. A node that serves images adds the `images` capability and its signed per-image variants
    (section 4.10); old clients ignore both.
 2. **Model listing.** The model listing gains one additive field per model that references the offer;
@@ -1363,10 +1371,11 @@ there too. The outputs of that day's runs are in `docs/evidence/`.
 - **Fake usage events:** a prompt instructing the model to emit them produced none. Every imitation was
   escaped inside a JSON string, and the raw stream contained no CR/LF inside events.
 
-**A.2 Profile application.** The pinned suffix for this provider:
-`,"model":M,"max_tokens":T,"max_completion_tokens":T,"n":1,"stream":true,"stream_options":{"include_usage":true},"venice_parameters":{...}`,
+**A.2 Profile application.** The pinned suffix for this provider, as its offer describes it:
+`,"model":M,"max_tokens":T,"max_completion_tokens":T,"n":1,"stream":true,"stream_options":{"include_usage":true},"venice_parameters":{"enable_web_search":"off","include_venice_system_prompt":false}}`,
 with `max_completion_tokens` pinned because it overrides `max_tokens` (a bypass observed in testing) and
-the provider-specific parameters pinned to keep web search and system-prompt injection off the bill.
+the provider-specific parameters pinned off to keep web search and system-prompt injection off the
+bill. Another provider's offer leaves out `venice_parameters` and pins its own extras off instead.
 
 **A.3 Other providers.** The generic pieces (epochs, 2PC, proofs) port unchanged. The open questions per
 provider are profile items 4 to 6, 8 and 9, plus whether HTTP/1.1, P-256 and a mid-request KeyUpdate are

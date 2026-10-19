@@ -3,15 +3,35 @@
   "head_template": "POST /api/v1/chat/completions HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
   "key_alphabet": "[A-Za-z0-9_-]",
   "key_length": 42,
-  "suffix_keys": [
-    "model",
-    "max_tokens",
-    "max_completion_tokens",
-    "n",
-    "stream",
-    "stream_options",
-    "venice_parameters"
-  ],
+  "chat": {
+    "cap_keys": [
+      "max_tokens",
+      "max_completion_tokens"
+    ],
+    "fixed_pins": [
+      [
+        "n",
+        1
+      ],
+      [
+        "stream",
+        true
+      ],
+      [
+        "stream_options",
+        {
+          "include_usage": true
+        }
+      ],
+      [
+        "venice_parameters",
+        {
+          "enable_web_search": "off",
+          "include_venice_system_prompt": false
+        }
+      ]
+    ]
+  },
   "max_tokens_cap": 4096,
   "notary_pubkey": "",
   "model_allowlist": [],

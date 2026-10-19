@@ -43,6 +43,7 @@ README note. Do not rebase or update them.
 | `docs/ADVERSARIAL-QA.md` | model binding, provider transferability (OpenRouter, Groq…), what the node learns, cost bounds (starts with a current-state box) |
 | `docs/REVIEW-2026-10-09.md` | every bug found and fixed (numbered findings), measurements, the plug-in refactor (§8) |
 | `docs/TWOPC-DESIGN.md` | protocol v2: the two-party handshake, epochs, session flow, the 2PC security model |
+| `docs/CHAT-SUFFIX.md` | the offer-driven chat suffix: the `chat` block, byte-exact rendering, the client policy, the caller-conflict rule |
 | `docs/TWOPC-NODE-GARBLING.md` | the node-only authenticated garbling: construction, security argument, the download cuts (64-bit salted rows, three-halves; why h1/h2/hk stay SHA-256) |
 | `docs/V1-V2-ONE-PAGER.md` / `.pdf` | v1 vs v2 trade-offs (data, speed, security); historical, v1 is retired |
 | `docs/original/*` | **local only, not published** (git-ignored). The rows below describe what is in it |
@@ -90,9 +91,11 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
    could write in epoch 0; paper residual risk 1). On the client's `release_head` the sidecar writes it and a
    KeyUpdate (epoch 0) in one write.
 5. *Body.* The client sends the body under `c_ap_1`, with the pinned JSON
-   suffix (model, caps, …) as its own final record. **The sidecar holds that
-   record until π_C2S proves it is the canonical suffix**, so Venice cannot
-   start on anything else.
+   suffix (model, caps, …) as its own final record. The suffix is described
+   by the offer's `chat` block (cap keys + fixed pins, from the sidecar offer
+   file; `docs/CHAT-SUFFIX.md` has the rendering and the policy clients hold
+   it to). **The sidecar holds that record until π_C2S proves it is the
+   canonical suffix**, so Venice cannot start on anything else.
 6. *Response.* It streams back; the client decrypts and verifies it. When
    Venice closes the connection the sidecar signs an attestation (sid,
    certificate-chain hash, both handshake transcript hashes, record counts
@@ -138,6 +141,7 @@ offer without v2 (`offer_unsupported_version`).
 | Concern | File |
 |---|---|
 | sidecar state machine, setup gate and limits, record hold, tail anchoring, error-head disclosure | `crypto/relay/src/main.rs` (`handle_setup`, `handle_control`, `validate_error_head`; + `tls.rs` handshake verification) |
+| chat suffix (offer `chat` block: render + policy) | sidecar `ChatSuffix` in `main.rs`; SDK and web `suffix.ts` (`validateChatSuffix`, `canonicalSuffix`); `driver.ts` (`chatBlockProblem`); shared vectors `chat-suffix-vectors.json` (SDK `tests/unit/fixtures`, web `test/fixtures`) |
 | ZK statements / circuits (one-bit equality `eq_bytes`) | `crypto/zkbench/src/statements.rs`, `gadgets.rs`, `bin/cu-prover.rs` (`--job-stdin`); tests `tests/v2.rs`, `tests/malformed.rs` |
 | node offer, model→provider candidate, billing glue (images: `images_offer_block`, `reserve_image`, `settle_flat`) | `routstr-core/routstr/confidential.py` |
 | node relay + interception | `routstr-core/routstr/confidential_ws.py` |

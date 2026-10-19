@@ -161,7 +161,12 @@ crypto/tools/provider-profile-check.py --help    # run it against your provider;
 ```
 
 The sidecar ships with an offer for Venice (`crypto/relay/offer.venice.json`: host, request-head template,
-pinned suffix keys); adapt it for another OpenAI-compatible provider. **Models and prices come from the
+the `chat` block that describes the pinned suffix); adapt it for another OpenAI-compatible provider. The
+`chat` block names the request keys that carry the token cap and the pins that follow (`docs/CHAT-SUFFIX.md`):
+without it the sidecar pins `max_tokens`, `max_completion_tokens`, `n`, `stream` and `stream_options` only;
+Venice's file adds `venice_parameters` to keep Venice's own system prompt and web search off the bill. The
+sidecar refuses at startup a block that clients would refuse (a pin may only switch something off). A
+deployment that copies the offer file (for example to mount it) must add the block to its copy. **Models and prices come from the
 node:** every model the node serves through the sidecar's provider host is offered confidentially, at the
 node's normal rates (plus any surcharge). The node reserves a full-context prompt, so image inputs need no
 separate gate. The reservation is `max(MIN_REQUEST_MSAT, ⌈(context_length·in + (max_tokens + margin)·out)/1000⌉)`

@@ -186,7 +186,7 @@ async function runV2(model: string) {
     `,"model":${JSON.stringify(model)},"max_tokens":${MAX_TOKENS},` +
     `"max_completion_tokens":${MAX_TOKENS},"n":1,"stream":true,` +
     `"stream_options":{"include_usage":true},` +
-    `"venice_parameters":{"include_venice_system_prompt":false,"enable_web_search":"off"}}`
+    `"venice_parameters":{"enable_web_search":"off","include_venice_system_prompt":false}}`
   const priv = `{"messages":[{"role":"user","content":"Say hello in five words."}]`
   const bodyPriv = enc.encode(priv)
   const bodySuffix = enc.encode(suffix)

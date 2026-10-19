@@ -104,11 +104,17 @@ EXPECT_BAD_CHARACTER = (404, r"character")
 EXPECT_IMAGE_REJECTED = (400, r"Image content is not supported")
 
 MSG = '"messages":[{"role":"user","content":"Say hi."}]'
-# Every request carries the protocol's pinned venice_parameters, as real
-# sessions do (without it Venice injects a ~1.6k-token system prompt).
-STREAM = (
-    '"stream":true,"stream_options":{"include_usage":true},'
-    '"venice_parameters":{"include_venice_system_prompt":false,"enable_web_search":"off"}'
+# Every request carries the fixed pins of the shipped offer's chat block
+# (docs/CHAT-SUFFIX.md), rendered as the sidecar renders them, as real
+# sessions do (without venice_parameters Venice injects a ~1.6k-token system
+# prompt). CU_OFFER names another sidecar offer file.
+_OFFER_FILE = os.environ.get(
+    "CU_OFFER", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relay", "offer.venice.json")
+)
+with open(_OFFER_FILE) as _f:
+    _CHAT = json.load(_f)["chat"]
+STREAM = ",".join(
+    json.dumps(k) + ":" + json.dumps(v, sort_keys=True, separators=(",", ":")) for k, v in _CHAT["fixed_pins"]
 )
 # Positive-control body for CHEAP (well-formed, nothing offending).
 BASE = "{" + MSG + f',"model":"{CHEAP}","max_tokens":4,' + STREAM + "}"

@@ -32,7 +32,7 @@ fn xor(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 /// The pinned suffix in production shape (the sidecar's `canonical_suffix`
 /// for this model and max_tokens = 12): the statement size of π_C2S.
-pub const SUFFIX: &[u8] = b",\"model\":\"mistral-small-3-2-24b-instruct\",\"max_tokens\":12,\"max_completion_tokens\":12,\"n\":1,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"venice_parameters\":{\"include_venice_system_prompt\":false,\"enable_web_search\":\"off\"}}";
+pub const SUFFIX: &[u8] = b",\"model\":\"mistral-small-3-2-24b-instruct\",\"max_tokens\":12,\"max_completion_tokens\":12,\"n\":1,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"venice_parameters\":{\"enable_web_search\":\"off\",\"include_venice_system_prompt\":false}}";
 
 fn window_params(h1: [u8; 32], key: [u8; 16], iv: [u8; 12], seq: u64, inner: &[u8], target: &[u8]) -> PiC2S {
     let stream = aesgcm::ctr_keystream(&key, &iv, seq, inner.len());

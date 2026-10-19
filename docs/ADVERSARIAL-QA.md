@@ -266,7 +266,7 @@ current billing.
 | Piece | Venice value | Where pinned |
 |---|---|---|
 | Head template: path `/api/v1/chat/completions`, `Host`, `Authorization: Bearer {KEY:42}` | Venice path + 42-char key | `main.rs` `default_head_template_for`; offer `head_template` |
-| Suffix key set | `model,max_tokens,max_completion_tokens,n,stream,stream_options,venice_parameters` | SPEC §5.0/§5.5; `main.rs` `canonical_suffix` |
+| Suffix (keys and pinned values) | `model,max_tokens,max_completion_tokens,n,stream,stream_options,venice_parameters` | the sidecar offer's `chat` block (`relay/offer.venice.json`); docs/CHAT-SUFFIX.md |
 | Duplicate-key last-wins + escaped-key normalization + strict-schema 400s | Tested for Venice only | VENICE-TESTS |
 | `venice_parameters` semantics (system prompt, web search billing) | Venice-only fields | VENICE-TESTS |
 | Usage event shape: last `data:` event before `[DONE]`, `choices:[]`, `usage{prompt_tokens,completion_tokens[,prompt_tokens_details]}`, **`cost{usd,diem}`** | Venice format | VENICE-TESTS; SPEC §5.7 |

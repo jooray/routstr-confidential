@@ -14,7 +14,7 @@ const suffix =
   `,"model":${JSON.stringify(MODEL)},"max_tokens":${MAX_TOKENS},` +
   `"max_completion_tokens":${MAX_TOKENS},"n":1,"stream":true,` +
   `"stream_options":{"include_usage":true},` +
-  `"venice_parameters":{"include_venice_system_prompt":false,"enable_web_search":"off"}}`
+  `"venice_parameters":{"enable_web_search":"off","include_venice_system_prompt":false}}`
 const body = `{"messages":[{"role":"user","content":${JSON.stringify(PROMPT)}}]` + suffix
 
 function oneRun(): Promise<{ ttft: number; total: number; bytes: number }> {
