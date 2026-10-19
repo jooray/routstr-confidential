@@ -56,6 +56,12 @@ const SIDECAR = arg('--sidecar', 'http://127.0.0.1:7443')!
 const MODEL = arg('--model', 'mistral-small-3-2-24b-instruct')!
 const MAX_TOKENS = Number(arg('--max-tokens', '12'))
 const PROMPT = arg('--prompt', 'Say hi in three words.')!
+// Image generation (docs/CONFIDENTIAL-IMAGES.md): --image [--count N]
+// [--variant <id>] (node offer) or [--resolution 1K|2K|4K] (direct sidecar).
+const IMAGE = argv.includes('--image')
+const IMAGE_COUNT = Number(arg('--count', '1'))
+const IMAGE_VARIANT = arg('--variant')
+const IMAGE_RESOLUTION = arg('--resolution')
 const DECOY = arg('--decoy-model')
 // --- adversarial GAP-1 probes (crypto/tools/adversarial-model-swap) ---------
 // Craft a suffix whose model differs from the setup model, ignoring the node's
@@ -146,7 +152,7 @@ const SUFFIX_MODEL = ADV_SUFFIX_MODEL ?? MODEL
 // setup (the body is what the upstream sees; the suffix check is what would
 // catch it, so this matters only when the suffix is withheld).
 const BODY_MAX_TOKENS = Number(arg('--adv-body-max-tokens', String(MAX_TOKENS)))
-const suffix =
+const chatSuffix =
   `,"model":${JSON.stringify(SUFFIX_MODEL)},"max_tokens":${BODY_MAX_TOKENS},` +
   `"max_completion_tokens":${BODY_MAX_TOKENS},"n":1,"stream":true,` +
   `"stream_options":{"include_usage":true},` +
@@ -157,9 +163,53 @@ if (DECOY) priv += `,"model":${JSON.stringify(DECOY)}`
 // exercise the upstream-error path).
 const PRIVATE_EXTRA = arg('--private-extra')
 if (PRIVATE_EXTRA) priv += `,${PRIVATE_EXTRA}`
-const bodyText = priv + suffix
-const body = new TextEncoder().encode(bodyText)
-const suffixBytes = new TextEncoder().encode(suffix)
+let suffix = chatSuffix
+let bodyText = priv + suffix
+let body = new TextEncoder().encode(bodyText)
+let suffixBytes = new TextEncoder().encode(suffix)
+
+/** The offer's images block: the node's signed one, or the sidecar's endpoint. */
+function imagesOffer(): any {
+  const im = OFFER?.images ?? OFFER?.endpoints?.images
+  if (!im) throw new Error('offer_no_images: the offer has no images endpoint')
+  return im
+}
+
+/** The pinned image suffix (docs/CONFIDENTIAL-IMAGES.md §0.3), byte-exact. */
+export function renderImagesSuffix(im: any, model: string, count: number, pins: [string, unknown][]): string {
+  const parts = [`"model":${JSON.stringify(model)}`, `${JSON.stringify(im.count_key)}:${JSON.stringify(count)}`]
+  for (const [k, v] of [...(im.fixed_pins ?? []), ...pins]) parts.push(`${JSON.stringify(k)}:${JSON.stringify(v)}`)
+  return `,${parts.join(',')}}`
+}
+
+let IMAGE_PINS: [string, unknown][] = []
+let IMAGE_VARIANT_ID: string | undefined
+let IMAGE_MSAT = 0
+
+/** Build the image body once the offer is known: private prompt + suffix. */
+function setupImageBody(): void {
+  const im = imagesOffer()
+  if (!(Number.isSafeInteger(IMAGE_COUNT) && IMAGE_COUNT >= 1 && IMAGE_COUNT <= (im.max_count ?? 1))) {
+    throw new Error(`--count must be 1..${im.max_count ?? 1}`)
+  }
+  const variants: any[] | undefined = im.price_list?.[MODEL]
+  if (variants) {
+    const v = IMAGE_VARIANT ? variants.find((x) => x.id === IMAGE_VARIANT) : variants[0]
+    if (!v) throw new Error(`no offered variant ${IMAGE_VARIANT ?? ''} for ${MODEL}`)
+    IMAGE_PINS = v.pins
+    IMAGE_VARIANT_ID = v.id
+    IMAGE_MSAT = v.msat_per_image
+  } else {
+    if (IMAGE_RESOLUTION) IMAGE_PINS.push(['resolution', IMAGE_RESOLUTION])
+    IMAGE_PINS.push(['format', 'webp'])
+  }
+  suffix = renderImagesSuffix(im, MODEL, IMAGE_COUNT, IMAGE_PINS)
+  let p = `{"prompt":${JSON.stringify(PROMPT)}`
+  if (PRIVATE_EXTRA) p += `,${PRIVATE_EXTRA}`
+  bodyText = p + suffix
+  body = new TextEncoder().encode(bodyText)
+  suffixBytes = new TextEncoder().encode(suffix)
+}
 
 // ---------------------------------------------------------------------------
 // Signature verification
@@ -371,14 +421,16 @@ class Session {
     await this.wsReady
     const nonceC = hex(cryptoRandom(32))
     if (NODE_MODE) {
-      const setup: any = {
-        type: 'setup',
-        nonce_c: nonceC,
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
-        len: body.length,
-        armed: ARM,
-      }
+      const setup: any = IMAGE
+        ? { type: 'setup', kind: 'images', nonce_c: nonceC, model: MODEL, variant: IMAGE_VARIANT_ID, count: IMAGE_COUNT, len: body.length }
+        : {
+            type: 'setup',
+            nonce_c: nonceC,
+            model: MODEL,
+            max_tokens: MAX_TOKENS,
+            len: body.length,
+            armed: ARM,
+          }
       setup.auth = this.token ?? ''
       if (OFFER_SIG) setup.offer_sig = OFFER_SIG
       // Accept the signed offer's fees (the node refuses a setup that does
@@ -387,14 +439,18 @@ class Session {
       if (ABANDON_FEE > 0 && !NO_ACCEPT_FEE) setup.abandon_fee_msat = ABANDON_FEE
       this.sendText(setup)
     } else {
-      this.sendText({
-        type: 'setup',
-        nonce_c: nonceC,
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
-        len: body.length,
-        escrow_e: 1000,
-      })
+      this.sendText(
+        IMAGE
+          ? { type: 'setup', kind: 'images', nonce_c: nonceC, model: MODEL, count: IMAGE_COUNT, suffix, len: body.length, escrow_e: 1000 }
+          : {
+              type: 'setup',
+              nonce_c: nonceC,
+              model: MODEL,
+              max_tokens: MAX_TOKENS,
+              len: body.length,
+              escrow_e: 1000,
+            },
+      )
     }
     this.ready = await this.waitT('ready', 30000)
     this.sid = this.ready.sid
@@ -496,7 +552,7 @@ class Session {
     // an alphabet key, and K_0 is the one the 2PC anchored (hk).
     this.tNkStart = Date.now()
     const commit = await this.waitT('c_commit', 60000)
-    checkPiNKParams(commit.params, OFFER, this.ap!, body.length)
+    checkPiNKParams(commit.params, IMAGE ? { ...OFFER, head_template: imagesOffer().head_template } : OFFER, this.ap!, body.length)
     // The attestation must later name the commitment π_NK proves; the frame
     // has to carry exactly it.
     this.cCommitHex = hex(Uint8Array.from(commit.params.PiNK.c_commit))
@@ -606,6 +662,9 @@ class Session {
     const upstreamStatus = Number(/^HTTP\/1\.\d (\d{3})/.exec(statusLine)?.[1] ?? 0)
     if (upstreamStatus >= 400) {
       console.log(`[client ${this.label}] upstream error ${upstreamStatus}: ${Buffer.from(this.responseBytes).toString('utf8').split('\r\n\r\n')[1]?.slice(0, 200)}`)
+    }
+    if (IMAGE && upstreamStatus > 0 && upstreamStatus < 400) {
+      return await this.acceptImages(runDir, tClaim, tBodyWrite, attMsg, attOk)
     }
     let r: Uint8Array | null
     let skip = 0
@@ -776,11 +835,100 @@ class Session {
       proofs: ['twopc', 'pi_nk', 'pi_c2s', 'pi_c3s'],
     }
   }
+
+  /** A successful image response: accept it (no disclosure) and check the flat charge. */
+  async acceptImages(runDir: string, tClaim: number, tBodyWrite: number, attMsg: any, attOk: boolean): Promise<any> {
+    this.sendText({ type: 'accept' })
+    const terminal = await Promise.race([
+      this.bus.wait('receipt').then((m) => ({ kind: 'receipt' as const, m })),
+      this.bus.wait('usage').then((m) => ({ kind: 'usage' as const, m })),
+      this.errP,
+      timeout(60000, 'receipt/usage'),
+    ])
+    this.twopc?.close()
+    this.zkchan?.close()
+    let receipt: any
+    let okSig = false
+    if (terminal.kind === 'receipt') {
+      const receiptJson = terminal.m.receipt_json ?? JSON.stringify(terminal.m.receipt)
+      receipt = JSON.parse(receiptJson)
+      okSig = verifySig(receiptJson, terminal.m.sig, this.ready.pubkey, terminal.m.sig_scheme)
+      if (!okSig) throw new Error('receipt signature invalid')
+      if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${receipt.sid}, not ${this.sid}`)
+      if (this.attJson !== undefined && receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))) {
+        throw new Error("receipt is not bound to this session's attestation")
+      }
+    } else {
+      receipt = { sid: this.sid, model: terminal.m.model, usage: terminal.m.usage, unsigned: true }
+    }
+    // Flat charge: exactly the signed per-image price × count + the session fee.
+    let costOk = true
+    if (NODE_MODE) {
+      const want = IMAGE_MSAT * IMAGE_COUNT + SESSION_FEE
+      costOk = receipt.cost_msats === want && receipt.variant === IMAGE_VARIANT_ID && receipt.count === IMAGE_COUNT
+      if (!costOk) throw new Error(`image receipt charges ${receipt.cost_msats}, not ${want} for ${IMAGE_COUNT} × ${IMAGE_VARIANT_ID}`)
+    } else if (receipt.usage?.flat !== true || receipt.usage?.count !== IMAGE_COUNT) {
+      throw new Error('usage frame is not a flat charge for the pinned count')
+    }
+    const json = JSON.parse(Buffer.from(responseBody(this.responseBytes)).toString('utf8'))
+    const shape = imagesOffer().response_shape
+    const images: string[] = shape === 'venice' ? json.images ?? [] : (json.data ?? []).map((d: any) => d.b64_json)
+    const files = images.map((b64, i) => {
+      const f = `${runDir}/image-${i}.webp`
+      writeFileSync(f, Buffer.from(b64, 'base64'))
+      return f
+    })
+    writeFileSync(`${runDir}/client.jsonl`, this.logLines.join('\n') + '\n')
+    writeFileSync(`${runDir}/receipt.json`, JSON.stringify(receipt, null, 2))
+    if (attMsg.a) writeFileSync(`${runDir}/attestation.json`, JSON.stringify(attMsg.a, null, 2))
+    const tEnd = Date.now()
+    console.log(
+      `[client ${this.label}] images: ${images.length} of ${IMAGE_COUNT} (${files.join(', ')}) response_bytes=${this.responseBytes.length} ` +
+        `cost_msats=${receipt.cost_msats} cost_ok=${costOk} signature_ok=${okSig} attestation_ok=${attOk}`,
+    )
+    return {
+      sid: this.sid,
+      kind: 'images',
+      model: MODEL,
+      count: IMAGE_COUNT,
+      images: images.length,
+      files,
+      response_bytes: this.responseBytes.length,
+      cost_msats: receipt.cost_msats,
+      cost_ok: costOk,
+      receipt_sig_ok: okSig || !NODE_MODE,
+      total_ms: tEnd - tClaim,
+      upstream_ms: (this.ttft || tEnd) - tBodyWrite,
+      zk: this.zkTimes,
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
 // R extraction
 // ---------------------------------------------------------------------------
+
+/** The HTTP response body (de-chunked when chunked). */
+function responseBody(b: Uint8Array): Uint8Array {
+  const headEnd = Buffer.from(b).indexOf('\r\n\r\n')
+  if (headEnd < 0) throw new Error('response has no head')
+  const head = Buffer.from(b.subarray(0, headEnd)).toString('latin1').toLowerCase()
+  const rest = b.subarray(headEnd + 4)
+  if (!/\r\ntransfer-encoding:\s*chunked/.test(head)) return rest
+  const out: Uint8Array[] = []
+  let i = 0
+  for (;;) {
+    const eol = Buffer.from(rest.subarray(i)).indexOf('\r\n')
+    if (eol < 0) throw new Error('truncated chunk size')
+    const n = parseInt(Buffer.from(rest.subarray(i, i + eol)).toString('latin1'), 16)
+    if (!Number.isFinite(n)) throw new Error('bad chunk size')
+    i += eol + 2
+    if (n === 0) break
+    out.push(rest.subarray(i, i + n))
+    i += n + 2
+  }
+  return Buffer.concat(out)
+}
 
 function parseChunks(b: Uint8Array): { start: number; data: Uint8Array }[] | null {
   let off = 0
@@ -1005,6 +1153,10 @@ async function verifyOffer(): Promise<void> {
 
 async function main() {
   await verifyOffer()
+  if (IMAGE) {
+    if (ARM || POOL > 0) throw new Error('image sessions are never armed')
+    setupImageBody()
+  }
 
   if (ABANDON) {
     const s = new Session('abandon', ESCROW_TOKENS[0])

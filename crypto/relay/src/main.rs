@@ -85,6 +85,185 @@ struct Offer {
     /// a sidecar without it would charge every session its full reservation.
     #[serde(default)]
     node_settles: bool,
+    /// Further request kinds beside chat completions (absent: chat only).
+    #[serde(default, skip_serializing_if = "Endpoints::is_empty")]
+    endpoints: Endpoints,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Endpoints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<ImagesEndpoint>,
+}
+
+impl Endpoints {
+    fn is_empty(&self) -> bool {
+        self.images.is_none()
+    }
+}
+
+/// Image generation at a flat per-image price (docs/CONFIDENTIAL-IMAGES.md).
+/// The node prices the variants and renders the suffix; the sidecar checks
+/// that the suffix it is handed has exactly the shape this block allows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImagesEndpoint {
+    head_template: String,
+    #[serde(default = "default_images_billing")]
+    billing: String,
+    response_shape: String,
+    /// The request key that carries the image count (pinned after `model`).
+    count_key: String,
+    #[serde(default = "default_images_max_count")]
+    max_count: u64,
+    /// Pinned in this order after the count, for every request.
+    #[serde(default)]
+    fixed_pins: Vec<(String, serde_json::Value)>,
+    /// The per-variant keys and the values they may take.
+    #[serde(default)]
+    param_space: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    #[serde(default = "default_images_max_response")]
+    max_response_bytes: usize,
+    #[serde(default = "default_images_idle")]
+    response_idle_s: u64,
+}
+
+fn default_images_billing() -> String {
+    "flat".into()
+}
+
+fn default_images_max_count() -> u64 {
+    4
+}
+
+fn default_images_max_response() -> usize {
+    MAX_SERVER_BYTES
+}
+
+fn default_images_idle() -> u64 {
+    300
+}
+
+impl ImagesEndpoint {
+    /// Startup checks: a template the relay and π_NK can use, and pins whose
+    /// keys never collide (the suffix check relies on unique keys).
+    fn validate(&self, host: &str, key_len: usize) -> Result<()> {
+        let t = &self.head_template;
+        for need in [" HTTP/1.1\r\n", "\r\nConnection: close\r\n", "\r\nAccept-Encoding: identity\r\n", "{LEN}"] {
+            if !t.contains(need) {
+                bail!("images head_template lacks {need:?}");
+            }
+        }
+        if !t.starts_with("POST /") || !t.contains(&format!("\r\nHost: {host}\r\n")) || !t.ends_with("\r\n\r\n") {
+            bail!("images head_template must be a POST to {host} ending the head");
+        }
+        placeholder_head(t, key_len, 1)?;
+        if self.billing != "flat" {
+            bail!("images billing {:?} is not supported (only flat)", self.billing);
+        }
+        if !matches!(self.response_shape.as_str(), "venice" | "openai") {
+            bail!("images response_shape {:?} is not venice or openai", self.response_shape);
+        }
+        if !(1..=10).contains(&self.max_count) {
+            bail!("images max_count {} outside 1..=10", self.max_count);
+        }
+        if self.max_response_bytes == 0 || self.max_response_bytes > MAX_SERVER_BYTES {
+            bail!("images max_response_bytes outside 1..={MAX_SERVER_BYTES}");
+        }
+        let mut keys = std::collections::HashSet::new();
+        for k in std::iter::once(&"model".to_string())
+            .chain(std::iter::once(&self.count_key))
+            .chain(self.fixed_pins.iter().map(|(k, _)| k))
+            .chain(self.param_space.keys())
+        {
+            if k.is_empty() || !keys.insert(k.clone()) {
+                bail!("images pin key {k:?} is empty or repeated");
+            }
+        }
+        if self.param_space.values().any(|v| v.is_empty()) {
+            bail!("images param_space has a key with no allowed values");
+        }
+        Ok(())
+    }
+
+    /// The pinned suffix for `model`, `count` and the variant's `pins`, byte
+    /// for byte as the node and the clients render it.
+    fn render_suffix(&self, model: &str, count: u64, pins: &[(String, serde_json::Value)]) -> String {
+        let j = |v: &serde_json::Value| serde_json::to_string(v).unwrap_or_default();
+        let mut parts = vec![
+            format!("\"model\":{}", j(&serde_json::Value::from(model))),
+            format!("{}:{count}", j(&serde_json::Value::from(self.count_key.as_str()))),
+        ];
+        for (k, v) in self.fixed_pins.iter().chain(pins) {
+            parts.push(format!("{}:{}", j(&serde_json::Value::from(k.as_str())), j(v)));
+        }
+        format!(",{}}}", parts.join(","))
+    }
+
+    /// The image count `suffix` pins, if it is exactly a suffix this endpoint
+    /// allows for `model`: model, count in 1..=max_count, the fixed pins in
+    /// order, then variant pins from `param_space` with allowed values, keys
+    /// unique, compact.
+    fn check_suffix(&self, model: &str, suffix: &str) -> Result<u64> {
+        let body = suffix.strip_prefix(',').ok_or_else(|| anyhow!("images suffix must start with ','"))?;
+        let pairs: Pairs = serde_json::from_str(&format!("{{{body}"))
+            .map_err(|_| anyhow!("images suffix is not the tail of a JSON object"))?;
+        let pairs = pairs.0;
+        let nf = self.fixed_pins.len();
+        if pairs.len() < 2 + nf {
+            bail!("images suffix pins too few keys");
+        }
+        if pairs[0] != ("model".to_string(), serde_json::Value::from(model)) {
+            bail!("images suffix does not pin the setup's model first");
+        }
+        if pairs[1].0 != self.count_key {
+            bail!("images suffix does not pin {:?} second", self.count_key);
+        }
+        let count = pairs[1].1.as_u64().filter(|c| (1..=self.max_count).contains(c))
+            .ok_or_else(|| anyhow!("images count outside 1..={}", self.max_count))?;
+        if pairs[2..2 + nf] != self.fixed_pins[..] {
+            bail!("images suffix does not carry the fixed pins in order");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (k, _) in &pairs {
+            if !seen.insert(k) {
+                bail!("images suffix repeats {k:?}");
+            }
+        }
+        let pins = &pairs[2 + nf..];
+        for (k, v) in pins {
+            let allowed = self.param_space.get(k).ok_or_else(|| anyhow!("images suffix pins {k:?}, not a variant key"))?;
+            if !allowed.contains(v) {
+                bail!("images suffix pins {k:?} to a value the offer does not allow");
+            }
+        }
+        if self.render_suffix(model, count, pins) != suffix {
+            bail!("images suffix is not in canonical form");
+        }
+        Ok(count)
+    }
+}
+
+/// A JSON object's members in order, duplicates kept (so they can be refused).
+struct Pairs(Vec<(String, serde_json::Value)>);
+
+impl<'de> Deserialize<'de> for Pairs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Pairs;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> std::result::Result<Pairs, A::Error> {
+                let mut out = Vec::new();
+                while let Some((k, v)) = m.next_entry::<String, serde_json::Value>()? {
+                    out.push((k, v));
+                }
+                Ok(Pairs(out))
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 /// `["id", …]`, or the legacy `{"id": true, …}` map (entries marked true).
@@ -376,6 +555,8 @@ impl Drop for ZkConnSlot {
 /// Recorded relay state needed for the proofs.
 #[derive(Default)]
 struct RelayLog {
+    /// The endpoint's response cap (image sessions); `MAX_SERVER_BYTES` otherwise.
+    max_server_bytes: Option<usize>,
     /// The client's handshake flight as relayed (ClientHello, CCS, Finished)
     /// and the raw upstream bytes up to the handshake verification (it and
     /// the 2PC need them); later upstream bytes are only hashed and counted.
@@ -438,8 +619,9 @@ impl RelayLog {
     /// Upstream bytes: hashed and counted for the attestation, kept raw until
     /// the handshake is verified, and refused past `MAX_SERVER_BYTES`.
     fn server_bytes(&mut self, data: &[u8], handshake_verified: bool) -> Result<()> {
-        if self.recv_len + data.len() > MAX_SERVER_BYTES {
-            bail!("upstream sent more than {MAX_SERVER_BYTES} bytes");
+        let cap = self.max_server_bytes.unwrap_or(MAX_SERVER_BYTES);
+        if self.recv_len + data.len() > cap {
+            bail!("upstream sent more than {cap} bytes");
         }
         self.recv_len += data.len();
         self.recv.update(data);
@@ -531,6 +713,7 @@ async fn main() -> Result<()> {
             notary_pubkey: String::new(),
             model_allowlist: Vec::new(),
             node_settles: false,
+            endpoints: Endpoints::default(),
         }
     };
     offer.node_settles = node_settles;
@@ -563,6 +746,11 @@ async fn main() -> Result<()> {
         bail!("the offer's suffix_keys {:?} differ from the keys the sidecar pins {SUFFIX_KEYS:?}", offer.suffix_keys);
     }
     offer.key_length = key.len();
+    if let Some(images) = offer.endpoints.images.as_mut() {
+        images.head_template = with_key_length(&images.head_template, key.len());
+        let host = offer.upstream_host.clone();
+        images.validate(&host, key.len())?;
+    }
     // The π_NK membership circuit is a fixed-size check over one alphabet. An
     // offer demanding another alphabet must fail here rather than let the
     // sidecar prove membership in the wrong set.
@@ -662,8 +850,18 @@ enum ClientMsg {
     Setup {
         nonce_c: String,
         model: String,
+        #[serde(default)]
         max_tokens: u64,
         len: usize,
+        /// `chat` (default) or `images`; any other kind is refused.
+        #[serde(default)]
+        kind: Option<String>,
+        /// The node's rendered suffix for an image request (checked against
+        /// the offer's images endpoint).
+        #[serde(default)]
+        suffix: Option<String>,
+        #[serde(default)]
+        count: Option<u64>,
         #[serde(default)]
         escrow_e: u64,
         /// The client's Cashu escrow token (node-settles mode). The sidecar
@@ -705,6 +903,9 @@ enum ClientMsg {
     /// The client accepts π_NK (it verified it) and claims the session; N
     /// writes the credential record and the KeyUpdate under K_0.
     ReleaseHead {},
+    /// Image sessions: the client accepts a successful response. The charge
+    /// is the flat price fixed at setup, so nothing is disclosed.
+    Accept {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -786,6 +987,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     };
     let setup: ClientMsg = serde_json::from_str(&first).map_err(|e| anyhow!("bad setup: {e}"))?;
     handle_setup(setup, &app, &shared, &to_client, &mut st)?;
+    if st.images_count.is_some() {
+        log.max_server_bytes = app.offer.endpoints.images.as_ref().map(|e| e.max_response_bytes);
+    }
 
     // The 2PC preprocessing (tens of MB over the client's link) runs before
     // the ClientHello exists, and a pre-warmed session then waits for a request.
@@ -873,7 +1077,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                             let parsed: ClientMsg = match serde_json::from_str(&t) {
                                 Ok(p) => p, Err(e) => { return Err(anyhow!("bad control: {e}")); }
                             };
-                            if let Err(e) = handle_control(parsed, &shared, &to_client, &mut st, &mut log, &mut tcp_tx).await {
+                            if let Err(e) = handle_control(parsed, &app, &shared, &to_client, &mut st, &mut log, &mut tcp_tx).await {
                                 warn!("control error: {e}");
                                 // Propagate: the outer handler sends an explicit
                                 // {type:"error"} frame before closing, so the
@@ -1036,42 +1240,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 if !same {
                                     bail!("π_C3S parameters changed after the proof started");
                                 }
-                                if let Some(usage) = st.usage.clone() {
-                                    let model = usage
-                                        .get("model")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    if app.node_settles {
-                                        // The node holds the wallet and the
-                                        // Nostr key: it prices, refunds and
-                                        // signs. Send it the verified usage.
-                                        let _ = to_client.send(Message::Text(
-                                            serde_json::json!({
-                                                "type":"usage",
-                                                "sid": st.sid,
-                                                "model": model,
-                                                "usage": usage,
-                                            }).to_string().into(),
-                                        ));
-                                        side(&mut st, "pi_c3s verified; usage handed to the node to settle".into());
-                                        st.state = SessionState::Settled;
-                                    } else if let Some(receipt) = settle(&app, &st) {
-                                        // Prototype/stub settlement (sidecar signs).
-                                        // Sign the exact serialized bytes so the client
-                                        // can verify without JSON re-serialization drift.
-                                        let receipt_json = receipt.to_string();
-                                        let sig = app.signer.sign(receipt_json.as_bytes());
-                                        let _ = to_client.send(Message::Text(
-                                            serde_json::json!({
-                                                "type":"receipt","receipt":receipt,
-                                                "receipt_json":receipt_json,
-                                                "sig":hex::encode(sig.to_bytes()),
-                                            }).to_string().into(),
-                                        ));
-                                        write_receipt(&st.run_dir, &receipt);
-                                        st.state = SessionState::Settled;
-                                    }
+                                if st.usage.is_some() {
+                                    emit_settlement(&app, &mut st, &to_client);
                                 }
                             }
                             _ => {}
@@ -1175,6 +1345,13 @@ struct Session {
     /// Setup values the suffix must pin.
     model: String,
     max_tokens: u64,
+    /// `Some(count)` for an image session, `None` for chat.
+    images_count: Option<u64>,
+    /// The suffix the final body record must end with (rendered at setup).
+    suffix: String,
+    /// The request head template for this session's kind.
+    head_template: String,
+    accepted: bool,
     /// Body (epoch 1) accounting: records and content bytes relayed.
     body_records: usize,
     body_bytes: usize,
@@ -1208,15 +1385,42 @@ fn handle_setup(
     let send = |v: serde_json::Value| {
         let _ = to_client.send(Message::Text(v.to_string().into()));
     };
-    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed } = msg else {
+    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed, kind, suffix, count } = msg else {
         bail!("expected a setup frame");
     };
     if st.sid.is_some() || st.state != SessionState::Handshake {
         bail!("duplicate setup");
     }
-    if model.is_empty() || max_tokens == 0 {
-        bail!("setup needs a model and max_tokens >= 1");
-    }
+    let images = match kind.as_deref() {
+        None | Some("chat") => false,
+        Some("images") => true,
+        Some(other) => bail!("unknown session kind {other:?}"),
+    };
+    let images_count = if images {
+        let ep = app.offer.endpoints.images.as_ref().ok_or_else(|| anyhow!("this sidecar offers no images endpoint"))?;
+        if model.is_empty() || max_tokens != 0 || armed {
+            bail!("an image setup needs a model, no max_tokens, and is never armed");
+        }
+        let suffix = suffix.as_deref().ok_or_else(|| anyhow!("an image setup needs the node's suffix"))?;
+        let n = ep.check_suffix(&model, suffix)?;
+        if count.is_some_and(|c| c != n) {
+            bail!("setup count {count:?} differs from the suffix's count {n}");
+        }
+        st.suffix = suffix.to_string();
+        st.head_template = ep.head_template.clone();
+        Some(n)
+    } else {
+        if model.is_empty() || max_tokens == 0 {
+            bail!("setup needs a model and max_tokens >= 1");
+        }
+        let canonical = canonical_suffix(&model, max_tokens);
+        if suffix.as_deref().is_some_and(|s| s != canonical) || count.is_some() {
+            bail!("a chat setup's suffix is the canonical one and it has no count");
+        }
+        st.suffix = canonical;
+        st.head_template = app.offer.head_template.clone();
+        None
+    };
     if len == 0 || len > app.max_body {
         bail!("declared body length {len} outside 1..={}", app.max_body);
     }
@@ -1250,7 +1454,8 @@ fn handle_setup(
     st.body_len = len;
     st.model = model.clone();
     st.max_tokens = max_tokens;
-    let (head, _) = placeholder_head(&app.offer.head_template, app.key.len(), len)?;
+    st.images_count = images_count;
+    let (head, _) = placeholder_head(&st.head_template, app.key.len(), len)?;
     st.head_len = head.len();
     st.run_dir = Some(init_run_dir(app, &sid)?);
     app.sessions.lock().unwrap().insert(sid.clone(), shared.clone());
@@ -1258,19 +1463,25 @@ fn handle_setup(
         st,
         format!("setup sid={} model={} len={} max_tokens={} armed={} node_settles={}", sid, model, len, max_tokens, armed, app.node_settles),
     );
-    send(serde_json::json!({
+    let mut ready = serde_json::json!({
         "type":"ready","nonce_n":hex::encode(nonce_n),"sid":sid,
         "pubkey":app.offer.notary_pubkey,"head_len":head.len(),
-        "suffix": canonical_suffix(&model, max_tokens),
+        "suffix": st.suffix,
         "armed": armed,
         "v": app.offer.v,
-    }));
+    });
+    if let Some(n) = images_count {
+        ready["kind"] = "images".into();
+        ready["count"] = n.into();
+    }
+    send(ready);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_control(
     msg: ClientMsg,
+    app: &Arc<AppState>,
     shared: &Arc<SessionShared>,
     to_client: &mpsc::UnboundedSender<Message>,
     st: &mut Session,
@@ -1307,9 +1518,8 @@ async fn handle_control(
             let suffix = hex::decode(&suffix)?;
             // The suffix is not the client's choice: it must be exactly the one
             // that pins the setup's model and caps (and the escrow sizing).
-            let expect = canonical_suffix(&st.model, st.max_tokens);
-            if suffix != expect.as_bytes() {
-                bail!("body suffix does not match the canonical suffix for model/max_tokens");
+            if suffix != st.suffix.as_bytes() {
+                bail!("body suffix does not match the session's pinned suffix");
             }
             st.c2_requested = true;
             let last = log.client_app.last().ok_or_else(|| anyhow!("no body record"))?;
@@ -1333,10 +1543,20 @@ async fn handle_control(
             shared.params.lock().unwrap().insert("pi_c2s".into(), params.clone());
             send(serde_json::json!({"type":"zk_params","proof":"pi_c2s","params":params}));
         }
+        ClientMsg::Accept {} => {
+            let Some(count) = st.images_count else { bail!("accept is for image sessions only") };
+            if st.state != SessionState::Attested || st.disclosed || st.accepted || !st.c2_ok {
+                bail!("accept out of order or repeated");
+            }
+            st.accepted = true;
+            st.usage = Some(serde_json::json!({"flat": true, "kind": "images", "count": count, "model": st.model}));
+            side(st, format!("accepted: flat charge for {count} image(s)"));
+            emit_settlement(app, st, to_client);
+        }
         ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing } => {
             // Only once, and only after the upstream closed: the anchor is the
             // end of the final transcript.
-            if st.state != SessionState::Attested || st.disclosed {
+            if st.state != SessionState::Attested || st.disclosed || st.accepted {
                 bail!("disclose out of order or repeated");
             }
             st.disclosed = true;
@@ -1365,6 +1585,9 @@ async fn handle_control(
             // response head: its status decides the charge, the body stays
             // private (it sits in the `skip` bytes after the head).
             let error_head = r.starts_with(b"HTTP/1.");
+            if st.images_count.is_some() && !error_head {
+                bail!("an image session discloses only an error head (a success is accepted)");
+            }
             let usage = if error_head {
                 validate_error_head(&r)?
             } else {
@@ -1742,7 +1965,7 @@ async fn v2_progress(
         let header: [u8; 5] = rec[..5].try_into()?;
         let c_commit = cu_crypto::transcript::hash(&rec[..rec.len() - 16]);
         st.ku_record = Some(tls_v2::seal_record(&ap.k0, &ap.iv0, 1, &tls_v2::KEY_UPDATE_NOT_REQUESTED, tls::CT_HANDSHAKE));
-        let (template, _) = placeholder_head(&app.offer.head_template, app.key.len(), st.body_len)?;
+        let (template, _) = placeholder_head(&st.head_template, app.key.len(), st.body_len)?;
         let params = Params::PiNK(zkbench::statements::PiNK {
             hk: ap.hk,
             head_len: st.head_len,
@@ -1804,7 +2027,7 @@ where
 
 /// The head with the API key spliced in; zeroized when dropped.
 fn fill_head_now(app: &Arc<AppState>, st: &Session) -> Result<(Zeroizing<Vec<u8>>, Vec<usize>)> {
-    let (head, offsets) = placeholder_head(&app.offer.head_template, app.key.len(), st.body_len)?;
+    let (head, offsets) = placeholder_head(&st.head_template, app.key.len(), st.body_len)?;
     let mut head = Zeroizing::new(head);
     for (i, off) in offsets.iter().enumerate() {
         head[*off] = app.key[i];
@@ -2151,6 +2374,53 @@ fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
         bail!("R: usage event missing token counts");
     }
     Ok(v)
+}
+
+/// Hand the verified usage (π_C3S) or an image session's flat acceptance to
+/// the node, or, without `--node-settles`, sign a stub receipt.
+fn emit_settlement(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) {
+    let Some(usage) = st.usage.clone() else { return };
+    if app.node_settles {
+        // The node holds the wallet and the Nostr key: it prices, refunds
+        // and signs. An image usage carries the pinned model; a chat usage
+        // event names its own (checked against the setup's).
+        let model = if st.images_count.is_some() {
+            st.model.clone()
+        } else {
+            usage.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string()
+        };
+        // An accepted image session is charged flat; its error head (like a
+        // chat one) is handed over as verified by π_C3S.
+        let usage = match (st.accepted, st.images_count) {
+            (true, Some(count)) => serde_json::json!({"flat": true, "kind": "images", "count": count}),
+            _ => usage,
+        };
+        let _ = to_client.send(Message::Text(
+            serde_json::json!({
+                "type":"usage",
+                "sid": st.sid,
+                "model": model,
+                "usage": usage,
+            }).to_string().into(),
+        ));
+        side(st, "usage handed to the node to settle".into());
+        st.state = SessionState::Settled;
+    } else if let Some(receipt) = settle(app, st) {
+        // Prototype/stub settlement (sidecar signs). Sign the exact
+        // serialized bytes so the client can verify without JSON
+        // re-serialization drift.
+        let receipt_json = receipt.to_string();
+        let sig = app.signer.sign(receipt_json.as_bytes());
+        let _ = to_client.send(Message::Text(
+            serde_json::json!({
+                "type":"receipt","receipt":receipt,
+                "receipt_json":receipt_json,
+                "sig":hex::encode(sig.to_bytes()),
+            }).to_string().into(),
+        ));
+        write_receipt(&st.run_dir, &receipt);
+        st.state = SessionState::Settled;
+    }
 }
 
 fn settle(app: &Arc<AppState>, st: &Session) -> Option<serde_json::Value> {
@@ -2514,6 +2784,204 @@ mod hardening_tests {
             proofs_run: StdMutex::new(Default::default()),
         });
         (s, rx)
+    }
+
+    fn venice_images() -> ImagesEndpoint {
+        let offer: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
+        let ep = offer.endpoints.images.unwrap();
+        ep.validate("api.venice.ai", 42).unwrap();
+        ep
+    }
+
+    fn images_app() -> Arc<AppState> {
+        let mut offer: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
+        let ep = offer.endpoints.images.as_mut().unwrap();
+        ep.head_template = with_key_length(&ep.head_template, 32);
+        offer.head_template = with_key_length(&offer.head_template, 32);
+        let base = app_state();
+        Arc::new(AppState {
+            key: base.key.clone(),
+            offer: Arc::new(offer),
+            host: base.host.clone(),
+            upstream: base.upstream.clone(),
+            signer: base.signer.clone(),
+            runs_dir: base.runs_dir.clone(),
+            node_settles: true,
+            sessions: StdMutex::new(HashMap::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            max_body: 1 << 20,
+            token_hash: None,
+        })
+    }
+
+    #[test]
+    fn the_images_suffix_matches_the_shared_test_vector() {
+        let ep = venice_images();
+        let pins = vec![("format".to_string(), serde_json::json!("webp"))];
+        let s = ep.render_suffix("z-image-turbo", 2, &pins);
+        assert_eq!(
+            s,
+            r#","model":"z-image-turbo","variants":2,"return_binary":false,"enhance_prompt":false,"enable_web_search":false,"style_references":[],"format":"webp"}"#
+        );
+        assert_eq!(ep.check_suffix("z-image-turbo", &s).unwrap(), 2);
+        let res = ep.render_suffix("m", 1, &[("resolution".into(), "2K".into()), ("format".into(), "webp".into())]);
+        assert_eq!(ep.check_suffix("m", &res).unwrap(), 1);
+    }
+
+    #[test]
+    fn an_images_suffix_outside_the_offer_is_refused() {
+        let ep = venice_images();
+        let ok = ep.render_suffix("m", 1, &[("format".into(), "webp".into())]);
+        let fixed = r#""return_binary":false,"enhance_prompt":false,"enable_web_search":false,"style_references":[]"#;
+        let bad = [
+            ok.replace(r#""model":"m""#, r#""model":"other""#),
+            ok.replace(r#""variants":1"#, r#""variants":0"#),
+            ok.replace(r#""variants":1"#, r#""variants":5"#),
+            ok.replace(r#""variants":1"#, r#""variants":"1""#),
+            ok.replace(r#""enhance_prompt":false"#, r#""enhance_prompt":true"#),
+            ok.replace(&format!(",{fixed}"), ""),
+            ok.replace(r#""format":"webp""#, r#""format":"png""#),
+            ok.replace(r#""format":"webp""#, r#""quality":"ultra""#),
+            ok.replace(r#""format":"webp""#, r#""seed":1"#),
+            ok.replace(r#""format":"webp""#, r#""format":"webp","format":"webp""#),
+            ok.replace(r#""format":"webp""#, r#""variants":1"#),
+            ok.replace(":", ": "),
+            ok.trim_start_matches(',').to_string(),
+            ok.trim_end_matches('}').to_string(),
+            r#","model":"m","variants":1,"x":"}"#.to_string(),
+        ];
+        for b in bad {
+            assert!(ep.check_suffix("m", &b).is_err(), "accepted {b}");
+        }
+    }
+
+    #[test]
+    fn an_offer_with_colliding_image_pins_is_refused() {
+        let mut ep = venice_images();
+        ep.param_space.insert("enhance_prompt".into(), vec![false.into()]);
+        assert!(ep.validate("api.venice.ai", 42).is_err());
+        let mut ep = venice_images();
+        ep.count_key = "model".into();
+        assert!(ep.validate("api.venice.ai", 42).is_err());
+        let mut ep = venice_images();
+        ep.head_template = ep.head_template.replace("Connection: close", "Connection: keep-alive");
+        assert!(ep.validate("api.venice.ai", 42).is_err());
+        assert!(venice_images().validate("api.other.ai", 42).is_err());
+    }
+
+    fn setup(kind: Option<&str>, extra: serde_json::Value) -> serde_json::Value {
+        let mut v = serde_json::json!({"type": "setup", "nonce_c": "11".repeat(32), "model": "m", "len": 100});
+        if let Some(k) = kind {
+            v["kind"] = k.into();
+        }
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    }
+
+    fn run_setup(app: &Arc<AppState>, v: serde_json::Value) -> Result<(Session, serde_json::Value)> {
+        let (s, _rx) = shared(app);
+        let (tx, mut out) = mpsc::unbounded_channel();
+        let mut st = Session::default();
+        handle_setup(serde_json::from_value(v)?, app, &s, &tx, &mut st)?;
+        let Some(Message::Text(t)) = out.try_recv().ok() else { bail!("no ready") };
+        Ok((st, serde_json::from_str(&t)?))
+    }
+
+    #[test]
+    fn image_setups_take_the_node_suffix_and_chat_setups_stay_as_they_were() {
+        let app = images_app();
+        let suffix = venice_images().render_suffix("m", 3, &[("format".into(), "webp".into())]);
+        let (st, ready) = run_setup(&app, setup(Some("images"), serde_json::json!({"suffix": suffix, "count": 3}))).unwrap();
+        assert_eq!(st.images_count, Some(3));
+        assert_eq!(ready["suffix"], suffix);
+        assert_eq!(ready["kind"], "images");
+        assert!(st.head_template.starts_with("POST /api/v1/image/generate "));
+        let (st, ready) = run_setup(&app, setup(None, serde_json::json!({"max_tokens": 7}))).unwrap();
+        assert_eq!(st.images_count, None);
+        assert_eq!(ready["suffix"], canonical_suffix("m", 7));
+        assert!(ready.get("kind").is_none());
+        for bad in [
+            setup(Some("video"), serde_json::json!({"max_tokens": 7})),
+            setup(Some("images"), serde_json::json!({})),
+            setup(Some("images"), serde_json::json!({"suffix": suffix, "count": 2})),
+            setup(Some("images"), serde_json::json!({"suffix": suffix, "armed": true})),
+            setup(Some("images"), serde_json::json!({"suffix": suffix, "max_tokens": 7})),
+            setup(Some("chat"), serde_json::json!({"max_tokens": 7, "count": 1})),
+            setup(Some("chat"), serde_json::json!({"max_tokens": 7, "suffix": suffix})),
+        ] {
+            assert!(run_setup(&app, bad.clone()).is_err(), "accepted {bad}");
+        }
+        // A sidecar without the images endpoint refuses image setups.
+        assert!(run_setup(&app_state(), setup(Some("images"), serde_json::json!({"suffix": suffix}))).is_err());
+    }
+
+    #[test]
+    fn accept_is_for_attested_image_sessions_once() {
+        let app = images_app();
+        let (s, _rx) = shared(&app);
+        let (tx, mut out) = mpsc::unbounded_channel();
+        let mut st = Session { images_count: Some(2), model: "m".into(), sid: Some("ab".into()), ..Session::default() };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = tokio::net::TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+            let (_r, mut w) = c.into_split();
+            let mut log = RelayLog::default();
+            let mut go = |st: &mut Session| {
+                let msg = ClientMsg::Accept {};
+                let fut = handle_control(msg, &app, &s, &tx, st, &mut log, &mut w);
+                futures_executor_block(fut)
+            };
+            st.state = SessionState::Body;
+            assert!(go(&mut st).is_err(), "before the attestation");
+            st.state = SessionState::Attested;
+            assert!(go(&mut st).is_err(), "before π_C2S");
+            st.c2_ok = true;
+            go(&mut st).unwrap();
+            let Some(Message::Text(t)) = out.try_recv().ok() else { panic!("no usage frame") };
+            let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+            assert_eq!(v["usage"], serde_json::json!({"flat": true, "kind": "images", "count": 2}));
+            assert_eq!(v["model"], "m");
+            assert_eq!(st.state, SessionState::Settled);
+            st.state = SessionState::Attested;
+            assert!(go(&mut st).is_err(), "twice");
+            let mut chat = Session { state: SessionState::Attested, c2_ok: true, ..Session::default() };
+            assert!(go(&mut chat).is_err(), "on a chat session");
+            let mut disclosed = Session { images_count: Some(1), state: SessionState::Attested, c2_ok: true, disclosed: true, ..Session::default() };
+            assert!(go(&mut disclosed).is_err(), "after a disclosure");
+            // An image session discloses only an error head, never a usage event.
+            let mut img = Session { images_count: Some(1), state: SessionState::Attested, c2_ok: true, ..Session::default() };
+            let usage = ClientMsg::Disclose {
+                r: hex::encode(b"data: {\"usage\":{}}\n\n"),
+                tail_lens: vec![40],
+                skip: 0,
+                key_updates: 0,
+                epoch_start: 0,
+                trailing: None,
+            };
+            let err = futures_executor_block(handle_control(usage, &app, &s, &tx, &mut img, &mut log, &mut w)).unwrap_err();
+            assert!(err.to_string().contains("only an error head"), "{err}");
+        });
+    }
+
+    /// Poll a future that never actually waits (the accept path does no I/O).
+    fn futures_executor_block<F: std::future::Future>(f: F) -> F::Output {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut f = std::pin::pin!(f);
+        match f.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(v) => v,
+            std::task::Poll::Pending => panic!("accept waited"),
+        }
+    }
+
+    #[test]
+    fn an_image_session_caps_the_response_at_its_endpoint_limit() {
+        let mut log = RelayLog { max_server_bytes: Some(10), ..RelayLog::default() };
+        assert!(log.server_bytes(&[0; 8], true).is_ok());
+        assert!(log.server_bytes(&[0; 3], true).is_err());
     }
 
     #[test]

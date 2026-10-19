@@ -451,3 +451,72 @@ fn cu_prover_job_refuses_params_for_another_proof() {
         assert!(err.contains("its params are for pi_c3s"), "{role}: {err}");
     }
 }
+
+// --- image requests (docs/CONFIDENTIAL-IMAGES.md) ---------------------------
+// The same statements with an images head and suffix: no circuit change.
+
+/// The shared test vector (model z-image-turbo, 2 variants, WebP).
+const IMAGES_SUFFIX: &[u8] = br#","model":"z-image-turbo","variants":2,"return_binary":false,"enhance_prompt":false,"enable_web_search":false,"style_references":[],"format":"webp"}"#;
+
+/// π_C2S parameters shaped as the sidecar builds them: the window ends at the
+/// record end and the compared range runs through the inner content type.
+fn images_c2s(suffix_in_record: &[u8], expected_suffix: &[u8]) -> (Params, Witness) {
+    use cu_crypto::aesgcm;
+    let v = fixtures::v2_secrets();
+    let secret = cu_crypto::keyschedule::Secret::new(v.c_ap_1);
+    let mut inner = br#"{"prompt":"a red apple","aspect_ratio":"16:9","safe_mode":true"#.to_vec();
+    inner.extend_from_slice(suffix_in_record);
+    inner.push(0x17);
+    let seq = 0;
+    let ks = aesgcm::ctr_keystream(&secret.key(), &secret.iv(), seq, inner.len());
+    let ct: Vec<u8> = inner.iter().zip(&ks).map(|(a, b)| a ^ b).collect();
+    let w = (expected_suffix.len() + 1 + 13).min(inner.len());
+    let off = inner.len() - w;
+    let sel_start = w - 1 - expected_suffix.len();
+    let mut expected = expected_suffix.to_vec();
+    expected.push(0x17);
+    (
+        Params::PiC2S(zkbench::statements::PiC2S {
+            h1: v.h1(),
+            seq,
+            ct_window: ct[off..off + w].to_vec(),
+            off,
+            w,
+            sel_start,
+            sel_len: expected.len(),
+            expected,
+        }),
+        Witness::Secret(v.c_ap_1),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn images_suffix_proves_and_a_swapped_count_does_not() {
+    let (params, witness) = images_c2s(IMAGES_SUFFIX, IMAGES_SUFFIX);
+    let res = run_pair_ideal(&params, &witness).await;
+    assert!(passed(&res), "{res:?}");
+    // The client sent 4 variants while the node pinned 2: one bit, zero.
+    let sent = String::from_utf8(IMAGES_SUFFIX.to_vec()).unwrap().replace(r#""variants":2"#, r#""variants":4"#);
+    let (params, witness) = images_c2s(sent.as_bytes(), IMAGES_SUFFIX);
+    let res = run_pair_ideal(&params, &witness).await.unwrap();
+    assert_eq!(res.last().unwrap().got, "00");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn images_head_template_proves_under_pi_nk() {
+    let v = fixtures::v2_secrets();
+    let mut parts = fixtures::pi_nk_parts();
+    let chat = b"POST /api/v1/chat/completions ".as_slice();
+    let images = b"POST /api/v1/image/generate ".as_slice();
+    assert!(parts.template.starts_with(chat));
+    let shift = images.len() as isize - chat.len() as isize;
+    let mut t = images.to_vec();
+    t.extend_from_slice(&parts.template[chat.len()..]);
+    parts.template = t;
+    parts.key_offsets = parts.key_offsets.iter().map(|o| (*o as isize + shift) as usize).collect();
+    let c1 = fixtures::pi_nk_ciphertext(&v, &parts.template, &parts.key_offsets, &parts.key);
+    let params = Params::PiNK(fixtures::pi_nk_params(&v, &parts, &c1));
+    let witness = Witness::NodeKey { k0: v.k0, iv0: v.iv0, key: parts.key.clone() };
+    let res = run_pair_ideal(&params, &witness).await;
+    assert!(passed(&res), "{res:?}");
+}

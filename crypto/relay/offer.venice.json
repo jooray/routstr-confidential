@@ -14,5 +14,49 @@
   ],
   "max_tokens_cap": 4096,
   "notary_pubkey": "",
-  "model_allowlist": []
+  "model_allowlist": [],
+  "endpoints": {
+    "images": {
+      "head_template": "POST /api/v1/image/generate HTTP/1.1\r\nHost: api.venice.ai\r\nAuthorization: Bearer {KEY:42}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n",
+      "billing": "flat",
+      "response_shape": "venice",
+      "count_key": "variants",
+      "max_count": 4,
+      "fixed_pins": [
+        [
+          "return_binary",
+          false
+        ],
+        [
+          "enhance_prompt",
+          false
+        ],
+        [
+          "enable_web_search",
+          false
+        ],
+        [
+          "style_references",
+          []
+        ]
+      ],
+      "param_space": {
+        "resolution": [
+          "1K",
+          "2K",
+          "4K"
+        ],
+        "quality": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "format": [
+          "webp"
+        ]
+      },
+      "max_response_bytes": 67108864,
+      "response_idle_s": 300
+    }
+  }
 }

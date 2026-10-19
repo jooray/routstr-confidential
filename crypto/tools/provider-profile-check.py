@@ -150,9 +150,9 @@ def connect() -> ssl.SSLSocket:
     return ctx.wrap_socket(raw, server_hostname=HOST)
 
 
-def head(length: int) -> bytes:
+def head(length: int, path: str = "") -> bytes:
     return (
-        f"POST {PATH} HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {KEY}\r\n"
+        f"POST {path or PATH} HTTP/1.1\r\nHost: {HOST}\r\nAuthorization: Bearer {KEY}\r\n"
         "Content-Type: application/json\r\nAccept-Encoding: identity\r\n"
         f"Connection: close\r\nContent-Length: {length}\r\n\r\n"
     ).encode()
@@ -202,12 +202,12 @@ def _recv_all(s: ssl.SSLSocket) -> bytes:
         out += chunk
 
 
-def _http_real(body: str) -> Resp:
+def _http_real(body: str, path: str = "") -> Resp:
     data = body.encode()
     try:
         s = connect()
         try:
-            s.sendall(head(len(data)) + data)
+            s.sendall(head(len(data), path) + data)
             raw = _recv_all(s)
         finally:
             s.close()
@@ -695,9 +695,9 @@ def tag(fn: Callable) -> str:
     return fn.__name__.split("_")[0].upper()
 
 
-def run_all(pause: float = 0.3, quiet: bool = False) -> int:
+def run_all(pause: float = 0.3, quiet: bool = False, checks: list | None = None) -> int:
     RESULTS.clear()
-    for fn in CHECKS:
+    for fn in checks or CHECKS:
         n = len(RESULTS)
         try:
             fn()
@@ -715,6 +715,65 @@ def run_all(pause: float = 0.3, quiet: bool = False) -> int:
     if not quiet:
         print(f"summary: {passed} PASS, {fails} FAIL, {inc} INCONCLUSIVE of {len(RESULTS)}")
     return 1 if fails else (2 if inc else 0)
+
+
+# ---------------------------------------------------------------------------
+# Image route (--images, paid: one cheap image). The confidential image
+# session pins model, count and the paid extras in a suffix and charges a flat
+# price, so the route must keep the last duplicate, reject unknown keys and
+# unknown models (no silent fallback) and never reflect the request head.
+# ---------------------------------------------------------------------------
+
+IMAGE_PATH = os.environ.get("CU_IMAGE_PATH", "/api/v1/image/generate")
+IMAGE_MODEL = os.environ.get("CU_IMAGE_MODEL", "z-image-turbo")
+IMAGE_PINS = ('"return_binary":false,"enhance_prompt":false,"enable_web_search":false,'
+              '"style_references":[],"format":"webp"')
+
+
+def image_request(body: str, label: str) -> Resp:
+    return with_retries(lambda: TRANSPORT["http"](body, IMAGE_PATH), label)
+
+
+def i1_image_last_wins() -> None:
+    r = image_request(
+        '{"prompt":"a red apple on a white table","variants":4,"enhance_prompt":true,'
+        f'"model":"no-such-model","model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "I1")
+    try:
+        d = json.loads(r.text)
+    except ValueError:
+        d = {}
+    echo = (d.get("request") or {}).get("data") or {}
+    n = len(d.get("images") or [])
+    check(
+        "I1 image route: last duplicate wins (count, paid extras, model)",
+        r.status == 200 and n == 1 and echo.get("enhance_prompt") is False and echo.get("model") == IMAGE_MODEL
+        and echo.get("variants") == 1,
+        f"{r.status}; {n} image(s), echoed variants={echo.get('variants')} enhance_prompt={echo.get('enhance_prompt')} "
+        f"model={echo.get('model')}",
+    )
+    reflected = "authorization" in r.text.lower() or (KEY and KEY in r.text)
+    check("I4 image route: no request-head reflection", r.status == 200 and not reflected,
+          f"{r.status}; response {'reflects' if reflected else 'does not reflect'} the request head")
+
+
+def i2_image_unknown_rejected() -> None:
+    r = image_request(f'{{"prompt":"x","bogus_field_xyz":1,"model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "I2")
+    check("I2 image route: unknown keys rejected (free)", rejected(r, EXPECT_UNKNOWN_FIELD), f"{r.status} {snip(r.text, 60)}")
+
+
+def i3_image_unknown_model() -> None:
+    r = image_request(f'{{"prompt":"x","model":"{IMAGE_MODEL}","model":"no-such-model","variants":1,{IMAGE_PINS}}}', "I3")
+    check("I3 image route: unknown model refused, no fallback (free)", 400 <= r.status < 500 and r.status != 429,
+          f"{r.status} {snip(r.text, 60)}")
+
+
+def i5_image_malformed() -> None:
+    r = image_request(f'{{"prompt":"x,"model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "I5")
+    check("I5 image route: an open string cannot swallow the suffix (free)", 400 <= r.status < 500 and r.status != 429,
+          f"{r.status} {snip(r.text, 60)}")
+
+
+IMAGE_CHECKS = [i2_image_unknown_rejected, i3_image_unknown_model, i5_image_malformed, i1_image_last_wins]
 
 
 def provider_build() -> str:
@@ -870,6 +929,9 @@ def main() -> int:
     print(f"  provider: https://{HOST}{PATH}  build: {provider_build()}")
     print(f"  models: cheap={CHEAP} reasoning={REASONING} text_only={TEXT_ONLY}")
     print(f"  openssl: {find_openssl() or 'NOT FOUND'}  retries={RETRIES}")
+    if "--images" in sys.argv[1:]:
+        print(f"  image route: {IMAGE_PATH} model={IMAGE_MODEL} (one paid image)")
+        return run_all(checks=IMAGE_CHECKS)
     return run_all()
 
 
