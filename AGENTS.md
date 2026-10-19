@@ -25,11 +25,14 @@ Each has `origin` = Routstr upstream and `fork` = `jooray/<repo>`.
 | `paper/` | — | the paper (`paper.md` → `build.sh` → `paper.pdf`) |
 | `docs/` | — | engineering docs and research (below) |
 
-The upstream PRs (core #824, SDK #90, routstrd #137) are closed while the
-work is tested on these fork branches; they will be reopened (probably v2
-only) after user testing. Local-only branches `confidential-upstream-on-tlsn`
-(core, SDK) are pre-rebase snapshots on top of unmerged TLSN work. Ignore
-them.
+The upstream PRs for protocol v2 are open: core
+[#855](https://github.com/Routstr/routstr-core/pull/855), SDK
+[#112](https://github.com/Routstr/routstr-sdk/pull/112), routstrd
+[#155](https://github.com/Routstr/routstrd/pull/155), from the fork branches
+above, rebased on upstream `main` (2026-10-19). The v1 PRs (core #824, SDK
+#90, routstrd #137) are closed. Local-only branches
+`confidential-upstream-on-tlsn` (core, SDK) are pre-rebase snapshots on top
+of unmerged TLSN work. Ignore them.
 
 ## Docs map
 
