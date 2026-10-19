@@ -55,7 +55,7 @@
           "webp"
         ]
       },
-      "max_response_bytes": 67108864,
+      "max_response_bytes": 50331648,
       "response_idle_s": 300
     }
   }

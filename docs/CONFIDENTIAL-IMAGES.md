@@ -1,8 +1,14 @@
 # Confidential image generation: feasibility and specification
 
-Status: study and spec only (2026-10-19). Nothing here is implemented. Code references are to
-`twopc-v2` (this repo), `confidential-2pc` (routstr-core, routstr-sdk), the web library at `2af9a79`
-and the PWA at `ec06e83`.
+Status: implemented and deployed (2026-10-19), with the decisions in section 0. The study sections
+below were written before the implementation, so their code references are to `twopc-v2` (this repo),
+`confidential-2pc` (routstr-core, routstr-sdk), the web library at `2af9a79` and the PWA at `ec06e83`;
+where they differ from section 0 or from the notes in this paragraph, those win:
+the image gate is `provider-profile-check.py --images`, checks I1 to I9 (output in `docs/evidence/`);
+`accept` is a claim, not a proof (an honest client sends it only for a 2xx; a dishonest one that
+accepts a 5xx pays the flat price instead of the reservation, at most `max(f_s, f_a) - f_s` less); the
+Venice endpoint caps the response at 48 MiB (four 4K WebPs fit); and only per-image books with resolution/quality tiers and
+WebP output are offered, so megapixel books, other tier keys or response shapes need code.
 
 Question: can `POST /v1/images/generations` go through confidential mode (protocol v2) so that the
 node sees neither the image prompt nor the image, with the same properties the paper claims for chat

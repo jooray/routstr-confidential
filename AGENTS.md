@@ -118,7 +118,7 @@ to the sidecar, which checks it byte-exactly; the credential record uses the
 images head template; on a 2xx the client sends `accept` instead of a usage
 disclosure and the node charges `msat_per_image × count + f_s` (`settle_flat`);
 an error head works as for chat. Live check: `provider-profile-check.py
---images` (I1-I5), `driver.ts --image`.
+--images` (I1-I9), `driver.ts --image`.
 
 **Protocol v1 is retired.** The earlier design (the client ran the TLS
 handshake alone with X25519; proofs π_C1, π_N, π_C2, π_C3; the client's KU1)

@@ -1,0 +1,39 @@
+# Confidential image session, direct sidecar (stub settlement), 2026-10-19
+# client: crypto/client/src/driver.ts --sidecar ... --image --model z-image-turbo --count 1
+# local paths shortened; no secrets in either log
+
+## client
+[client single] <- ready
+[client single] sid=e3ee2d7d0dbb6215aef518b48e409dac6ea330cc7d9aba5c8547e4d52e15e46d head_len=226
+[client single] <- hs_verified
+[client single] <- c_commit
+[client single] <- head_written
+[client single] <- zk_params
+[client single] <- body_released
+[client single] <- attestation
+[client single] <- receipt
+[client single] images: 1 of 1 (<runs>/e3ee2d7d0dbb6215aef518b48e409dac6ea330cc7d9aba5c8547e4d52e15e46d/image-0.webp) response_bytes=240185 cost_msats=undefined cost_ok=true signature_ok=true attestation_ok=true
+E2E_JSON {"sid":"e3ee2d7d0dbb6215aef518b48e409dac6ea330cc7d9aba5c8547e4d52e15e46d","kind":"images","model":"z-image-turbo","count":1,"images":1,"files":["<runs>/e3ee2d7d0dbb6215aef518b48e409dac6ea330cc7d9aba5c8547e4d52e15e46d/image-0.webp"],"response_bytes":240185,"cost_ok":true,"receipt_sig_ok":true,"total_ms":5412,"upstream_ms":4199,"zk":{"pi_nk":{"via":"zkchan","ms":64,"inner_ms":63.567,"bytes_sent":22,"bytes_recv":30915},"pi_c2s":{"via":"zkchan","ms":32,"inner_ms":32.009,"bytes_sent":30084,"bytes_recv":0}}}
+
+## sidecar
+2026-10-19T13:02:08.798330Z  INFO cu_sidecar: loaded upstream API key key_len=42
+2026-10-19T13:02:08.798583Z  WARN cu_sidecar: running WITHOUT --node-settles: the stub settlement signs its own receipts; a node in front of this sidecar would charge every session its full reservation
+2026-10-19T13:02:08.799066Z  INFO cu_sidecar: cu-sidecar listening listen=127.0.0.1:7445 token=false
+2026-10-19T13:02:10.781636Z  INFO cu_sidecar: zk start proof="twopc" sid="e3ee2d7d0dbb6215aef518b48e409dac6ea330cc7d9aba5c8547e4d52e15e46d"
+2026-10-19T13:02:10.781910Z  INFO cu_sidecar: zk start proof="zkchan" sid="e3ee2d7d0dbb6215aef518b48e409dac6ea330cc7d9aba5c8547e4d52e15e46d"
+2026-10-19T13:02:11.286487Z  INFO cu_sidecar: zkchan ready steps=hello=255ms/0B preprocess=249ms/2958277B
+2026-10-19T13:02:11.418545Z  INFO cu_sidecar: v2 ClientHello checked: one P-256 share, the joint key
+2026-10-19T13:02:11.583927Z  INFO cu_sidecar::tls: CertificateVerify scheme="0x0403" sig_len=72
+2026-10-19T13:02:11.584056Z  INFO cu_sidecar: v2 handshake verified: chain + hostname + CertificateVerify + both Finished th_sh=21d18bc22aa741de29d68d33764406832e431cd03756cbd43f1cc8cff9144534
+2026-10-19T13:02:11.637784Z  INFO cu_sidecar: 2pc done steps=preprocess=544.258291ms key_share=88.379667ms ectf=1.750583ms phase_a=44.878583ms phase_b=130.078208ms
+2026-10-19T13:02:11.637916Z  INFO cu_sidecar: 2pc end elapsed_ms=856 ok=true
+2026-10-19T13:02:11.637948Z  INFO cu_sidecar: v2 credential record assembled under K_0; π_NK params sent
+2026-10-19T13:02:11.672165Z  INFO cu_sidecar: zkchan proof proof="pi_nk" ok=true elapsed_ms=32
+2026-10-19T13:02:11.672207Z  INFO cu_sidecar: zk result proof="pi_nk" ok=true err=None
+2026-10-19T13:02:11.703664Z  INFO cu_sidecar: credential record + KeyUpdate written to upstream record_len=248
+2026-10-19T13:02:11.704382Z  INFO cu_sidecar: final body record held until π_C2S verifies
+2026-10-19T13:02:11.756493Z  INFO cu_sidecar: zkchan proof proof="pi_c2s" ok=true elapsed_ms=51
+2026-10-19T13:02:11.756536Z  INFO cu_sidecar: zk result proof="pi_c2s" ok=true err=None
+2026-10-19T13:02:11.756630Z  INFO cu_sidecar: π_C2S verified; final body record released to the upstream
+2026-10-19T13:02:16.181690Z  INFO cu_sidecar: upstream closed the connection
+2026-10-19T13:02:16.188134Z  INFO cu_sidecar: zkchan end elapsed_ms=5406 ok=true

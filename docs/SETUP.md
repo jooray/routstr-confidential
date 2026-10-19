@@ -181,7 +181,9 @@ provider row; a `generic` row lists no image models). Each variant is priced at 
 for that tier, plus any surcharge; settlement is flat (`msat_per_image × count` plus the session fee) after
 the client's `accept`, with no usage proof. Image setups are never armed. A deployment that copies the
 offer file (for example to mount it) must add the block to its copy. Check the provider with
-`crypto/tools/provider-profile-check.py --images` (one paid image).
+`crypto/tools/provider-profile-check.py --images` (checks I1 to I9: duplicates, unknown fields and
+models, head reflection, open strings, paid extras and arrays, incomplete body, TLS with P-256, and a
+KeyUpdate mid-body; three paid images).
 
 **1. The sidecar** (container build, from the `twopc-v2` checkout):
 

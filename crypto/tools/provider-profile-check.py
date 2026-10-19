@@ -216,13 +216,13 @@ def _http_real(body: str, path: str = "") -> Resp:
     return parse_http(raw)
 
 
-def _partial_real(body: str, hold_s: float, cut: int) -> tuple[bytes, Resp]:
+def _partial_real(body: str, hold_s: float, cut: int, path: str = "") -> tuple[bytes, Resp]:
     """Send all but the last ``cut`` body bytes, wait ``hold_s``, send the rest."""
     data = body.encode()
     try:
         s = connect()
         try:
-            s.sendall(head(len(data)) + data[:-cut])
+            s.sendall(head(len(data), path) + data[:-cut])
             s.settimeout(hold_s)
             try:
                 early = s.recv(1024)
@@ -267,7 +267,7 @@ def find_openssl() -> str | None:
     return None
 
 
-def _s_client_real(brief: bool, steps: list, keep_open: bool, timeout_s: float) -> SClient:
+def _s_client_real(brief: bool, steps: list, keep_open: bool, timeout_s: float, groups: str = "X25519") -> SClient:
     """Run s_client with the client's exact TLS profile.
 
     ``steps`` is a list of bytes (written to stdin) or floats (sleep seconds),
@@ -280,7 +280,7 @@ def _s_client_real(brief: bool, steps: list, keep_open: bool, timeout_s: float) 
         raise Inconclusive("no OpenSSL >= 1.1.1 found (set CU_OPENSSL); LibreSSL cannot pin TLS 1.3 suites")
     args = [
         exe, "s_client", "-connect", f"{HOST}:443", "-servername", HOST,
-        "-tls1_3", "-ciphersuites", SUITE, "-groups", "X25519", "-alpn", "http/1.1",
+        "-tls1_3", "-ciphersuites", SUITE, "-groups", groups, "-alpn", "http/1.1",
         "-verify_return_error",
     ]
     if brief:
@@ -718,10 +718,18 @@ def run_all(pause: float = 0.3, quiet: bool = False, checks: list | None = None)
 
 
 # ---------------------------------------------------------------------------
-# Image route (--images, paid: one cheap image). The confidential image
+# Image route (--images, paid: three cheap images). The confidential image
 # session pins model, count and the paid extras in a suffix and charges a flat
-# price, so the route must keep the last duplicate, reject unknown keys and
-# unknown models (no silent fallback) and never reflect the request head.
+# price, so the route must keep the last duplicate (arrays replaced, not
+# merged), reject unknown keys and unknown models (no silent fallback), never
+# reflect the request head (success or error), wait for the whole body before
+# it starts, and speak the v2 transport: TLS 1.3, the one suite, P-256 only,
+# and a client KeyUpdate in the middle of the body.
+#   I1 last duplicate wins (count, model)        I6 paid extras and arrays pinned
+#   I2 unknown keys rejected                     I7 waits for the full body
+#   I3 unknown model refused, no fallback        I8 TLS 1.3 / suite / P-256 / ALPN
+#   I4 no head reflection (success and error)    I9 KeyUpdate mid-body
+#   I5 an open string cannot swallow the suffix
 # ---------------------------------------------------------------------------
 
 IMAGE_PATH = os.environ.get("CU_IMAGE_PATH", "/api/v1/image/generate")
@@ -734,31 +742,89 @@ def image_request(body: str, label: str) -> Resp:
     return with_retries(lambda: TRANSPORT["http"](body, IMAGE_PATH), label)
 
 
-def i1_image_last_wins() -> None:
-    r = image_request(
-        '{"prompt":"a red apple on a white table","variants":4,"enhance_prompt":true,'
-        f'"model":"no-such-model","model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "I1")
+def _reflects(r: Resp) -> bool:
+    return "authorization" in r.text.lower() or bool(KEY and KEY in r.text)
+
+
+def _image_json(r: Resp) -> dict:
     try:
         d = json.loads(r.text)
     except ValueError:
-        d = {}
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def i1_image_last_wins() -> None:
+    # Every value the suffix pins appears earlier with a dearer or different
+    # value: the count, each paid extra, the binary switch, a non-empty array
+    # (which must be replaced, not merged) and an unknown model.
+    r = image_request(
+        '{"prompt":"a red apple on a white table","variants":4,"enhance_prompt":true,"enable_web_search":true,'
+        '"return_binary":true,"style_references":["https://example.com/style.png"],'
+        f'"model":"no-such-model","model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "I1")
+    d = _image_json(r)
     echo = (d.get("request") or {}).get("data") or {}
     n = len(d.get("images") or [])
     check(
-        "I1 image route: last duplicate wins (count, paid extras, model)",
-        r.status == 200 and n == 1 and echo.get("enhance_prompt") is False and echo.get("model") == IMAGE_MODEL
-        and echo.get("variants") == 1,
-        f"{r.status}; {n} image(s), echoed variants={echo.get('variants')} enhance_prompt={echo.get('enhance_prompt')} "
-        f"model={echo.get('model')}",
+        "I1 image route: last duplicate wins (count, model)",
+        r.status == 200 and n == 1 and echo.get("model") == IMAGE_MODEL and echo.get("variants") == 1,
+        f"{r.status}; {n} image(s), echoed variants={echo.get('variants')} model={echo.get('model')}",
     )
-    reflected = "authorization" in r.text.lower() or (KEY and KEY in r.text)
-    check("I4 image route: no request-head reflection", r.status == 200 and not reflected,
-          f"{r.status}; response {'reflects' if reflected else 'does not reflect'} the request head")
+    extras = {k: echo.get(k) for k in ("enhance_prompt", "enable_web_search", "return_binary", "style_references")}
+    # The echo leaves out an empty array; a merged one would still hold the URL.
+    check(
+        "I6 image route: paid extras and arrays take the pinned value (array replaced, not merged)",
+        r.status == 200 and r.headers.get("content-type", "").startswith("application/json")
+        and extras["enhance_prompt"] is False and extras["enable_web_search"] is False
+        and extras["return_binary"] is False and extras["style_references"] in (None, [])
+        and "example.com/style.png" not in json.dumps(echo),
+        f"{r.status} {r.headers.get('content-type', '?')}; echoed {extras}",
+    )
+    check("I4 image route: no request-head reflection (success)", r.status == 200 and not _reflects(r),
+          f"{r.status}; response {'reflects' if _reflects(r) else 'does not reflect'} the request head")
 
 
 def i2_image_unknown_rejected() -> None:
     r = image_request(f'{{"prompt":"x","bogus_field_xyz":1,"model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "I2")
     check("I2 image route: unknown keys rejected (free)", rejected(r, EXPECT_UNKNOWN_FIELD), f"{r.status} {snip(r.text, 60)}")
+    check("I4e image route: no request-head reflection (error body, free)", 400 <= r.status < 500 and not _reflects(r),
+          f"{r.status}; error body {'reflects' if _reflects(r) else 'does not reflect'} the request head")
+
+
+def i7_image_waits_for_body() -> None:
+    body = f'{{"prompt":"a small blue cup","model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}'
+    early, r = with_retries(lambda: TRANSPORT["partial"](body, 8.0, 20, IMAGE_PATH), "I7")
+    n = len(_image_json(r).get("images") or [])
+    check("I7 image route: waits for the full body (paid)", early == b"" and r.status == 200 and n == 1,
+          f"{len(early)} bytes in 8 s with body incomplete; then {r.status}, {n} image(s)")
+
+
+def i8_image_tls_p256() -> None:
+    # The v2 client offers only P-256 (the joint key share), with the one suite.
+    sc = TRANSPORT["s_client"](False, [], False, 30.0, "P-256")
+    f = _handshake_fields(sc.out)
+    if not (f["protocol"] and f["cipher"]) and not (sc.rc not in (0, None) and _HS_FAIL.search(sc.err)):
+        raise Inconclusive(f"I8: no handshake (rc={sc.rc} {snip(sc.err.strip()[-60:])})")
+    p256 = "prime256v1" in sc.out or "P-256" in sc.out or f["group"] in ("P-256", "prime256v1")
+    check("I8 TLS 1.3 / AES-128-GCM / P-256 only / ALPN http/1.1 (free)",
+          f["protocol"] == "TLSv1.3" and f["cipher"] == SUITE and f["alpn"] == "http/1.1" and f["verify"] == "0" and p256,
+          f"offered only {SUITE}+P-256+http/1.1 -> {f['protocol']} {f['cipher']} group={f['group']} p256={p256} "
+          f"alpn={f['alpn']} verify={f['verify']}")
+
+
+def i9_image_keyupdate_mid_body() -> None:
+    body = f'{{"prompt":"a small green leaf","model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}'.encode()
+    assert body[30:31] not in (b"k", b"K", b"Q", b"R", b"C")
+    steps = [head(len(body), IMAGE_PATH) + body[:30], 0.5, b"k\n", 0.5, body[30:]]
+    sc = TRANSPORT["s_client"](True, steps, True, 90.0, "P-256")
+    if "HTTP/1." not in sc.out:
+        raise Inconclusive(f"I9: no response (rc={sc.rc} {snip(sc.err.strip()[-60:])})")
+    r = parse_http(sc.out.encode("latin1"))
+    ku = "KEYUPDATE" in sc.err or "KEYUPDATE" in sc.out
+    n = len(_image_json(r).get("images") or [])
+    check("I9 image route: client KeyUpdate mid-body; image returned; server closes (paid)",
+          ku and r.status == 200 and n == 1 and sc.exited_by_itself,
+          f"keyupdate_sent={ku} -> {r.status}, {n} image(s), server_closed={sc.exited_by_itself}")
 
 
 def i3_image_unknown_model() -> None:
@@ -773,7 +839,8 @@ def i5_image_malformed() -> None:
           f"{r.status} {snip(r.text, 60)}")
 
 
-IMAGE_CHECKS = [i2_image_unknown_rejected, i3_image_unknown_model, i5_image_malformed, i1_image_last_wins]
+IMAGE_CHECKS = [i8_image_tls_p256, i2_image_unknown_rejected, i3_image_unknown_model, i5_image_malformed,
+                i1_image_last_wins, i7_image_waits_for_body, i9_image_keyupdate_mid_body]
 
 
 def provider_build() -> str:
@@ -837,11 +904,11 @@ class MockProvider:
     def http(self, body: str) -> Resp:
         return self._answer(body)
 
-    def partial(self, body: str, hold_s: float, cut: int) -> tuple[bytes, Resp]:
+    def partial(self, body: str, hold_s: float, cut: int, path: str = "") -> tuple[bytes, Resp]:
         r = self._answer(body)
         return (b"HTTP/1.1 400" if self.early else b""), r
 
-    def s_client(self, brief: bool, steps: list, keep_open: bool, timeout_s: float) -> SClient:
+    def s_client(self, brief: bool, steps: list, keep_open: bool, timeout_s: float, groups: str = "X25519") -> SClient:
         if self.timeout:
             return SClient(None, "", "connect: Operation timed out", False)
         if self.hs_refuse:
@@ -930,7 +997,7 @@ def main() -> int:
     print(f"  models: cheap={CHEAP} reasoning={REASONING} text_only={TEXT_ONLY}")
     print(f"  openssl: {find_openssl() or 'NOT FOUND'}  retries={RETRIES}")
     if "--images" in sys.argv[1:]:
-        print(f"  image route: {IMAGE_PATH} model={IMAGE_MODEL} (one paid image)")
+        print(f"  image route: {IMAGE_PATH} model={IMAGE_MODEL} (three paid images)")
         return run_all(checks=IMAGE_CHECKS)
     return run_all()
 

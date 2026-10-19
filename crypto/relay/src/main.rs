@@ -169,6 +169,12 @@ impl ImagesEndpoint {
         if self.max_response_bytes == 0 || self.max_response_bytes > MAX_SERVER_BYTES {
             bail!("images max_response_bytes outside 1..={MAX_SERVER_BYTES}");
         }
+        // Clients wait this long for the image; past the session limit the
+        // relay ends the session anyway, and a value they refuse would make
+        // them refuse the whole signed offer.
+        if !(30..=SESSION_TIMEOUT.as_secs()).contains(&self.response_idle_s) {
+            bail!("images response_idle_s {} outside 30..={}", self.response_idle_s, SESSION_TIMEOUT.as_secs());
+        }
         let mut keys = std::collections::HashSet::new();
         for k in std::iter::once(&"model".to_string())
             .chain(std::iter::once(&self.count_key))
@@ -2867,6 +2873,11 @@ mod hardening_tests {
         ep.head_template = ep.head_template.replace("Connection: close", "Connection: keep-alive");
         assert!(ep.validate("api.venice.ai", 42).is_err());
         assert!(venice_images().validate("api.other.ai", 42).is_err());
+        for idle in [0, 29, 601] {
+            let mut ep = venice_images();
+            ep.response_idle_s = idle;
+            assert!(ep.validate("api.venice.ai", 42).is_err(), "response_idle_s {idle}");
+        }
     }
 
     fn setup(kind: Option<&str>, extra: serde_json::Value) -> serde_json::Value {

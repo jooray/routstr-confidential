@@ -166,20 +166,27 @@ assembly do not change per provider; the head template, the pinned suffix, the p
 parser do. In the current implementation only the head template and the price list come from the offer:
 the suffix and the usage parser are written for the case-study provider in the relay and in the
 clients, so a second provider needs a code change in each (the offer's `suffix_keys` only names the
-pinned keys). Image generation (section 4.10) is the exception: its suffix is rendered from the signed
-offer (path, count key, fixed pins, variant pins), so a second flat-priced image provider is a new offer
-entry, not a code change.
+pinned keys). Image generation (section 4.10) goes further: its suffix is rendered from the signed
+offer (path, count key, fixed pins, variant pins). A second image provider that has the same shape (a
+per-image price book with resolution and quality tiers, WebP output, and one of the two response
+shapes the clients parse) is a new offer entry; a provider priced per megapixel, keyed on other tier
+parameters, or answering in another shape still needs code in the node and the clients.
 
 **The image route.** Image generation uses a second route of the same provider, which must satisfy items
-1 to 5 and 8 on its own: the route's JSON keeps the last duplicate key, rejects unknown fields and
-malformed JSON, and does not reflect the request head. Items 6 and 7 change form. The price of an image
-is a function of request parameters only (model, count, resolution tier, output format, and paid extras
-that must be pinned off), so every one of them must be overridable by the suffix; there is no usage
-event to parse. For the case-study provider's native image route these properties were checked live with
-paid requests (`provider-profile-check.py --images`, checks I1 to I5): a duplicate count, paid extra and
-model in the private prefix are overridden by the suffix's values; unknown fields and an unknown model are
-rejected (no silent fallback to a default model); the response does not echo the request head; and a
-prefix that leaves a string open cannot swallow the suffix.
+1 to 5 and 8 on its own: the transport (TLS 1.3, the one suite, P-256, a client KeyUpdate mid-request),
+no processing before the complete body, a JSON parser that keeps the last duplicate key, replaces
+arrays, rejects unknown fields and malformed JSON, and no reflection of the request head. Items 6 and 7
+change form. The price of an image is a function of request parameters only (model, count, resolution
+tier, output format, and paid extras that must be pinned off), so every one of them must be overridable
+by the suffix; there is no usage event to parse. For the case-study provider's native image route these
+properties were checked live (`provider-profile-check.py --images`, checks I1 to I9, three paid images;
+the output is in `docs/evidence/`): a duplicate count and model in the private prefix are overridden by
+the suffix (I1); unknown fields (I2) and an unknown model (I3, no silent fallback to a default model) are
+rejected; neither a success nor an error response echoes the request head (I4); a prefix that leaves a
+string open cannot swallow the suffix (I5); every paid extra and a non-empty `style_references` array are
+replaced by the pinned values (I6); nothing is sent back before the body is complete (I7); a client
+offering only TLS 1.3, the one suite and P-256 is served (I8); and a client KeyUpdate in the middle of the
+body is accepted (I9).
 
 ## 3.2 TLS 1.3 key schedule
 
@@ -601,8 +608,11 @@ $k \cdot m_v + \max(f_s, f_a)$. After the attestation, C sends `accept` for a 2x
 disclosure and no $\pi_{C3S}$ run, and N charges exactly the flat amount. For an HTTP error C discloses
 the response head as in section 4.8 and the 4xx/503 rule applies. A client that sends neither is
 charged the reservation, which exceeds the flat charge only by $\max(f_s, f_a) - f_s$, so withholding
-gains nothing. N gains nothing by refusing to charge, and C knows the charge in advance; a refund is
-the only outcome that needs a proof. The receipt adds the kind, the variant, $k$ and $m_v$, and C
+gains nothing. `accept` itself proves nothing: the relay cannot read the response, so it cannot tell a
+2xx from a 5xx or from no answer at all, and on `accept` N charges the flat amount whatever happened. An
+honest C accepts only a 2xx. A dishonest C that accepts after a 5xx pays the flat charge instead of the
+reservation and so saves at most $\max(f_s, f_a) - f_s$; it gets no image for it. N gains nothing by
+refusing to charge, and C knows the charge in advance; a refund is the only outcome that needs a proof. The receipt adds the kind, the variant, $k$ and $m_v$, and C
 checks $cost = \lceil k \cdot m_v + f_s \rceil$ exactly. The attestation is unchanged.
 
 **What N learns.** The model, the variant (tier and format) and the count, as it learns the model and
@@ -612,8 +622,9 @@ does not learn the prompt, the private options, the image, or, on success, the r
 headers flag a blurred or policy-violating image).
 
 **Residuals.** A 2xx with fewer images than $k$ or with an error object in the body is charged in
-full, as is a 5xx after the body was released (the chat rule, kept until it is known whether the
-provider bills failed generations). Image sessions are never armed: each pays a cold 2PC.
+full. A 5xx after the body was released is charged the reservation when C discloses the error head or
+sends nothing (the chat rule, kept until it is known whether the provider bills failed generations),
+and the flat amount when a dishonest C accepts it, as above. Image sessions are never armed: each pays a cold 2PC.
 
 # 5. Security analysis
 
@@ -1262,7 +1273,8 @@ egress private.
 2026-10-19 with a completion margin of 16; rate limits, 5xx and timeouts count as inconclusive, never as
 a pass, and each rejection check asserts the exact status and error text against a valid control). The
 token-cap overshoot, the system-prompt pin and the fake usage events are manual tests outside the gate.
-The outputs of that day's runs are in `docs/evidence/`.
+The image route's gate (`--images`, I1 to I9, 10 PASS on 2026-10-19) and a direct image session log are
+there too. The outputs of that day's runs are in `docs/evidence/`.
 
 - **Transport:** a client offering only TLS 1.3 with `TLS_AES_128_GCM_SHA256` is served; a client
   KeyUpdate sent in the middle of the request is accepted and the server answers completely and closes
