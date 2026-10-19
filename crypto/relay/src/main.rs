@@ -196,7 +196,9 @@ struct AppState {
 
 /// A session must send its `setup` this soon after connecting.
 const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Hard limit on one session's lifetime (handshake to settlement).
+/// Hard limit on one session's lifetime, from its connection (armed time
+/// included) to settlement. The node's limit is as long but counts from its
+/// own, earlier accept, so it ends a session first.
 const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Largest TLS 1.3 record on the wire: header + 2^14 plaintext + 256 expansion.
 const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
@@ -331,6 +333,19 @@ struct SessionShared {
     zkchan_taken: std::sync::atomic::AtomicBool,
     /// Open `/zk` connections of this session (`MAX_ZK_CONNS_PER_SESSION`).
     zk_conns: Arc<std::sync::atomic::AtomicUsize>,
+    /// Proofs that started running (on the channel or their own connection):
+    /// each runs at most once per session.
+    proofs_run: StdMutex<std::collections::HashSet<String>>,
+}
+
+impl SessionShared {
+    /// Claim `proof`'s one run, refusing a second one.
+    fn claim_proof(&self, proof: &str) -> Result<()> {
+        if !self.proofs_run.lock().unwrap().insert(proof.to_string()) {
+            bail!("{proof} already ran for this session");
+        }
+        Ok(())
+    }
 }
 
 /// One open `/zk` connection, counted against its session's limit.
@@ -361,8 +376,9 @@ impl Drop for ZkConnSlot {
 /// Recorded relay state needed for the proofs.
 #[derive(Default)]
 struct RelayLog {
-    /// The raw streams up to the handshake verification (it and the 2PC need
-    /// them); later bytes are only hashed and counted.
+    /// The client's handshake flight as relayed (ClientHello, CCS, Finished)
+    /// and the raw upstream bytes up to the handshake verification (it and
+    /// the 2PC need them); later upstream bytes are only hashed and counted.
     client_raw: Vec<u8>,
     server_raw: Vec<u8>,
     /// SHA-256 and length of every byte received from the upstream.
@@ -380,14 +396,15 @@ struct RelayLog {
 }
 
 impl RelayLog {
-    /// Client bytes before the handshake is verified, capped like the
-    /// pre-relay buffers (an honest client sends only its handshake flight and
-    /// the body by then).
-    fn client_bytes(&mut self, data: &[u8], handshake_verified: bool, body_len: usize) -> Result<()> {
-        if handshake_verified {
-            return Ok(());
+    /// A client handshake record, as relayed upstream. Only the handshake
+    /// flight is kept (at most three records, each at most `MAX_TLS_RECORD`):
+    /// the body stays in the relay buffers alone.
+    fn client_handshake_record(&mut self, record: &[u8]) -> Result<()> {
+        if self.client_raw.len() + record.len() > 3 * MAX_TLS_RECORD {
+            bail!("client handshake flight longer than three records");
         }
-        buffer_client(&mut self.client_raw, data, body_len)
+        self.client_raw.extend_from_slice(record);
+        Ok(())
     }
 
     /// A complete server record: counted, and kept while it is among the last
@@ -509,15 +526,7 @@ async fn main() -> Result<()> {
             head_template: default_head_template_for(&host, key.len()),
             key_alphabet: default_key_alphabet(),
             key_length: key.len(),
-            suffix_keys: vec![
-                "model".into(),
-                "max_tokens".into(),
-                "max_completion_tokens".into(),
-                "n".into(),
-                "stream".into(),
-                "stream_options".into(),
-                "venice_parameters".into(),
-            ],
+            suffix_keys: SUFFIX_KEYS.iter().map(|k| k.to_string()).collect(),
             max_tokens_cap: default_max_tokens_cap(),
             notary_pubkey: String::new(),
             model_allowlist: Vec::new(),
@@ -545,16 +554,13 @@ async fn main() -> Result<()> {
         offer.head_template = default_head_template_for(&offer.upstream_host, key.len());
     }
     offer.head_template = with_key_length(&offer.head_template, key.len());
+    // The offer advertises the keys the suffix pins; they are the ones
+    // `canonical_suffix` writes, so an offer naming others is refused.
     if offer.suffix_keys.is_empty() {
-        offer.suffix_keys = vec![
-            "model".into(),
-            "max_tokens".into(),
-            "max_completion_tokens".into(),
-            "n".into(),
-            "stream".into(),
-            "stream_options".into(),
-            "venice_parameters".into(),
-        ];
+        offer.suffix_keys = SUFFIX_KEYS.iter().map(|k| k.to_string()).collect();
+    }
+    if offer.suffix_keys != SUFFIX_KEYS {
+        bail!("the offer's suffix_keys {:?} differ from the keys the sidecar pins {SUFFIX_KEYS:?}", offer.suffix_keys);
     }
     offer.key_length = key.len();
     // The π_NK membership circuit is a fixed-size check over one alphabet. An
@@ -642,7 +648,12 @@ fn os_random_32() -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 async fn session_ws(ws: WebSocketUpgrade, State(app): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| session_handler(socket, app))
+    // No honest message is larger than a whole buffered body: refuse bigger
+    // ones before they are read into memory.
+    let max = client_buffer_cap(app.max_body);
+    ws.max_message_size(max)
+        .max_frame_size(max)
+        .on_upgrade(move |socket| session_handler(socket, app))
 }
 
 #[derive(Debug, Deserialize)]
@@ -734,6 +745,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         zk_lock: tokio::sync::Mutex::new(()),
         zkchan_taken: std::sync::atomic::AtomicBool::new(false),
         zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        proofs_run: StdMutex::new(Default::default()),
     });
 
     // Upstream bytes in flight to the client (queued or being sent) hold
@@ -756,6 +768,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     let mut server_pending: Vec<u8> = Vec::new();
     let mut cleanup = SessionCleanup { app: app.clone(), shared: shared.clone(), budget: budget.clone(), reader: None };
 
+    let session_end = tokio::time::Instant::now() + SESSION_TIMEOUT;
     let result = std::panic::AssertUnwindSafe(async {
     // A connection holds a session slot from the start, so connections that
     // never send a setup are bounded too.
@@ -782,9 +795,11 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     {
         let prep = tokio::time::sleep(TWOPC_TIMEOUT);
         tokio::pin!(prep);
-        let armed = tokio::time::sleep(SESSION_TIMEOUT);
+        let armed = tokio::time::sleep_until(session_end);
         tokio::pin!(armed);
-        while st.joint.is_none() || client_pending.is_empty() {
+        // Wait for a ClientHello that passes the v2 checks: a client that
+        // sends anything else never makes the sidecar dial the provider.
+        while !check_hello(&mut st, &client_pending)? {
             tokio::select! {
                 _ = &mut prep, if st.joint.is_none() => bail!("2PC preprocessing did not finish within {}s", TWOPC_TIMEOUT.as_secs()),
                 _ = &mut armed => bail!("pre-warmed session unused for {}s", SESSION_TIMEOUT.as_secs()),
@@ -800,7 +815,6 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 msg = ws_rx.next() => match msg {
                     Some(Ok(Message::Binary(data))) => {
                         buffer_client(&mut client_pending, &data, st.body_len)?;
-                        log.client_bytes(&data, false, st.body_len)?;
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => bail!("client left before the handshake"),
                     Some(Ok(Message::Text(_))) => bail!("unexpected control message during 2PC preprocessing"),
@@ -811,7 +825,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     }
 
     // The session deadline covers dialing the upstream too.
-    let deadline_at = tokio::time::Instant::now() + SESSION_TIMEOUT;
+    let deadline_at = session_end;
     st.deadline = Some(deadline_at);
     let deadline = tokio::time::sleep_until(deadline_at);
     tokio::pin!(deadline);
@@ -847,7 +861,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         }));
     }
 
-    v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
+    v2_pump_client(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
 
         loop {
             tokio::select! {
@@ -871,15 +885,14 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         if st.sid.is_none() {
                             bail!("TLS bytes before setup");
                         }
-                        log.client_bytes(&data, st.handshake.is_some(), st.body_len)?;
                         match st.state {
                             SessionState::Handshake => {
                                 buffer_client(&mut client_pending, &data, st.body_len)?;
-                                v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
+                                v2_pump_client(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                             }
                             SessionState::AwaitHead => buffer_client(&mut st.held_client, &data, st.body_len)?,
                             SessionState::Body => {
-                                client_pending.extend_from_slice(&data);
+                                buffer_client(&mut client_pending, &data, st.body_len)?;
                                 relay_body(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                             }
                             _ => bail!("unexpected client record in state {:?}", st.state),
@@ -906,7 +919,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         if st.joint.is_some() { bail!("unexpected key share"); }
                         st.joint = Some(p);
                         side(&mut st, "2pc key share ready".into());
-                        v2_pump_client(&mut st, &mut client_pending, &mut tcp_tx).await?;
+                        v2_pump_client(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                         v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
                     }
                     Ev::Hs(s) => {
@@ -963,7 +976,15 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                     Ev::ZkDone { proof, ok, err, params: proven } => {
                         info!(proof, ok, ?err, "zk result");
                         side(&mut st, format!("zk proof={} ok={} err={:?}", proof, ok, err));
-                        if !ok { bail!("proof {proof} failed: {err:?}"); }
+                        if !ok {
+                            // Nothing can change a settled session: a late
+                            // failure (a proof connection dropping) only ends
+                            // that connection.
+                            if st.state == SessionState::Settled {
+                                continue;
+                            }
+                            bail!("proof {proof} failed: {err:?}");
+                        }
                         match proof.as_str() {
                             "pi_nk" => {
                                 // π_NK ran to completion on the session's own
@@ -1076,7 +1097,13 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         ));
     }
     if let Some(dir) = &st.run_dir {
-        let _ = std::fs::write(dir.join("sidecar.jsonl"), st.side_log.join("\n") + "\n");
+        // Keep a record only of sessions that wrote a credential record: the rest
+        // (abandoned armed sessions, failed setups) would pile up unbounded.
+        if matches!(st.state, SessionState::Handshake | SessionState::AwaitHead) {
+            let _ = std::fs::remove_dir_all(dir);
+        } else {
+            let _ = std::fs::write(dir.join("sidecar.jsonl"), st.side_log.join("\n") + "\n");
+        }
     }
     drop(cleanup);
     // Close the outbound queue so the sender task drains and flushes any last
@@ -1118,6 +1145,8 @@ struct Session {
     twopc_tx: Option<mpsc::UnboundedSender<TwoPcCmd>>,
     joint: Option<[u8; 65]>,
     ch_checked: bool,
+    /// The checked ClientHello was relayed to the upstream.
+    ch_sent: bool,
     hs_cmd_sent: bool,
     app_cmd_sent: bool,
     ap: Option<Box<ApN>>,
@@ -1335,7 +1364,8 @@ async fn handle_control(
             // at the end of the transcript), or, for an upstream error, only the
             // response head: its status decides the charge, the body stays
             // private (it sits in the `skip` bytes after the head).
-            let usage = if r.starts_with(b"HTTP/1.") {
+            let error_head = r.starts_with(b"HTTP/1.");
+            let usage = if error_head {
                 validate_error_head(&r)?
             } else {
                 if skip != 0 {
@@ -1364,6 +1394,11 @@ async fn handle_control(
             let need = r.len().checked_add(skip).ok_or_else(|| anyhow!("skip overflow"))?;
             if total < need {
                 bail!("disclosed records ({total}) do not cover R + skip ({need})");
+            }
+            // An error head is the start of the response: it begins the first
+            // covered record, and the records after it hold only its body.
+            if error_head && total != need {
+                bail!("an error head must start the first covered record ({total} content bytes, R + skip {need})");
             }
             // The proof decrypts the first covered record only from the
             // last block boundary that still covers R + skip, so its cost
@@ -1486,6 +1521,17 @@ fn locate_tail(lens: &[usize], first_response: usize, tail_lens: &[usize], trail
     Ok(chosen)
 }
 
+/// The keys `canonical_suffix` pins, in order (published in the offer).
+const SUFFIX_KEYS: [&str; 7] = [
+    "model",
+    "max_tokens",
+    "max_completion_tokens",
+    "n",
+    "stream",
+    "stream_options",
+    "venice_parameters",
+];
+
 /// The public JSON suffix that pins every cost-relevant parameter (paper
 /// §4.4 / A.2). Last-wins semantics at the provider make these the effective
 /// values whatever the private prefix carries.
@@ -1519,7 +1565,7 @@ async fn relay_body(
         // Bytes past the declared Content-Length would be a smuggled second
         // request, and records after the proven final record would let the
         // proven suffix not be the body's tail.
-        if r.ctype != CT_APPLICATION_DATA || r.payload.len() < 18 {
+        if r.ctype != CT_APPLICATION_DATA || r.payload.len() < 18 || 5 + r.payload.len() > MAX_TLS_RECORD {
             bail!("unexpected body record");
         }
         let content = r.payload.len() - 17;
@@ -1582,12 +1628,37 @@ async fn write_head(
     Ok(())
 }
 
+/// Whether `pending` starts with a ClientHello that offers exactly the joint
+/// key share (checked once, as soon as both are there): false while either is
+/// missing, an error for anything else.
+fn check_hello(st: &mut Session, pending: &[u8]) -> Result<bool> {
+    if st.ch_checked {
+        return Ok(true);
+    }
+    if pending.first().is_some_and(|t| *t != tls::CT_HANDSHAKE) {
+        bail!("first client record must be the ClientHello");
+    }
+    let Some(joint) = st.joint else { return Ok(false) };
+    let (recs, _) = parse_records(pending);
+    let Some(r) = recs.first() else { return Ok(false) };
+    let msgs = tls::parse_handshake_messages(&r.payload);
+    let [(ty, msg)] = msgs.as_slice() else { bail!("ClientHello must be one message in one record") };
+    if *ty != tls::HS_CLIENT_HELLO || msg.len() != r.payload.len() {
+        bail!("first client record must be exactly the ClientHello");
+    }
+    tls_v2::check_client_hello(msg, &joint)?;
+    st.ch_checked = true;
+    info!("v2 ClientHello checked: one P-256 share, the joint key");
+    Ok(true)
+}
+
 /// Before the client Finished: relay the ClientHello only once the joint
 /// key share is known and the hello offers exactly that share (else C could
 /// complete the handshake alone), then CCS and the client Finished. Anything
 /// after the Finished waits for the credential record.
 async fn v2_pump_client(
     st: &mut Session,
+    log: &mut RelayLog,
     pending: &mut Vec<u8>,
     tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<()> {
@@ -1598,19 +1669,14 @@ async fn v2_pump_client(
         let (recs, _) = parse_records(pending);
         let Some(r) = recs.into_iter().next() else { return Ok(()) };
         let n = 5 + r.payload.len();
-        if !st.ch_checked {
-            let Some(joint) = st.joint else { return Ok(()) }; // wait for the 2PC
-            if r.ctype != tls::CT_HANDSHAKE {
-                bail!("first client record must be the ClientHello");
+        if n > MAX_TLS_RECORD {
+            bail!("client record of {n} bytes exceeds the TLS 1.3 limit");
+        }
+        if !st.ch_sent {
+            if !check_hello(st, pending)? {
+                return Ok(()); // wait for the 2PC
             }
-            let msgs = tls::parse_handshake_messages(&r.payload);
-            let [(ty, msg)] = msgs.as_slice() else { bail!("ClientHello must be one message in one record") };
-            if *ty != tls::HS_CLIENT_HELLO || msg.len() != r.payload.len() {
-                bail!("first client record must be exactly the ClientHello");
-            }
-            tls_v2::check_client_hello(msg, &joint)?;
-            st.ch_checked = true;
-            info!("v2 ClientHello checked: one P-256 share, the joint key");
+            st.ch_sent = true;
         } else if r.ctype == tls::CT_CHANGE_CIPHER_SPEC {
             // relayed as is
         } else if r.ctype == CT_APPLICATION_DATA {
@@ -1619,6 +1685,7 @@ async fn v2_pump_client(
         } else {
             bail!("unexpected client record type {} during the v2 handshake", r.ctype);
         }
+        log.client_handshake_record(&pending[..n])?;
         write_upstream(tcp_tx, &pending[..n], st.deadline).await?;
         st.sent.update(&pending[..n]);
         pending.drain(..n);
@@ -1766,7 +1833,8 @@ async fn zk_handler(socket: WebSocket, q: HashMap<String, String>, app: Arc<AppS
     // Only a proof that actually ran reports its result to the session (and a
     // failed one ends it); zk_inner sends that report itself. A connection
     // refused before that (unknown proof name, no parameters yet, a second
-    // 2PC or proof channel, too many connections, the proof lock busy) only
+    // 2PC or proof channel, a proof that already ran, too many connections,
+    // the proof lock busy) only
     // closes, so whoever learns a live sid cannot end the session that way.
     // A proof channel that fails outside a proof also reports nothing: the
     // client falls back to the per-proof path.
@@ -1823,6 +1891,7 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
         bail!("zk proof waited {}s for the session's previous proof", PROOF_TIMEOUT.as_secs());
     };
     let (role, mut witness) = node_side(proof, &shared)?;
+    shared.claim_proof(proof)?;
     let (io, bridge) = ws_duplex(socket);
     let result = match tokio::time::timeout(PROOF_TIMEOUT, zkbench::proofs::run_io(io, role, &params, witness.as_ref())).await {
         Ok(r) => r,
@@ -1908,7 +1977,8 @@ where
         let proof = req.proof;
         let t = std::time::Instant::now();
         // A request the node cannot run (a name it does not serve, no
-        // parameters yet, the proof lock busy) did not run a proof: it closes
+        // parameters yet, the proof lock busy, a proof that already ran) did
+        // not run a proof: it closes
         // the channel without reporting to the session, which goes on (the
         // client may fall back to the per-proof path).
         let ready = async {
@@ -1920,6 +1990,7 @@ where
                 bail!("{proof} waited {}s for the session's previous proof", PROOF_TIMEOUT.as_secs());
             };
             let (_, witness) = node_side(&proof, shared)?;
+            shared.claim_proof(&proof)?;
             Ok((params, guard, witness))
         }
         .await;
@@ -1963,7 +2034,8 @@ where
 ///
 /// R is exactly the status line and the header block, ending in the blank
 /// line; π_C3S proves it sits `skip` bytes before the end of the response, so
-/// the body stays private. Sound because a strict status line followed by
+/// the body stays private, and the disclosure check pins it to the start of a
+/// record. Sound because a strict status line followed by
 /// well-formed `Name: value` header lines cannot be produced by anything but
 /// the provider's own response head: model output travels in JSON strings
 /// (no raw CR/LF) and chunk framing lines are bare hex sizes, not headers. The
@@ -1979,9 +2051,12 @@ fn validate_error_head(r: &[u8]) -> Result<serde_json::Value> {
     }
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
+    // Field text: visible characters, spaces and tabs (obs-text allowed),
+    // never a control character such as the LF that ends an event-stream line.
+    let is_field_text = |v: &str| !v.chars().any(|c| c.is_ascii_control() && c != '\t');
     let mut parts = status_line.splitn(3, ' ');
     let (ver, code) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    if !(ver == "HTTP/1.1" || ver == "HTTP/1.0") || code.len() != 3 {
+    if !(ver == "HTTP/1.1" || ver == "HTTP/1.0") || code.len() != 3 || !is_field_text(parts.next().unwrap_or("")) {
         bail!("error R: malformed status line");
     }
     let status: u16 = code.parse().context("error R: status not numeric")?;
@@ -1992,7 +2067,7 @@ fn validate_error_head(r: &[u8]) -> Result<serde_json::Value> {
     let mut headers = 0usize;
     for l in lines {
         let (k, v) = l.split_once(':').ok_or_else(|| anyhow!("error R: malformed header"))?;
-        if k.is_empty() || !k.chars().all(is_tchar) || v.contains('\r') || v.contains('\n') {
+        if k.is_empty() || !k.chars().all(is_tchar) || !is_field_text(v) {
             bail!("error R: malformed header");
         }
         headers += 1;
@@ -2306,20 +2381,13 @@ mod relay_log_tests {
         assert_eq!(log.server_raw, b"hello ");
         assert_eq!(log.recv_len, 11);
         assert_eq!(log.recv.hash(), cu_crypto::transcript::hash(b"hello world"));
-
-        log.client_bytes(b"ch", false, 100).unwrap();
-        log.client_bytes(b"body", true, 100).unwrap();
-        assert_eq!(log.client_raw, b"ch");
     }
 
     #[test]
     fn unverified_client_bytes_and_server_bytes_are_capped() {
         let mut log = RelayLog::default();
         let big = vec![0u8; client_buffer_cap(100) + 1];
-        assert!(log.client_bytes(&big, false, 100).is_err());
-        // After the handshake they are not kept, so not capped here (the
-        // body accounting bounds them).
-        assert!(log.client_bytes(&big, true, 100).is_ok());
+        assert!(super::buffer_client(&mut Vec::new(), &big, 100).is_err());
 
         let chunk = vec![0u8; 1 << 20];
         for _ in 0..MAX_SERVER_BYTES >> 20 {
@@ -2443,8 +2511,55 @@ mod hardening_tests {
             zk_lock: tokio::sync::Mutex::new(()),
             zkchan_taken: std::sync::atomic::AtomicBool::new(false),
             zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            proofs_run: StdMutex::new(Default::default()),
         });
         (s, rx)
+    }
+
+    #[test]
+    fn the_offer_names_the_keys_the_suffix_pins() {
+        let s = canonical_suffix("m", 5);
+        let v: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&format!("{{{}", &s[1..])).unwrap();
+        let mut keys: Vec<&str> = v.keys().map(|k| k.as_str()).collect();
+        let mut want = SUFFIX_KEYS.to_vec();
+        keys.sort();
+        want.sort();
+        assert_eq!(keys, want);
+    }
+
+    #[test]
+    fn an_error_head_is_a_strict_status_line_and_headers() {
+        let ok = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\r\n";
+        assert_eq!(validate_error_head(ok).unwrap()["error_status"], 503);
+        // A reason phrase or header value carrying an event-stream line end.
+        assert!(validate_error_head(b"HTTP/1.1 503 x\"}]}\n\n\r\nA: b\r\n\r\n").is_err());
+        assert!(validate_error_head(b"HTTP/1.1 503 x\r\nA: b\n\r\n\r\n").is_err());
+        assert!(validate_error_head(b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n").is_err());
+        assert!(validate_error_head(b"HTTP/1.1 503 x\r\n1a3\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn anything_but_a_client_hello_is_refused_before_the_dial() {
+        let mut st = Session::default();
+        // Before the key share: a handshake record is awaited, anything else refused.
+        assert!(!check_hello(&mut st, &[]).unwrap());
+        assert!(!check_hello(&mut st, &[tls::CT_HANDSHAKE, 3, 1]).unwrap());
+        assert!(check_hello(&mut st, &[CT_APPLICATION_DATA]).is_err());
+        st.joint = Some([4; 65]);
+        let mut garbage = rec(tls::CT_HANDSHAKE, 8).bytes();
+        assert!(!check_hello(&mut st, &garbage[..7]).unwrap());
+        garbage[5] = tls::HS_CLIENT_HELLO;
+        assert!(check_hello(&mut st, &garbage).is_err());
+        assert!(!st.ch_checked);
+    }
+
+    #[test]
+    fn each_proof_runs_once_per_session() {
+        let app = app_state();
+        let (s, _rx) = shared(&app);
+        assert!(s.claim_proof("pi_c3s").is_ok());
+        assert!(s.claim_proof("pi_c2s").is_ok());
+        assert!(s.claim_proof("pi_c3s").is_err());
     }
 
     #[test]

@@ -1,0 +1,13 @@
+modality regression  2026-10-19T06:32:52Z  provider=https://api.venice.ai/api/v1/chat/completions  models=8  retries=2
+PASS         deepseek-v3.2                      text=200  image_url=400  data_uri=400 
+PASS         deepseek-v4-flash                  text=200  image_url=400  data_uri=400 
+PASS         deepseek-v4-flash-0731             text=200  image_url=400  data_uri=400 
+PASS         deepseek-v4-pro                    text=200  image_url=400  data_uri=400 
+PASS         deepseek-v4-pro-0813               text=200  image_url=400  data_uri=400 
+PASS         hermes-3-llama-3.1-405b            text=200  image_url=400  data_uri=400 
+PASS         mercury-2                          text=200  image_url=400  data_uri=400 
+PASS         qwen3-235b-a22b-thinking-2507      text=200  image_url=400  data_uri=400 
+wrote docs/evidence/regression-modality-2026-10-19.json
+
+summary: 8 PASS, 0 FAIL, 0 INCONCLUSIVE of 8 models
+PASS: all 8 advertised models reject image_url and data URI parts (GAP-3 gate holds)

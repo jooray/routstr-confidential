@@ -263,7 +263,8 @@ pub fn stats(params: &Params) -> Stats {
             for r in &p.records {
                 aes_blocks += r.ct.len().div_ceil(16);
             }
-            7
+            // Each server KeyUpdate adds one "traffic upd" step (4).
+            7 + 4 * p.key_updates as usize
         }
         Params::PiNK(p) => {
             // hk (28 bytes, one block) + SHA256(header || C_1).

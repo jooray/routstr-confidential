@@ -516,7 +516,8 @@ pub fn decrypt_window<VM: Vm<Binary>>(
 
 /// Decrypt the tail of a record, from block-aligned inner-plaintext offset
 /// `off` to its end (`ct` is that tail's ciphertext), and return its content
-/// (minus the trailing content-type byte).
+/// and, separately, its last byte: the inner content type of an unpadded
+/// record, which the caller must check.
 pub fn decrypt_record_tail<VM: Vm<Binary>>(
     vm: &mut VM,
     key: &Array<U8, 16>,
@@ -524,7 +525,7 @@ pub fn decrypt_record_tail<VM: Vm<Binary>>(
     seq: u64,
     ct: &Vector<U8>,
     off: usize,
-) -> anyhow::Result<Vector<U8>> {
+) -> anyhow::Result<(Vector<U8>, Vector<U8>)> {
     if ct.len() < 2 {
         anyhow::bail!("decrypt_record_tail: record has no content");
     }
@@ -545,7 +546,7 @@ pub fn decrypt_record_tail<VM: Vm<Binary>>(
     let ks_all = concat(vm, &ks_blocks)?;
     let ks_used = select(vm, &ks_all, 0, ct.len())?;
     let pt = xor_bytes(vm, ct, &ks_used)?;
-    select(vm, &pt, 0, ct.len() - 1)
+    Ok((select(vm, &pt, 0, ct.len() - 1)?, select(vm, &pt, ct.len() - 1, 1)?))
 }
 
 /// Slice a `Vector<U8>` into a raw `Slice` view (helper for callers).

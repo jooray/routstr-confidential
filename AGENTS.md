@@ -92,6 +92,7 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
 6. *Response.* It streams back; the client decrypts and verifies it. When
    Venice closes the connection the sidecar signs an attestation (sid,
    certificate-chain hash, both handshake transcript hashes, record counts
+   (the client's body records, every server record)
    and SHA-256 of all bytes in each direction, `c_commit`, time) with its
    per-process Ed25519 key; the node re-signs it with its Nostr key, and the
    client checks that signature and that the sid and transcript hashes are
@@ -199,7 +200,8 @@ v1 proof of concept is the `v1-poc` branch. The earlier dual-execution 2PC
 the tag `v2-symmetric` in this repo, routstr-core and routstr-sdk. Note:
 routstr-core persists most settings in its DB, but `confidential_sidecar_url`
 is env-only (the routes are mounted at startup), and the node must run as a
-single worker (offers, sessions and `/zk` admission are per process).
+single worker (offers, sessions and `/zk` admission are per process); it
+refuses to start in confidential mode when it detects more than one.
 
 ## Browser client (separate repos)
 

@@ -14,8 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::tls::{
     parse_handshake_messages, parse_records, CT_APPLICATION_DATA, CT_CHANGE_CIPHER_SPEC,
-    CT_HANDSHAKE, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY, HS_CLIENT_HELLO, HS_ENCRYPTED_EXTENSIONS,
-    HS_FINISHED, HS_SERVER_HELLO,
+    CT_HANDSHAKE, HS_CLIENT_HELLO, HS_FINISHED, HS_SERVER_HELLO,
 };
 
 pub const SUITE_AES128_GCM_SHA256: u16 = 0x1301;
@@ -26,6 +25,8 @@ const EXT_KEY_SHARE: u16 = 51;
 const EXT_PRE_SHARED_KEY: u16 = 41;
 const EXT_EARLY_DATA: u16 = 42;
 const TLS13: u16 = 0x0304;
+/// `legacy_version` of a TLS 1.3 ClientHello and ServerHello (RFC 8446 §4.1).
+const LEGACY_VERSION: u16 = 0x0303;
 
 /// SHA-256("HelloRetryRequest"), the ServerHello.random of an HRR.
 const HRR_RANDOM: [u8; 32] = [
@@ -97,7 +98,9 @@ pub fn check_client_hello(msg: &[u8], joint: &[u8; 65]) -> Result<()> {
         bail!("not a ClientHello");
     }
     let mut r = Reader::new(&msg[4..]);
-    r.take(2)?; // legacy_version
+    if r.u16()? != LEGACY_VERSION {
+        bail!("ClientHello legacy_version must be TLS 1.2");
+    }
     r.take(32)?; // random
     r.vec8()?; // legacy_session_id
     let suites = r.vec16()?;
@@ -148,7 +151,9 @@ pub fn server_hello_share(msg: &[u8]) -> Result<[u8; 65]> {
         bail!("not a ServerHello");
     }
     let mut r = Reader::new(&msg[4..]);
-    r.take(2)?;
+    if r.u16()? != LEGACY_VERSION {
+        bail!("ServerHello legacy_version must be TLS 1.2");
+    }
     if r.take(32)? == HRR_RANDOM {
         bail!("HelloRetryRequest is not supported");
     }
@@ -156,8 +161,17 @@ pub fn server_hello_share(msg: &[u8]) -> Result<[u8; 65]> {
     if r.u16()? != SUITE_AES128_GCM_SHA256 {
         bail!("server selected a suite that was not offered");
     }
-    r.u8()?;
+    if r.u8()? != 0 {
+        bail!("ServerHello compression method must be null");
+    }
     let exts = extensions(r.vec16()?)?;
+    if !r.done() {
+        bail!("trailing bytes after ServerHello extensions");
+    }
+    // Without a PSK offered, a TLS 1.3 ServerHello carries only these two.
+    if exts.iter().any(|(t, _)| *t != EXT_SUPPORTED_VERSIONS && *t != EXT_KEY_SHARE) {
+        bail!("ServerHello carries an extension other than supported_versions and key_share");
+    }
     let v = ext(&exts, EXT_SUPPORTED_VERSIONS).ok_or_else(|| anyhow!("ServerHello: no supported_versions"))?;
     if v != TLS13.to_be_bytes() {
         bail!("server did not negotiate TLS 1.3");
@@ -229,12 +243,8 @@ pub fn th_sf(ch: &[u8], sh: &[u8], server_bytes: &[u8], s_hs: &[u8; 32]) -> Resu
             _ => {}
         }
     }
-    let msgs = parse_handshake_messages(&plain);
-    let find = |t: u8| msgs.iter().find(|(ty, _)| *ty == t).map(|(_, m)| m.as_slice());
-    let Some(fin) = find(HS_FINISHED) else { return Ok(None) };
-    let ee = find(HS_ENCRYPTED_EXTENSIONS).ok_or_else(|| anyhow!("no EncryptedExtensions"))?;
-    let cert = find(HS_CERTIFICATE).ok_or_else(|| anyhow!("no Certificate"))?;
-    let cv = find(HS_CERTIFICATE_VERIFY).ok_or_else(|| anyhow!("no CertificateVerify"))?;
+    let Some([ee, cert, cv, fin]) = crate::tls::server_flight(&plain)? else { return Ok(None) };
+    let (ee, cert, cv, fin) = (ee.as_slice(), cert.as_slice(), cv.as_slice(), fin.as_slice());
     let th_cv = sha256(&[ch, sh, ee, cert, cv]);
     if fin.len() < 4 || fin[4..] != hkdf::verify_data(&hkdf::finished_key(s_hs), &th_cv) {
         bail!("server Finished verify_data mismatch");

@@ -378,12 +378,15 @@ pub fn build_pi_c3s<VM: Vm<Binary>>(
     }
     let (anchor, k, iv) = anchored_keys_after_updates(vm, role, "h2", &p.h2, witness, p.key_updates)?;
     let mut contents = Vec::with_capacity(p.records.len());
+    let mut types = Vec::with_capacity(p.records.len());
     for (i, r) in p.records.iter().enumerate() {
         if i > 0 && r.off != 0 {
             anyhow::bail!("π_C3S: only the first record may start at an offset");
         }
         let ct = public_bytes(vm, &r.ct)?;
-        contents.push(decrypt_record_tail(vm, &k, &iv, r.seq, &ct, r.off)?);
+        let (content, ctype) = decrypt_record_tail(vm, &k, &iv, r.seq, &ct, r.off)?;
+        contents.push(content);
+        types.push(ctype);
     }
     let all = concat(vm, &contents)?;
     let start = all
@@ -392,7 +395,14 @@ pub fn build_pi_c3s<VM: Vm<Binary>>(
         .and_then(|x| x.checked_sub(p.skip))
         .ok_or_else(|| anyhow::anyhow!("π_C3S: records do not cover R plus skip"))?;
     let out = select(vm, &all, start, p.expected.len())?;
-    let expected = public_bytes(vm, &p.expected)?;
+    // Every covered record is unpadded application data: R cannot be read
+    // out of a handshake or alert record. One comparison keeps the result
+    // a single bit.
+    types.insert(0, out);
+    let out = concat(vm, &types)?;
+    let mut want = p.expected.clone();
+    want.resize(p.expected.len() + p.records.len(), 0x17);
+    let expected = public_bytes(vm, &want)?;
     let eq = eq_bytes(vm, &out, &expected)?;
     Ok(vec![anchor, Check::full("disclosure", eq, vec![1u8])])
 }

@@ -261,7 +261,9 @@ CONFIDENTIAL_SIDECAR_TOKEN=<the sidecar's CU_SIDECAR_TOKEN>
 
 The sidecar URL is read only from the environment (the confidential routes are mounted at startup; it is
 not stored in the database and cannot be changed through the admin API). Run the node as a single worker:
-offers, sessions and `/zk` admission are kept per process. The token is read only from the environment (never stored in the
+offers, sessions and `/zk` admission are kept per process, and the node refuses to start when it detects
+more than one worker (`--workers`, `WEB_CONCURRENCY`, gunicorn `-w`, or a second process on the same
+sidecar and database). The token is read only from the environment (never stored in the
 database, shown as `[REDACTED]` by the admin API). The node then serves `GET /v1/confidential/offer` (signed with its Nostr
 key) and marks the offered models in `/v1/models` with `confidential_upstream`. Its reverse proxy must pass
 WebSockets for `/v1/confidential/ws` and `/v1/confidential/zk` (`Upgrade`/`Connection` headers, read timeout

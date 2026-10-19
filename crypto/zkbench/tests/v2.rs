@@ -193,6 +193,20 @@ async fn c3s_after_server_key_updates() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c3s_records_must_be_application_data() {
+    // The same R inside a record whose inner content type is handshake (0x16)
+    // or a padded record (last byte 0): no equality.
+    let (params, witness) = fixtures::pi_c3s_after_updates(0);
+    let Params::PiC3S(p) = params else { unreachable!() };
+    for flip in [0x17 ^ 0x16, 0x17] {
+        let mut wrong = p.clone();
+        *wrong.records[0].ct.last_mut().unwrap() ^= flip;
+        let res = run_pair_ideal(&Params::PiC3S(wrong), &witness).await.unwrap();
+        assert!(!res.last().unwrap().ok, "inner type {:#04x} must not verify", 0x17 ^ flip);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c3s_first_record_from_an_offset() {
     // Only the record's tail is decrypted: from a block-aligned offset that
     // still covers R. Fewer AES blocks, same statement about the end.

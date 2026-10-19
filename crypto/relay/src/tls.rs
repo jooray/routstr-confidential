@@ -85,6 +85,24 @@ pub fn parse_handshake_messages(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
     out
 }
 
+/// The server's decrypted handshake flight: `None` until its Finished
+/// arrived, then exactly EncryptedExtensions, Certificate, CertificateVerify
+/// and Finished, in RFC 8446 order, each once, with nothing after them.
+pub fn server_flight(plain: &[u8]) -> Result<Option<[Vec<u8>; 4]>> {
+    let msgs = parse_handshake_messages(plain);
+    if !msgs.iter().any(|(t, _)| *t == HS_FINISHED) {
+        return Ok(None);
+    }
+    match <[(u8, Vec<u8>); 4]>::try_from(msgs) {
+        Ok([(HS_ENCRYPTED_EXTENSIONS, ee), (HS_CERTIFICATE, cert), (HS_CERTIFICATE_VERIFY, cv), (HS_FINISHED, fin)])
+            if ee.len() + cert.len() + cv.len() + fin.len() == plain.len() =>
+        {
+            Ok(Some([ee, cert, cv, fin]))
+        }
+        _ => bail!("server flight is not EncryptedExtensions, Certificate, CertificateVerify, Finished, each once and in order"),
+    }
+}
+
 /// The handshake traffic secrets (public outputs of the two-party key schedule).
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct HsSecrets {
@@ -194,34 +212,18 @@ pub fn verify_handshake(
         }
     }
 
-    let msgs = parse_handshake_messages(&plaintext_stream);
-    let ee = msgs
-        .iter()
-        .find(|(t, _)| *t == HS_ENCRYPTED_EXTENSIONS)
-        .ok_or_else(|| anyhow!("no EncryptedExtensions"))?;
-    let cert = msgs
-        .iter()
-        .find(|(t, _)| *t == HS_CERTIFICATE)
-        .ok_or_else(|| anyhow!("no Certificate"))?;
-    let cv = msgs
-        .iter()
-        .find(|(t, _)| *t == HS_CERTIFICATE_VERIFY)
-        .ok_or_else(|| anyhow!("no CertificateVerify"))?;
-    let sfin = msgs
-        .iter()
-        .find(|(t, _)| *t == HS_FINISHED)
-        .ok_or_else(|| anyhow!("no server Finished"))?;
+    let [ee, cert, cv, sfin] = server_flight(&plaintext_stream)?.ok_or_else(|| anyhow!("no server Finished"))?;
 
     // transcript through Certificate: this is what CertificateVerify signs
-    let th_certs = sha256(&[ch_msg.as_slice(), sh_msg.as_slice(), &ee.1, &cert.1].concat());
+    let th_certs = sha256(&[ch_msg.as_slice(), sh_msg.as_slice(), &ee, &cert].concat());
     // transcript through CertificateVerify: the server Finished covers this
     let th_cv = sha256(
-        &[ch_msg.as_slice(), sh_msg.as_slice(), &ee.1, &cert.1, &cv.1].concat(),
+        &[ch_msg.as_slice(), sh_msg.as_slice(), &ee, &cert, &cv].concat(),
     );
 
     // --- server Finished ------------------------------------------------
     let sf_key = hkdf::finished_key(s_hs.as_bytes());
-    let sf_body = &sfin.1[4..];
+    let sf_body = &sfin[4..];
     let expect = hkdf::verify_data(&sf_key, &th_cv);
     if !ct_eq(sf_body, &expect) {
         bail!("server Finished verify_data mismatch");
@@ -232,16 +234,16 @@ pub fn verify_handshake(
         &[
             ch_msg.as_slice(),
             sh_msg.as_slice(),
-            &ee.1,
-            &cert.1,
-            &cv.1,
-            &sfin.1,
+            &ee,
+            &cert,
+            &cv,
+            &sfin,
         ]
         .concat(),
     );
 
     // --- certificate chain + hostname -----------------------------------
-    let certs = parse_certificate_message(&cert.1[4..])?;
+    let certs = parse_certificate_message(&cert[4..])?;
     if certs.is_empty() {
         bail!("empty certificate chain");
     }
@@ -272,7 +274,7 @@ pub fn verify_handshake(
         .map_err(|e| anyhow!("hostname verification failed: {e}"))?;
 
     // --- CertificateVerify ----------------------------------------------
-    verify_certificate_verify(&end_entity, &cv.1[4..], &th_certs)?;
+    verify_certificate_verify(&end_entity, &cv[4..], &th_certs)?;
 
     // --- client Finished -------------------------------------------------
     let ck = c_hs.key();
@@ -367,8 +369,8 @@ fn verify_certificate_verify(cert: &EndEntityCert, body: &[u8], th_cv: &[u8; 32]
     }
     let scheme = u16::from_be_bytes([body[0], body[1]]);
     let sig_len = u16::from_be_bytes([body[2], body[3]]) as usize;
-    if body.len() < 4 + sig_len {
-        bail!("CertificateVerify signature truncated");
+    if body.len() != 4 + sig_len {
+        bail!("CertificateVerify signature truncated or followed by extra bytes");
     }
     let sig = &body[4..4 + sig_len];
     info!(scheme = format!("{scheme:#06x}"), sig_len, "CertificateVerify");
@@ -445,5 +447,34 @@ mod inner_type_tests {
         assert!(handshake_inner(&[1, 2, 0x17]).is_err());
         assert!(handshake_inner(&[0, 0]).is_err());
         assert!(handshake_inner(&[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(ty: u8, body: &[u8]) -> Vec<u8> {
+        let mut m = vec![ty, 0, 0, body.len() as u8];
+        m.extend_from_slice(body);
+        m
+    }
+
+    #[test]
+    fn the_server_flight_is_four_messages_in_order() {
+        let (ee, cert, cv, fin) = (
+            msg(HS_ENCRYPTED_EXTENSIONS, b"e"),
+            msg(HS_CERTIFICATE, b"c"),
+            msg(HS_CERTIFICATE_VERIFY, b"v"),
+            msg(HS_FINISHED, b"f"),
+        );
+        let flight = |ms: &[&Vec<u8>]| ms.iter().flat_map(|m| m.iter().copied()).collect::<Vec<u8>>();
+        assert!(server_flight(&flight(&[&ee, &cert])).unwrap().is_none());
+        assert_eq!(server_flight(&flight(&[&ee, &cert, &cv, &fin])).unwrap().unwrap()[3], fin);
+        assert!(server_flight(&flight(&[&cert, &ee, &cv, &fin])).is_err());
+        assert!(server_flight(&flight(&[&ee, &ee, &cert, &cv, &fin])).is_err());
+        let mut trailing = flight(&[&ee, &cert, &cv, &fin]);
+        trailing.push(0);
+        assert!(server_flight(&trailing).is_err());
     }
 }

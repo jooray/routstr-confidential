@@ -3,7 +3,7 @@ title: "Confidential and verifiable upstream inference over standard TLS 1.3"
 subtitle: "A no-trusted-hardware protocol for LLM routing nodes"
 author: '`Juraj Bednar \href{mailto:juraj@bednar.io}{<juraj@bednar.io>}\\[0.5em]\small Coauthors: Claude Opus 5.5, Claude Sonnet 5.5, Kimi K3,\\ \small DeepSeek V4.1 Flash, GPT-6 Astra, GLM-5.3 Flash`{=latex}'
 author-meta: "Juraj Bednar, with Claude Opus 5.5, Claude Sonnet 5.5, Kimi K3, DeepSeek V4.1 Flash, GPT-6 Astra, GLM-5.3 Flash"
-date: "2026-10-10"
+date: "2026-10-19"
 abstract: |
   LLM routing nodes forward user requests to upstream providers with the node's own API key, so users
   must trust the node with their prompts, and the node must keep its key from its users. Enclave-based
@@ -18,8 +18,9 @@ abstract: |
   proofs anchored on hashes the computation outputs show the client that the node's record matches a
   published template, and show the node that the request ends in a public suffix pinning the model and
   token cap and that the billed usage is the provider's own report. Against a live provider on one host,
-  a cold request reaches the provider after about 1.2 s and a pre-warmed one 5 ms after it is claimed,
-  followed by a 0.10 s suffix proof. The price is about 22 MB from the node to the client and 1.2 MB back
+  a cold request reaches the provider after about 1.2 s; a session armed through the handshake sends
+  its body 5 ms after it is claimed, followed by the suffix proof (0.16 s with its own OT setup, less
+  over a pre-warmed proof channel). The price is about 22 MB from the node to the client and 1.2 MB back
   per request; on a home link with a 2 Mbit/s uplink the cold two-party computation takes about 7 s, and
   pre-warming moves it off the request path. We also describe a single-party variant that needs under a
   quarter of the bandwidth but protects the key only while no observer of the node's egress colludes
@@ -161,8 +162,11 @@ case-study provider (Appendix A) a live regression gate tests items 1 to 7 and 9
 requirements hold as far as those samples show, and the gate is re-run after provider changes. Item 8
 is a property of the provider's error handling that the gate does not test. Everything except the
 specifics of items 4 to 7 and 9 is provider-generic: the epoch structure, the 2PC, the proofs and the record
-assembly do not change per provider; only the offer (template, pinned keys, price list, usage parser)
-does.
+assembly do not change per provider; the head template, the pinned suffix, the price list and the usage
+parser do. In the current implementation only the head template and the price list come from the offer:
+the suffix and the usage parser are written for the case-study provider in the relay and in the
+clients, so a second provider needs a code change in each (the offer's `suffix_keys` only names the
+pinned keys).
 
 ## 3.2 TLS 1.3 key schedule
 
@@ -447,7 +451,10 @@ length, $T$ the pinned token cap, $r_{in}, r_{out}$ the per-1k rates of the froz
 node's minimum charge and $M$ a completion margin (16 tokens by default, an operator setting, published
 in the signed offer as `reserve_margin_tokens` so C can size its balance). The margin exists because a
 provider may bill a few tokens beyond the cap (Appendix A) and the charge is capped at the reservation;
-it only enlarges the hold, and the charge is still the reported usage. Overshoot beyond $M$ is N's loss. $L$ must be the whole context, not the context minus the model's own completion
+it only enlarges the hold, and the charge is still the reported usage. Overshoot beyond $M$ is N's loss.
+(Two node configurations fall outside this formula: a model without a known context length is reserved at
+its maximum per-request cost plus the margin, and a node with fixed per-request pricing reserves that
+price.) $L$ must be the whole context, not the context minus the model's own completion
 limit: the pinned cap $T$ is usually far below that limit, the provider accepts a prompt of up to
 $L - T$ tokens, and since the charge is capped at the reservation, any prompt tokens beyond the
 reserved bound would be free. (The sessions measured in section 6 reserved with the smaller bound; for
@@ -458,7 +465,8 @@ the case study, `deepseek-v4-flash` with $T$ = 40, that was 2,282 msat for a ses
 U's response streams under $s_{ap,0}$; C decrypts it and verifies every GCM tag natively (P3 for the
 response) and streams tokens to the application live. At close, N signs a **session attestation**
 binding the session id, the certificate chain hash, the two handshake transcript hashes (through
-ServerHello and through the server Finished), the record counts in each direction, the SHA-256 of all bytes sent to U and of all bytes received
+ServerHello and through the server Finished), the number of body records C sent and of all records
+received from U, the SHA-256 of all bytes sent to U and of all bytes received
 from it, the commitment to the credential record ($c_{commit}$) and the time. N's relay signs it with a
 per-process Ed25519 key and N signs it again with its Nostr key; C checks N's signature and that the
 session id and both transcript hashes are its own.
@@ -472,8 +480,10 @@ stream terminator, with its chunk framing, anchored at the end of the transcript
 - *public*: $h_2$, the final records' ciphertexts and sequence numbers, R, a count `skip` of
   undisclosed bytes after R, and the number $k$ of server KeyUpdates before the covered records;
 - *statement*: $\mathrm{SHA256}(s_{ap,0}) = h_2$; derive $s_{ap,k}$ by $k$ "traffic upd" steps and its
-  key and IV; CTR-decrypt the covered records; R ends `skip` bytes before the end of the response;
-  in-circuit equality with R, decoded as one bit. For a usage disclosure `skip` is 0.
+  key and IV; CTR-decrypt the covered records; each record's last plaintext byte (its inner content
+  type) is `0x17`, so R cannot be read out of a handshake or alert record or a padded one; R ends `skip`
+  bytes before the end of the response; in-circuit equality of R and the content types with their
+  expected values, decoded as one bit. For a usage disclosure `skip` is 0.
 
 U may rotate its keys mid-response (a KeyUpdate inside the encrypted stream, which only C can see). C
 then reports $k$ and the record where that epoch starts, whose sequence numbers restart at 0; a wrong
@@ -503,7 +513,7 @@ Confidential sessions use the node's ordinary billing; nothing about money is sp
    the usage at the frozen rates,
    $\lceil (r_{in}(p - c) + r_{cached} \min(c, p) + r_{out} \cdot o) / 1000 \rceil$ msat for $p$ prompt
    tokens of which $c$ cached and $o$ completion tokens, capped at the reservation, through the node's
-   ordinary finalize path.
+   ordinary finalize path. (If an offer priced cached tokens above $r_{in}$, N uses $r_{in}$ for them.)
 3. **Receipt.** N signs (BIP-340 Schnorr, over canonical JSON) a receipt with the session id, model,
    usage, cost, reservation, the resulting balance, the frozen rates, its key, the SHA-256 of the exact
    attestation bytes, and the time. C requires the signature, takes every field from the signed bytes,
@@ -521,7 +531,8 @@ disclosure, so it is charged like one (residual risk 11).
 carries no usage event. C then discloses only the response *head*: the status line, the header lines and
 the blank line that ends them. $\pi_{C3S}$ proves it with `skip` set to the length of the rest of the
 response, so the head is anchored at a known distance from the end of the transcript and the error body,
-which can quote the request, stays private. For statuses the provider answers before doing any work (4xx,
+which can quote the request, stays private. The relay also requires the head to start the first record C
+discloses. For statuses the provider answers before doing any work (4xx,
 503), N releases the reservation; other 5xx are charged like a missing disclosure. The head is
 unambiguous for the same reason as the usage event: a strict status line followed by well-formed
 `Name: value` header lines cannot come from model output, nor from chunk framing.
@@ -744,18 +755,18 @@ path to $c_{hs}$ and $s_{hs}$.
 Of the 22 MB C downloads, 16.2 MB are the three-halves tables and 5.3 MB the 64-bit check rows; the rest
 is the mask commitments and the correlated OT. Of the 1.21 MB it uploads, 1.15 MB is its part of Ferret,
 in which C is the sender. Ferret is the only backend: KOS alone would upload almost nothing but would
-make N send 16 bytes per MAC, 42.7 MB in all, and with N scheduling its tables around C's upload Ferret
+make N send 16 bytes per MAC, so that C would download 42.7 MB instead of 22.1 MB, and with N scheduling its tables around C's upload Ferret
 was faster on every link we measured. N spends about 0.5 s of CPU per session (six hash calls per AND
 gate, Ferret, the check material) and C about 0.4 s; each online phase takes 35 to 45 ms.
 
 Across a network the online steps take about 0.5 s at 80 ms RTT: the key share 84 ms, ECtF 170 ms,
-phase A about 121 ms and phase B about 126 ms, each phase about 1.5 round trips. Preprocessing is
+phase A about 126 ms and phase B about 131 ms, each phase about 1.5 round trips. Preprocessing is
 bandwidth-bound and dominates a cold session (section 6.4).
 
 **Proofs.** The anchors remove the key schedule from the client's proofs, and $\pi_{NK}$ replaces the
 single-party variant's pair $\pi_{C1}$ + $\pi_N$ (section 7):
 
-| Proof | Local | 50 ms RTT | Data | SHA-256 compr. | AES blocks |
+| Proof (benchmark sizes) | Local | 50 ms RTT | Data | SHA-256 compr. | AES blocks |
 |---|---|---|---|---|---|
 | $\pi_{NK}$ (credential record) | 0.16 s | 1.23 s | 1.45 MB | 5 | 15 |
 | $\pi_{C2S}$ (suffix) | 0.16 s | 1.22 s | 1.45 MB | 7 | 15 |
@@ -765,30 +776,36 @@ single-party variant's pair $\pi_{C1}$ + $\pi_N$ (section 7):
 | v1 $\pi_{C2}$ (suffix) | 0.47 s | 1.58 s | 1.67 MB | 36 | 15 |
 | v1 $\pi_{C3}$ (usage) | 0.46 s | 1.56 s | 1.67 MB | 28 | 38 |
 
-The 50 ms RTT column uses 100 Mbit/s. At 50 ms RTT about 0.7 s of each proof is fixed cost (OT setup and the final flush). Data sizes move in
+The AES block counts are for the benchmark's 228-byte head, 230-byte suffix and one 596-byte server
+record; they grow with those sizes. $\pi_{C3S}$ adds 4 compressions per server KeyUpdate it steps
+through (at most 16). The 50 ms RTT column uses 100 Mbit/s. At 50 ms RTT about 0.7 s of each proof is fixed cost (OT setup and the final flush). Data sizes move in
 steps of about 0.48 MB per direction because the OT extension runs in fixed chunks.
 
 ## 6.3 End to end
 
 Live sessions against api.venice.ai (`deepseek-v4-flash`, 40 tokens), client and node on one host,
-medians of 5 sessions each. The single-party variant (v1, section 7) is measured on the same setup.
+medians of 5 sessions each unless noted. The single-party variant (v1, section 7) is measured on the
+same setup. These and the other live end-to-end figures in this section are the author's measurements;
+unlike the component benchmarks, their session logs are not published. In these runs the reference
+client opens the proof channel alongside the 2PC preprocessing, so the proofs on the request path run
+over it.
 
 | | v1 (single-party) | v2 (this protocol) |
 |---|---|---|
-| Cold: request start → body sent | 0.73 s | 1.2 s (2PC preprocessing 0.76 s; $\pi_{NK}$ 0.06 s); one run |
-| Cold: suffix proof held before U starts | 0.45 s ($\pi_{C2}$) | 0.10 s ($\pi_{C2S}$) |
+| Cold: request start → body sent | 0.73 s | 1.2 s (2PC preprocessing 0.76 s; $\pi_{NK}$ 0.06 s over the proof channel); one run |
+| Cold: suffix proof held before U starts | 0.45 s ($\pi_{C2}$) | at most 0.16 s ($\pi_{C2S}$; component benchmark, not timed in the live run) |
 | Cold: time to first token | 1.90 s | 2.43 s † |
 | Pre-warmed: arming time per session | 0.71 s | 0.88 s † |
-| Pre-warmed: claim → body sent | 3 ms | 5 ms |
+| Pre-warmed (reference client, armed through $\pi_{NK}$): claim → body sent | 3 ms | 5 ms |
 | Pre-warmed: time to first token | 1.41 s | 0.90 s † |
 
-† Measured with the dual-execution 2PC (section 6.6). Its local preprocessing took 0.49 s against
+† Measured with the dual-execution 2PC (section 6.6). Its preprocessing took 0.49 s in the live client against
 0.70-0.84 s now, so arming and the cold time to first token are now a few hundred milliseconds
 longer; its online phases took 27 and 33 ms with their checks, against 33 and 40 ms now, so the
 pre-warmed path is essentially unchanged.
 
-On one host the protocol's own path to U starting work is 1.18 s for v1 and about 1.3 s for v2 cold, and
-0.45 s against 0.10 s pre-warmed. The time-to-first-token figures are dominated by the provider's own
+On one host the protocol's own path to U starting work is 1.18 s for v1 and about 1.3-1.4 s for v2 cold,
+and 0.45 s against at most 0.16 s pre-warmed. The time-to-first-token figures are dominated by the provider's own
 latency, which varied by several hundred milliseconds during the runs. An earlier interleaved
 comparison of the single-party variant with a direct HTTPS call (60 tokens, n = 8) measured +1.07 s to
 first token cold and about +0.25 s pre-warmed. $\pi_{C3S}$ and settlement run after the client's stream
@@ -883,8 +900,8 @@ messages that Ferret's round trips wait for. On a fast symmetric link node-only 
 dual execution (3.05 s against 2.27 s), because 22 MB travel one way instead of 21 MB each way in
 parallel and the checks add sequential steps. With a 10 Mbit/s downlink the download dominates (20 s).
 The online phases are faster than with dual execution, because there is no separate equality-check
-round trip: at 40 ms one way, phase A takes about 121 ms against 207 ms and phase B about 126 ms against
-287 ms.
+round trip: at 40 ms one way, phase A takes about 126 ms against 207 ms and phase B about 131 ms against
+287 ms (the dual-execution figures are from `crypto/twopc-ag/REPORT.md` at the tag `v2-symmetric`).
 
 The critical-path work before U starts, with client and node 50 ms apart at 100 Mbit/s (sums of the
 component benchmarks with per-proof setup, without the relayed handshake round trips that both
@@ -1006,7 +1023,8 @@ else stays the deployment's own code. Negotiation is per request and stateless:
    that advertise the field for the model, and requires that the offer signature verifies with a pinned
    node key (not just the key the offer names): one the user configured, or else the key that announced
    the node's URL on Nostr, for an https or onion URL only, where fetching the offer authenticates the
-   server. It also requires that the upstream hostname is on its trusted hostname
+   server. (Plain http is accepted only for a loopback node, for development; the session carries the
+   node credential.) It also requires that the upstream hostname is on its trusted hostname
    list (an empty list refuses every host), and that its prover is available. It rebuilds every public
    input of $\pi_{NK}$ from the signed offer.
 4. **Billing** is the node's ordinary billing (section 4.8). The client's credential, reservation,
@@ -1039,14 +1057,15 @@ being used. We therefore layer several limits, from free and always on to priced
    gets no garbled circuit.
 3. **Global and per-address caps.** N serves at most a fixed number of concurrent sessions (32 by
    default), each limited to 600 s from the node's WebSocket accept, with 15 s to send its setup. (The
-   relay has its own 600 s limits, one for an armed session to send its ClientHello and a fresh one
-   after it, so in practice the node's limit is the one that ends a session.) N also refuses a new session
+   relay has its own 600 s limit, counted from its own connection accept and including the time a
+   session waits armed, so in practice the node's limit is the one that ends a session.) N also refuses a new session
    from a client address that already holds a set number of unused sessions, counted from the WebSocket
    accept, before the setup arrives, until the credential record is written (12 by default; HTTP 429).
    The address is the TCP peer, or, only for peers configured as trusted reverse proxies, the rightmost `X-Forwarded-For` entry, so a remote
-   client cannot name its own address. Loopback is trusted by default (for a reverse proxy on the same
-   host), so a process on N's own host that connects to the node's port directly can set the header and
-   choose its address; an operator who does not trust local users keeps the node's port to the proxy. Clients behind one address, such as all Tor users of an onion service, share
+   client cannot name its own address. No proxy is trusted by default, so behind a reverse proxy that is
+   not configured all clients share the proxy's address. A trusted loopback proxy lets a process on N's
+   own host that connects to the node's port directly set the header and choose its address; an operator
+   who does not trust local users keeps the node's port to the proxy. Clients behind one address, such as all Tor users of an onion service, share
    the limit.
 4. **Fees in the signed offer (section 4.8).** A session fee $f_s$ on completed requests, an abandon fee
    $f_a \ge f_s$ on sessions that end without a completed request, and a rate surcharge, all 0 by
@@ -1085,7 +1104,10 @@ session fee to cover the node's bandwidth.
 encryption and decryption runs inside the MPC. With the roles arranged so that the node is the notary,
 it gives prompt confidentiality and lets the API key be the node's private input, and it works with TLS
 1.2. The cost scales with the payload and there is no streaming: we measured about 5.8 s and 41.5 MB for
-a 2 KB request, 34 s and 377 MB for 32 KB, and 129 s and 1.44 GB for 128 KB (100 Mbit/s, 50 ms). Our 2PC
+a 2 KB request, 34 s and 377 MB for 32 KB, and 129 s and 1.44 GB for 128 KB (100 Mbit/s, 50 ms RTT,
+emulated; one sample per size, against TLSNotary's local TLS 1.2 test server rather than an LLM
+provider). Most of that time is preprocessing, which can run ahead; the part after the connection opens
+took 1.5 s to 15 s. Our 2PC
 moves about half the data of the 2 KB case, and it covers only the key schedule, so its cost is
 constant, can be precomputed, and the payload then streams at native speed. TLSNotary's key-exchange
 conversion is the basis of our ECtF.
@@ -1122,7 +1144,7 @@ different epoch's key in full and the payload never enters the MPC.
 **Proxy zkTLS attestors** (the "verified mode" deployed on Routstr nodes; Reclaim-style attestors). The
 node is the TLS client and an attestor checks its transcript. This gives request and response integrity
 and portable proofs, but the node and the attestor see the plaintext; we measured +10.8 s to first token
-on a live node.
+on a live node (another node and upstream than our case study).
 
 **TEE (enclave) designs.** The node runs in a hardware enclave that holds the API key and processes the
 prompt in the clear, and users verify attestations. This is fast and streams, and it works with any
@@ -1142,7 +1164,7 @@ provider, without having to review the node's software.
 | API key hidden from client | yes | if N's egress is private | yes | yes | yes |
 | Trusted hardware or attested software | no | no | no | no | yes |
 | Streaming, native-speed payload | yes | yes | no | yes | yes |
-| Added latency, pre-warmed (local) | 0.10 s proof | 0.45 s proof | 5.8-129 s | ≈10 s | ≈0 |
+| Added latency, pre-warmed (local) | 0.16 s proof | 0.45 s proof | 1.5-15 s (100 Mbit/s) | ≈10 s | ≈0 |
 | Data per request | ≈28 MB, constant | ≈5.9 MB | 41 MB-1.4 GB | transcript size | ≈0 |
 | Third-party-verifiable transcript | no | no | yes | yes | attestation only |
 | Provider requirement | TLS 1.3 profile with P-256 | TLS 1.3 profile | TLS 1.2+ | TLS 1.2/1.3 | any |
@@ -1160,7 +1182,8 @@ payload. Its trust rests on the provider's TLS certificate and on cryptography, 
 software. The mechanisms are a two-party TLS key schedule that gives the node the first application
 epoch and the client every other one, a proven public suffix for parameter pinning, and a proven usage
 disclosure for settlement. A complete implementation, verified against a live provider, reaches the
-provider 5 ms after a pre-warmed request is claimed, plus a 0.10 s suffix proof. Its cost is about 22 MB
+provider 5 ms after a request claims a session armed through the handshake, plus a suffix proof of
+at most 0.16 s on one host. Its cost is about 22 MB
 of precomputable tables and check data sent to the client and 1.2 MB sent back per request, because
 only the node garbles and the client checks the garbling instead of garbling a second copy; a cold
 two-party computation takes about 7 s on a home link with a 2 Mbit/s uplink. The price of that
@@ -1173,12 +1196,14 @@ egress private.
 # Appendix A. Case study: the provider profile in practice
 
 **A.1 Verified behaviours** (live gate `crypto/tools/provider-profile-check.py`, checks A1-A12, 12/12 on
-2026-10-12; rate limits, 5xx and timeouts count as inconclusive, never as a pass, and each rejection
-check asserts the exact status and error text against a valid control).
+2026-10-19 with a completion margin of 16; rate limits, 5xx and timeouts count as inconclusive, never as
+a pass, and each rejection check asserts the exact status and error text against a valid control). The
+token-cap overshoot, the system-prompt pin and the fake usage events are manual tests outside the gate.
+The outputs of that day's runs are in `docs/evidence/`.
 
 - **Transport:** a client offering only TLS 1.3 with `TLS_AES_128_GCM_SHA256` is served; a client
   KeyUpdate sent in the middle of the request is accepted and the server answers completely and closes
-  (`Connection: close`, HTTP/1.1). The v2 live sessions establish that a single secp256r1 key share is
+  (`Connection: close`, HTTP/1.1). The gate offers X25519; the v2 live sessions establish that a single secp256r1 key share is
   accepted without a HelloRetryRequest.
 - **Waits for the full body:** nothing for 8 s with the body incomplete, then a response within 0.7 s
   of the last bytes.
@@ -1192,12 +1217,13 @@ check asserts the exact status and error text against a valid control).
 - **Token cap:** `max_completion_tokens` caps output including reasoning, with a small overshoot on tiny
   caps (3 billed up to 6, 40 billed 39). The reservation's completion margin (16 tokens by default,
   section 4.6) covers this.
-- **Input bound:** with the pinned `include_venice_system_prompt: false` a 224-byte request billed 6
-  prompt tokens. Without the pin the provider injects about 1.6k tokens of system prompt.
+- **Input bound:** with the pinned `include_venice_system_prompt: false` a 224-byte request billed 5
+  prompt tokens. Without the pin the provider injects about 1.7k tokens of system prompt.
 - **Unpinned price fields (sampled):** `service_tier`, `web_search_options` and `prediction` are
   rejected.
-- **Images:** every offered model rejects image parts, both `image_url` and data URIs
-  (`crypto/tools/regression-modality.py`, 8/8).
+- **Images:** the eight text models we checked reject image parts, both `image_url` and data URIs
+  (`crypto/tools/regression-modality.py`, 8/8). This is no longer load-bearing: the reservation covers a
+  full-context prompt, so an image part cannot raise the cost above it.
 - **Usage event:** the terminal event carries usage, cost and model with empty `choices`, followed by
   `[DONE]`.
 - **Event framing:** the dechunked stream uses LF line endings only, and every event is one

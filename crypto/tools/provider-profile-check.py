@@ -36,7 +36,7 @@ Assumptions (paper section 3.1):
   A5  malformed JSON is rejected (400), so the suffix cannot land inside a
       nested object or a string
   A6  max_completion_tokens caps the billed output, reasoning included, up to a
-      small overshoot that the escrow margin (OUTPUT_MARGIN tokens) must cover
+      small overshoot that the reservation margin (OUTPUT_MARGIN tokens) must cover
   A7  the terminal usage event names the model and precedes [DONE], and with
       the pinned venice_parameters the prompt tokens stay below the body bytes
   A8  text-only models reject image parts (400, image not supported)
@@ -84,8 +84,10 @@ KEY = os.environ.get("VENICE_API_KEY", "")
 CHEAP = os.environ.get("CU_CHEAP_MODEL", "mercury-2")
 REASONING = os.environ.get("CU_REASONING_MODEL", "mercury-2")
 TEXT_ONLY = os.environ.get("CU_TEXT_ONLY_MODEL", "deepseek-v4-flash")
-# Must match the output margin the node/SDK add to max_tokens when sizing E.
-OUTPUT_MARGIN = 32
+# The completion margin the node reserves beyond max_tokens (routstr-core
+# CONFIDENTIAL_RESERVE_MARGIN_TOKENS, 16 by default, published in the offer as
+# reserve_margin_tokens). Set CU_OUTPUT_MARGIN to the node's value if it differs.
+OUTPUT_MARGIN = int(os.environ.get("CU_OUTPUT_MARGIN", "16"))
 SUITE = "TLS_AES_128_GCM_SHA256"
 
 # Retry policy for inconclusive outcomes (429, 5xx, timeouts, connection errors).

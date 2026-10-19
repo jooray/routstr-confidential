@@ -1,6 +1,6 @@
 ---
 title: "Confidential mode v1 vs v2: who can ever see the node's API key"
-geometry: "margin=0.5in"
+geometry: "margin=0.4in"
 fontsize: 9pt
 documentclass: extarticle
 ---
@@ -27,13 +27,13 @@ the request exists.
 | New cryptography in the trust base | ZK proofs | ZK proofs **and** a 2PC (node-only authenticated garbling, share conversion), not yet externally reviewed |
 
 **Speed.** Measured with real Venice (`deepseek-v4-flash`, 40 tokens), client and node on one host, medians of
-5 sessions each:
+5 sessions each unless noted:
 
 | | v1 | v2 |
 |---|---|---|
-| Cold: request start → body sent | 0.73 s | 1.2 s (2PC preprocessing 0.76 s; π_NK 0.06 s; one run) |
-| Pre-warmed: claim → body sent | 3 ms | 5 ms |
-| Suffix proof π_C2 (before the provider may start) | 0.45 s | **0.10 s** |
+| Cold: request start → body sent | 0.73 s | 1.2 s (2PC preprocessing 0.76 s; π_NK 0.06 s over the proof channel; one run) |
+| Pre-warmed (armed through π_NK): claim → body sent | 3 ms | 5 ms |
+| Suffix proof π_C2 (before the provider may start) | 0.45 s | **at most 0.16 s** (component benchmark) |
 | Pre-warm (arm) time per session | 0.71 s | about 1.1 s (estimate) |
 
 Across a network link (from the component benchmarks, 2026-10 node-only garbling): the cold 2PC takes **3.1 s on

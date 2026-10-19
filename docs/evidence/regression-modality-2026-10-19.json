@@ -1,0 +1,87 @@
+{
+  "time": "2026-10-19T06:32:52Z",
+  "provider": "https://api.venice.ai/api/v1/chat/completions",
+  "exit": 0,
+  "results": [
+    {
+      "model": "deepseek-v3.2",
+      "text_status": 200,
+      "image_url_status": 400,
+      "image_url_prompt_tokens": null,
+      "data_uri_status": 400,
+      "data_uri_prompt_tokens": null,
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "text_status": 200,
+      "image_url_status": 400,
+      "image_url_prompt_tokens": null,
+      "data_uri_status": 400,
+      "data_uri_prompt_tokens": null,
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "model": "deepseek-v4-flash-0731",
+      "text_status": 200,
+      "image_url_status": 400,
+      "image_url_prompt_tokens": null,
+      "data_uri_status": 400,
+      "data_uri_prompt_tokens": null,
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "text_status": 200,
+      "image_url_status": 400,
+      "image_url_prompt_tokens": null,
+      "data_uri_status": 400,
+      "data_uri_prompt_tokens": null,
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "model": "deepseek-v4-pro-0813",
+      "text_status": 200,
+      "image_url_status": 400,
+      "image_url_prompt_tokens": null,
+      "data_uri_status": 400,
+      "data_uri_prompt_tokens": null,
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "model": "hermes-3-llama-3.1-405b",
+      "text_status": 200,
+      "image_url_status": 400,
+      "image_url_prompt_tokens": null,
+      "data_uri_status": 400,
+      "data_uri_prompt_tokens": null,
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "model": "mercury-2",
+      "text_status": 200,
+      "image_url_status": 400,
+      "image_url_prompt_tokens": null,
+      "data_uri_status": 400,
+      "data_uri_prompt_tokens": null,
+      "verdict": "PASS",
+      "reasons": []
+    },
+    {
+      "model": "qwen3-235b-a22b-thinking-2507",
+      "text_status": 200,
+      "image_url_status": 400,
+      "image_url_prompt_tokens": null,
+      "data_uri_status": 400,
+      "data_uri_prompt_tokens": null,
+      "verdict": "PASS",
+      "reasons": []
+    }
+  ]
+}

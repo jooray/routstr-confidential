@@ -1,0 +1,8 @@
+manual provider checks 2026-10-19T06:33:21Z https://api.venice.ai/api/v1/chat/completions
+cap   3 mercury-2: status 200 completion_tokens=6 prompt_tokens=12
+cap  40 mercury-2: status 200 completion_tokens=39 prompt_tokens=12
+cap   3 deepseek-v4-flash: status 200 completion_tokens=3 prompt_tokens=12
+cap  40 deepseek-v4-flash: status 200 completion_tokens=40 prompt_tokens=12
+system-prompt pin=True: 206-byte body, status 200, prompt_tokens=7
+system-prompt pin=False: 147-byte body, status 200, prompt_tokens=1695
+fake usage prompt: status 200, CR in raw stream: False, events 38, events with usage 1, non-JSON data lines 0, [DONE] count 1
