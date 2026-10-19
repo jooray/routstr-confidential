@@ -166,7 +166,20 @@ assembly do not change per provider; the head template, the pinned suffix, the p
 parser do. In the current implementation only the head template and the price list come from the offer:
 the suffix and the usage parser are written for the case-study provider in the relay and in the
 clients, so a second provider needs a code change in each (the offer's `suffix_keys` only names the
-pinned keys).
+pinned keys). Image generation (section 4.10) is the exception: its suffix is rendered from the signed
+offer (path, count key, fixed pins, variant pins), so a second flat-priced image provider is a new offer
+entry, not a code change.
+
+**The image route.** Image generation uses a second route of the same provider, which must satisfy items
+1 to 5 and 8 on its own: the route's JSON keeps the last duplicate key, rejects unknown fields and
+malformed JSON, and does not reflect the request head. Items 6 and 7 change form. The price of an image
+is a function of request parameters only (model, count, resolution tier, output format, and paid extras
+that must be pinned off), so every one of them must be overridable by the suffix; there is no usage
+event to parse. For the case-study provider's native image route these properties were checked live with
+paid requests (`provider-profile-check.py --images`, checks I1 to I5): a duplicate count, paid extra and
+model in the private prefix are overridden by the suffix's values; unknown fields and an unknown model are
+rejected (no silent fallback to a default model); the response does not echo the request head; and a
+prefix that leaves a string open cannot swallow the suffix.
 
 ## 3.2 TLS 1.3 key schedule
 
@@ -562,6 +575,46 @@ described above.
 | U returned a 4xx or 503 (disclosed) | reservation released (less the session fee $f_s$) |
 | Released, no usage disclosed (or another 5xx) | full reservation charged; C keeps its transcript and attestation |
 
+## 4.10 Image generation
+
+The same session carries an image request instead of a chat completion. The TLS epochs, the 2PC and
+the three statements are unchanged; what changes is the HTTP request, the price, and how a session
+settles.
+
+**Offer.** N's signed offer adds `capabilities: ["chat","images"]` and an `images` block: the head
+template of the image route, the key under which the count is sent, the fixed pins (the provider's paid
+extras switched off), the parameter space, a maximum count (4), and per image model a list of variants,
+each a set of pins (a resolution tier and the output format, WebP) with a signed price per image
+$m_v$. N builds the list from its per-image price books, so only models whose price is a pure function
+of the pinned parameters are offered; token-metered image models and providers that report their own
+cost are left out.
+
+**Suffix.** The suffix pins the model, the count $k$, the fixed pins and the variant's pins, in that
+order and byte-exactly, rendered by N, the relay and C from the signed offer. C's prompt and every
+option that does not change the price (aspect ratio, seed, negative prompt, safety mode) stay in the
+private prefix. $\pi_{C2S}$ is unchanged; it proves the image suffix exactly as it proves the chat one,
+so the provider receives no complete request until model, count and tier are proven. $\pi_{NK}$ uses the
+image route's head template.
+
+**Settlement without a usage proof.** The charge is known at setup: $k \cdot m_v + f_s$. N reserves
+$k \cdot m_v + \max(f_s, f_a)$. After the attestation, C sends `accept` for a 2xx response; no
+disclosure and no $\pi_{C3S}$ run, and N charges exactly the flat amount. For an HTTP error C discloses
+the response head as in section 4.8 and the 4xx/503 rule applies. A client that sends neither is
+charged the reservation, which exceeds the flat charge only by $\max(f_s, f_a) - f_s$, so withholding
+gains nothing. N gains nothing by refusing to charge, and C knows the charge in advance; a refund is
+the only outcome that needs a proof. The receipt adds the kind, the variant, $k$ and $m_v$, and C
+checks $cost = \lceil k \cdot m_v + f_s \rceil$ exactly. The attestation is unchanged.
+
+**What N learns.** The model, the variant (tier and format) and the count, as it learns the model and
+token cap of a chat request; the body length; the response size and timing, which for an image is a
+weak signal about its content (a flat image compresses better); and success or the error status. It
+does not learn the prompt, the private options, the image, or, on success, the response head (whose
+headers flag a blurred or policy-violating image).
+
+**Residuals.** A 2xx with fewer images than $k$ or with an error object in the body is charged in
+full, as is a 5xx after the body was released (the chat rule, kept until it is known whether the
+provider bills failed generations). Image sessions are never armed: each pays a cold 2PC.
+
 # 5. Security analysis
 
 **P1 (credential).** The API key exists in the protocol only as plaintext of N's epoch-0 record,
@@ -945,6 +998,14 @@ every attack was refused with the reservation released:
 A client that puts its own P-256 key share in the ClientHello instead of the joint one is refused
 before anything reaches the provider. The unit and integration suites of all components pass.
 
+Image sessions (section 4.10) were run live against the case-study provider and the production node
+(author measurements): a one-image request with the cheapest model completed in 10 s from the reference
+client over a home connection, settled at exactly the signed per-image price, and a request the
+provider rejected with a 400 settled at zero cost from the disclosed head. In the browser client a cold
+image request took 16.7 s, of which 7.2 s was the provider generating the image and most of the rest the
+2PC preparation; every image request sets up about 26 MB of protocol traffic (the 2PC plus the proof
+channel), since image sessions are never pre-armed.
+
 ## 6.6 The dual-execution version
 
 The first implementation of v2 used dual execution (Mohassel and Franklin 2006; Huang, Katz and Evans
@@ -1016,10 +1077,12 @@ else stays the deployment's own code. Negotiation is per request and stateless:
 
 1. **Offer.** The node publishes a signed offer (protocol version, upstream hostname, key length and
    alphabet, head template, pinned suffix keys, a signed rate snapshot, attestation key) at a public
-   endpoint.
+   endpoint. A node that serves images adds the `images` capability and its signed per-image variants
+   (section 4.10); old clients ignore both.
 2. **Model listing.** The model listing gains one additive field per model that references the offer;
    old clients ignore it.
-3. **Opt-in.** A client opts in per request, for `POST /v1/chat/completions` only. It routes only to nodes
+3. **Opt-in.** A client opts in per request, for `POST /v1/chat/completions` and, on nodes with the
+   `images` capability, the image routes. It routes only to nodes
    that advertise the field for the model, and requires that the offer signature verifies with a pinned
    node key (not just the key the offer names): one the user configured, or else the key that announced
    the node's URL on Nostr, for an https or onion URL only, where fetching the offer authenticates the

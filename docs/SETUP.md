@@ -171,6 +171,18 @@ beyond the margin is the node's loss. The offer file carries no prices. To restr
 `model_allowlist` (empty = all), which the sidecar and the node both enforce (the earlier name
 `text_only_ok`, a map `{"id": true}`, is still read).
 
+**Confidential images** need the offer file's `endpoints.images` block (the shipped Venice offer has one:
+the native `POST /api/v1/image/generate` head template, `count_key` `"variants"`, the `fixed_pins` that
+switch Venice's paid extras off, `param_space` with the resolution tiers and `format: ["webp"]`,
+`max_response_bytes`, `response_idle_s`). A node only advertises images (`capabilities: ["chat", "images"]`
+and an `images` price list in its signed offer) when its sidecar serves that block, and only for image models
+it can price per image: the provider must list them with per-image books (on routstr-core, a `venice`-type
+provider row; a `generic` row lists no image models). Each variant is priced at the node's per-image price
+for that tier, plus any surcharge; settlement is flat (`msat_per_image × count` plus the session fee) after
+the client's `accept`, with no usage proof. Image setups are never armed. A deployment that copies the
+offer file (for example to mount it) must add the block to its copy. Check the provider with
+`crypto/tools/provider-profile-check.py --images` (one paid image).
+
 **1. The sidecar** (container build, from the `twopc-v2` checkout):
 
 ```sh

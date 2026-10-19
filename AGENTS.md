@@ -107,6 +107,19 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
 8. *Abort.* Before the final body record is released: release (less any
    abandon fee). After it, with no disclosure: charge the reservation.
 
+**Image sessions** (`kind: "images"`, `docs/CONFIDENTIAL-IMAGES.md`, §0 has
+the binding decisions). Same steps and circuits, with these differences: the
+offer has `capabilities: ["chat","images"]` and an `images` block (built by
+the node from the sidecar offer's `endpoints.images` and per-image price
+books; Venice native `/api/v1/image/generate`); the setup names `variant`
+and `count` (1-4) instead of `max_tokens` and is never armed; the node
+renders the suffix (model, count, fixed pins, variant pins) and forwards it
+to the sidecar, which checks it byte-exactly; the credential record uses the
+images head template; on a 2xx the client sends `accept` instead of a usage
+disclosure and the node charges `msat_per_image × count + f_s` (`settle_flat`);
+an error head works as for chat. Live check: `provider-profile-check.py
+--images` (I1-I5), `driver.ts --image`.
+
 **Protocol v1 is retired.** The earlier design (the client ran the TLS
 handshake alone with X25519; proofs π_C1, π_N, π_C2, π_C3; the client's KU1)
 is no longer in the code here, in routstr-core or in routstr-sdk. It lives on
@@ -121,7 +134,7 @@ offer without v2 (`offer_unsupported_version`).
 |---|---|
 | sidecar state machine, setup gate and limits, record hold, tail anchoring, error-head disclosure | `crypto/relay/src/main.rs` (`handle_setup`, `handle_control`, `validate_error_head`; + `tls.rs` handshake verification) |
 | ZK statements / circuits (one-bit equality `eq_bytes`) | `crypto/zkbench/src/statements.rs`, `gadgets.rs`, `bin/cu-prover.rs` (`--job-stdin`); tests `tests/v2.rs`, `tests/malformed.rs` |
-| node offer, model→provider candidate, billing glue | `routstr-core/routstr/confidential.py` |
+| node offer, model→provider candidate, billing glue (images: `images_offer_block`, `reserve_image`, `settle_flat`) | `routstr-core/routstr/confidential.py` |
 | node relay + interception | `routstr-core/routstr/confidential_ws.py` |
 | node hooks | `core/main.py` (routes), `core/settings.py` (`CONFIDENTIAL_SIDECAR_URL`, `CONFIDENTIAL_SIDECAR_TOKEN`), `payment/models.py` (`confidential_upstream` field) |
 | SDK transport + session | `routstr-sdk/client/confidential/{transport,session,offer,suffix,receipt,hosts}.ts`, vendored TLS fork in `tls-fork/` (MIT, see `FORK-NOTES.md`) |
