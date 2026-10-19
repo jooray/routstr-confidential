@@ -113,12 +113,64 @@ async fn suffix_mismatch_gives_zero_bit() {
     let (params, witness) = fixtures::pi_c2s();
     let Params::PiC2S(mut p) = params else { unreachable!() };
     let n = p.expected.len();
-    p.expected = vec![b'z'; n];
+    p.expected = vec![b'z'; n - 1];
+    p.expected.push(0x17);
     let res = run_pair_ideal(&Params::PiC2S(p), &witness).await.unwrap();
     assert!(check(&res, "h1").ok);
     let last = res.last().unwrap();
     assert!(!last.ok);
     assert_eq!(last.got, "00");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c2s_record_must_be_application_data() {
+    // The suffix inside a record whose inner content type is handshake (0x16)
+    // or padding (0): the compared range ends with that byte, so no equality.
+    let (params, witness) = fixtures::pi_c2s();
+    let Params::PiC2S(p) = params else { unreachable!() };
+    for flip in [0x17 ^ 0x16, 0x17] {
+        let mut wrong = p.clone();
+        *wrong.ct_window.last_mut().unwrap() ^= flip;
+        let res = run_pair_ideal(&Params::PiC2S(wrong), &witness).await.unwrap();
+        assert_eq!(res.last().unwrap().got, "00", "inner type {:#04x} must not verify", 0x17 ^ flip);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c2s_geometry_is_bound_to_the_record() {
+    // A wrong sequence number or window offset gives a different keystream.
+    let (params, witness) = fixtures::pi_c2s_after(64);
+    let Params::PiC2S(p) = params else { unreachable!() };
+    let mutations: Vec<(&str, Box<dyn Fn(&mut zkbench::statements::PiC2S)>)> = vec![
+        ("seq + 1", Box::new(|q| q.seq += 1)),
+        ("seq - 1", Box::new(|q| q.seq -= 1)),
+        ("off + 1", Box::new(|q| q.off += 1)),
+        ("off - 1", Box::new(|q| q.off -= 1)),
+    ];
+    for (name, m) in mutations {
+        let mut q = p.clone();
+        m(&mut q);
+        let res = run_pair_ideal(&Params::PiC2S(q), &witness).await.unwrap();
+        assert_eq!(res.last().unwrap().got, "00", "{name} must not verify");
+    }
+    // A compared range that does not end the window, or does not end with
+    // the content type, is refused before any proof runs.
+    for m in [
+        (|q: &mut zkbench::statements::PiC2S| q.sel_start -= 1) as fn(&mut _),
+        |q| {
+            q.w += 1;
+            q.ct_window.push(0);
+        },
+        |q| {
+            q.expected.pop();
+            q.sel_len -= 1;
+            q.sel_start += 1;
+        },
+    ] {
+        let mut q = p.clone();
+        m(&mut q);
+        assert!(run_pair_ideal(&Params::PiC2S(q), &witness).await.is_err());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -168,9 +220,12 @@ async fn c3s_usage_mismatch_and_error_head_skip() {
     p.skip = r.len() - 40;
     let res = run_pair_ideal(&Params::PiC3S(p.clone()), &witness).await;
     assert!(passed(&res), "{res:?}");
-    p.skip += 1;
-    let res = run_pair_ideal(&Params::PiC3S(p), &witness).await.unwrap();
-    assert!(!res.last().unwrap().ok);
+    for skip in [p.skip + 1, p.skip - 1] {
+        let mut q = p.clone();
+        q.skip = skip;
+        let res = run_pair_ideal(&Params::PiC3S(q), &witness).await.unwrap();
+        assert!(!res.last().unwrap().ok, "skip {skip} must not verify");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

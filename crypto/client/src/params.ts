@@ -282,6 +282,9 @@ export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat
   if (!line) fail("π_NK", "template is not an HTTP/1.1 POST");
   const path = line![1]!;
   if (/[?#]/.test(path)) fail("π_NK", "template path carries a query or fragment");
+  // A canonical path: no dot segments, empty segments, escapes or parameters
+  // a provider might normalise onto another route.
+  if (!/^(\/(?!\.\.?(?:\/|$))[A-Za-z0-9._~-]+)+$/.test(path)) fail("π_NK", `template path ${path} is not canonical`);
   const paths = kind === "images" ? ["/image/generate", "/images/generations"] : ["/chat/completions"];
   if (!paths.some((p) => path.endsWith(p))) fail("π_NK", `template path is not a ${kind} endpoint`);
   if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {

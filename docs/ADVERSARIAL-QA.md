@@ -515,9 +515,11 @@ The prompt is opaque to the node, so the reservation never discounts it
   unbilled. Without a known context length the node
   reserves the model's undiscounted maximum cost; fixed-pricing deployments
   keep their per-request reservation.
-- Example (2026-10-10, `deepseek-v4-flash`): `prompt_limit` 104,858 tokens at
-  21.16 msat/1k plus 40 × 1565.58 msat/1k → **2,282 msats** reserved; the
-  session cost 63 msats.
+- Example (2026-10-19, `deepseek-v4-flash`, a 1M-token context): **167,308
+  msats** reserved; the session cost 6 msats. (The 2026-10-10 example, 2,282
+  msats for a session of 63, predates the full-context reservation.) When the
+  catalogue gives a model two context lengths (its own and a top provider's),
+  the larger is reserved.
 - **Completion side:** exactly bounded. The suffix pins `max_tokens` **and**
   `max_completion_tokens` to `T ≤ max_tokens_cap` (the cap is checked by the
   node and in `handle_setup`; the dual pin exists because Venice otherwise lets

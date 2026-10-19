@@ -50,6 +50,11 @@ fn check_ok(expected: &[u8], compare_len: Option<usize>, got: &[u8]) -> bool {
 }
 
 fn check_results(checks: &[Check], got: &[Vec<u8>]) -> Vec<CheckResult> {
+    // `zip` would silently drop checks without a decoded value: a short
+    // decode yields no results, which `all_ok` refuses.
+    if checks.len() != got.len() {
+        return Vec::new();
+    }
     checks
         .iter()
         .zip(got)
@@ -71,8 +76,9 @@ fn check_results(checks: &[Check], got: &[Vec<u8>]) -> Vec<CheckResult> {
         .collect()
 }
 
+/// A proof with no checks proved nothing: refused like a failed one.
 fn all_ok(results: &[CheckResult]) -> bool {
-    results.iter().all(|r| r.ok)
+    !results.is_empty() && results.iter().all(|r| r.ok)
 }
 
 /// Run one side of a proof over an arbitrary duplex, using real OT.
@@ -323,7 +329,16 @@ pub async fn run_pair_transport(
 
 #[cfg(test)]
 mod tests {
-    use super::check_ok;
+    use super::{CheckResult, all_ok, check_ok, check_results};
+
+    #[test]
+    fn no_checks_is_not_a_pass() {
+        assert!(!all_ok(&[]), "an empty check list proved nothing");
+        // A decoded value without its check (or the reverse) yields no results.
+        assert!(check_results(&[], &[vec![1]]).is_empty());
+        let ok = CheckResult { label: "x".into(), ok: true, got: "01".into(), first_diff: None };
+        assert!(all_ok(&[ok]));
+    }
 
     #[test]
     fn full_check_is_exact_length() {

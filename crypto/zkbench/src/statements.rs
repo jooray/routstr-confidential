@@ -349,6 +349,15 @@ pub fn build_pi_c2s<VM: Vm<Binary>>(
     if p.sel_len != p.expected.len() {
         anyhow::bail!("π_C2S: sel_len {} != |expected| {}", p.sel_len, p.expected.len());
     }
+    // The compared range is the window's end and its last byte is the inner
+    // content type (application data): the statement itself says the record
+    // ends with the suffix, not only the parameters the verifier chose.
+    if p.sel_start.checked_add(p.sel_len) != Some(p.w) || p.ct_window.len() != p.w {
+        anyhow::bail!("π_C2S: the compared range must end the window");
+    }
+    if p.expected.last() != Some(&0x17) {
+        anyhow::bail!("π_C2S: the compared range must end with the inner content type 0x17");
+    }
     let (anchor, k, iv) = anchored_keys(vm, role, "h1", &p.h1, witness)?;
     let ct = public_bytes(vm, &p.ct_window)?;
     let out = decrypt_window(vm, &k, &iv, p.seq, &ct, p.off, p.w, p.sel_start, p.sel_len)?;

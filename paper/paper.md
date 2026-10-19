@@ -159,7 +159,8 @@ The protocol is defined for any upstream satisfying:
 10. **No copy for the account owner, no forwarding.** The owner of the API key (N) cannot retrieve request
     or response content from the provider (no request log or stored output readable through the
     account), and no request parameter, path or header sends it anywhere else (a callback, a webhook, a
-    third-party search). C pins the head template's path to the endpoint of its kind (no query string)
+    third-party search). C pins the head template's path to the endpoint of its kind (a canonical path with no dot or empty
+    segments, escapes or query string, so the provider cannot normalise it onto another route)
     and its headers to a fixed set (`Host`, `Authorization`, `Content-Type`, `Accept-Encoding: identity`,
     `Connection: close`, `Content-Length`), and an image request's fixed pins may only switch a provider
     extra off, so N cannot pick a path, header or pin that turns such a feature on. What this item covers
@@ -487,8 +488,9 @@ its maximum per-request cost plus the margin, and a node with fixed per-request 
 price.) $L$ must be the whole context, not the context minus the model's own completion
 limit: the pinned cap $T$ is usually far below that limit, the provider accepts a prompt of up to
 $L - T$ tokens, and since the charge is capped at the reservation, any prompt tokens beyond the
-reserved bound would be free. (The sessions measured in section 6 reserved with the smaller bound; for
-the case study, `deepseek-v4-flash` with $T$ = 40, that was 2,282 msat for a session that cost 63.)
+reserved bound would be free. For the case study, `deepseek-v4-flash` (a 1M-token context) with $T$ = 40
+reserved 167,308 msat for a session that cost 6 (2026-10-19). Where the node's catalogue gives the model
+two context lengths (its own and a top provider's), the larger is reserved.
 
 ## 4.7 Response and usage disclosure ($\pi_{C3S}$)
 
@@ -612,7 +614,9 @@ template of the image route, the key under which the count is sent, the fixed pi
 extras switched off), the parameter space, a maximum count (4), and per image model a list of variants,
 each a set of pins (a resolution tier and the output format, WebP) with a signed price per image
 $m_v$ and, optionally, a smaller maximum count of its own. N builds the list from its per-image price
-books, so only models whose price is a pure function of the pinned parameters are offered;
+books, so only models whose price is a pure function of the pinned parameters are offered (this
+assumes the provider, too, prices by those parameters alone, whatever else the private part of the body
+asks for, e.g. an output size within the pinned tier);
 token-metered image models and providers that report their own cost are left out. The pins are the
 request's last word, so C does not take them on trust: a fixed pin must be `false` or `[]` (an extra
 switched off), a variant may pin only a price axis (resolution, quality, format) to a value of the
@@ -807,6 +811,12 @@ salt are fresh per session.
     balance and, by sampling the counters across its own sessions, roughly how many requests other
     clients sent through the same key. The protocol cannot hide them from C; the clients drop them before
     handing headers to an application.
+15. *The session id admits proof channels.* While a session is live, its protocol sid (which both
+    parties know) is what admits a connection to N's proof and 2PC channels. A third party holding it
+    could take a channel before C does and so end the session; after the final body record is released
+    that charges the reservation, as an abort by N would. It cannot read C's channel (each channel has one
+    peer) or prove anything for C. The sid is in C's channel URLs, so N's and the relay's logs keep only
+    a prefix of it.
 
 # 6. Implementation and evaluation
 
@@ -1032,7 +1042,7 @@ on the 2PC. The 2PC cost is constant in the size of the prompt and the response.
 ## 6.5 Live verification
 
 Live sessions against the case-study provider completed with all proofs verified, a signed receipt
-passing every client check, and the cost within the reservation (63 of 2,282 msat in the example of
+passing every client check, and the cost within the reservation (6 of 167,308 msat in the example of
 section 4.6). They were billed through the node's ordinary accounts, with both an API key and a one-off
 e-cash token as the credential. Sessions over the production SDK transport and the client daemon, driven
 by an off-the-shelf OpenAI client, settled; the node logged no plain chat request. Earlier runs of the

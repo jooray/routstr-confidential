@@ -1209,20 +1209,14 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 // stored parameters. N is the prover and learns
                                 // no verdict: the client's `release_head` is the
                                 // acceptance, and both are needed for the write.
-                                let same = match (&proven, shared.params.lock().unwrap().get(proof.as_str())) {
-                                    (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
-                                    _ => false,
-                                };
+                                let same = same_params(proven.as_ref(), shared.params.lock().unwrap().get(proof.as_str()));
                                 if same {
                                     st.head_proof_ok = true;
                                     write_head(&mut st, &mut log, &to_client, &mut tcp_tx).await?;
                                 }
                             }
                             "pi_c2s" => {
-                                let same = match (&proven, shared.params.lock().unwrap().get(proof.as_str())) {
-                                    (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
-                                    _ => false,
-                                };
+                                let same = same_params(proven.as_ref(), shared.params.lock().unwrap().get(proof.as_str()));
                                 if same && !st.c2_ok {
                                     st.c2_ok = true;
                                     // Suffix proven: release the final body record.
@@ -1247,10 +1241,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 if !st.c2_ok {
                                     bail!("π_C3S before π_C2S verified: the suffix (model, caps) is not proven");
                                 }
-                                let same = match (&proven, shared.params.lock().unwrap().get(proof.as_str())) {
-                                    (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
-                                    _ => false,
-                                };
+                                let same = same_params(proven.as_ref(), shared.params.lock().unwrap().get(proof.as_str()));
                                 if !same {
                                     bail!("π_C3S parameters changed after the proof started");
                                 }
@@ -1779,6 +1770,15 @@ fn canonical_suffix(model: &str, max_tokens: u64) -> String {
     )
 }
 
+/// Whether the parameters a proof ran on are the session's stored ones. Both
+/// must be present and serialize: a failure on either side is "changed".
+fn same_params(proven: Option<&Params>, stored: Option<&Params>) -> bool {
+    match (proven.map(serde_json::to_value), stored.map(serde_json::to_value)) {
+        (Some(Ok(a)), Some(Ok(b))) => a == b,
+        _ => false,
+    }
+}
+
 /// Choose a block-aligned window ending at the record end that contains the
 /// final `sel_len` content bytes (before the inner content-type byte).
 fn window(sel_len: usize, ct_len: usize) -> (usize, usize, usize) {
@@ -2094,7 +2094,8 @@ fn zk_admit(app: &AppState, proof: &str, sid: &str) -> Result<(Arc<SessionShared
 async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>) -> Result<()> {
     let started = std::time::Instant::now();
     let (shared, _conn) = zk_admit(app, proof, sid)?;
-    info!(proof, sid, "zk start");
+    // The sid admits proof channels while the session is live: logged short.
+    info!(proof, sid = sid.get(..12).unwrap_or(sid), "zk start");
     if proof == "twopc" {
         let rx = shared.twopc_rx.lock().unwrap().take().ok_or_else(|| anyhow!("2PC not available for this session"))?;
         let (io, bridge) = ws_duplex(socket);
@@ -3261,5 +3262,22 @@ mod disclosure_limit_tests {
         let many: Vec<_> = (0..=MAX_C3S_RECORDS).map(|_| rec(2)).collect();
         assert!(check_c3s_records(&many).is_err());
         assert!(check_c3s_records(&many[1..]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod same_params_tests {
+    use super::same_params;
+    use zkbench::fixtures;
+
+    #[test]
+    fn only_equal_present_params_are_the_same() {
+        let (a, _) = fixtures::pi_c2s();
+        let (b, _) = fixtures::pi_c2s_after(1);
+        assert!(same_params(Some(&a), Some(&a.clone())));
+        assert!(!same_params(Some(&a), Some(&b)));
+        assert!(!same_params(Some(&a), None));
+        assert!(!same_params(None, Some(&a)));
+        assert!(!same_params(None, None));
     }
 }

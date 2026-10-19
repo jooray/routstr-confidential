@@ -42,6 +42,10 @@ fn window_params(h1: [u8; 32], key: [u8; 16], iv: [u8; 12], seq: u64, inner: &[u
     let off = inner.len() - w;
     let sel_start = w - 1 - tlen;
     assert_eq!(&inner[off + sel_start..off + sel_start + tlen], target);
+    // As the sidecar builds it: the compared range runs through the inner
+    // content type byte at the record's end.
+    let mut expected = target.to_vec();
+    expected.push(0x17);
     PiC2S {
         h1,
         seq,
@@ -49,8 +53,8 @@ fn window_params(h1: [u8; 32], key: [u8; 16], iv: [u8; 12], seq: u64, inner: &[u
         off,
         w,
         sel_start,
-        sel_len: tlen,
-        expected: target.to_vec(),
+        sel_len: expected.len(),
+        expected,
     }
 }
 
