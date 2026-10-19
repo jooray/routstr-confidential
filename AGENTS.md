@@ -18,8 +18,8 @@ Each has `origin` = Routstr upstream and `fork` = `jooray/<repo>`.
 
 | Path | Git | What |
 |---|---|---|
-| `routstr-core/` | **`confidential-2pc`** (v2, the only protocol; deployed on routstr.cypherpunk.today); `confidential-upstream` (retired v1, reference only); `fix/no-announce-unroutable-urls` → PR [#823](https://github.com/Routstr/routstr-core/pull/823) | the node (Python/FastAPI) |
-| `routstr-sdk/` | **`confidential-2pc`** (v2 + pre-warming); `confidential-upstream` (retired v1, reference only) | client SDK (TypeScript) |
+| `routstr-core/` | **`confidential-2pc`** (v2, the only protocol; deployed on routstr.cypherpunk.today); `confidential-upstream` (retired v1, unmaintained) | the node (Python/FastAPI) |
+| `routstr-sdk/` | **`confidential-2pc`** (v2 + pre-warming); `confidential-upstream` (retired v1, unmaintained) | client SDK (TypeScript) |
 | `routstrd/` | **`confidential-upstream`** (uses the SDK's `confidential-2pc` build; pre-warm config) | client daemon (TypeScript/Bun) |
 | `crypto/` | this repo | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (v2 two-party key schedule + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK circuits π_NK, π_C2S, π_C3S; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (test scripts), `runs/` (session evidence) |
 | `paper/` | — | the paper (`paper.md` → `build.sh` → `paper.pdf`) |
@@ -30,9 +30,9 @@ The upstream PRs for protocol v2 are open: core
 [#112](https://github.com/Routstr/routstr-sdk/pull/112), routstrd
 [#155](https://github.com/Routstr/routstrd/pull/155), from the fork branches
 above, rebased on upstream `main` (2026-10-19). The v1 PRs (core #824, SDK
-#90, routstrd #137) are closed. Local-only branches
-`confidential-upstream-on-tlsn` (core, SDK) are pre-rebase snapshots on top
-of unmerged TLSN work. Ignore them.
+#90, routstrd #137) are closed; their branches
+(`confidential-upstream` in core and SDK) are frozen with an "unmaintained"
+README note. Do not rebase or update them.
 
 ## Docs map
 
@@ -241,8 +241,8 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
   on the node, env-only); never publish its port.
 - **Never let a test node announce itself.** Set `RELAYS` to an unreachable
   relay, and stop test nodes when done (a forgotten node without `RELAYS`
-  keeps re-announcing). The listing code now skips loopback/private URLs (the
-  `fix/no-announce-unroutable-urls` branch).
+  keeps re-announcing). The listing code now skips loopback/private URLs (merged
+  upstream, PR #823).
 - **Client and node trust the same roots.** The TLS fork's
   `utils/mozilla-root-cas.js` (SDK, `crypto/client/vendor/tls`, web library)
   is generated from the sidecar's pinned `webpki-roots` by
