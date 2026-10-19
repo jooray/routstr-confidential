@@ -229,12 +229,13 @@ export function checkPiNKParams(
     offer: { head_template?: string; key_length?: number; key_alphabet?: string; upstream_host?: string };
     hk: Uint8Array;
     bodyLen: number;
+    kind?: "chat" | "images";
   },
 ): void {
   const p = (params as { PiNK?: Record<string, any> } | null)?.PiNK;
   if (!p) fail("π_NK", "missing");
   const tpl = own.offer.head_template ?? "";
-  checkHeadTemplate(tpl, own.offer.upstream_host ?? "");
+  checkHeadTemplate(tpl, own.offer.upstream_host ?? "", own.kind ?? "chat");
   const keyLen = own.offer.key_length;
   if (typeof keyLen !== "number" || !Number.isInteger(keyLen) || keyLen <= 0) {
     fail("π_NK", "signed offer has no key length");
@@ -264,29 +265,46 @@ export function checkPiNKParams(
 
 /**
  * The published head template must be one HTTP/1.1 POST request head for the
- * offer's upstream host: `Host` names that host, the body length is the
- * `Content-Length`, and exactly one key token and one length token appear.
- * (The node writes the head, so this is what π_NK lets us hold it to.)
+ * offer's upstream host, with exactly the headers a confidential request
+ * needs: `Host` names that host, `Authorization` carries the key token,
+ * `Content-Type: application/json`, `Accept-Encoding: identity`,
+ * `Connection: close` and `Content-Length: {LEN}`. The path has no query and
+ * names the endpoint of its kind. (The node writes the head, so this is what
+ * π_NK lets us hold it to: a path, query or extra header the node chose could
+ * turn on a provider feature or make the session fail on purpose.)
  */
-export function checkHeadTemplate(tpl: string, upstreamHost: string): void {
+export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat" | "images" = "chat"): void {
   const count = (re: RegExp) => (tpl.match(re) ?? []).length;
   if (count(/\{KEY:\d+\}/g) !== 1) fail("π_NK", "template must carry exactly one {KEY:n} token");
   if (count(/\{LEN\}/g) !== 1) fail("π_NK", "template must carry exactly one {LEN} token");
   if (count(/[{}]/g) !== 4) fail("π_NK", "template carries other placeholders");
-  if (!/^POST \/[\x21-\x7e]* HTTP\/1\.1\r\n/.test(tpl)) fail("π_NK", "template is not an HTTP/1.1 POST");
+  const line = /^POST (\/[\x21-\x7e]*) HTTP\/1\.1\r\n/.exec(tpl);
+  if (!line) fail("π_NK", "template is not an HTTP/1.1 POST");
+  const path = line![1]!;
+  if (/[?#]/.test(path)) fail("π_NK", "template path carries a query or fragment");
+  const paths = kind === "images" ? ["/image/generate", "/images/generations"] : ["/chat/completions"];
+  if (!paths.some((p) => path.endsWith(p))) fail("π_NK", `template path is not a ${kind} endpoint`);
   if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {
     fail("π_NK", "template is not exactly one request head");
   }
   const headers = tpl.slice(0, -4).split("\r\n").slice(1);
-  const values = (name: string) =>
-    headers
-      .filter((h) => h.slice(0, h.indexOf(":")).trim().toLowerCase() === name)
-      .map((h) => h.slice(h.indexOf(":") + 1).trim());
-  const host = values("host");
-  if (!upstreamHost || host.length !== 1 || host[0]!.toLowerCase() !== upstreamHost.toLowerCase()) {
+  const named = headers.map((h) => {
+    const i = h.indexOf(":");
+    if (i <= 0) fail("π_NK", "template carries a malformed header line");
+    return [h.slice(0, i).trim().toLowerCase(), h.slice(i + 1).trim()] as const;
+  });
+  const allowed = ["host", "authorization", "content-type", "accept-encoding", "connection", "content-length"];
+  const names = named.map(([n]) => n);
+  if (names.length !== allowed.length || !allowed.every((n) => names.filter((x) => x === n).length === 1)) {
+    fail("π_NK", "template headers are not exactly Host, Authorization, Content-Type, Accept-Encoding, Connection, Content-Length");
+  }
+  const value = (name: string) => named.find(([n]) => n === name)![1];
+  if (!upstreamHost || value("host").toLowerCase() !== upstreamHost.toLowerCase()) {
     fail("π_NK", "template Host is not the offer's upstream host");
   }
-  const len = values("content-length");
-  if (len.length !== 1 || len[0] !== "{LEN}") fail("π_NK", "template Content-Length is not the body length");
-  if (values("transfer-encoding").length > 0) fail("π_NK", "template sets Transfer-Encoding");
+  if (!/\{KEY:\d+\}/.test(value("authorization"))) fail("π_NK", "template Authorization does not carry the key");
+  if (value("content-type").toLowerCase() !== "application/json") fail("π_NK", "template Content-Type is not application/json");
+  if (value("accept-encoding").toLowerCase() !== "identity") fail("π_NK", "template Accept-Encoding is not identity");
+  if (value("connection").toLowerCase() !== "close") fail("π_NK", "template Connection is not close");
+  if (value("content-length") !== "{LEN}") fail("π_NK", "template Content-Length is not the body length");
 }

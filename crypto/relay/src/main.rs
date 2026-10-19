@@ -188,6 +188,14 @@ impl ImagesEndpoint {
         if self.param_space.values().any(|v| v.is_empty()) {
             bail!("images param_space has a key with no allowed values");
         }
+        // A fixed pin only switches a provider extra off; clients refuse any
+        // other value, so an offer carrying one would serve nobody.
+        for (k, v) in &self.fixed_pins {
+            let off = *v == serde_json::Value::Bool(false) || v.as_array().is_some_and(|a| a.is_empty());
+            if !off {
+                bail!("images fixed pin {k:?} must be false or [] (it may only switch an extra off)");
+            }
+        }
         Ok(())
     }
 
@@ -2878,6 +2886,15 @@ mod hardening_tests {
             ep.response_idle_s = idle;
             assert!(ep.validate("api.venice.ai", 42).is_err(), "response_idle_s {idle}");
         }
+        // A fixed pin may only switch an extra off.
+        for on in [serde_json::json!(true), serde_json::json!(["x"]), serde_json::json!("on"), serde_json::json!(1)] {
+            let mut ep = venice_images();
+            ep.fixed_pins.push(("embed_exif_metadata".into(), on.clone()));
+            assert!(ep.validate("api.venice.ai", 42).is_err(), "fixed pin {on}");
+        }
+        let mut ep = venice_images();
+        ep.fixed_pins.push(("embed_exif_metadata".into(), serde_json::json!(false)));
+        assert!(ep.validate("api.venice.ai", 42).is_ok());
     }
 
     fn setup(kind: Option<&str>, extra: serde_json::Value) -> serde_json::Value {

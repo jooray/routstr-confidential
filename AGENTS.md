@@ -82,8 +82,9 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
    node gets only `K_0, IV_0`. The sidecar verifies the certificate chain,
    hostname, CertificateVerify and both Finished messages.
 4. *Credential record.* The sidecar builds the head record with the API key
-   under `K_0`; π_NK proves to the client that it matches the published
-   template. On the client's `release_head` the sidecar writes it and a
+   under `K_0`; π_NK proves to the client that the head record's content
+   matches the published template (it does not bind other records the node
+   could write in epoch 0; paper residual risk 1). On the client's `release_head` the sidecar writes it and a
    KeyUpdate (epoch 0) in one write.
 5. *Body.* The client sends the body under `c_ap_1`, with the pinned JSON
    suffix (model, caps, …) as its own final record. **The sidecar holds that
@@ -100,8 +101,9 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
 7. *Settlement.* π_C3S proves the disclosed usage event (or, for an upstream
    HTTP error, only the response head; the body stays private). The node
    charges the usage at the frozen offer rates (EHBP's
-   `finalize_ehbp_actual_cost_payment`), or releases the reservation for a
-   4xx/503, and returns a signed receipt bound to the sid and attestation.
+   `finalize_ehbp_actual_cost_payment`), or releases the reservation for an
+   upstream refusal (less the session fee for 429/503, less the abandon fee
+   for any other 4xx), and returns a signed receipt bound to the sid and attestation.
    π_C2S/π_C3S compare inside the circuit (the node learns one bit), and the
    client checks every proof parameter against its own records (`params.ts`).
 8. *Abort.* Before the final body record is released: release (less any

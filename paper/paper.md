@@ -156,11 +156,21 @@ The protocol is defined for any upstream satisfying:
    anywhere in the dechunked body), each event is a single `data:` line of JSON followed by a blank line,
    and the stream ends in `data: [DONE]`. N's relay and C locate the usage event by this framing, and the
    argument that R is unambiguous (section 4.7) relies on it.
+10. **No copy for the account owner, no forwarding.** The owner of the API key (N) cannot retrieve request
+    or response content from the provider (no request log or stored output readable through the
+    account), and no request parameter, path or header sends it anywhere else (a callback, a webhook, a
+    third-party search). C pins the head template's path to the endpoint of its kind (no query string)
+    and its headers to a fixed set (`Host`, `Authorization`, `Content-Type`, `Accept-Encoding: identity`,
+    `Connection: close`, `Content-Length`), and an image request's fixed pins may only switch a provider
+    extra off, so N cannot pick a path, header or pin that turns such a feature on. What this item covers
+    is the provider's own behaviour on those requests.
 
 Items (5) and (6) quantify over every field and input, which no finite test can establish. For the
 case-study provider (Appendix A) a live regression gate tests items 1 to 7 and 9 with sampled cases; the
 requirements hold as far as those samples show, and the gate is re-run after provider changes. Item 8
-is a property of the provider's error handling that the gate does not test. Everything except the
+is a property of the provider's error handling that the gate does not test, and item 10 is a property of
+the provider's account and API design that no request can test; for the case-study provider we found no
+such retrieval or forwarding in its published API on the two routes used. Everything except the
 specifics of items 4 to 7 and 9 is provider-generic: the epoch structure, the 2PC, the proofs and the record
 assembly do not change per provider; the head template, the pinned suffix, the price list and the usage
 parser do. In the current implementation only the head template and the price list come from the offer:
@@ -173,7 +183,7 @@ shapes the clients parse) is a new offer entry; a provider priced per megapixel,
 parameters, or answering in another shape still needs code in the node and the clients.
 
 **The image route.** Image generation uses a second route of the same provider, which must satisfy items
-1 to 5 and 8 on its own: the transport (TLS 1.3, the one suite, P-256, a client KeyUpdate mid-request),
+1 to 5, 8 and 10 on its own: the transport (TLS 1.3, the one suite, P-256, a client KeyUpdate mid-request),
 no processing before the complete body, a JSON parser that keeps the last duplicate key, replaces
 arrays, rejects unknown fields and malformed JSON, and no reflection of the request head. Items 6 and 7
 change form. The price of an image is a function of request parameters only (model, count, resolution
@@ -461,7 +471,7 @@ suffix, 0.16 s locally.
 each against its own view before proving: $\pi_{C2S}$ must be a window ending at the end of C's own final
 body record (sequence number, offset and ciphertext bytes as C sent them) with C's suffix as the expected
 value; $\pi_{C3S}$ (section 4.7) must cover the final server records exactly as C received them, matched
-from the end of the transcript with at most one trailing close_notify record, with C's own disclosure as
+from the end of the transcript after at most 17 small trailing records (KeyUpdates or a close_notify, section 4.7), with C's own disclosure as
 the expected value; the anchors must equal C's own 2PC outputs. N therefore cannot aim a proof, or its
 one-bit result, at other plaintext.
 
@@ -552,10 +562,16 @@ carries no usage event. C then discloses only the response *head*: the status li
 the blank line that ends them. $\pi_{C3S}$ proves it with `skip` set to the length of the rest of the
 response, so the head is anchored at a known distance from the end of the transcript and the error body,
 which can quote the request, stays private. The relay also requires the head to start the first record C
-discloses. For statuses the provider answers before doing any work (4xx,
-503), N releases the reservation; other 5xx are charged like a missing disclosure. The head is
-unambiguous for the same reason as the usage event: a strict status line followed by well-formed
-`Name: value` header lines cannot come from model output, nor from chunk framing.
+discloses. For statuses the provider answers before doing any work N releases the reservation: on a
+429 or 503 (the provider limiting or at capacity) less the session fee $f_s$, on any other 4xx (a
+request U rejected) less the abandon fee $f_a$, since N did the 2PC for a request that could not run;
+other 5xx are charged like a missing disclosure. The head is unambiguous for the same reason as the
+usage event: a strict status line followed by well-formed `Name: value` header lines cannot come from
+model output, nor from chunk framing. The relay holds the head to the start of a TLS record, not
+provably to the start of the response, so this rests on the provider's response format: a body with raw
+header-like lines next to client-controlled text could let C present a fabricated head (residual risk
+13). An error body larger than the disclosure limit (about 24.5 KB, or more than 64 records) cannot be
+disclosed at all and is charged like a missing disclosure.
 
 **Pricing the node's work (optional).** A session costs N about 22 MB of upload and 0.5 s of CPU before U
 sees a byte, and a pre-warmed session (section 6) costs it before any request exists, so an unpriced armed
@@ -565,7 +581,9 @@ abandon fee $f_a \ge f_s$. C accepts both fees by echoing them in its setup; N r
 not, so a client that does not know about fees is never charged one. N reserves the amount above plus
 $\max(f_s, f_a)$. A completed session is charged the usage at the signed rates plus $f_s$ (capped at the
 reservation), and C's receipt check becomes $cost \le \lceil (r_{in} p + r_{out} o)/1000 \rceil + f_s$. A
-4xx/503 from U is charged $f_s$: the request reached U and N did the 2PC. A session that N's relay accepted
+429 or 503 from U is charged $f_s$; another 4xx, a request U rejected, is charged $f_a$: N did the 2PC
+for a request that could not run, and without the fee an invalid body would buy N's 2PC and a share of
+the provider key's rate limit for free. A session that N's relay accepted
 but that ends without a complete request reaching U (armed and never used, aborted, C gone) is charged
 $f_a$ instead of nothing. N cannot tell a pre-warmed session from a cold one and does not need to. With
 the per-address limit on unused sessions this bounds what an idle or hostile client can make N do: each
@@ -579,7 +597,8 @@ described above.
 | Any 2PC check fails, the ClientHello is rejected, or the handshake does not verify | session discarded before anything is written under $K_0$; reservation released (less the abandon fee $f_a$, if N charges one) |
 | Abort before N releases the final body record (including a failed $\pi_{C2S}$, or an armed session never used) | U never received a complete request; reservation released (less $f_a$) |
 | Usage disclosed | charged per section 4.8 |
-| U returned a 4xx or 503 (disclosed) | reservation released (less the session fee $f_s$) |
+| U returned a 429 or 503 (disclosed) | reservation released (less the session fee $f_s$) |
+| U returned another 4xx (disclosed) | reservation released (less the abandon fee $f_a$) |
 | Released, no usage disclosed (or another 5xx) | full reservation charged; C keeps its transcript and attestation |
 
 ## 4.10 Image generation
@@ -592,9 +611,17 @@ settles.
 template of the image route, the key under which the count is sent, the fixed pins (the provider's paid
 extras switched off), the parameter space, a maximum count (4), and per image model a list of variants,
 each a set of pins (a resolution tier and the output format, WebP) with a signed price per image
-$m_v$. N builds the list from its per-image price books, so only models whose price is a pure function
-of the pinned parameters are offered; token-metered image models and providers that report their own
-cost are left out.
+$m_v$ and, optionally, a smaller maximum count of its own. N builds the list from its per-image price
+books, so only models whose price is a pure function of the pinned parameters are offered;
+token-metered image models and providers that report their own cost are left out. The pins are the
+request's last word, so C does not take them on trust: a fixed pin must be `false` or `[]` (an extra
+switched off), a variant may pin only a price axis (resolution, quality, format) to a value of the
+offer's parameter space, and a private option that names a pinned key is refused. A pin that switched a
+provider feature on (a web search, the prompt written into the image's metadata) would otherwise act on
+C's prompt. Variants at 4K carry a count of 1: one busy 4K WebP from the case-study provider took 44 s
+and 5.9 MB of response (a 4.4 MB image), so four in one request could run past the provider CDN's idle
+limit of about 100 s and turn a paid request into a 5xx after release; the relay's 48 MiB response cap
+fits four.
 
 **Suffix.** The suffix pins the model, the count $k$, the fixed pins and the variant's pins, in that
 order and byte-exactly, rendered by N, the relay and C from the signed offer. C's prompt and every
@@ -606,7 +633,8 @@ image route's head template.
 **Settlement without a usage proof.** The charge is known at setup: $k \cdot m_v + f_s$. N reserves
 $k \cdot m_v + \max(f_s, f_a)$. After the attestation, C sends `accept` for a 2xx response; no
 disclosure and no $\pi_{C3S}$ run, and N charges exactly the flat amount. For an HTTP error C discloses
-the response head as in section 4.8 and the 4xx/503 rule applies. A client that sends neither is
+the response head as in section 4.8 and its error rule applies (the error receipt carries the image
+terms, and its charge is at most the reservation). A client that sends neither is
 charged the reservation, which exceeds the flat charge only by $\max(f_s, f_a) - f_s$, so withholding
 gains nothing. `accept` itself proves nothing: the relay cannot read the response, so it cannot tell a
 2xx from a 5xx or from no answer at all, and on `accept` N charges the flat amount whatever happened. An
@@ -622,7 +650,8 @@ does not learn the prompt, the private options, the image, or, on success, the r
 headers flag a blurred or policy-violating image).
 
 **Residuals.** A 2xx with fewer images than $k$ or with an error object in the body is charged in
-full. A 5xx after the body was released is charged the reservation when C discloses the error head or
+full; C still accepts it (not accepting would cost the reservation) and then reports the shortfall it
+can see (the framing, the number of images, and the model and count the provider echoes). A 5xx after the body was released is charged the reservation when C discloses the error head or
 sends nothing (the chat rule, kept until it is known whether the provider bills failed generations),
 and the flat amount when a dishonest C accepts it, as above. Image sessions are never armed: each pays a cold 2PC.
 
@@ -711,7 +740,9 @@ salt are fresh per session.
    N's wire bytes and cannot detect this. The effect is bounded: epoch 0 carries none of C's data, C's
    own records stay authenticated under $c_{ap,1}$, the response is readable only by C, and a broken
    request shows up as a failed response. A node could always choose to misuse its own account; what
-   the protocol guarantees is that it cannot read or alter C's content.
+   the protocol guarantees is that it cannot read or alter C's content in transit. Whether the provider
+   keeps a copy that the account owner can read, or forwards content on its behalf, is profile item 10,
+   not something the protocol can rule out.
 2. *The 2PC is a new, unpublished variant.* The garbler-only authenticated garbling, its consistency
    check with garbler-held masks, the 64-bit projection and the salt are argued in section 4.4 and above,
    but this variant has no published proof, and the construction as a whole needs external review. The
@@ -765,6 +796,17 @@ salt are fresh per session.
     with N unless it listens on loopback; on loopback without a token every local process on that host
     can use it. The token travels over plain HTTP, so off the host the N-to-relay link needs a private
     network or an encrypted tunnel.
+13. *Error heads rest on the provider's format.* An error disclosure is held to the start of a TLS record,
+    not provably to the start of the response (section 4.8). With the case-study provider's JSON bodies,
+    whose client-controlled text is always escaped, no header-like block can be formed later in a
+    response; a provider whose bodies carried raw CRLF lines next to client-controlled text would let C
+    present a fabricated error head and get a refund. Error bodies beyond the disclosure limit cannot be
+    disclosed and are charged like a missing disclosure.
+14. *Provider headers.* C reads the whole response, including headers in which the provider reports the
+    account's balance and rate-limit counters. Every client therefore learns the operator's provider
+    balance and, by sampling the counters across its own sessions, roughly how many requests other
+    clients sent through the same key. The protocol cannot hide them from C; the clients drop them before
+    handing headers to an application.
 
 # 6. Implementation and evaluation
 

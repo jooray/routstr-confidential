@@ -57,7 +57,8 @@ authors' working documents and are not published:
 >   is never discounted (and never reduced by the model's own completion
 >   limit, which the pinned cap rarely reaches). It charges exactly the frozen-rate
 >   cost of the π_C3S-verified usage. It releases the reservation if the provider
->   never received the complete request or answered a 4xx/503, and charges the
+>   never received the complete request or refused it (less the session fee for a
+>   429/503, less the abandon fee for any other 4xx), and charges the
 >   reservation for another 5xx or if the client withholds its disclosure.
 > - **Q3, the prompt.** The node sees only ciphertext. π_C2S and π_C3S compare
 >   inside the circuit and reveal one bit; the client validates their

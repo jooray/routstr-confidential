@@ -7,8 +7,15 @@ where they differ from section 0 or from the notes in this paragraph, those win:
 the image gate is `provider-profile-check.py --images`, checks I1 to I9 (output in `docs/evidence/`);
 `accept` is a claim, not a proof (an honest client sends it only for a 2xx; a dishonest one that
 accepts a 5xx pays the flat price instead of the reservation, at most `max(f_s, f_a) - f_s` less); the
-Venice endpoint caps the response at 48 MiB (four 4K WebPs fit); and only per-image books with resolution/quality tiers and
-WebP output are offered, so megapixel books, other tier keys or response shapes need code.
+Venice endpoint caps the response at 48 MiB, and a 4K variant carries `max_count: 1` (one busy 4K WebP took
+44 s and 5.9 MB of response; four could pass the provider CDN's ~100 s idle limit); only per-image books
+with resolution/quality tiers and WebP output are offered, so megapixel books, other tier keys or response
+shapes need code. Clients take nothing in the offer's images block on trust: a fixed pin must be `false` or
+`[]`, a variant pins only resolution, quality or format to a `param_space` value, a private option that names
+a pinned key is refused, the head template must be the image path with exactly the six fixed headers, and
+the numbers stay in range (integer prices, `max_count` 1..4, unique variant ids, `response_idle_s` 30..600).
+Errors: a 429 or 503 costs the session fee, any other 4xx the abandon fee, other 5xx up to the reservation;
+an image error receipt carries the session's kind, model, variant and count.
 
 Question: can `POST /v1/images/generations` go through confidential mode (protocol v2) so that the
 node sees neither the image prompt nor the image, with the same properties the paper claims for chat

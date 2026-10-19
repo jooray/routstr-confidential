@@ -160,7 +160,8 @@ export class ZkChan {
     this.child.stdin?.write(frame(1, Buffer.from(JSON.stringify({ cmd, id, proof, params, witness: witness ?? null }))))
     const m = await p
     if (!m.ok) throw new Error(`proof channel: ${proof} failed: ${m.err}`)
-    if (cmd === 'verify' && !(m.checks ?? []).every((c) => c.ok)) throw new Error(`proof channel: ${proof} checks failed`)
+    // A verification with no checks proved nothing: refused like a failed one.
+    if (cmd === 'verify' && !(m.checks?.length && m.checks.every((c) => c.ok))) throw new Error(`proof channel: ${proof} checks failed`)
     return m
   }
 

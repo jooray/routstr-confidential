@@ -176,7 +176,65 @@ let suffixBytes = new TextEncoder().encode(suffix)
 function imagesOffer(): any {
   const im = OFFER?.images ?? OFFER?.endpoints?.images
   if (!im) throw new Error('offer_no_images: the offer has no images endpoint')
+  checkImagesBlock(im)
   return im
+}
+
+/** The variant pin keys a client lets the node pin (the price axes). */
+const VARIANT_PIN_KEYS = new Set(['resolution', 'quality', 'format'])
+
+/**
+ * The node signs the images block, but its pins reach the provider as the
+ * request's last word: a fixed pin may only switch a provider extra off
+ * (`false` or `[]`), a variant may only pin a price axis to a value the
+ * offer's parameter space lists, and the numbers stay in the ranges the relay
+ * enforces. Anything else is refused rather than rendered.
+ */
+function checkImagesBlock(im: any): void {
+  const bad = (why: string): never => {
+    throw new Error(`offer_malformed: images block ${why}`)
+  }
+  const countKey = im.count_key ?? 'variants'
+  if (typeof countKey !== 'string' || !countKey) bad('count_key')
+  if (!(Number.isSafeInteger(im.max_count) && im.max_count >= 1 && im.max_count <= 4)) bad('max_count must be 1..4')
+  if (im.response_idle_s !== undefined && !(Number.isSafeInteger(im.response_idle_s) && im.response_idle_s >= 30 && im.response_idle_s <= 600)) {
+    bad('response_idle_s must be 30..600')
+  }
+  const space = im.param_space ?? {}
+  if (typeof space !== 'object' || Array.isArray(space)) bad('param_space')
+  for (const [k, v] of Object.entries(space)) {
+    if (!Array.isArray(v) || !v.every((x) => typeof x === 'string')) bad(`param_space.${k}`)
+  }
+  const fixed: unknown[] = im.fixed_pins ?? []
+  if (!Array.isArray(fixed)) bad('fixed_pins')
+  const fixedKeys = new Set<string>()
+  for (const pin of fixed) {
+    if (!Array.isArray(pin) || pin.length !== 2 || typeof pin[0] !== 'string') bad('fixed_pins entry')
+    const [k, v] = pin as [string, unknown]
+    if (!(v === false || (Array.isArray(v) && v.length === 0))) bad(`fixed pin ${k} does not switch an extra off`)
+    if (k === 'model' || k === countKey || fixedKeys.has(k)) bad(`fixed pin ${k} repeats a pinned key`)
+    fixedKeys.add(k)
+  }
+  for (const [model, variants] of Object.entries(im.price_list ?? {})) {
+    if (!Array.isArray(variants) || variants.length === 0) bad(`price_list.${model}`)
+    const ids = new Set<string>()
+    for (const v of variants as any[]) {
+      if (typeof v?.id !== 'string' || ids.has(v.id)) bad(`variant ids of ${model}`)
+      ids.add(v.id)
+      if (!(Number.isSafeInteger(v.msat_per_image) && v.msat_per_image > 0)) bad(`${model}/${v.id} msat_per_image`)
+      if (v.max_count !== undefined && !(Number.isSafeInteger(v.max_count) && v.max_count >= 1 && v.max_count <= im.max_count)) {
+        bad(`${model}/${v.id} max_count`)
+      }
+      const keys = new Set<string>()
+      for (const pin of v.pins ?? []) {
+        if (!Array.isArray(pin) || pin.length !== 2) bad(`${model}/${v.id} pin`)
+        const [k, val] = pin
+        if (!VARIANT_PIN_KEYS.has(k) || keys.has(k) || fixedKeys.has(k)) bad(`${model}/${v.id} pins ${k}`)
+        if (typeof val !== 'string' || !(space[k] ?? []).includes(val)) bad(`${model}/${v.id} pins ${k} outside param_space`)
+        keys.add(k)
+      }
+    }
+  }
 }
 
 /** The pinned image suffix (docs/CONFIDENTIAL-IMAGES.md §0.3), byte-exact. */
@@ -193,12 +251,15 @@ let IMAGE_MSAT = 0
 /** Build the image body once the offer is known: private prompt + suffix. */
 function setupImageBody(): void {
   const im = imagesOffer()
-  if (!(Number.isSafeInteger(IMAGE_COUNT) && IMAGE_COUNT >= 1 && IMAGE_COUNT <= (im.max_count ?? 1))) {
-    throw new Error(`--count must be 1..${im.max_count ?? 1}`)
-  }
   const variants: any[] | undefined = im.price_list?.[MODEL]
+  const chosen = variants ? (IMAGE_VARIANT ? variants.find((x) => x.id === IMAGE_VARIANT) : variants[0]) : undefined
+  // A variant may allow fewer images per request than the offer (4K: one).
+  const maxCount = Math.min(im.max_count, chosen?.max_count ?? im.max_count)
+  if (!(Number.isSafeInteger(IMAGE_COUNT) && IMAGE_COUNT >= 1 && IMAGE_COUNT <= maxCount)) {
+    throw new Error(`--count must be 1..${maxCount}`)
+  }
   if (variants) {
-    const v = IMAGE_VARIANT ? variants.find((x) => x.id === IMAGE_VARIANT) : variants[0]
+    const v = chosen
     if (!v) throw new Error(`no offered variant ${IMAGE_VARIANT ?? ''} for ${MODEL}`)
     IMAGE_PINS = v.pins
     IMAGE_VARIANT_ID = v.id
@@ -612,6 +673,7 @@ class Session {
     // π_C2S runs concurrently with generation and does not gate settlement on
     // the client side; a failure is logged but never stalls the receipt.
     // (A malicious client ignores the node's canonical suffix — ADV_* probes.)
+    if (IMAGE && this.ready.suffix === undefined) throw new Error('the node named no pinned suffix for this image session')
     if (!ADV_SUFFIX_MODEL && ADV_IMAGE_COUNT === undefined && this.ready.suffix !== undefined && this.ready.suffix !== suffix) {
       throw new Error('node expects a different pinned suffix than ours')
     }
@@ -662,8 +724,13 @@ class Session {
     // An upstream HTTP error carries no usage event: disclose only its head
     // (status line + headers); π_C3S proves where it sits and the body stays
     // private (the node settles 4xx/503 at zero cost).
-    const statusLine = Buffer.from(this.responseBytes.subarray(0, 64)).toString('latin1')
+    // Interim 1xx heads are skipped; the final head is the status. (The
+    // template never asks for one, so an interim head before an error means
+    // the error head cannot start the first record: it is not disclosed.)
+    const finalHead = finalHeadOffset(this.responseBytes)
+    const statusLine = Buffer.from(this.responseBytes.subarray(finalHead, finalHead + 64)).toString('latin1')
     const upstreamStatus = Number(/^HTTP\/1\.\d (\d{3})/.exec(statusLine)?.[1] ?? 0)
+    if (finalHead > 0 && upstreamStatus >= 400) throw new Error('an interim 1xx head precedes the error head; it cannot be disclosed')
     if (upstreamStatus >= 400) {
       console.log(`[client ${this.label}] upstream error ${upstreamStatus}: ${Buffer.from(this.responseBytes).toString('utf8').split('\r\n\r\n')[1]?.slice(0, 200)}`)
     }
@@ -751,15 +818,27 @@ class Session {
       throw new Error('receipt names larger fees than the signed offer')
     }
     if (upstreamStatus >= 400) {
-      // A provider refusal (4xx/503) costs at most the session fee, any other
-      // error at most the session's reservation.
-      const unbilled = upstreamStatus === 503 || upstreamStatus < 500
-      const cost = receipt.cost_msats ?? 0
-      const costBound = unbilled
-        ? SESSION_FEE
-        : Math.max(SESSION_FEE, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
-      const errOk =
-        receipt.usage?.error_status === upstreamStatus && typeof cost === 'number' && cost >= 0 && cost <= costBound
+      // A request the provider rejected (4xx other than 429) costs the abandon
+      // fee: the node did the 2PC for it. Provider-side refusals (429, 503)
+      // cost the session fee. Any other error costs at most the reservation,
+      // which for an image session is its flat price plus the larger fee.
+      const cost = receipt.cost_msats
+      let costOk: boolean
+      // Less than the rule allows only favours us, so the checks are bounds.
+      if (upstreamStatus === 429 || upstreamStatus === 503) costOk = cost <= SESSION_FEE
+      else if (upstreamStatus < 500) costOk = cost <= Math.max(SESSION_FEE, ABANDON_FEE)
+      else {
+        const bound = IMAGE
+          ? IMAGE_MSAT * IMAGE_COUNT + ABANDON_FEE
+          : Math.max(SESSION_FEE, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
+        costOk = Number.isSafeInteger(cost) && cost >= 0 && cost <= bound
+      }
+      // An image session's error receipt carries its terms.
+      const termsOk =
+        !IMAGE ||
+        !NODE_MODE ||
+        (receipt.kind === 'images' && receipt.model === MODEL && receipt.variant === IMAGE_VARIANT_ID && receipt.count === IMAGE_COUNT)
+      const errOk = receipt.usage?.error_status === upstreamStatus && (!NODE_MODE || (costOk && termsOk))
       console.log(
         `[client ${this.label}] error receipt: status=${upstreamStatus} cost_msats=${receipt.cost_msats} ok=${errOk} signature_ok=${okSig}`,
       )
@@ -876,9 +955,19 @@ class Session {
     } else if (receipt.usage?.flat !== true || receipt.usage?.count !== IMAGE_COUNT) {
       throw new Error('usage frame is not a flat charge for the pinned count')
     }
-    const json = JSON.parse(Buffer.from(responseBody(this.responseBytes)).toString('utf8'))
+    // The charge was fixed at setup and accepting cannot change it (not
+    // accepting would cost the reservation), so what the response is short of
+    // is reported, not thrown: framing, image count, the provider's echo.
+    const warnings: string[] = []
+    let json: any = {}
+    try {
+      json = JSON.parse(Buffer.from(responseBody(this.responseBytes)).toString('utf8'))
+    } catch (e) {
+      warnings.push(`response body is incomplete or not JSON: ${String(e)}`)
+    }
     const shape = imagesOffer().response_shape
     const images: string[] = shape === 'venice' ? json.images ?? [] : (json.data ?? []).map((d: any) => d.b64_json)
+    if (images.length !== IMAGE_COUNT) warnings.push(`${images.length} of ${IMAGE_COUNT} images returned`)
     // What the provider says it ran (Venice echoes the effective request).
     const meta: Record<string, unknown> = { ...json }
     delete meta.images
@@ -889,6 +978,10 @@ class Session {
     for (const k of ['model', 'variants', 'resolution', 'format', 'enhance_prompt', 'enable_web_search', 'return_binary', 'style_references']) {
       if (k in req) echo[k] = req[k]
     }
+    const countKey = imagesOffer().count_key ?? 'variants'
+    if ('model' in req && req.model !== MODEL) warnings.push(`the provider ran ${String(req.model)}, not ${MODEL}`)
+    if (countKey in req && req[countKey] !== IMAGE_COUNT) warnings.push(`the provider ran ${String(req[countKey])} images, not ${IMAGE_COUNT}`)
+    for (const w of warnings) console.log(`[client ${this.label}] warning: ${w}`)
     const files = images.map((b64, i) => {
       const f = `${runDir}/image-${i}.webp`
       writeFileSync(f, Buffer.from(b64, 'base64'))
@@ -910,8 +1003,9 @@ class Session {
       images: images.length,
       files,
       response_bytes: this.responseBytes.length,
-      upstream_status: Number(/^HTTP\/1\.\d (\d{3})/.exec(Buffer.from(this.responseBytes.subarray(0, 64)).toString('latin1'))?.[1] ?? 0),
+      upstream_status: Number(/^HTTP\/1\.\d (\d{3})/.exec(Buffer.from(this.responseBytes.subarray(finalHeadOffset(this.responseBytes), finalHeadOffset(this.responseBytes) + 64)).toString('latin1'))?.[1] ?? 0),
       echo,
+      warnings,
       cost_msats: receipt.cost_msats,
       cost_ok: costOk,
       receipt_sig_ok: okSig || !NODE_MODE,
@@ -926,13 +1020,30 @@ class Session {
 // R extraction
 // ---------------------------------------------------------------------------
 
-/** The HTTP response body (de-chunked when chunked). */
-function responseBody(b: Uint8Array): Uint8Array {
+/** Where the final response head starts, after any interim 1xx heads. */
+function finalHeadOffset(b: Uint8Array): number {
+  let off = 0
+  for (;;) {
+    const line = Buffer.from(b.subarray(off, off + 16)).toString('latin1')
+    if (!/^HTTP\/1\.\d 1\d\d/.test(line)) return off
+    const end = Buffer.from(b).indexOf('\r\n\r\n', off)
+    if (end < 0) return off
+    off = end + 4
+  }
+}
+
+/** The HTTP response body (de-chunked when chunked), after any interim heads. */
+function responseBody(full: Uint8Array): Uint8Array {
+  const b = full.subarray(finalHeadOffset(full))
   const headEnd = Buffer.from(b).indexOf('\r\n\r\n')
   if (headEnd < 0) throw new Error('response has no head')
   const head = Buffer.from(b.subarray(0, headEnd)).toString('latin1').toLowerCase()
   const rest = b.subarray(headEnd + 4)
-  if (!/\r\ntransfer-encoding:\s*chunked/.test(head)) return rest
+  if (!/\r\ntransfer-encoding:\s*chunked/.test(head)) {
+    const len = /\r\ncontent-length:\s*(\d+)/.exec(head)
+    if (len && rest.length !== Number(len[1])) throw new Error(`body is ${rest.length} bytes, Content-Length says ${len[1]}`)
+    return rest
+  }
   const out: Uint8Array[] = []
   let i = 0
   for (;;) {
@@ -1084,11 +1195,12 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
   const p = params?.PiNK
   if (!p) throw new Error('π_NK params missing')
   const tpl: string = offer?.head_template ?? ''
-  const keyLen: number = offer?.key_length ?? p.key_len
+  const keyLen: number = offer?.key_length
+  if (!(Number.isSafeInteger(keyLen) && keyLen > 0)) throw new Error('π_NK: the offer names no key length')
   const alphabet: string = offer?.key_alphabet ?? '[A-Za-z0-9_-]'
   const token = `{KEY:${keyLen}}`
   if (!tpl.includes(token)) throw new Error('π_NK: template lacks key token')
-  checkHeadTemplate(tpl, offer?.upstream_host ?? '')
+  checkHeadTemplate(tpl, offer?.upstream_host ?? '', IMAGE ? 'images' : 'chat')
   if ((p.key_alphabet ?? alphabet) !== alphabet) throw new Error('π_NK: key alphabet differs from the offer')
   const filled = new TextEncoder().encode(tpl.replace(token, '\u0000'.repeat(keyLen)).replace('{LEN}', String(bodyLen)))
   const offs: number[] = []

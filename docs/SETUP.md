@@ -121,7 +121,8 @@ surcharge, already included in the offer's rates; a **session fee** added to eac
 (`session_fee_msat`); and an **abandon fee** (`abandon_fee_msat`, at least the session fee) for a session
 that is set up and then ends without a request reaching the provider, for example a pre-warmed session that
 is never used. The client accepts both fees from the signed offer, checks every receipt against usage × the
-signed rates + the session fee (a provider refusal, 4xx/503, may cost the session fee only), and sizes its
+signed rates + the session fee (a 429 or 503 costs the session fee, any other 4xx the abandon fee: the
+node did the 2PC for a request the provider rejected), and sizes its
 deposit to include the larger fee, which the node reserves. With an abandon fee, an armed session that is
 never used costs you that fee, so routstrd arms at most `prewarm.maxArmedWithFee` (default 6) sessions for
 such a node, and none if the
@@ -243,7 +244,7 @@ default, let the node charge for that:
 | Setting | Effect |
 |---|---|
 | `CONFIDENTIAL_RATE_SURCHARGE_PCT` | percentage added to the per-token rates of confidential sessions (the signed offer lists the surcharged rates) |
-| `CONFIDENTIAL_SESSION_FEE_MSAT` | flat fee added to every completed request; also charged when the provider refuses the request (4xx/503), since it reached the provider |
+| `CONFIDENTIAL_SESSION_FEE_MSAT` | flat fee added to every completed request; also charged when the provider is limiting or at capacity (429/503), since the request reached it; any other 4xx is charged the abandon fee |
 | `CONFIDENTIAL_ABANDON_FEE_MSAT` | charged instead when a session the sidecar accepted ends without a request reaching the provider (armed but never used, aborted, client gone); at least the session fee, and equal to it when unset. Reserved at setup |
 
 The abandon fee is the anti-DoS mechanism: together with the per-address limit above, every unused session
