@@ -159,8 +159,8 @@ The protocol is defined for any upstream satisfying:
 10. **No copy for the account owner, no forwarding.** The owner of the API key (N) cannot retrieve request
     or response content from the provider (no request log or stored output readable through the
     account), and no request parameter, path or header sends it anywhere else (a callback, a webhook, a
-    third-party search). C pins the head template's path to the endpoint of its kind (a canonical path with no dot or empty
-    segments, escapes or query string, so the provider cannot normalise it onto another route)
+    third-party search). C pins the head template's route to exactly the API base it trusts for that host followed by the
+    endpoint of its kind (a canonical path, no query string)
     and its headers to a fixed set (`Host`, `Authorization`, `Content-Type`, `Accept-Encoding: identity`,
     `Connection: close`, `Content-Length`), and an image request's fixed pins may only switch a provider
     extra off, so N cannot pick a path, header or pin that turns such a feature on. What this item covers
@@ -811,12 +811,12 @@ salt are fresh per session.
     balance and, by sampling the counters across its own sessions, roughly how many requests other
     clients sent through the same key. The protocol cannot hide them from C; the clients drop them before
     handing headers to an application.
-15. *The session id admits proof channels.* While a session is live, its protocol sid (which both
-    parties know) is what admits a connection to N's proof and 2PC channels. A third party holding it
-    could take a channel before C does and so end the session; after the final body record is released
-    that charges the reservation, as an abort by N would. It cannot read C's channel (each channel has one
-    peer) or prove anything for C. The sid is in C's channel URLs, so N's and the relay's logs keep only
-    a prefix of it.
+15. *Proof-channel admission.* N admits a connection to a live session's proof and 2PC channels by its
+    sid and a random token N gives only C (in `ready`; unlike the sid it is in no receipt or
+    attestation, and N's logs drop it). Whoever learns both from C could take a channel before C does and
+    so end the session; after the final body record is released that charges the reservation, as an
+    abort by N would. Such a party cannot read C's channel (each channel has one peer) or prove anything
+    for C.
 
 # 6. Implementation and evaluation
 

@@ -379,7 +379,9 @@ class Session {
   zkUrl(proof: string, sid: string): string {
     if (NODE_MODE) {
       const base = NODE!.replace(/^http/, 'ws').replace(/\/$/, '')
-      return `${base}/v1/confidential/zk?proof=${proof}&session_id=${sid}`
+      // The node's per-session /zk token (from `ready`): the sid alone admits nothing.
+      const token = typeof this.ready?.zk_token === 'string' ? `&zk_token=${encodeURIComponent(this.ready.zk_token)}` : ''
+      return `${base}/v1/confidential/zk?proof=${proof}&session_id=${sid}${token}`
     }
     return `${SIDECAR.replace(/^http/, 'ws')}/zk?proof=${proof}&sid=${sid}`
   }
@@ -1201,6 +1203,12 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
   const token = `{KEY:${keyLen}}`
   if (!tpl.includes(token)) throw new Error('π_NK: template lacks key token')
   checkHeadTemplate(tpl, offer?.upstream_host ?? '', IMAGE ? 'images' : 'chat')
+  // The route is exactly a trusted API base plus the endpoint (CU_API_BASES,
+  // comma-separated; default the two common bases, as the SDK's bare host).
+  const bases = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
+  const ends = IMAGE ? ['/image/generate', '/images/generations'] : ['/chat/completions']
+  const route = /^POST (\S+) /.exec(tpl)?.[1]
+  if (!bases.some((b) => ends.some((e) => route === b + e))) throw new Error(`π_NK: route ${route} is not a trusted API base plus the endpoint`)
   if ((p.key_alphabet ?? alphabet) !== alphabet) throw new Error('π_NK: key alphabet differs from the offer')
   const filled = new TextEncoder().encode(tpl.replace(token, '\u0000'.repeat(keyLen)).replace('{LEN}', String(bodyLen)))
   const offs: number[] = []
