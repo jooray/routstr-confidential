@@ -1,0 +1,2 @@
+case	expected	verdict	driver	node
+img-resolution-inject	images	PASS	rc=0 images=1 sizes=[(1024, 1024)] cost_msats=24240 flat=24240x1 sig=True status=200 echo={"enable_web_search": false, "enhance_prompt": false, "format": "webp", "model": "qwen-image-2-1-turbo", "resolution": "1K", "return_binary": false, "variants": 1}	settled cost_msats=24240

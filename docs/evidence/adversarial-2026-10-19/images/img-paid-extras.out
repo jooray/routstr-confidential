@@ -1,0 +1,5 @@
+[client] offer v=2 host=api.venice.ai prewarm=undefined models=136 sig_ok=true
+[client] offer session_fee_msat=0 abandon_fee_msat=0 rate_surcharge_pct=0
+[client single] sid=56ddf90aef4a50347968dcf628295c7238c23cd383c04c83036a9ea4d1a573b3 head_len=226
+[client single] images: 1 of 1 (<out>/runs/56ddf90aef4a50347968dcf628295c7238c23cd383c04c83036a9ea4d1a573b3/image-0.webp) response_bytes=264427 cost_msats=12120 cost_ok=true signature_ok=true attestation_ok=true
+E2E_JSON {"sid":"56ddf90aef4a50347968dcf628295c7238c23cd383c04c83036a9ea4d1a573b3","kind":"images","model":"z-image-turbo","count":1,"images":1,"files":["<out>/runs/56ddf90aef4a50347968dcf628295c7238c23cd383c04c83036a9ea4d1a573b3/image-0.webp"],"response_bytes":264427,"upstream_status":200,"echo":{"model":"z-image-turbo","variants":1,"format":"webp","enhance_prompt":false,"enable_web_search":false,"return_binary":false},"cost_msats":12120,"cost_ok":true,"receipt_sig_ok":true,"total_ms":5161,"upstream_ms":3813,"zk":{"pi_nk":{"via":"zkchan","ms":63,"inner_ms":62.838,"bytes_sent":22,"bytes_recv":30915},"pi_c2s":{"via":"zkchan","ms":32,"inner_ms":32.188,"bytes_sent":30084,"bytes_recv":0}}}

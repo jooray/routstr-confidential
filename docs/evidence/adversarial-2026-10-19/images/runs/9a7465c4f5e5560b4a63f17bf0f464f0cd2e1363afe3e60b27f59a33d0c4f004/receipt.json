@@ -1,0 +1,20 @@
+{
+  "attestation_hash": "11f38e4e97d98f5fd5208a88ff1e21ca06835cb69bd9a4e4c033dbb46418ce45",
+  "balance_msats": 19866500,
+  "cost_msats": 24240,
+  "count": 1,
+  "kind": "images",
+  "model": "qwen-image-2-1-turbo",
+  "msat_per_image": 24240,
+  "notary_pubkey": "68c6e4a9d44106af42c82b32befd50e01f78c90b003191075f97b23dba341d02",
+  "reserved_msats": 24240,
+  "sid": "9a7465c4f5e5560b4a63f17bf0f464f0cd2e1363afe3e60b27f59a33d0c4f004",
+  "time": 1792416563,
+  "usage": {
+    "count": 1,
+    "flat": true,
+    "kind": "images"
+  },
+  "v": 1,
+  "variant": "1K-webp"
+}

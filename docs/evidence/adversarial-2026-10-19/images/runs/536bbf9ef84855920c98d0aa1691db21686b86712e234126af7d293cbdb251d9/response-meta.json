@@ -1,0 +1,29 @@
+{
+  "id": "qpG6YGzezbUduaY3mAb82JhGVaUM2Eiz",
+  "request": {
+    "success": true,
+    "data": {
+      "embed_exif_metadata": false,
+      "format": "webp",
+      "height": 1024,
+      "hide_watermark": false,
+      "model": "qwen-image-2-1-turbo",
+      "prompt": "A small red bicycle leaning on a white wall, watercolor",
+      "return_binary": false,
+      "variants": 1,
+      "safe_mode": true,
+      "seed": -66399282,
+      "steps": 0,
+      "resolution": "1K",
+      "enable_web_search": false,
+      "enhance_prompt": false,
+      "width": 1024
+    }
+  },
+  "timing": {
+    "inferenceDuration": 6604,
+    "inferencePreprocessingTime": 6626,
+    "inferenceQueueTime": 2113,
+    "total": 8755
+  }
+}

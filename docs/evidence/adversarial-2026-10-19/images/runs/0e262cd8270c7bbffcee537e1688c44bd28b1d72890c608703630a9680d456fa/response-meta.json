@@ -1,0 +1,18 @@
+{
+  "details": {
+    "_errors": [
+      "Unrecognized key(s) in object: 'bogus_field_xyz'"
+    ]
+  },
+  "error": "Invalid request parameters",
+  "issues": [
+    {
+      "code": "unrecognized_keys",
+      "keys": [
+        "bogus_field_xyz"
+      ],
+      "path": [],
+      "message": "Unrecognized key(s) in object: 'bogus_field_xyz'"
+    }
+  ]
+}

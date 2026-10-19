@@ -1,0 +1,1 @@
+{"asctime": "2026-10-19 15:29:23", "name": "routstr.confidential_ws", "levelname": "INFO", "message": "confidential ws: settled", "pathname": "<repo>/routstr-core/routstr/confidential_ws.py", "lineno": 798, "version": "0.5.0", "request_id": "no-request-id", "client_app": "unknown", "sid": "9a7465c4f5e5", "model": "qwen-image-2-1-turbo", "cost_msats": 24240}

@@ -1,0 +1,1 @@
+{"asctime": "2026-10-19 15:24:52", "name": "routstr.confidential_ws", "levelname": "INFO", "message": "confidential ws: session aborted", "pathname": "<repo>/routstr-core/routstr/confidential_ws.py", "lineno": 842, "version": "0.5.0", "request_id": "no-request-id", "client_app": "unknown", "sid": "6982ab0ad049", "outcome": "released"}

@@ -1,0 +1,7 @@
+case	expected	verdict	driver	node
+control	settled	PASS	rc=0 model=deepseek-v4-flash sig=True usage=True cost=True cost_msats=6	settled cost_msats=6
+a-suffix-mismatch	refused	PASS	rc=1 refused: sidecar rejected: body suffix does not match the session's pinned suffix	aborted outcome=released
+b-decoy	settled	PASS	rc=0 model=deepseek-v4-flash sig=True usage=True cost=True cost_msats=6	settled cost_msats=6
+d-no-suffix-swap	withheld	PASS	rc=3 withheld: response_bytes=0 model_output=False	aborted outcome=released
+e-unoffered-model	withheld	PASS	rc=3 withheld: response_bytes=0 model_output=False	aborted outcome=released
+f-claim-canonical	refused	PASS	rc=1 refused: sidecar rejected: proof pi_c2s failed: Some("proof checks failed: [CheckResult { label: \"h1\", ok: true, got:	aborted outcome=released

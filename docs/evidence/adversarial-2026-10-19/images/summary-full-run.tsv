@@ -1,0 +1,12 @@
+case	expected	verdict	driver	node
+img-control	images	PASS	rc=0 images=1 sizes=[(1024, 1024)] cost_msats=12120 flat=12120x1 sig=True status=200 echo={"enable_web_search": false, "enhance_prompt": false, "format": "webp", "model": "z-image-turbo", "return_binary": false, "variants": 1}	settled cost_msats=12120
+img-decoy-model	images	PASS	rc=0 images=1 sizes=[(1024, 1024)] cost_msats=12120 flat=12120x1 sig=True status=200 echo={"enable_web_search": false, "enhance_prompt": false, "format": "webp", "model": "z-image-turbo", "return_binary": false, "variants": 1}	settled cost_msats=12120
+img-count-inject	images	PASS	rc=0 images=1 sizes=[(1024, 1024)] cost_msats=12120 flat=12120x1 sig=True status=200 echo={"enable_web_search": false, "enhance_prompt": false, "format": "webp", "model": "z-image-turbo", "return_binary": false, "variants": 1}	settled cost_msats=12120
+img-paid-extras	images	PASS	rc=0 images=1 sizes=[(1024, 1024)] cost_msats=12120 flat=12120x1 sig=True status=200 echo={"enable_web_search": false, "enhance_prompt": false, "format": "webp", "model": "z-image-turbo", "return_binary": false, "variants": 1}	settled cost_msats=12120
+img-resolution-inject	images	DEVIATION: node: expected exactly one session line, got 2	rc=0 images=1 sizes=[(1024, 1024)] cost_msats=24240 flat=24240x1 sig=True status=200 echo={"enable_web_search": false, "enhance_prompt": false, "format": "webp", "model": "qwen-image-2-1-turbo", "resolution": "1K", "return_binary": false, "variants": 1}	aborted outcome=charged_abandon_fee:2000; settled cost_msats=24240
+img-count-mismatch	refused	PASS	rc=1 refused: sidecar rejected: body suffix does not match the session's pinned suffix	aborted outcome=released
+img-count-claim	refused	PASS	rc=1 refused: sidecar rejected: proof pi_c2s failed: Some("proof checks failed: [CheckResult { label: \"h1\", ok: true, got: \"918d742c55f08fc77bcb51c50a0	aborted outcome=released
+img-suffix-model	refused	PASS	rc=1 refused: sidecar rejected: body suffix does not match the session's pinned suffix	aborted outcome=released
+img-no-suffix-swap	withheld	PASS	rc=3 withheld: response_bytes=0 output=False	aborted outcome=released
+img-error-honest	error-released	PASS	rc=0 error receipt: status=400 cost_msats=0 ok=true signature_ok=true	settled cost_msats=0
+img-accept-on-error	accept-residual	PASS (documented residual)	rc=0 images=0 sizes=[] cost_msats=12120 flat=12120x1 sig=True status=400 echo={}	settled cost_msats=12120

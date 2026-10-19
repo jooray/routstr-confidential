@@ -1,0 +1,3 @@
+[client] offer v=2 host=api.venice.ai prewarm=undefined models=136 sig_ok=true
+[client] offer session_fee_msat=0 abandon_fee_msat=0 rate_surcharge_pct=0
+[client single] sid=6982ab0ad049b527632a8da69a74c90f9c0d3b995698cdbe6a4bbd670c80659e head_len=228

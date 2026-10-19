@@ -1,0 +1,5 @@
+[client] offer v=2 host=api.venice.ai prewarm=undefined models=136 sig_ok=true
+[client] offer session_fee_msat=0 abandon_fee_msat=0 rate_surcharge_pct=0
+[client single] sid=04abfd6fbe9e0bb8b106139d1c3cc93498d6d314d770e4dc1f4a76571fffecd0 head_len=228
+ADV_NO_SUFFIX {"response_bytes":0,"tls_ended":false,"has_model_output":false,"snippet":""}
+E2E_JSON {"adv":"no-suffix","response_bytes":0,"has_model_output":false,"sid":"04abfd6fbe9e0bb8b106139d1c3cc93498d6d314d770e4dc1f4a76571fffecd0"}

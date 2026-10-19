@@ -62,6 +62,10 @@ const IMAGE = argv.includes('--image')
 const IMAGE_COUNT = Number(arg('--count', '1'))
 const IMAGE_VARIANT = arg('--variant')
 const IMAGE_RESOLUTION = arg('--resolution')
+// Adversarial image probes: pin a different count in the body suffix than the
+// setup names, and accept the response whatever its status (a dishonest client).
+const ADV_IMAGE_COUNT = arg('--adv-image-count') === undefined ? undefined : Number(arg('--adv-image-count'))
+const ADV_ACCEPT_ANY = argv.includes('--adv-accept-any')
 const DECOY = arg('--decoy-model')
 // --- adversarial GAP-1 probes (crypto/tools/adversarial-model-swap) ---------
 // Craft a suffix whose model differs from the setup model, ignoring the node's
@@ -203,7 +207,7 @@ function setupImageBody(): void {
     if (IMAGE_RESOLUTION) IMAGE_PINS.push(['resolution', IMAGE_RESOLUTION])
     IMAGE_PINS.push(['format', 'webp'])
   }
-  suffix = renderImagesSuffix(im, MODEL, IMAGE_COUNT, IMAGE_PINS)
+  suffix = renderImagesSuffix(im, SUFFIX_MODEL, ADV_IMAGE_COUNT ?? IMAGE_COUNT, IMAGE_PINS)
   let p = `{"prompt":${JSON.stringify(PROMPT)}`
   if (PRIVATE_EXTRA) p += `,${PRIVATE_EXTRA}`
   bodyText = p + suffix
@@ -593,7 +597,7 @@ class Session {
       }
       const text = Buffer.from(this.responseBytes).toString('utf8')
       writeFileSync(`${runDir}/adv-response.txt`, text)
-      const hasContent = /"content":\s*"[^"]/.test(text)
+      const hasContent = /"content":\s*"[^"]/.test(text) || /"images"\s*:\s*\[\s*"/.test(text)
       console.log(
         `ADV_NO_SUFFIX ${JSON.stringify({
           response_bytes: this.responseBytes.length,
@@ -608,14 +612,14 @@ class Session {
     // π_C2S runs concurrently with generation and does not gate settlement on
     // the client side; a failure is logged but never stalls the receipt.
     // (A malicious client ignores the node's canonical suffix — ADV_* probes.)
-    if (!ADV_SUFFIX_MODEL && this.ready.suffix !== undefined && this.ready.suffix !== suffix) {
+    if (!ADV_SUFFIX_MODEL && ADV_IMAGE_COUNT === undefined && this.ready.suffix !== undefined && this.ready.suffix !== suffix) {
       throw new Error('node expects a different pinned suffix than ours')
     }
     const claimed = ADV_CLAIM_CANONICAL ? new TextEncoder().encode(this.ready.suffix) : suffixBytes
     this.sendText({ type: 'body_suffix', suffix: hex(claimed) })
     const c2params = await this.waitT('zk_params', 30000)
     const lastBody = this.bodyRecords[this.bodyRecords.length - 1] ?? new Uint8Array(0)
-    if (!ADV_SUFFIX_MODEL && !ADV_CLAIM_CANONICAL) {
+    if (!ADV_SUFFIX_MODEL && ADV_IMAGE_COUNT === undefined && !ADV_CLAIM_CANONICAL) {
       checkPiC2SParams(c2params.params, { h1: this.ap!.h1, seq: this.bodyRecords.length - 1, record: lastBody, suffix: suffixBytes })
     }
     const c2Promise = this.proofV2('pi_c2s', 'prove', c2params.params, { Secret: Array.from(this.ap!.clientAp1) })
@@ -663,7 +667,9 @@ class Session {
     if (upstreamStatus >= 400) {
       console.log(`[client ${this.label}] upstream error ${upstreamStatus}: ${Buffer.from(this.responseBytes).toString('utf8').split('\r\n\r\n')[1]?.slice(0, 200)}`)
     }
-    if (IMAGE && upstreamStatus > 0 && upstreamStatus < 400) {
+    // Only a 2xx is accepted; any other status either discloses its error head
+    // (>= 400) or fails without accepting. ADV_ACCEPT_ANY is the dishonest client.
+    if (IMAGE && ((upstreamStatus >= 200 && upstreamStatus < 300) || (ADV_ACCEPT_ANY && upstreamStatus > 0))) {
       return await this.acceptImages(runDir, tClaim, tBodyWrite, attMsg, attOk)
     }
     let r: Uint8Array | null
@@ -873,6 +879,16 @@ class Session {
     const json = JSON.parse(Buffer.from(responseBody(this.responseBytes)).toString('utf8'))
     const shape = imagesOffer().response_shape
     const images: string[] = shape === 'venice' ? json.images ?? [] : (json.data ?? []).map((d: any) => d.b64_json)
+    // What the provider says it ran (Venice echoes the effective request).
+    const meta: Record<string, unknown> = { ...json }
+    delete meta.images
+    delete meta.data
+    writeFileSync(`${runDir}/response-meta.json`, JSON.stringify(meta, null, 2))
+    const req = json.request?.data ?? json.request ?? {}
+    const echo: Record<string, unknown> = {}
+    for (const k of ['model', 'variants', 'resolution', 'format', 'enhance_prompt', 'enable_web_search', 'return_binary', 'style_references']) {
+      if (k in req) echo[k] = req[k]
+    }
     const files = images.map((b64, i) => {
       const f = `${runDir}/image-${i}.webp`
       writeFileSync(f, Buffer.from(b64, 'base64'))
@@ -894,6 +910,8 @@ class Session {
       images: images.length,
       files,
       response_bytes: this.responseBytes.length,
+      upstream_status: Number(/^HTTP\/1\.\d (\d{3})/.exec(Buffer.from(this.responseBytes.subarray(0, 64)).toString('latin1'))?.[1] ?? 0),
+      echo,
       cost_msats: receipt.cost_msats,
       cost_ok: costOk,
       receipt_sig_ok: okSig || !NODE_MODE,

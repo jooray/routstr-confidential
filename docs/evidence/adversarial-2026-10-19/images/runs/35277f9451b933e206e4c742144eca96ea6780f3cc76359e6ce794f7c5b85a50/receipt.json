@@ -1,0 +1,20 @@
+{
+  "attestation_hash": "2b1dba6b993d86a1b2b3ec134ed2155d16310960012c7ea4a1dcd9859faf2758",
+  "balance_msats": 19963460,
+  "cost_msats": 12120,
+  "count": 1,
+  "kind": "images",
+  "model": "z-image-turbo",
+  "msat_per_image": 12120,
+  "notary_pubkey": "68c6e4a9d44106af42c82b32befd50e01f78c90b003191075f97b23dba341d02",
+  "reserved_msats": 12120,
+  "sid": "35277f9451b933e206e4c742144eca96ea6780f3cc76359e6ce794f7c5b85a50",
+  "time": 1792416465,
+  "usage": {
+    "count": 1,
+    "flat": true,
+    "kind": "images"
+  },
+  "v": 1,
+  "variant": "webp"
+}

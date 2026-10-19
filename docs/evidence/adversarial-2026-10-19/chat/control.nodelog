@@ -1,0 +1,1 @@
+{"asctime": "2026-10-19 15:23:59", "name": "routstr.confidential_ws", "levelname": "INFO", "message": "confidential ws: settled", "pathname": "<repo>/routstr-core/routstr/confidential_ws.py", "lineno": 798, "version": "0.5.0", "request_id": "no-request-id", "client_app": "unknown", "sid": "b6d7e2326cc9", "model": "deepseek-v4-flash", "cost_msats": 6}

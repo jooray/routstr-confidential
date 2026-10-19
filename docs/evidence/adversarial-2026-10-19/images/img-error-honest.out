@@ -1,0 +1,6 @@
+[client] offer v=2 host=api.venice.ai prewarm=undefined models=136 sig_ok=true
+[client] offer session_fee_msat=0 abandon_fee_msat=0 rate_surcharge_pct=0
+[client single] sid=a18684dd3f4086cf67269d696e89d90972fbe5e084083c513d18ad3926f0c5be head_len=226
+[client single] upstream error 400: {"details":{"_errors":["Unrecognized key(s) in object: 'bogus_field_xyz'"]},"error":"Invalid request parameters","issues":[{"code":"unrecognized_keys","keys":["bogus_field_xyz"],"path":[],"message":"U
+[client single] error receipt: status=400 cost_msats=0 ok=true signature_ok=true
+E2E_JSON {"sid":"a18684dd3f4086cf67269d696e89d90972fbe5e084083c513d18ad3926f0c5be","upstream_status":400,"cost_msats":0,"receipt_sig_ok":true}

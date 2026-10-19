@@ -23,3 +23,21 @@ one host, live api.venice.ai, `deepseek-v4-flash`, 40 tokens, 5 sessions each) a
 `deployed-cold`/`deployed-arm` (from a home connection to routstr.cypherpunk.today, 3 each). `arm`
 means the reference client's `--arm` (armed through the handshake and pi_NK, then claimed at once).
 These are the figures in paper §6.3.
+
+## adversarial-2026-10-19/
+
+Malicious-client gates against a local node and sidecar (one host, live api.venice.ai), 2026-10-19.
+
+- `chat/`: `crypto/tools/adversarial-model-swap.sh`, 6/6 as expected (control, suffix mismatch,
+  decoy model, withheld suffix twice, claimed canonical suffix).
+- `images/`: `crypto/tools/adversarial-images.sh`, 11 cases: control; decoy expensive model, count
+  injection (`"variants":4`), paid-extra injection and resolution injection in the private part, all
+  neutralised by the pinned suffix (the provider's echo in `runs/*/response-meta.json` shows the pinned
+  model, count, extras and 1K resolution; flat charge at the signed price); count and model mismatch in
+  the suffix refused by the sidecar or by pi_C2S, and a withheld suffix, each released; an honest
+  provider error (400) charged nothing; and a client that sends `accept` after the 400, charged the
+  flat price for no image (the bounded residual of paper §4.10). In the full run,
+  `img-resolution-inject` was flagged only because a unit-test fixture line written to the same node
+  log file at that moment (empty sid, a fee this node does not charge) fell into its time window; the
+  case itself was correct and passes on its own in `images-rerun/`.
+- Image runs keep receipts, attestations and the response metadata, not the images.

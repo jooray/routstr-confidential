@@ -1,0 +1,6 @@
+[client] offer v=2 host=api.venice.ai prewarm=undefined models=136 sig_ok=true
+[client] offer session_fee_msat=0 abandon_fee_msat=0 rate_surcharge_pct=0
+[client single] sid=0e262cd8270c7bbffcee537e1688c44bd28b1d72890c608703630a9680d456fa head_len=226
+[client single] upstream error 400: {"details":{"_errors":["Unrecognized key(s) in object: 'bogus_field_xyz'"]},"error":"Invalid request parameters","issues":[{"code":"unrecognized_keys","keys":["bogus_field_xyz"],"path":[],"message":"U
+[client single] images: 0 of 1 () response_bytes=1720 cost_msats=12120 cost_ok=true signature_ok=true attestation_ok=true
+E2E_JSON {"sid":"0e262cd8270c7bbffcee537e1688c44bd28b1d72890c608703630a9680d456fa","kind":"images","model":"z-image-turbo","count":1,"images":0,"files":[],"response_bytes":1720,"upstream_status":400,"echo":{},"cost_msats":12120,"cost_ok":true,"receipt_sig_ok":true,"total_ms":1428,"upstream_ms":221,"zk":{"pi_nk":{"via":"zkchan","ms":65,"inner_ms":63.952,"bytes_sent":22,"bytes_recv":30915},"pi_c2s":{"via":"zkchan","ms":32,"inner_ms":31.401,"bytes_sent":30079,"bytes_recv":0}}}
