@@ -5,14 +5,16 @@
 //!
 //! Security-critical ordering (protocol v2, docs/TWOPC-DESIGN.md):
 //!   SETUP → 2PC preprocessing → joint key share (armed; no provider
-//!   connection, up to 600 s) → ClientHello (exactly the joint P-256 share;
-//!   the upstream is dialed now; fresh 600 s deadline) → 2PC handshake and
-//!   application phases → AWAIT_HEAD (client records held) → HS_VERIFIED →
-//!   credential record assembled under K_0, π_NK params → π_NK run (the
-//!   client verifies it; N, the prover, learns no verdict) → RELEASE_HEAD
-//!   (the client's acceptance) → [credential record ‖ KeyUpdate] (atomic,
-//!   epoch 0) → BODY (final suffix record held until π_C2S verifies)
-//!   → CLOSE → ATTESTED → π_C3S → SETTLED.
+//!   connection) → ClientHello (exactly the joint P-256 share; the upstream
+//!   is dialed now) → 2PC handshake and application phases → AWAIT_HEAD
+//!   (client records held) → HS_VERIFIED → credential record assembled
+//!   under K_0, π_NK params → π_NK run (the client verifies it; N, the
+//!   prover, learns no verdict) → RELEASE_HEAD (the client's acceptance) →
+//!   [credential record ‖ KeyUpdate] (atomic, epoch 0) → BODY (final suffix
+//!   record held until π_C2S verifies) → CLOSE → ATTESTED → π_C3S → SETTLED.
+//!   Everything up to the release of the final body record must happen
+//!   within 600 s of the connection; the release starts a fresh 600 s for
+//!   the response, the attestation and the disclosure.
 //!
 //! The API key lives only in memory, is never logged (only its length), and
 //! appears only inside the single credential record written to the upstream.
@@ -193,22 +195,32 @@ impl ChatSuffix {
             if !pin_value_ok(v) {
                 bail!("chat pin {k:?} has a value outside the pin grammar (booleans, integers, plain ASCII strings, lists, objects)");
             }
+            if let Some(bad) = refused_pin_key(k, v) {
+                bail!("chat pin {k:?} names {bad:?}: a negated or protective key cannot be pinned off");
+            }
             let ok = match k.as_str() {
                 "stream" => *v == serde_json::Value::Bool(true),
                 "n" => *v == serde_json::json!(1),
-                "stream_options" => v.as_object().is_some_and(|o| {
-                    o.get("include_usage") == Some(&serde_json::Value::Bool(true))
-                        && o.iter().all(|(m, x)| m == "include_usage" || pin_is_off(x))
-                }),
+                "stream_options" => *v == serde_json::json!({"include_usage": true}),
                 _ => pin_is_off(v),
             };
             if !ok {
-                bail!("chat pin {k:?} is not allowed: stream must be true, n 1, stream_options include usage, and every other pin switch something off (false, \"off\", [] or an object of those)");
+                bail!("chat pin {k:?} is not allowed: stream must be true, n 1, stream_options exactly {{\"include_usage\":true}}, and every other pin switch something off (false, \"off\", [] or a non-empty object of those)");
             }
         }
         for need in ["stream", "stream_options"] {
             if !self.fixed_pins.iter().any(|(k, _)| k == need) {
                 bail!("chat fixed_pins must pin {need:?} (the usage proof reads the streamed usage event)");
+            }
+        }
+        // The client's part of the body is opaque to the node: the suffix must
+        // pin one completion and every cap alias the reservation is sized for.
+        if !self.fixed_pins.iter().any(|(k, v)| k == "n" && *v == serde_json::json!(1)) {
+            bail!("chat fixed_pins must pin [\"n\", 1]");
+        }
+        for need in ["max_tokens", "max_completion_tokens"] {
+            if !self.cap_keys.iter().any(|k| k == need) {
+                bail!("chat cap_keys must include {need:?}");
             }
         }
         if self.render_pins().len() > MAX_CHAT_PINS_LEN {
@@ -239,15 +251,39 @@ fn pin_value_ok(v: &serde_json::Value) -> bool {
     }
 }
 
-/// A pin that switches something off: `false`, `"off"`, `[]`, or an object of those.
+/// A pin that switches something off: `false`, `"off"`, `[]`, or a non-empty
+/// object of those (an empty object can itself switch a feature on).
 fn pin_is_off(v: &serde_json::Value) -> bool {
     use serde_json::Value;
     match v {
         Value::Bool(b) => !b,
         Value::String(s) => s == "off",
         Value::Array(a) => a.is_empty(),
-        Value::Object(o) => o.values().all(pin_is_off),
+        Value::Object(o) => !o.is_empty() && o.values().all(pin_is_off),
         _ => false,
+    }
+}
+
+/// Key names an "off" value cannot be trusted under: after a negating prefix
+/// `false` switches a feature on, and a protective key can only be pinned to
+/// switch a protection off (left to the caller or the provider default).
+const PIN_NEGATING_PREFIXES: [&str; 7] = ["disable", "no_", "skip", "without", "exclude", "omit", "hide"];
+const PIN_PROTECTIVE_PARTS: [&str; 6] = ["safe", "moderat", "filter", "nsfw", "censor", "guard"];
+
+/// The first key of the pin `k: v`, at any depth, that may not be pinned.
+fn refused_pin_key(k: &str, v: &serde_json::Value) -> Option<String> {
+    let l = k.to_ascii_lowercase();
+    if PIN_NEGATING_PREFIXES.iter().any(|p| l.starts_with(p)) || PIN_PROTECTIVE_PARTS.iter().any(|p| l.contains(p)) {
+        return Some(k.to_string());
+    }
+    refused_member_key(v)
+}
+
+fn refused_member_key(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(o) => o.iter().find_map(|(m, x)| refused_pin_key(m, x)),
+        serde_json::Value::Array(a) => a.iter().find_map(refused_member_key),
+        _ => None,
     }
 }
 
@@ -296,16 +332,7 @@ impl ImagesEndpoint {
     /// Startup checks: a template the relay and π_NK can use, and pins whose
     /// keys never collide (the suffix check relies on unique keys).
     fn validate(&self, host: &str, key_len: usize) -> Result<()> {
-        let t = &self.head_template;
-        for need in [" HTTP/1.1\r\n", "\r\nConnection: close\r\n", "\r\nAccept-Encoding: identity\r\n", "{LEN}"] {
-            if !t.contains(need) {
-                bail!("images head_template lacks {need:?}");
-            }
-        }
-        if !t.starts_with("POST /") || !t.contains(&format!("\r\nHost: {host}\r\n")) || !t.ends_with("\r\n\r\n") {
-            bail!("images head_template must be a POST to {host} ending the head");
-        }
-        placeholder_head(t, key_len, 1)?;
+        check_head_template(&self.head_template, host, key_len, IMAGES_ROUTES).context("images head_template")?;
         if self.billing != "flat" {
             bail!("images billing {:?} is not supported (only flat)", self.billing);
         }
@@ -343,6 +370,9 @@ impl ImagesEndpoint {
             let off = *v == serde_json::Value::Bool(false) || v.as_array().is_some_and(|a| a.is_empty());
             if !off {
                 bail!("images fixed pin {k:?} must be false or [] (it may only switch an extra off)");
+            }
+            if refused_pin_key(k, v).is_some() {
+                bail!("images fixed pin {k:?} is a negated or protective key and cannot be pinned off");
             }
         }
         Ok(())
@@ -464,6 +494,89 @@ fn default_head_template_for(host: &str, key_len: usize) -> String {
     )
 }
 
+/// The routes a head template may post to, by kind (as the clients hold them).
+const CHAT_ROUTES: &[&str] = &["/chat/completions"];
+const IMAGES_ROUTES: &[&str] = &["/image/generate", "/images/generations"];
+/// The headers a head template sets, each exactly once.
+const TEMPLATE_HEADERS: [&str; 6] = ["host", "authorization", "content-type", "accept-encoding", "connection", "content-length"];
+
+/// Startup check of a head template, the same rules clients apply to the
+/// signed offer: one HTTP/1.1 POST head to a canonical path ending in one of
+/// `routes`, exactly the `TEMPLATE_HEADERS` in strict `Name: value` lines
+/// (`Bearer {KEY:n}`, `{LEN}` for the length, identity encoding, close), no
+/// other placeholder or control byte. A template the clients would refuse
+/// must stop the sidecar, not every session after its reservation.
+fn check_head_template(t: &str, host: &str, key_len: usize, routes: &[&str]) -> Result<()> {
+    let key_token = format!("{{KEY:{key_len}}}");
+    if t.matches("{KEY:").count() != 1 || !t.contains(&key_token) {
+        bail!("must carry exactly one {key_token}");
+    }
+    if t.matches("{LEN}").count() != 1 {
+        bail!("must carry exactly one {{LEN}}");
+    }
+    if t.bytes().filter(|b| *b == b'{' || *b == b'}').count() != 4 {
+        bail!("carries other placeholders");
+    }
+    if !t.ends_with("\r\n\r\n") || t.find("\r\n\r\n") != Some(t.len() - 4) {
+        bail!("is not exactly one request head");
+    }
+    if t.replace("\r\n", "").bytes().any(|b| b < 0x20 || b == 0x7f) {
+        bail!("carries a control byte");
+    }
+    let mut lines = t[..t.len() - 4].split("\r\n");
+    let path = lines
+        .next()
+        .and_then(|l| l.strip_prefix("POST "))
+        .and_then(|l| l.strip_suffix(" HTTP/1.1"))
+        .ok_or_else(|| anyhow!("is not an HTTP/1.1 POST"))?;
+    let canonical = path.starts_with('/')
+        && path[1..].split('/').all(|seg| {
+            !seg.is_empty() && seg != "." && seg != ".." && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b"._~-".contains(&b))
+        });
+    if !canonical {
+        bail!("path {path:?} is not canonical");
+    }
+    if !routes.iter().any(|r| path.ends_with(r)) {
+        bail!("path {path} is not one of the endpoints {routes:?}");
+    }
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for line in lines {
+        let (name, value) = line.split_once(": ").ok_or_else(|| anyhow!("carries a malformed header line"))?;
+        let name_ok = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        let value_ok = value.split(' ').all(|w| !w.is_empty() && w.bytes().all(|b| (0x21..=0x7e).contains(&b)));
+        if !name_ok || !value_ok {
+            bail!("carries a malformed header line");
+        }
+        let name = name.to_ascii_lowercase();
+        if !TEMPLATE_HEADERS.contains(&name.as_str()) {
+            bail!("sets the header {name}");
+        }
+        if seen.insert(name.clone(), value).is_some() {
+            bail!("repeats the header {name}");
+        }
+    }
+    for need in TEMPLATE_HEADERS {
+        if !seen.contains_key(need) {
+            bail!("lacks the header {need}");
+        }
+    }
+    let ok = |name: &str, want: &str| seen[name].eq_ignore_ascii_case(want);
+    if !ok("host", host) {
+        bail!("Host is not the upstream host {host}");
+    }
+    if seen["authorization"] != format!("Bearer {key_token}") {
+        bail!("Authorization is not Bearer {key_token}");
+    }
+    if !ok("content-type", "application/json") || !ok("accept-encoding", "identity") || !ok("connection", "close") {
+        bail!("Content-Type, Accept-Encoding or Connection is not application/json, identity, close");
+    }
+    if seen["content-length"] != "{LEN}" {
+        bail!("Content-Length is not {{LEN}}");
+    }
+    placeholder_head(t, key_len, 1)?;
+    Ok(())
+}
+
 /// Point the template's `{KEY:N}` token at the loaded key's real length.
 fn with_key_length(template: &str, key_len: usize) -> String {
     match (template.find("{KEY:"), template.find("{KEY:").and_then(|i| template[i..].find('}').map(|j| i + j))) {
@@ -538,9 +651,11 @@ struct AppState {
 
 /// A session must send its `setup` this soon after connecting.
 const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Hard limit on one session's lifetime, from its connection (armed time
-/// included) to settlement. The node's limit is as long but counts from its
-/// own, earlier accept, so it ends a session first.
+/// Hard limit on a session up to the release of its final body record, from
+/// its connection (armed time included), and again from that release to
+/// settlement. The node's limits are as long; the first counts from its own,
+/// earlier accept, so it ends a session that is never released first, and
+/// the second from its receipt of `body_released`.
 const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Largest TLS 1.3 record on the wire: header + 2^14 plaintext + 256 expansion.
 const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
@@ -728,8 +843,10 @@ struct RelayLog {
     /// SHA-256 and length of every byte received from the upstream.
     recv: cu_crypto::transcript::Transcript,
     recv_len: usize,
-    /// Client body records in wire order.
-    client_app: Vec<Record>,
+    /// Client body records relayed, and the last of them (the held final
+    /// record π_C2S reads): earlier records are not kept.
+    client_app_records: usize,
+    client_app_last: Option<Record>,
     /// Server records received (every content type), for the attestation.
     server_records: usize,
     /// Server application-data records received (the encrypted handshake
@@ -749,6 +866,12 @@ impl RelayLog {
         }
         self.client_raw.extend_from_slice(record);
         Ok(())
+    }
+
+    /// A client body record, as relayed: counted, and kept only while last.
+    fn client_body_record(&mut self, r: Record) {
+        self.client_app_records += 1;
+        self.client_app_last = Some(r);
     }
 
     /// A complete server record: counted, and kept while it is among the last
@@ -901,6 +1024,8 @@ async fn main() -> Result<()> {
         offer.head_template = default_head_template_for(&offer.upstream_host, key.len());
     }
     offer.head_template = with_key_length(&offer.head_template, key.len());
+    check_head_template(&offer.head_template, &offer.upstream_host, key.len(), CHAT_ROUTES)
+        .context("the offer's head_template")?;
     // The chat suffix is the offer's `chat` block; `suffix_keys` lists its
     // keys, so an offer file naming others is refused.
     offer.chat.validate().context("the offer's chat block")?;
@@ -1192,7 +1317,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         }
     }
 
-    // The session deadline covers dialing the upstream too.
+    // The session deadline (`SESSION_TIMEOUT` from the connection) covers
+    // dialing the upstream too; releasing the final body record restarts it.
     let deadline_at = session_end;
     st.deadline = Some(deadline_at);
     let deadline = tokio::time::sleep_until(deadline_at);
@@ -1323,7 +1449,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 "th_sf": hex::encode(hs.th_sf),
                                 "sha256_sent": hex::encode(st.sent.hash()),
                                 "sha256_recv": hex::encode(log.recv.hash()),
-                                "client_records": log.client_app.len(),
+                                "client_records": log.client_app_records,
                                 "server_records": log.server_records,
                                 "c_commit": st.c_commit.map(hex::encode),
                                 "time": now_unix(),
@@ -1371,15 +1497,22 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                     st.c2_ok = true;
                                     // Suffix proven: release the final body record.
                                     let held = st.held.take().ok_or_else(|| anyhow!("π_C2S verified but no held body record"))?;
-                                    // Tell the node *before* the write: once the
-                                    // upstream may have the full request, the node
-                                    // must treat the escrow as at stake (it drains
-                                    // these frames even if the client leaves).
+                                    // A failed write ends the session without
+                                    // `body_released`: the upstream never got a
+                                    // complete record, so nothing is at stake.
+                                    write_upstream(&mut tcp_tx, &held, st.deadline).await?;
+                                    st.sent.update(&held);
+                                    // The upstream has the full request: the node
+                                    // must now treat the escrow as at stake (it
+                                    // drains these frames even if the client leaves).
                                     let _ = to_client.send(Message::Text(
                                         serde_json::json!({"type":"body_released"}).to_string().into(),
                                     ));
-                                    write_upstream(&mut tcp_tx, &held, st.deadline).await?;
-                                    st.sent.update(&held);
+                                    // A released request gets a fresh session
+                                    // window to finish and be disclosed.
+                                    let deadline_at = tokio::time::Instant::now() + SESSION_TIMEOUT;
+                                    st.deadline = Some(deadline_at);
+                                    deadline.as_mut().reset(deadline_at);
                                     info!("π_C2S verified; final body record released to the upstream");
                                     side(&mut st, "pi_c2s verified; final body record released".into());
                                 }
@@ -1427,7 +1560,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         if matches!(st.state, SessionState::Handshake | SessionState::AwaitHead) {
             let _ = std::fs::remove_dir_all(dir);
         } else {
-            let _ = std::fs::write(dir.join("sidecar.jsonl"), st.side_log.join("\n") + "\n");
+            let _ = write_private(&dir.join("sidecar.jsonl"), (st.side_log.join("\n") + "\n").as_bytes());
         }
     }
     drop(cleanup);
@@ -1473,7 +1606,9 @@ struct Session {
     /// The checked ClientHello was relayed to the upstream.
     ch_sent: bool,
     hs_cmd_sent: bool,
-    app_cmd_sent: bool,
+    /// The transcript hash through the server Finished fed to the 2PC
+    /// application phase (the keys of the credential record derive from it).
+    app_th_sf: Option<[u8; 32]>,
     ap: Option<Box<ApN>>,
     /// Client bytes after its Finished, held until the head is written.
     held_client: Vec<u8>,
@@ -1677,7 +1812,7 @@ async fn handle_control(
                 bail!("body suffix does not match the session's pinned suffix");
             }
             st.c2_requested = true;
-            let last = log.client_app.last().ok_or_else(|| anyhow!("no body record"))?;
+            let last = log.client_app_last.as_ref().ok_or_else(|| anyhow!("no body record"))?;
             let inner_len = last.payload.len().saturating_sub(16); // drop the GCM tag
             if inner_len == 0 || suffix.len() + 1 > inner_len {
                 bail!("suffix does not fit in the last body record");
@@ -1950,7 +2085,7 @@ async fn relay_body(
             write_upstream(tcp_tx, &r.bytes(), st.deadline).await?;
             st.sent.update(&r.bytes());
         }
-        log.client_app.push(r);
+        log.client_body_record(r);
     }
     buf.drain(..used);
     Ok(())
@@ -2087,15 +2222,19 @@ async fn v2_progress(
         st.hs_cmd_sent = true;
     }
     let Some(hs) = st.hs_secrets.clone() else { return Ok(()) };
-    if !st.app_cmd_sent {
+    if st.app_th_sf.is_none() {
         let Some(th_sf) = tls_v2::th_sf(&ch, &sh, &log.server_raw, &hs.server_hs)? else { return Ok(()) };
         cmd.send(TwoPcCmd::App { th_sf }).map_err(|_| anyhow!("2PC task gone"))?;
-        st.app_cmd_sent = true;
+        st.app_th_sf = Some(th_sf);
     }
     if st.handshake.is_none() && st.state == SessionState::AwaitHead {
         // The full fail-closed check (chain, hostname, CertificateVerify, both
         // Finished) before anything is written under K_0.
         let info = verify_handshake(&log.client_raw, &log.server_raw, &hs, &app.host)?;
+        // The verified transcript must be the one the 2PC derived K_0 from.
+        if st.app_th_sf != Some(info.th_sf) {
+            bail!("verified handshake transcript differs from the one fed to the 2PC");
+        }
         info!(th_sh = %hex::encode(info.th_sh), "v2 handshake verified: chain + hostname + CertificateVerify + both Finished");
         side(st, format!("handshake_verified th_sh={}", hex::encode(info.th_sh)));
         st.handshake = Some(info);
@@ -2104,10 +2243,10 @@ async fn v2_progress(
     if st.assembled.is_none() && st.handshake.is_some() {
         let Some(ap) = st.ap.as_ref() else { return Ok(()) };
         let (head, offsets) = fill_head_now(app, st)?;
-        let rec = tls_v2::seal_record(&ap.k0, &ap.iv0, 0, &head, CT_APPLICATION_DATA);
+        let rec = tls_v2::seal_record(&ap.k0, &ap.iv0, 0, &head, CT_APPLICATION_DATA)?;
         let header: [u8; 5] = rec[..5].try_into()?;
         let c_commit = cu_crypto::transcript::hash(&rec[..rec.len() - 16]);
-        st.ku_record = Some(tls_v2::seal_record(&ap.k0, &ap.iv0, 1, &tls_v2::KEY_UPDATE_NOT_REQUESTED, tls::CT_HANDSHAKE));
+        st.ku_record = Some(tls_v2::seal_record(&ap.k0, &ap.iv0, 1, &tls_v2::KEY_UPDATE_NOT_REQUESTED, tls::CT_HANDSHAKE)?);
         let (template, _) = placeholder_head(&st.head_template, app.key.len(), st.body_len)?;
         let params = Params::PiNK(zkbench::statements::PiNK {
             hk: ap.hk,
@@ -2187,8 +2326,16 @@ async fn zk_ws(
     Query(q): Query<HashMap<String, String>>,
     State(app): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| zk_handler(socket, q, app))
+    // Clients relay their prover's output as it comes (pipe-sized chunks,
+    // one mux frame is at most 1 MiB): refuse much larger messages before
+    // they are buffered (axum's default is 64 MiB).
+    ws.max_message_size(ZK_MAX_MESSAGE)
+        .max_frame_size(ZK_MAX_MESSAGE)
+        .on_upgrade(move |socket| zk_handler(socket, q, app))
 }
+
+/// Largest `/zk` WebSocket message.
+const ZK_MAX_MESSAGE: usize = 4 << 20;
 
 /// The proof names a `/zk` connection may carry.
 const ZK_PROOFS: [&str; 5] = ["twopc", "zkchan", "pi_nk", "pi_c2s", "pi_c3s"];
@@ -2243,7 +2390,9 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
             bail!("proof channel already open for this session");
         }
         let (io, bridge) = ws_duplex(socket);
-        let result = tokio::time::timeout(SESSION_TIMEOUT, run_zkchan(io, &shared))
+        // The channel ends with its session, which lasts at most two
+        // `SESSION_TIMEOUT`s (up to the release, then after it).
+        let result = tokio::time::timeout(2 * SESSION_TIMEOUT, run_zkchan(io, &shared))
             .await
             .unwrap_or_else(|_| Err(anyhow!("proof channel reached the session time limit")));
         bridge.finish().await;
@@ -2599,21 +2748,41 @@ fn settle(app: &Arc<AppState>, st: &Session) -> Option<serde_json::Value> {
 // Artifacts
 // ---------------------------------------------------------------------------
 
+/// A session's run directory, readable by this user only (it holds the
+/// session's transcript hashes and metadata).
 fn init_run_dir(app: &Arc<AppState>, sid: &str) -> Result<std::path::PathBuf> {
     let dir = app.runs_dir.join(sid);
-    std::fs::create_dir_all(&dir)?;
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(&dir)?;
     Ok(dir)
+}
+
+/// Write a run file readable by this user only (mode 0600, also when it
+/// already existed with another mode).
+fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(path)?;
+    #[cfg(unix)]
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    f.write_all(contents)
 }
 
 fn write_attestation(dir: &Option<std::path::PathBuf>, a: &serde_json::Value) {
     if let Some(dir) = dir {
-        let _ = std::fs::write(dir.join("attestation.json"), serde_json::to_string_pretty(a).unwrap_or_default());
+        let _ = write_private(&dir.join("attestation.json"), serde_json::to_string_pretty(a).unwrap_or_default().as_bytes());
     }
 }
 
 fn write_receipt(dir: &Option<std::path::PathBuf>, r: &serde_json::Value) {
     if let Some(dir) = dir {
-        let _ = std::fs::write(dir.join("receipt.json"), serde_json::to_string_pretty(r).unwrap_or_default());
+        let _ = write_private(&dir.join("receipt.json"), serde_json::to_string_pretty(r).unwrap_or_default().as_bytes());
     }
 }
 
@@ -2818,6 +2987,18 @@ mod relay_log_tests {
     }
 
     #[test]
+    fn only_the_last_body_record_is_kept() {
+        let mut log = RelayLog::default();
+        for i in 0..1000u16 {
+            let l = 18u16.to_be_bytes();
+            let p = vec![(i & 0xff) as u8; 18];
+            log.client_body_record(super::Record { ctype: 0x17, header: [0x17, 3, 3, l[0], l[1]], payload: p });
+        }
+        assert_eq!(log.client_app_records, 1000);
+        assert_eq!(log.client_app_last.as_ref().unwrap().payload, vec![(999 & 0xff) as u8; 18]);
+    }
+
+    #[test]
     fn proof_connections_are_counted() {
         let count = Arc::new(AtomicUsize::new(0));
         let slots: Vec<_> = (0..MAX_ZK_CONNS_PER_SESSION).map(|_| ZkConnSlot::take(&count).unwrap()).collect();
@@ -2899,6 +3080,51 @@ mod tail_locator_tests {
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
+
+    #[test]
+    fn the_chat_head_template_is_checked_at_startup() {
+        let good = default_head_template_for("api.venice.ai", 42);
+        check_head_template(&good, "api.venice.ai", 42, CHAT_ROUTES).unwrap();
+        // The images route is not a chat endpoint, and vice versa.
+        assert!(check_head_template(&good, "api.venice.ai", 42, IMAGES_ROUTES).is_err());
+        let swap = |from: &str, to: &str| good.replacen(from, to, 1);
+        for bad in [
+            swap("Content-Length: {LEN}", "Content-Length: 12"),
+            swap("{KEY:42}", "{KEY:41}"),
+            swap("Host: api.venice.ai", "Host: evil.example"),
+            swap("Connection: close", "Connection: keep-alive"),
+            swap("Accept-Encoding: identity", "Accept-Encoding: gzip"),
+            swap("Bearer {KEY:42}", "Basic {KEY:42}"),
+            swap("POST /api/v1/chat/completions", "POST /api/v1/../chat/completions"),
+            swap("POST /api/v1/chat/completions", "POST /api/v1/chat/completions?x=1"),
+            swap("POST ", "GET "),
+            swap("\r\nConnection: close", "\r\nConstructor: x\r\nConnection: close"),
+            swap("\r\nConnection: close", "\r\nConnection: close\r\nConnection: close"),
+            swap("Connection: close", "Connection:  close"),
+            swap("\r\nConnection", "\nConnection"),
+            swap("\r\n\r\n", "\r\n\r\nX: {y}\r\n\r\n"),
+            good.replace("\r\nContent-Type: application/json", ""),
+        ] {
+            assert!(check_head_template(&bad, "api.venice.ai", 42, CHAT_ROUTES).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn run_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cu-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = AppState { runs_dir: dir.clone(), ..Arc::try_unwrap(app_state()).ok().unwrap() };
+        let run = init_run_dir(&Arc::new(app), "ab").unwrap();
+        assert_eq!(std::fs::metadata(&run).unwrap().permissions().mode() & 0o777, 0o700);
+        let f = run.join("receipt.json");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_receipt(&Some(run.clone()), &serde_json::json!({"x": 1}));
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(std::fs::read_to_string(&f).unwrap().contains("\"x\": 1"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn rec(ctype: u8, len: usize) -> Record {
         let l = (len as u16).to_be_bytes();
@@ -3032,6 +3258,12 @@ mod hardening_tests {
         let mut ep = venice_images();
         ep.fixed_pins.push(("embed_exif_metadata".into(), serde_json::json!(false)));
         assert!(ep.validate("api.venice.ai", 42).is_ok());
+        // false under a negated or protective key switches something on or a protection off.
+        for k in ["safe_mode", "hide_watermark", "disable_nsfw_check", "Moderation"] {
+            let mut ep = venice_images();
+            ep.fixed_pins.push((k.into(), serde_json::json!(false)));
+            assert!(ep.validate("api.venice.ai", 42).is_err(), "fixed pin {k}");
+        }
     }
 
     fn setup(kind: Option<&str>, extra: serde_json::Value) -> serde_json::Value {
@@ -3187,6 +3419,16 @@ mod hardening_tests {
             ("n", json!(false)),
             ("1x", json!(false)),
             ("stream", json!(false)),
+            // An empty object is not off; a negated or protective key, at
+            // any depth, cannot be judged by its value.
+            ("web_search_options", json!({})),
+            ("reasoning", json!({"exclude": false})),
+            ("disable_thinking", json!(false)),
+            ("venice_parameters", json!({"disable_thinking": false})),
+            ("x", json!({"y": {"No_Logging": false}})),
+            ("safe_mode", json!(false)),
+            ("extras", json!({"content_filter": "off"})),
+            ("skip_x", json!([])),
         ] {
             assert!(with(k, v.clone()).is_err(), "{k}={v} accepted");
         }
@@ -3195,10 +3437,16 @@ mod hardening_tests {
         let mut c = ChatSuffix::default();
         c.fixed_pins.retain(|(k, _)| k != "stream_options");
         assert!(c.validate().is_err(), "stream_options is required");
+        for so in [json!({"include_usage": false}), json!({"include_usage": true, "include_obfuscation": false}), json!({})] {
+            let mut c = ChatSuffix::default();
+            c.fixed_pins[2].1 = so.clone();
+            assert!(c.validate().is_err(), "stream_options {so} accepted");
+        }
+        // The node reserves for one completion under every cap alias.
         let mut c = ChatSuffix::default();
-        c.fixed_pins[2].1 = json!({"include_usage": false});
-        assert!(c.validate().is_err());
-        for caps in [vec![], vec!["max_tokens", "max_tokens"], vec!["temperature"]] {
+        c.fixed_pins.retain(|(k, _)| k != "n");
+        assert!(c.validate().is_err(), "n is required");
+        for caps in [vec![], vec!["max_tokens", "max_tokens"], vec!["temperature"], vec!["max_completion_tokens"], vec!["max_tokens"]] {
             let c = ChatSuffix { cap_keys: caps.iter().map(|k| k.to_string()).collect(), ..ChatSuffix::default() };
             assert!(c.validate().is_err(), "{caps:?} accepted");
         }

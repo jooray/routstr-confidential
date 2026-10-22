@@ -161,9 +161,15 @@ pub fn gcm_open(key: &[u8; 16], iv: &[u8; 12], seq: u64, aad: &[u8], ct_and_tag:
     Some(ct.iter().zip(ks.iter()).map(|(c, k)| c ^ k).collect())
 }
 
+/// The largest TLSInnerPlaintext (content plus content type) a record may
+/// carry: 2^14 + 1 (RFC 8446 §5.2).
+pub const MAX_INNER_PLAINTEXT: usize = (1 << 14) + 1;
+
 /// The 5-byte TLS 1.3 application-data record header for a given ciphertext
-/// length (which excludes the tag, per RFC 8446 §5.3).
+/// length (which excludes the tag, per RFC 8446 §5.3). Panics above
+/// `MAX_INNER_PLAINTEXT` rather than writing a truncated length.
 pub fn record_header(ct_len: usize) -> [u8; 5] {
+    assert!(ct_len <= MAX_INNER_PLAINTEXT, "TLS record of {ct_len} inner bytes exceeds {MAX_INNER_PLAINTEXT}");
     let l = (ct_len as u16 + 16).to_be_bytes();
     [0x17, 0x03, 0x03, l[0], l[1]]
 }
@@ -172,6 +178,13 @@ pub fn record_header(ct_len: usize) -> [u8; 5] {
 mod tests {
     use super::*;
     use crate::hex;
+
+    #[test]
+    fn record_header_refuses_oversized_records() {
+        assert_eq!(record_header(MAX_INNER_PLAINTEXT), [0x17, 3, 3, 0x40, 0x11]);
+        assert!(std::panic::catch_unwind(|| record_header(MAX_INNER_PLAINTEXT + 1)).is_err());
+        assert!(std::panic::catch_unwind(|| record_header(65520)).is_err());
+    }
 
     /// RFC 8448: server handshake record encrypting EE||Cert||CV||SFin.
     #[test]

@@ -9,6 +9,8 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 
+import { MAX_UNFLUSHED, wsBytes } from './twopc.ts'
+
 export const CU_PROVER =
   process.env.CU_PROVER ||
   new URL('../../zkbench/target/release/cu-prover', import.meta.url).pathname
@@ -37,6 +39,9 @@ export class ZkChan {
   private buf = Buffer.alloc(0)
   private wsOpen = false
   private outbox: Buffer[] = []
+  // Bytes written to the child's stdin and not yet flushed.
+  private unflushed = 0
+  private closing = false
   private nextId = 1
   private pending = new Map<number, { res: (m: ZkDone) => void; rej: (e: Error) => void }>()
   private readyP: Promise<any>
@@ -67,9 +72,11 @@ export class ZkChan {
       this.outbox.length = 0
     }
     this.ws.onmessage = (ev) => {
-      const d = ev.data
-      const bytes = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array((d as any).buffer ?? d)
-      this.child.stdin?.write(frame(0, bytes))
+      try {
+        this.toChild(frame(0, wsBytes(ev.data)))
+      } catch (e) {
+        this.fail(e as Error)
+      }
     }
     this.ws.onerror = () => this.fail(new Error('proof channel websocket error'))
     this.ws.onclose = () => this.fail(new Error('proof channel websocket closed'))
@@ -78,6 +85,8 @@ export class ZkChan {
     if (process.env.CU_PREALLOC_CP) args.push('--prealloc-cp', process.env.CU_PREALLOC_CP)
     this.child = spawn(CU_PROVER, args, { stdio: ['pipe', 'pipe', 'inherit'], env: process.env })
     this.child.on('error', (e) => this.fail(e))
+    // A write after the child is gone (EPIPE) is reported by its exit, not here.
+    this.child.stdin!.on('error', () => {})
     this.child.on('close', (code) => this.fail(new Error(`cu-prover --channel exited ${code}`)))
     this.child.stdout!.on('data', (chunk: Buffer) => this.onData(chunk))
   }
@@ -116,12 +125,40 @@ export class ZkChan {
     }
   }
 
+  /** Write to cu-prover; a node that sends faster than it reads fails the channel. */
+  private toChild(b: Buffer): void {
+    if (this.failure) return
+    this.unflushed += b.length
+    if (this.unflushed > MAX_UNFLUSHED) {
+      this.fail(new Error('proof channel: more node data unread by cu-prover than the limit'))
+      return
+    }
+    this.child.stdin?.write(b, () => {
+      this.unflushed -= b.length
+    })
+  }
+
   private fail(e: Error): void {
     if (this.failure) return
     this.failure = e
     this.readyRej(e)
     for (const w of this.pending.values()) w.rej(e)
     this.pending.clear()
+    // An orderly close() tears down on its own schedule (the last bytes flush first).
+    if (!this.closing) this.teardown()
+  }
+
+  private teardown(): void {
+    try {
+      this.ws.close()
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.child.kill()
+    } catch {
+      /* ignore */
+    }
   }
 
   /** Resolves when both correlation chains are preprocessed; false if the channel failed. */
@@ -157,7 +194,7 @@ export class ZkChan {
         rej: (e) => (clearTimeout(t), rej(e)),
       })
     })
-    this.child.stdin?.write(frame(1, Buffer.from(JSON.stringify({ cmd, id, proof, params, witness: witness ?? null }))))
+    this.toChild(frame(1, Buffer.from(JSON.stringify({ cmd, id, proof, params, witness: witness ?? null }))))
     const m = await p
     if (!m.ok) throw new Error(`proof channel: ${proof} failed: ${m.err}`)
     // A verification with no checks proved nothing: refused like a failed one.
@@ -166,6 +203,8 @@ export class ZkChan {
   }
 
   close(): void {
+    if (this.closing) return
+    this.closing = true
     try {
       this.child.stdin?.write(frame(1, Buffer.from(JSON.stringify({ cmd: 'close' }))))
       this.child.stdin?.end()
@@ -173,17 +212,6 @@ export class ZkChan {
       /* ignore */
     }
     // Give the process a moment to flush its last bytes before the socket goes.
-    setTimeout(() => {
-      try {
-        this.ws.close()
-      } catch {
-        /* ignore */
-      }
-      try {
-        this.child.kill()
-      } catch {
-        /* ignore */
-      }
-    }, 500).unref?.()
+    setTimeout(() => this.teardown(), 500).unref?.()
   }
 }

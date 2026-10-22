@@ -58,7 +58,7 @@ authors' working documents and are not published:
 >   limit, which the pinned cap rarely reaches). It charges exactly the frozen-rate
 >   cost of the π_C3S-verified usage. It releases the reservation if the provider
 >   never received the complete request or refused it (less the session fee for a
->   429/503, less the abandon fee for any other 4xx), and charges the
+>   429/503 or a 401/402/403, less the abandon fee for any other 4xx), and charges the
 >   reservation for another 5xx or if the client withholds its disclosure.
 > - **Q3, the prompt.** The node sees only ciphertext. π_C2S and π_C3S compare
 >   inside the circuit and reveal one bit; the client validates their
@@ -539,8 +539,11 @@ The prompt is opaque to the node, so the reservation never discounts it
 
 ### 3.3 Settlement, aborts, and who pays what
 
-- **Happy path.** π_C3-verified usage → `cost = ⌈(in·(prompt − cached) +
-  min(cached_in, in)·cached + out·completion)/1000⌉`, capped at the
+- **Happy path.** π_C3-verified usage → `cost = ⌈(in·(prompt − cached −
+  written) + min(cached_in, in)·cached + cache_write·written +
+  out·completion)/1000⌉` (`written`: the prompt-cache writes the provider
+  reports inside `prompt_tokens`; `cache_write` is `in` for an offer signed
+  without it), capped at the
   reservation (`frozen_cost_msats`), finalized through the node's existing
   path; the rest of the reservation stays on the credential. A zero cost
   releases the reservation. The client checks `cost ≤ usage × signed rates`,

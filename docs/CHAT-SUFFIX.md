@@ -75,14 +75,27 @@ refused session.)
 3. Values: `true`/`false`, integers with `|n| < 2^53`, strings of printable
    ASCII without `"` or `\`, arrays of values, objects whose keys match the
    key pattern and whose values are values. No `null`, no fractions.
-4. Required: `stream` pinned to `true`, and `stream_options` pinned to an
-   object with `include_usage: true` (the usage proof reads the final SSE
-   usage event); its other members must be off (rule 6).
+4. Required: `stream` pinned to `true`, and `stream_options` pinned to
+   exactly `{"include_usage": true}` (the usage proof reads the final SSE
+   usage event), with no other members.
 5. `n`, when pinned, is `1`.
-6. Every other pin switches something off: `false`, `"off"`, `[]`, or an
-   object whose members are all off.
-7. The fixed part (everything after the caps) renders to at most 1024 bytes.
-8. `suffix_keys` equals `["model", ...cap_keys, ...fixed pin keys]`.
+6. Every other pin switches something off: `false`, `"off"`, `[]`, or a
+   non-empty object whose members are all off (an empty object is not off:
+   its presence alone can switch a feature on).
+7. No pin key, at any depth (a fixed pin's key or a member key inside an
+   object pin), may, lowercased, start with `disable`, `no_`, `skip`,
+   `without`, `exclude`, `omit` or `hide` (`false` under such a key turns a
+   feature on), or contain `safe`, `moderat`, `filter`, `nsfw`, `censor` or
+   `guard` (pinning those can only switch a protection off; they are left to
+   the caller and the provider default).
+8. The fixed part (everything after the caps) renders to at most 1024 bytes.
+9. `suffix_keys` equals `["model", ...cap_keys, ...fixed pin keys]`.
+
+The sidecar also requires, at startup, that `fixed_pins` contains
+`["n", 1]` and that `cap_keys` contains both `max_tokens` and
+`max_completion_tokens`. The client's part of the body is opaque to the
+node, so the suffix must pin one completion under every cap alias the
+reservation is sized for. Clients do not check this; it protects the node.
 
 ## The caller's request
 

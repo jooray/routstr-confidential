@@ -266,10 +266,11 @@ export function checkPiNKParams(
 /**
  * The published head template must be one HTTP/1.1 POST request head for the
  * offer's upstream host, with exactly the headers a confidential request
- * needs: `Host` names that host, `Authorization` carries the key token,
+ * needs: `Host` names that host, `Authorization` is `Bearer {KEY:n}`,
  * `Content-Type: application/json`, `Accept-Encoding: identity`,
- * `Connection: close` and `Content-Length: {LEN}`. The path has no query and
- * names the endpoint of its kind. (The node writes the head, so this is what
+ * `Connection: close` and `Content-Length: {LEN}`, each line `Name: value`
+ * with no other whitespace or control bytes. The path has no query and names
+ * the endpoint of its kind. (The node writes the head, so this is what
  * π_NK lets us hold it to: a path, query or extra header the node chose could
  * turn on a provider feature or make the session fail on purpose.)
  */
@@ -290,11 +291,14 @@ export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat
   if (!tpl.endsWith("\r\n\r\n") || tpl.indexOf("\r\n\r\n") !== tpl.length - 4) {
     fail("π_NK", "template is not exactly one request head");
   }
+  // No control byte (bare CR or LF, tab, NUL, DEL) other than the CRLFs that end lines.
+  if (/[\x00-\x1f\x7f]/.test(tpl.replaceAll("\r\n", ""))) fail("π_NK", "template carries a control byte");
   const headers = tpl.slice(0, -4).split("\r\n").slice(1);
   const named = headers.map((h) => {
-    const i = h.indexOf(":");
-    if (i <= 0) fail("π_NK", "template carries a malformed header line");
-    return [h.slice(0, i).trim().toLowerCase(), h.slice(i + 1).trim()] as const;
+    // `Name: value`: no space before the colon, one after it, none around the value (no folding).
+    const m = /^([A-Za-z0-9-]+): ([\x21-\x7e]+(?: [\x21-\x7e]+)*)$/.exec(h);
+    if (!m) fail("π_NK", "template carries a malformed header line");
+    return [m![1]!.toLowerCase(), m![2]!] as const;
   });
   const allowed = ["host", "authorization", "content-type", "accept-encoding", "connection", "content-length"];
   const names = named.map(([n]) => n);
@@ -305,7 +309,7 @@ export function checkHeadTemplate(tpl: string, upstreamHost: string, kind: "chat
   if (!upstreamHost || value("host").toLowerCase() !== upstreamHost.toLowerCase()) {
     fail("π_NK", "template Host is not the offer's upstream host");
   }
-  if (!/\{KEY:\d+\}/.test(value("authorization"))) fail("π_NK", "template Authorization does not carry the key");
+  if (!/^Bearer \{KEY:\d+\}$/.test(value("authorization"))) fail("π_NK", "template Authorization is not Bearer {KEY:n}");
   if (value("content-type").toLowerCase() !== "application/json") fail("π_NK", "template Content-Type is not application/json");
   if (value("accept-encoding").toLowerCase() !== "identity") fail("π_NK", "template Accept-Encoding is not identity");
   if (value("connection").toLowerCase() !== "close") fail("π_NK", "template Connection is not close");

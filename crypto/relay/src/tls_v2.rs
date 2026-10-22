@@ -24,6 +24,10 @@ const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
 const EXT_PRE_SHARED_KEY: u16 = 41;
 const EXT_EARLY_DATA: u16 = 42;
+const EXT_ALPN: u16 = 16;
+/// The only ALPN a ClientHello may offer: the credential record is an
+/// HTTP/1.1 head, which a provider that negotiated h2 would refuse.
+const ALPN_HTTP11: &[u8] = b"\x00\x09\x08http/1.1";
 const TLS13: u16 = 0x0304;
 /// `legacy_version` of a TLS 1.3 ClientHello and ServerHello (RFC 8446 §4.1).
 const LEGACY_VERSION: u16 = 0x0303;
@@ -141,6 +145,9 @@ pub fn check_client_hello(msg: &[u8], joint: &[u8; 65]) -> Result<()> {
     if group != GROUP_SECP256R1 || share != joint.as_slice() {
         bail!("ClientHello key share is not the joint P-256 share");
     }
+    if ext(&exts, EXT_ALPN).is_some_and(|a| a != ALPN_HTTP11) {
+        bail!("ClientHello may offer only http/1.1 (ALPN)");
+    }
     Ok(())
 }
 
@@ -253,14 +260,18 @@ pub fn th_sf(ch: &[u8], sh: &[u8], server_bytes: &[u8], s_hs: &[u8; 32]) -> Resu
 }
 
 /// One TLS 1.3 record under (key, iv) at `seq`: `inner` content plus the inner
-/// content type, sealed with AES-128-GCM.
-pub fn seal_record(key: &[u8; 16], iv: &[u8; 12], seq: u64, inner: &[u8], ctype: u8) -> Vec<u8> {
+/// content type, sealed with AES-128-GCM. Content longer than one record
+/// allows is refused.
+pub fn seal_record(key: &[u8; 16], iv: &[u8; 12], seq: u64, inner: &[u8], ctype: u8) -> Result<Vec<u8>> {
+    if inner.len() + 1 > aesgcm::MAX_INNER_PLAINTEXT {
+        bail!("record content of {} bytes exceeds one TLS record", inner.len());
+    }
     let mut pt = inner.to_vec();
     pt.push(ctype);
     let header = aesgcm::record_header(pt.len());
     let mut rec = header.to_vec();
     rec.extend_from_slice(&aesgcm::gcm_seal(key, iv, seq, &header, &pt));
-    rec
+    Ok(rec)
 }
 
 /// KeyUpdate(update_not_requested) handshake message.
@@ -345,6 +356,17 @@ mod tests {
         assert!(check_client_hello(&ch, &joint()).is_err());
     }
 
+    #[test]
+    fn alpn_is_absent_or_http11() {
+        let share = [(0x17, joint().to_vec())];
+        let ch = client_hello(&[0x1301], &[0x17], &share, &[(EXT_ALPN, ALPN_HTTP11.to_vec())]);
+        check_client_hello(&ch, &joint()).unwrap();
+        for bad in [&b"\x00\x03\x02h2"[..], b"\x00\x0c\x02h2\x08http/1.1", b"\x00\x09\x08http/1.0", b""] {
+            let ch = client_hello(&[0x1301], &[0x17], &share, &[(EXT_ALPN, bad.to_vec())]);
+            assert!(check_client_hello(&ch, &joint()).is_err(), "{bad:?}");
+        }
+    }
+
     fn server_hello(random: [u8; 32], suite: u16, group: u16, key: &[u8]) -> Vec<u8> {
         let mut body = vec![3, 3];
         body.extend_from_slice(&random);
@@ -375,10 +397,14 @@ mod tests {
     #[test]
     fn sealed_record_opens() {
         let (k, iv) = ([3u8; 16], [4u8; 12]);
-        let rec = seal_record(&k, &iv, 1, &KEY_UPDATE_NOT_REQUESTED, 22);
+        let rec = seal_record(&k, &iv, 1, &KEY_UPDATE_NOT_REQUESTED, 22).unwrap();
         assert_eq!(rec.len(), 5 + 5 + 1 + 16);
         assert_eq!(rec[..5], [0x17, 3, 3, 0, 22]);
         let pt = aesgcm::gcm_open(&k, &iv, 1, &rec[..5], &rec[5..]).unwrap();
         assert_eq!(pt, [24, 0, 0, 1, 0, 22]);
+        // Content past one record is refused, not sealed under a wrapped length.
+        assert!(seal_record(&k, &iv, 0, &vec![0; 1 << 14], 23).is_ok());
+        assert!(seal_record(&k, &iv, 0, &vec![0; (1 << 14) + 1], 23).is_err());
+        assert!(seal_record(&k, &iv, 0, &vec![0; 65520], 23).is_err());
     }
 }

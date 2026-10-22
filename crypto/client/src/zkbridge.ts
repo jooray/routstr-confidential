@@ -6,6 +6,8 @@
 
 import { spawn } from 'node:child_process'
 
+import { MAX_UNFLUSHED, wsBytes } from './twopc.ts'
+
 export const CU_PROVER =
   process.env.CU_PROVER ||
   new URL('../../zkbench/target/release/cu-prover', import.meta.url).pathname
@@ -41,6 +43,8 @@ export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Prom
     stdio: ['pipe', 'pipe', 'inherit'],
     env: process.env,
   })
+  // A write after the child is gone (EPIPE) is reported by its exit, not here.
+  child.stdin.on('error', () => {})
   const jobBytes = Buffer.from(JSON.stringify({ proof: job.proof, params: job.params, witness: job.witness ?? null }))
   const lenPrefix = Buffer.alloc(4)
   lenPrefix.writeUInt32BE(jobBytes.length)
@@ -70,12 +74,45 @@ export async function runZk(zkUrl: string, job: ZkJob, timeoutMs = 60_000): Prom
         wsOpen = true
         for (const chunk of pending) ws.send(chunk)
         pending.length = 0
+        // Bytes written to cu-prover's stdin and not yet flushed: a node
+        // that sends faster than the prover reads fails the proof.
+        let unflushed = 0
+        let failed = false
+        const fail = (e: Error) => {
+          if (failed) return
+          failed = true
+          reject(e)
+          try {
+            ws.close()
+          } catch {
+            /* ignore */
+          }
+          try {
+            child.kill()
+          } catch {
+            /* ignore */
+          }
+        }
         ws.onmessage = (ev) => {
-          const data = ev.data
+          if (failed) return
           if (!prof.first_byte_ms) prof.first_byte_ms = Date.now() - t0
-          prof.bytes_recv += (data as ArrayBuffer).byteLength ?? 0
-          if (data instanceof ArrayBuffer) child.stdin.write(Buffer.from(data))
-          else if (ArrayBuffer.isView(data)) child.stdin.write(Buffer.from(data.buffer))
+          let bytes: Uint8Array
+          try {
+            bytes = wsBytes(ev.data)
+          } catch (e) {
+            fail(e as Error)
+            return
+          }
+          prof.bytes_recv += bytes.byteLength
+          unflushed += bytes.byteLength
+          if (unflushed > MAX_UNFLUSHED) {
+            fail(new Error(`zk: more node data unread by cu-prover than the limit for ${job.proof}`))
+            return
+          }
+          const b = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+          child.stdin.write(b, () => {
+            unflushed -= b.length
+          })
         }
         ws.onerror = () => reject(new Error(`zk ws error for ${job.proof}`))
         ws.onclose = () => {

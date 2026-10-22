@@ -108,8 +108,9 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
    HTTP error, only the response head; the body stays private). The node
    charges the usage at the frozen offer rates (EHBP's
    `finalize_ehbp_actual_cost_payment`), or releases the reservation for an
-   upstream refusal (less the session fee for 429/503, less the abandon fee
-   for any other 4xx), and returns a signed receipt bound to the sid and attestation.
+   upstream refusal (less the session fee for 429/503 and for 401/402/403,
+   the node's own provider key or account; less the abandon fee for any other
+   4xx), and returns a signed receipt bound to the sid and attestation.
    π_C2S/π_C3S compare inside the circuit (the node learns one bit), and the
    client checks every proof parameter against its own records (`params.ts`).
 8. *Abort.* Before the final body record is released: release (less any
@@ -247,11 +248,16 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
   relay, and stop test nodes when done (a forgotten node without `RELAYS`
   keeps re-announcing). The listing code now skips loopback/private URLs (merged
   upstream, PR #823).
-- **Client and node trust the same roots.** The TLS fork's
-  `utils/mozilla-root-cas.js` (SDK, `crypto/client/vendor/tls`, web library)
-  is generated from the sidecar's pinned `webpki-roots` by
-  `crypto/tools/gen-client-roots.py`; re-run it on all three copies after a
-  `webpki-roots` bump.
+- **Client and node trust the same roots** (the client a subset). The TLS
+  fork's `utils/mozilla-root-cas.js` (SDK, `crypto/client/vendor/tls`, web
+  library) is generated from the sidecar's pinned `webpki-roots` by
+  `crypto/tools/gen-client-roots.py`, which drops the anchors with name
+  constraints (the fork cannot enforce them); re-run it on all three copies
+  after a `webpki-roots` bump.
+- **The reference driver against a remote node** needs `--node-pubkey` (or
+  `CU_NODE_PUBKEY`, which the `tools/*.sh` scripts pass through) and an
+  https/onion URL; loopback nodes need neither. `--no-verify-offer` needs
+  `ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`.
 - **Rebuild after SDK changes.** routstrd uses the SDK via a
   `node_modules/@routstr/sdk` symlink to `../routstr-sdk`, which loads
   `dist/`, so rebuild it (`npm run build`).

@@ -551,9 +551,13 @@ Confidential sessions use the node's ordinary billing; nothing about money is sp
 2. **Charge.** N's relay parses R (dechunk, take the usage event and the terminal marker) and requires
    the event's model to equal the setup model; N requires it again before charging. N charges exactly
    the usage at the frozen rates,
-   $\lceil (r_{in}(p - c) + r_{cached} \min(c, p) + r_{out} \cdot o) / 1000 \rceil$ msat for $p$ prompt
-   tokens of which $c$ cached and $o$ completion tokens, capped at the reservation, through the node's
-   ordinary finalize path. (If an offer priced cached tokens above $r_{in}$, N uses $r_{in}$ for them.)
+   $\lceil (r_{in}(p - c - w) + r_{cached}\, c + r_{write}\, w + r_{out} \cdot o) / 1000 \rceil$ msat for
+   $p$ prompt tokens of which $c \le p$ cached and $w \le p - c$ written to the provider's prompt cache,
+   and $o$ completion tokens, capped at the reservation, through the node's ordinary finalize path. (If
+   an offer priced cached tokens above $r_{in}$, N uses $r_{in}$ for them; an offer without a cache-write
+   rate bills writes at $r_{in}$. A provider such as Venice prices cache writes above input, so billing
+   them at $r_{in}$ would cost N the difference.) The reservation sizes the prompt at
+   $\max(r_{in}, r_{write})$.
 3. **Receipt.** N signs (BIP-340 Schnorr, over canonical JSON) a receipt with the session id, model,
    usage, cost, reservation, the resulting balance, the frozen rates, its key, the SHA-256 of the exact
    attestation bytes, and the time. C requires the signature, takes every field from the signed bytes,
@@ -573,7 +577,8 @@ the blank line that ends them. $\pi_{C3S}$ proves it with `skip` set to the leng
 response, so the head is anchored at a known distance from the end of the transcript and the error body,
 which can quote the request, stays private. The relay also requires the head to start the first record C
 discloses. For statuses the provider answers before doing any work N releases the reservation: on a
-429 or 503 (the provider limiting or at capacity) less the session fee $f_s$, on any other 4xx (a
+429 or 503 (the provider limiting or at capacity) or a 401, 402 or 403 (U refusing N's own key or
+account, which only the operator can fix) less the session fee $f_s$, on any other 4xx (a
 request U rejected) less the abandon fee $f_a$, since N did the 2PC for a request that could not run;
 other 5xx are charged like a missing disclosure. The head is unambiguous for the same reason as the
 usage event: a strict status line followed by well-formed `Name: value` header lines cannot come from
@@ -590,8 +595,10 @@ session is a cheap way to make N work. N can therefore publish, in the same sign
 abandon fee $f_a \ge f_s$. C accepts both fees by echoing them in its setup; N refuses a setup that does
 not, so a client that does not know about fees is never charged one. N reserves the amount above plus
 $\max(f_s, f_a)$. A completed session is charged the usage at the signed rates plus $f_s$ (capped at the
-reservation), and C's receipt check becomes $cost \le \lceil (r_{in} p + r_{out} o)/1000 \rceil + f_s$. A
-429 or 503 from U is charged $f_s$; another 4xx, a request U rejected, is charged $f_a$: N did the 2PC
+reservation), and C's receipt check becomes $cost \le \lceil (r_{in} p + r_{out} o)/1000 \rceil + f_s$ (with
+cache writes, the larger of that and the charge formula above at the signed rates, plus $f_s$). A
+429 or 503 from U, or a 401/402/403 for N's own key, is charged $f_s$; another 4xx, a request U
+rejected, is charged $f_a$: N did the 2PC
 for a request that could not run, and without the fee an invalid body would buy N's 2PC and a share of
 the provider key's rate limit for free. A session that N's relay accepted
 but that ends without a complete request reaching U (armed and never used, aborted, C gone) is charged
@@ -607,7 +614,7 @@ described above.
 | Any 2PC check fails, the ClientHello is rejected, or the handshake does not verify | session discarded before anything is written under $K_0$; reservation released (less the abandon fee $f_a$, if N charges one) |
 | Abort before N releases the final body record (including a failed $\pi_{C2S}$, or an armed session never used) | U never received a complete request; reservation released (less $f_a$) |
 | Usage disclosed | charged per section 4.8 |
-| U returned a 429 or 503 (disclosed) | reservation released (less the session fee $f_s$) |
+| U returned a 429, 503, 401, 402 or 403 (disclosed) | reservation released (less the session fee $f_s$) |
 | U returned another 4xx (disclosed) | reservation released (less the abandon fee $f_a$) |
 | Released, no usage disclosed (or another 5xx) | full reservation charged; C keeps its transcript and attestation |
 

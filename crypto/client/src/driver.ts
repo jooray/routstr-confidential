@@ -21,9 +21,10 @@
 // See docs/TWOPC-DESIGN.md and docs/APPROACH.md.
 
 import { createHash, createPublicKey, randomUUID, verify as cryptoVerify } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { argv } from 'node:process'
+import { fileURLToPath } from 'node:url'
 
 // Temporary/low-noise tracing: `CU_TRACE=1` prints every control frame with a
 // millisecond timestamp to stderr. Off by default so normal runs stay quiet.
@@ -33,6 +34,43 @@ const trace = (label: string, extra = '') =>
   TRACE ? process.stderr.write(`[t+${String(Date.now() - T0).padStart(6)}] ${label} ${extra}\n`) : undefined
 
 import { schnorr } from '@noble/curves/secp256k1'
+
+/**
+ * A node-chosen value as it may appear on the terminal: a number or a plain
+ * token as is, anything else truncated, JSON-quoted and ASCII only (no
+ * terminal escapes).
+ */
+export function shown(v: unknown, max = 120): string {
+  if (typeof v === 'number' || typeof v === 'boolean' || v === undefined || v === null) return String(v)
+  let s = typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v))
+  if (/^[A-Za-z0-9_.:/+-]+$/.test(s) && s.length <= max) return s
+  if (s.length > max) s = `${s.slice(0, max)}...`
+  return termSafe(JSON.stringify(s))
+}
+
+/**
+ * Text for the terminal: control and format characters (escape sequences,
+ * bidi overrides, line separators) escaped, newlines too unless kept.
+ */
+export function termSafe(s: string, keepNewlines = false): string {
+  return s.replace(/[\p{C}\p{Zl}\p{Zp}]/gu, (c) => {
+    if (keepNewlines && c === '\n') return c
+    const cp = c.codePointAt(0)!
+    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`
+  })
+}
+
+/** An error for the terminal: its message escaped and bounded (the stack only under CU_TRACE). */
+const errText = (e: unknown): string => {
+  const text = e instanceof Error ? (TRACE && e.stack ? e.stack : `${e.name}: ${e.message}`) : String(e)
+  return termSafe(text.length > 2000 ? `${text.slice(0, 2000)}...` : text, TRACE)
+}
+
+/** The protocol sid: a 32-byte digest in lowercase hex. */
+export const SID_RE = /^[0-9a-f]{64}$/
+
+/** Evidence files hold plaintext (prompt, response, receipt): owner-only. */
+const writePrivate = (path: string, data: string | Uint8Array) => writeFileSync(path, data, { mode: 0o600 })
 
 import { makeTLSClient } from '../vendor/tls/lib/index.js'
 import { setCryptoImplementation } from '../vendor/tls/lib/crypto/index.js'
@@ -104,12 +142,43 @@ const ESCROW_TOKENS = (arg('--auth') ?? arg('--escrow-token') ?? '')
   .split(',')
   .map((t) => t.trim())
   .filter(Boolean)
+// Skipping the offer signature check is for tests against a throwaway node
+// only, as in the SDK: it needs ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1.
+if (NODE && argv.includes('--no-verify-offer') && process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING !== '1') {
+  console.error('[client] --no-verify-offer needs ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1 (tests only)')
+  process.exit(2)
+}
 const VERIFY_OFFER = NODE ? !argv.includes('--no-verify-offer') : false
 const RUNS = arg('--runs-dir', new URL('../../runs', import.meta.url).pathname)!
 const NODE_MODE = !!NODE
-// Optional pin of the node's signing key (hex x-only, e.g. from its Nostr
-// announcement). Without it the offer is only self-consistent, not authentic.
-const NODE_PUBKEY = arg('--node-pubkey')
+// Pin of the node's signing key (hex x-only, e.g. from its Nostr
+// announcement; also CU_NODE_PUBKEY). Without it the offer is only
+// self-consistent, not authentic, so it is required for a node off this host
+// unless --allow-unpinned.
+const NODE_PUBKEY = arg('--node-pubkey') ?? (process.env.CU_NODE_PUBKEY || undefined)
+if (NODE) {
+  let url: URL | undefined
+  try {
+    url = new URL(NODE)
+  } catch {}
+  const host = (url?.hostname ?? '').replace(/^\[|\]$/g, '').toLowerCase()
+  const local = host === 'localhost' || host === '::1' || /^127\./.test(host)
+  // The setup carries the bearer (an sk- key or Cashu token): only an
+  // encrypted transport may take it off this host (as in the SDK).
+  const encrypted = url?.protocol === 'https:' || host.endsWith('.onion')
+  if (!url || !/^https?:$/.test(url.protocol)) {
+    console.error(`[client] --node ${shown(NODE)} is not an http(s) URL`)
+    process.exit(2)
+  }
+  if (!local && !encrypted && !argv.includes('--allow-insecure-transport')) {
+    console.error('[client] a remote node must be https (or onion): the setup sends your credential (--allow-insecure-transport to override)')
+    process.exit(2)
+  }
+  if (!local && VERIFY_OFFER && !NODE_PUBKEY && !argv.includes('--allow-unpinned')) {
+    console.error("[client] a remote node needs --node-pubkey (or CU_NODE_PUBKEY): without it the offer's own key is not authenticated (--allow-unpinned to override)")
+    process.exit(2)
+  }
+}
 let OFFER_PUBKEY: string | undefined
 // Escrow (sats) the node requires for this body: MODEL at MAX_TOKENS.
 let OFFER: any = null
@@ -193,9 +262,30 @@ const pinValueOk = (v: unknown): boolean =>
   (typeof v === 'string' && /^[\x20-\x7e]*$/.test(v) && !/["\\]/.test(v)) ||
   (Array.isArray(v) && v.every(pinValueOk)) ||
   (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.entries(v).every(([k, x]) => PIN_KEY.test(k) && pinValueOk(x)))
+/** A pin that switches something off: `false`, `"off"`, `[]`, or a non-empty object of those. */
 const pinIsOff = (v: unknown): boolean =>
   v === false || v === 'off' || (Array.isArray(v) && v.length === 0) ||
-  (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.values(v).every(pinIsOff))
+  (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 && Object.values(v).every(pinIsOff))
+/** Key prefixes under which `false` turns a feature on. */
+const NEGATING_PREFIXES = ['disable', 'no_', 'skip', 'without', 'exclude', 'omit', 'hide']
+/** Key words naming a protection: pinning one can only switch it off, so it stays the provider's default. */
+const PROTECTION_WORDS = ['safe', 'moderat', 'filter', 'nsfw', 'censor', 'guard']
+/** The first pin key, at any depth, that is negating or names a protection, or null. */
+export function refusedPinKey(k: string, v: unknown): string | null {
+  const l = k.toLowerCase()
+  if (NEGATING_PREFIXES.some((p) => l.startsWith(p)) || PROTECTION_WORDS.some((w) => l.includes(w))) return k
+  return refusedMemberKey(v)
+}
+function refusedMemberKey(v: unknown): string | null {
+  const members: [string | null, unknown][] = Array.isArray(v)
+    ? v.map((x) => [null, x])
+    : v !== null && typeof v === 'object' ? Object.entries(v) : []
+  for (const [m, x] of members) {
+    const bad = m === null ? refusedMemberKey(x) : refusedPinKey(m, x)
+    if (bad !== null) return bad
+  }
+  return null
+}
 
 /** Why the offer's chat block is outside the policy every client applies, or null. */
 export function chatBlockProblem(offer: any): string | null {
@@ -213,10 +303,11 @@ export function chatBlockProblem(offer: any): string | null {
     if (!PIN_KEY.test(k) || k === 'model' || CAP_KEYS.includes(k) || seen.has(k)) return `pin key ${JSON.stringify(k)}`
     seen.add(k)
     if (!pinValueOk(v)) return `pin ${k} outside the grammar`
+    const refused = refusedPinKey(k, v)
+    if (refused !== null) return `pin key ${JSON.stringify(refused)} negates or names a protection`
     const ok = k === 'stream' ? v === true
       : k === 'n' ? v === 1
-      : k === 'stream_options' ? v !== null && typeof v === 'object' && !Array.isArray(v) && v.include_usage === true &&
-        Object.entries(v).every(([m, x]) => m === 'include_usage' || pinIsOff(x))
+      : k === 'stream_options' ? canonicalJson(v) === '{"include_usage":true}'
       : pinIsOff(v)
     if (!ok) return `pin ${k}=${JSON.stringify(v)} is not allowed`
   }
@@ -255,7 +346,7 @@ const VARIANT_PIN_KEYS = new Set(['resolution', 'quality', 'format'])
  * offer's parameter space lists, and the numbers stay in the ranges the relay
  * enforces. Anything else is refused rather than rendered.
  */
-function checkImagesBlock(im: any): void {
+export function checkImagesBlock(im: any): void {
   const bad = (why: string): never => {
     throw new Error(`offer_malformed: images block ${why}`)
   }
@@ -277,6 +368,7 @@ function checkImagesBlock(im: any): void {
     if (!Array.isArray(pin) || pin.length !== 2 || typeof pin[0] !== 'string') bad('fixed_pins entry')
     const [k, v] = pin as [string, unknown]
     if (!(v === false || (Array.isArray(v) && v.length === 0))) bad(`fixed pin ${k} does not switch an extra off`)
+    if (refusedPinKey(k, v) !== null) bad(`fixed pin ${k} negates or names a protection`)
     if (k === 'model' || k === countKey || fixedKeys.has(k)) bad(`fixed pin ${k} repeats a pinned key`)
     fixedKeys.add(k)
   }
@@ -446,9 +538,9 @@ class Session {
       const base = NODE!.replace(/^http/, 'ws').replace(/\/$/, '')
       // The node's per-session /zk token (from `ready`): the sid alone admits nothing.
       const token = typeof this.ready?.zk_token === 'string' ? `&zk_token=${encodeURIComponent(this.ready.zk_token)}` : ''
-      return `${base}/v1/confidential/zk?proof=${proof}&session_id=${sid}${token}`
+      return `${base}/v1/confidential/zk?proof=${encodeURIComponent(proof)}&session_id=${encodeURIComponent(sid)}${token}`
     }
-    return `${SIDECAR.replace(/^http/, 'ws')}/zk?proof=${proof}&sid=${sid}`
+    return `${SIDECAR.replace(/^http/, 'ws')}/zk?proof=${encodeURIComponent(proof)}&sid=${encodeURIComponent(sid)}`
   }
 
   connect(): Promise<void> {
@@ -468,15 +560,15 @@ class Session {
       // A close with a reason is a rejection (e.g. the node's escrow check);
       // surface it instead of waiting out a protocol timeout.
       const reason = ev?.reason
-      if (reason) this.errRej(new Error(`connection closed: ${reason}`))
+      if (reason) this.errRej(new Error(`connection closed: ${shown(reason, 300)}`))
     }
     this.ws.onmessage = (ev) => {
       const d = ev.data
       if (typeof d === 'string') {
         const m = JSON.parse(d)
-        process.stderr.write(`[client ${this.label}] <- ${m.type}\n`)
-        trace('<-', m.type)
-        if (m.type === 'error') this.errRej(new Error(`sidecar rejected: ${m.reason}`))
+        process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
+        trace('<-', shown(m.type))
+        if (m.type === 'error') this.errRej(new Error(`sidecar rejected: ${shown(m.reason, 300)}`))
         this.bus.emit(m)
         return
       }
@@ -484,7 +576,7 @@ class Session {
       this.trackServerRecords(bytes)
       this.flushChain = this.flushChain
         .then(() => this.tls.handleReceivedBytes(bytes))
-        .catch((e) => console.error(`[client ${this.label}] handleReceivedBytes:`, e))
+        .catch((e) => console.error(`[client ${this.label}] handleReceivedBytes: ${errText(e)}`))
     }
     return this.wsReady
   }
@@ -585,9 +677,13 @@ class Session {
       )
     }
     this.ready = await this.waitT('ready', 30000)
+    // The sid names the run directory and goes into URLs: only the digest form.
+    if (typeof this.ready?.sid !== 'string' || !SID_RE.test(this.ready.sid)) {
+      throw new Error(`the node's sid ${shown(this.ready?.sid)} is not a 64-digit hex digest`)
+    }
     this.sid = this.ready.sid
     this.tReady = Date.now()
-    console.log(`[client ${this.label}] sid=${this.sid} head_len=${this.ready.head_len}`)
+    console.log(`[client ${this.label}] sid=${this.sid} head_len=${shown(this.ready.head_len)}`)
 
     if (this.ready.v !== 2) throw new Error('node did not start a v2 session')
     this.twopc = new TwoPc()
@@ -677,7 +773,7 @@ class Session {
   async prepareProofs(): Promise<void> {
     if (this.prepared) return
     this.runDir = `${RUNS}/${this.sid}`
-    mkdirSync(this.runDir, { recursive: true })
+    mkdirSync(this.runDir, { recursive: true, mode: 0o700 })
     this.log = (o: unknown) => this.logLines.push(JSON.stringify(o))
 
     // π_NK: the node's head record under K_0 is the published template with
@@ -724,7 +820,7 @@ class Session {
         await new Promise((r) => setTimeout(r, 20))
       }
       const text = Buffer.from(this.responseBytes).toString('utf8')
-      writeFileSync(`${runDir}/adv-response.txt`, text)
+      writePrivate(`${runDir}/adv-response.txt`, text)
       const hasContent = /"content":\s*"[^"]/.test(text) || /"images"\s*:\s*\[\s*"/.test(text)
       console.log(
         `ADV_NO_SUFFIX ${JSON.stringify({
@@ -799,7 +895,7 @@ class Session {
     const upstreamStatus = Number(/^HTTP\/1\.\d (\d{3})/.exec(statusLine)?.[1] ?? 0)
     if (finalHead > 0 && upstreamStatus >= 400) throw new Error('an interim 1xx head precedes the error head; it cannot be disclosed')
     if (upstreamStatus >= 400) {
-      console.log(`[client ${this.label}] upstream error ${upstreamStatus}: ${Buffer.from(this.responseBytes).toString('utf8').split('\r\n\r\n')[1]?.slice(0, 200)}`)
+      console.log(`[client ${this.label}] upstream error ${upstreamStatus}: ${shown(Buffer.from(this.responseBytes).toString('utf8').split('\r\n\r\n')[1], 200)}`)
     }
     // Only a 2xx is accepted; any other status either discloses its error head
     // (>= 400) or fails without accepting. ADV_ACCEPT_ANY is the dishonest client.
@@ -874,7 +970,7 @@ class Session {
     const okSig = verifySig(receiptJson, sigHex, this.ready.pubkey, scheme)
     if (terminal.kind === 'receipt') {
       if (!okSig) throw new Error('receipt signature invalid')
-      if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${receipt.sid}, not ${this.sid}`)
+      if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${shown(receipt.sid)}, not ${this.sid}`)
       if (this.attJson !== undefined && receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))) {
         throw new Error("receipt is not bound to this session's attestation")
       }
@@ -885,14 +981,16 @@ class Session {
       throw new Error('receipt names larger fees than the signed offer')
     }
     if (upstreamStatus >= 400) {
-      // A request the provider rejected (4xx other than 429) costs the abandon
-      // fee: the node did the 2PC for it. Provider-side refusals (429, 503)
-      // cost the session fee. Any other error costs at most the reservation,
-      // which for an image session is its flat price plus the larger fee.
+      // A request the provider rejected (a 4xx other than those below) costs
+      // the abandon fee: the node did the 2PC for it. Refusals for the
+      // provider's capacity (429, 503) or the node's own key or account (401,
+      // 402, 403) cost the session fee. Any other error costs at most the
+      // reservation, which for an image session is its flat price plus the
+      // larger fee.
       const cost = receipt.cost_msats
       let costOk: boolean
       // Less than the rule allows only favours us, so the checks are bounds.
-      if (upstreamStatus === 429 || upstreamStatus === 503) costOk = cost <= SESSION_FEE
+      if ([401, 402, 403, 429, 503].includes(upstreamStatus)) costOk = cost <= SESSION_FEE
       else if (upstreamStatus < 500) costOk = cost <= Math.max(SESSION_FEE, ABANDON_FEE)
       else {
         const bound = IMAGE
@@ -907,7 +1005,7 @@ class Session {
         (receipt.kind === 'images' && receipt.model === MODEL && receipt.variant === IMAGE_VARIANT_ID && receipt.count === IMAGE_COUNT)
       const errOk = receipt.usage?.error_status === upstreamStatus && (!NODE_MODE || (costOk && termsOk))
       console.log(
-        `[client ${this.label}] error receipt: status=${upstreamStatus} cost_msats=${receipt.cost_msats} ok=${errOk} signature_ok=${okSig}`,
+        `[client ${this.label}] error receipt: status=${upstreamStatus} cost_msats=${shown(receipt.cost_msats)} ok=${errOk} signature_ok=${okSig}`,
       )
       if (!errOk) throw new Error('error receipt does not match the disclosed upstream error')
       return { sid: this.sid, upstream_status: upstreamStatus, cost_msats: receipt.cost_msats, receipt_sig_ok: okSig }
@@ -924,18 +1022,13 @@ class Session {
     // The node may charge less than the signed rates (cached input), never
     // more; the rates include any surcharge, the session fee comes on top.
     const rates = OFFER?.price_list?.[MODEL]
-    const maxCost = rates
-      ? Math.ceil(
-          (rates.in * (ownUsage.usage?.prompt_tokens ?? 0) +
-            rates.out * (ownUsage.usage?.completion_tokens ?? 0)) / 1000,
-        ) + SESSION_FEE
-      : Infinity
+    const maxCost = rates ? maxUsageCharge(rates, ownUsage.usage ?? {}) + SESSION_FEE : Infinity
     const costOk = (receipt.cost_msats ?? 0) <= maxCost
     console.log(
-      `[client ${this.label}] receipt: model=${receipt.model} cost_msats=${receipt.cost_msats} ` +
-        `reserved_msats=${receipt.reserved_msats} balance_msats=${receipt.balance_msats} ` +
-        `session_fee_msat=${receipt.session_fee_msat ?? 0} abandon_fee_msat=${receipt.abandon_fee_msat ?? 0} ` +
-        `rate_surcharge_pct=${receipt.rate_surcharge_pct ?? 0} ` +
+      `[client ${this.label}] receipt: model=${shown(receipt.model)} cost_msats=${shown(receipt.cost_msats)} ` +
+        `reserved_msats=${shown(receipt.reserved_msats)} balance_msats=${shown(receipt.balance_msats)} ` +
+        `session_fee_msat=${shown(receipt.session_fee_msat ?? 0)} abandon_fee_msat=${shown(receipt.abandon_fee_msat ?? 0)} ` +
+        `rate_surcharge_pct=${shown(receipt.rate_surcharge_pct ?? 0)} ` +
         `usage_match=${usageMatch} cost_ok=${costOk} signature_ok=${okSig}`,
     )
     if (!usageMatch) throw new Error('receipt usage does not match our own plaintext')
@@ -943,13 +1036,13 @@ class Session {
 
     const modelMatch = [...text.matchAll(/"model":"([^"]+)"/g)].map((m) => m[1])
     const effective = modelMatch[modelMatch.length - 1]
-    if (effective !== MODEL) throw new Error(`effective model ${effective} != ${MODEL}`)
+    if (effective !== MODEL) throw new Error(`effective model ${shown(effective)} != ${MODEL}`)
 
     this.log({ ev: 'receipt', ok_sig: okSig, receipt })
-    writeFileSync(`${runDir}/client.jsonl`, logLines.join('\n') + '\n')
-    writeFileSync(`${runDir}/response.txt`, text)
-    writeFileSync(`${runDir}/receipt.json`, JSON.stringify(receipt, null, 2))
-    if (attMsg.a) writeFileSync(`${runDir}/attestation.json`, JSON.stringify(attMsg.a, null, 2))
+    writePrivate(`${runDir}/client.jsonl`, logLines.join('\n') + '\n')
+    writePrivate(`${runDir}/response.txt`, text)
+    writePrivate(`${runDir}/receipt.json`, JSON.stringify(receipt, null, 2))
+    if (attMsg.a) writePrivate(`${runDir}/attestation.json`, JSON.stringify(attMsg.a, null, 2))
 
     const tEnd = Date.now()
     const ttftAbs = this.ttft || tEnd
@@ -1006,7 +1099,7 @@ class Session {
       receipt = JSON.parse(receiptJson)
       okSig = verifySig(receiptJson, terminal.m.sig, this.ready.pubkey, terminal.m.sig_scheme)
       if (!okSig) throw new Error('receipt signature invalid')
-      if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${receipt.sid}, not ${this.sid}`)
+      if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${shown(receipt.sid)}, not ${this.sid}`)
       if (this.attJson !== undefined && receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))) {
         throw new Error("receipt is not bound to this session's attestation")
       }
@@ -1018,7 +1111,7 @@ class Session {
     if (NODE_MODE) {
       const want = IMAGE_MSAT * IMAGE_COUNT + SESSION_FEE
       costOk = receipt.cost_msats === want && receipt.variant === IMAGE_VARIANT_ID && receipt.count === IMAGE_COUNT
-      if (!costOk) throw new Error(`image receipt charges ${receipt.cost_msats}, not ${want} for ${IMAGE_COUNT} × ${IMAGE_VARIANT_ID}`)
+      if (!costOk) throw new Error(`image receipt charges ${shown(receipt.cost_msats)}, not ${want} for ${IMAGE_COUNT} × ${IMAGE_VARIANT_ID}`)
     } else if (receipt.usage?.flat !== true || receipt.usage?.count !== IMAGE_COUNT) {
       throw new Error('usage frame is not a flat charge for the pinned count')
     }
@@ -1039,28 +1132,28 @@ class Session {
     const meta: Record<string, unknown> = { ...json }
     delete meta.images
     delete meta.data
-    writeFileSync(`${runDir}/response-meta.json`, JSON.stringify(meta, null, 2))
+    writePrivate(`${runDir}/response-meta.json`, JSON.stringify(meta, null, 2))
     const req = json.request?.data ?? json.request ?? {}
     const echo: Record<string, unknown> = {}
     for (const k of ['model', 'variants', 'resolution', 'format', 'enhance_prompt', 'enable_web_search', 'return_binary', 'style_references']) {
       if (k in req) echo[k] = req[k]
     }
     const countKey = imagesOffer().count_key ?? 'variants'
-    if ('model' in req && req.model !== MODEL) warnings.push(`the provider ran ${String(req.model)}, not ${MODEL}`)
-    if (countKey in req && req[countKey] !== IMAGE_COUNT) warnings.push(`the provider ran ${String(req[countKey])} images, not ${IMAGE_COUNT}`)
+    if ('model' in req && req.model !== MODEL) warnings.push(`the provider ran ${shown(req.model)}, not ${MODEL}`)
+    if (countKey in req && req[countKey] !== IMAGE_COUNT) warnings.push(`the provider ran ${shown(req[countKey])} images, not ${IMAGE_COUNT}`)
     for (const w of warnings) console.log(`[client ${this.label}] warning: ${w}`)
     const files = images.map((b64, i) => {
       const f = `${runDir}/image-${i}.webp`
-      writeFileSync(f, Buffer.from(b64, 'base64'))
+      writePrivate(f, Buffer.from(b64, 'base64'))
       return f
     })
-    writeFileSync(`${runDir}/client.jsonl`, this.logLines.join('\n') + '\n')
-    writeFileSync(`${runDir}/receipt.json`, JSON.stringify(receipt, null, 2))
-    if (attMsg.a) writeFileSync(`${runDir}/attestation.json`, JSON.stringify(attMsg.a, null, 2))
+    writePrivate(`${runDir}/client.jsonl`, this.logLines.join('\n') + '\n')
+    writePrivate(`${runDir}/receipt.json`, JSON.stringify(receipt, null, 2))
+    if (attMsg.a) writePrivate(`${runDir}/attestation.json`, JSON.stringify(attMsg.a, null, 2))
     const tEnd = Date.now()
     console.log(
       `[client ${this.label}] images: ${images.length} of ${IMAGE_COUNT} (${files.join(', ')}) response_bytes=${this.responseBytes.length} ` +
-        `cost_msats=${receipt.cost_msats} cost_ok=${costOk} signature_ok=${okSig} attestation_ok=${attOk}`,
+        `cost_msats=${shown(receipt.cost_msats)} cost_ok=${costOk} signature_ok=${okSig} attestation_ok=${attOk}`,
     )
     return {
       sid: this.sid,
@@ -1273,7 +1366,7 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
   const bases = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
   const ends = IMAGE ? ['/image/generate', '/images/generations'] : ['/chat/completions']
   const route = /^POST (\S+) /.exec(tpl)?.[1]
-  if (!bases.some((b) => ends.some((e) => route === b + e))) throw new Error(`π_NK: route ${route} is not a trusted API base plus the endpoint`)
+  if (!bases.some((b) => ends.some((e) => route === b + e))) throw new Error(`π_NK: route ${shown(route)} is not a trusted API base plus the endpoint`)
   if ((p.key_alphabet ?? alphabet) !== alphabet) throw new Error('π_NK: key alphabet differs from the offer')
   const filled = new TextEncoder().encode(tpl.replace(token, '\u0000'.repeat(keyLen)).replace('{LEN}', String(bodyLen)))
   const offs: number[] = []
@@ -1295,14 +1388,55 @@ function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): v
  */
 function checkOfferVersion(offer: any): void {
   if (offer && offer.v !== undefined && offer.v !== PROTO) {
-    console.error(`[client] the offer is for protocol v${offer.v}; this client speaks only v${PROTO}`)
+    console.error(`[client] the offer is for protocol v${shown(offer.v)}; this client speaks only v${PROTO}`)
     process.exit(4)
   }
   const problem = offer ? chatBlockProblem(offer) : null
   if (problem) {
-    console.error(`[client] the offer's chat block is refused: ${problem}`)
+    console.error(`[client] the offer's chat block is refused: ${termSafe(problem)}`)
     process.exit(4)
   }
+  // The chat head template is held to its syntax before any setup (π_NK checks it again).
+  if (offer && !IMAGE) {
+    try {
+      checkHeadTemplate(offer.head_template ?? '', offer.upstream_host ?? '', 'chat')
+    } catch (e) {
+      console.error(`[client] the offer's head template is refused: ${errText(e)}`)
+      process.exit(4)
+    }
+  }
+}
+
+/** A token count as the node reads one (a non-negative integer, else 0). */
+function tokenCount(v: unknown): number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v > 0 ? v : 0
+}
+
+/**
+ * The most the node may charge for a usage at the signed rates (msats, no
+ * fee): prompt tokens at `in`, less cached reads at `cached_in` (never above
+ * `in`) and prompt-cache writes at `cache_write` (`in` when the offer has
+ * none), both counted inside `prompt_tokens`; the larger of that, the formula
+ * without writes and the uncached one (as the SDK's maxChargeMsats).
+ */
+function maxUsageCharge(rates: any, usage: any): number {
+  const inRate = Number(rates.in)
+  const outRate = Number(rates.out)
+  const prompt = tokenCount(usage.prompt_tokens)
+  const completion = tokenCount(usage.completion_tokens)
+  const d = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object' ? usage.prompt_tokens_details : {}
+  const cached = Math.min(tokenCount(d.cached_tokens), prompt)
+  const written = Math.min(
+    [d.cache_creation_input_tokens, d.cache_write_tokens, d.cache_creation_tokens, usage.cache_creation_input_tokens]
+      .map(tokenCount)
+      .find((n) => n > 0) ?? 0,
+    prompt - cached,
+  )
+  const cachedRate = Math.min(Number(rates.cached_in ?? inRate), inRate)
+  const writeRate = Number(rates.cache_write ?? inRate)
+  const cost = (c: number, w: number) =>
+    Math.ceil((inRate * (prompt - c - w) + cachedRate * c + writeRate * w + outRate * completion) / 1000)
+  return Math.max(cost(0, 0), cost(cached, 0), cost(cached, written))
 }
 
 async function verifyOffer(): Promise<void> {
@@ -1318,7 +1452,7 @@ async function verifyOffer(): Promise<void> {
       OFFER = raw.sig_payload ? JSON.parse(raw.sig_payload) : raw
       OFFER_SIG = raw.sig
     } catch (e) {
-      console.error('[client] could not fetch the offer:', e)
+      console.error(`[client] could not fetch the offer: ${errText(e)}`)
     }
     checkOfferVersion(OFFER)
     return
@@ -1331,7 +1465,7 @@ async function verifyOffer(): Promise<void> {
     const parsed = offer.sig_payload ? JSON.parse(offer.sig_payload) : offer
     const ok = verifySig(payload, offer.sig, parsed.notary_pubkey, 'schnorr-secp256k1')
     console.log(
-      `[client] offer v=${parsed.v} host=${parsed.upstream_host} prewarm=${parsed.prewarm} ` +
+      `[client] offer v=${shown(parsed.v)} host=${shown(parsed.upstream_host)} prewarm=${shown(parsed.prewarm)} ` +
         `models=${Object.keys(parsed.price_list ?? {}).length} sig_ok=${ok}`,
     )
     if (!ok) throw new Error('offer signature invalid')
@@ -1350,10 +1484,10 @@ async function verifyOffer(): Promise<void> {
     ABANDON_FEE = Math.max(parsed.abandon_fee_msat ?? 0, SESSION_FEE)
     console.log(
       `[client] offer session_fee_msat=${SESSION_FEE} abandon_fee_msat=${ABANDON_FEE} ` +
-        `rate_surcharge_pct=${parsed.rate_surcharge_pct ?? 0}`,
+        `rate_surcharge_pct=${shown(parsed.rate_surcharge_pct ?? 0)}`,
     )
   } catch (e) {
-    console.error('[client] offer verification failed:', e)
+    console.error(`[client] offer verification failed: ${errText(e)}`)
     process.exit(4)
   }
 }
@@ -1419,10 +1553,20 @@ async function main() {
   process.exit(out.receipt_sig_ok ? 0 : 3)
 }
 
-main().catch((e) => {
-  console.error('[client] FAILED:', e)
-  process.exit(1)
-})
+// Run only as the entry point, so the offer checks above can be imported offline.
+const isEntry = (() => {
+  try {
+    return !!argv[1] && realpathSync(argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+})()
+if (isEntry) {
+  main().catch((e) => {
+    console.error(`[client] FAILED: ${errText(e)}`)
+    process.exit(1)
+  })
+}
 
 /** KeyUpdate messages (type 24) in a decrypted handshake record. */
 function countKeyUpdates(content: Uint8Array): number {

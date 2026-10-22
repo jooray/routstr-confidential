@@ -11,10 +11,13 @@ Venice endpoint caps the response at 48 MiB, and a 4K variant carries `max_count
 44 s and 5.9 MB of response; four could pass the provider CDN's ~100 s idle limit); only per-image books
 with resolution/quality tiers and WebP output are offered, so megapixel books, other tier keys or response
 shapes need code. Clients take nothing in the offer's images block on trust: a fixed pin must be `false` or
-`[]`, a variant pins only resolution, quality or format to a `param_space` value, a private option that names
+`[]`, under a key that neither starts with a negating prefix (`disable`, `no_`, `skip`, `without`, `exclude`,
+`omit`, `hide`) nor names a protection (`safe`, `moderat`, `filter`, `nsfw`, `censor`, `guard`; matched
+lowercased, docs/CHAT-SUFFIX.md rule 7), a variant pins only resolution, quality or format to a `param_space` value, a private option that names
 a pinned key is refused, the head template must be the image path with exactly the six fixed headers, and
 the numbers stay in range (integer prices, `max_count` 1..4, unique variant ids, `response_idle_s` 30..600).
-Errors: a 429 or 503 costs the session fee, any other 4xx the abandon fee, other 5xx up to the reservation;
+Errors: a 429 or 503 (capacity) or a 401, 402 or 403 (the node's provider key or account) costs the
+session fee, any other 4xx the abandon fee, other 5xx up to the reservation;
 an image error receipt carries the session's kind, model, variant and count.
 
 Question: can `POST /v1/images/generations` go through confidential mode (protocol v2) so that the
@@ -265,7 +268,8 @@ records real sizes per model and format.)
 - π_C3S caps (`MAX_C3S_RECORDS = 64`, `MAX_C3S_BYTES = 24 KiB`, `statements.rs:174`, `:186`) are only
   relevant on the error path, where the error body is small. No change. They make a head-only success
   proof with `skip` = body length impossible, which is fine because none is needed (§2.1).
-- `SESSION_TIMEOUT = 600 s` (`main.rs:202`) covers slow models.
+- `SESSION_TIMEOUT = 600 s` covers slow models: the sidecar allows 600 s from the connection to the release
+  of the final body record, and a fresh 600 s from that release for the response and its settlement.
 
 ### 3.3 Node
 

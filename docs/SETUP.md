@@ -64,7 +64,8 @@ or `routstrd receive <sats>` for Lightning). Then add to `~/.routstrd/config.jso
   an enclave: your client checks the provider's certificate itself.
 - `node_pubkeys`: nodes whose signed offers you accept (for routstr.cypherpunk.today:
   `2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7`). Optional: without it, routstrd
-  accepts an offer signed by the key that announced that node's URL on Nostr, for https and onion
+  accepts an offer signed by a key that announced that node's URL on Nostr and has a positive review
+  (anyone can announce any URL, so an unreviewed announcement is never a pin), for https and onion
   nodes only. Set it to pin specific nodes; set `"pin_from_announcement": false` to require it.
 - `cu-2pc` is found next to `cu-prover` (or set `CU_2PC`).
 
@@ -121,8 +122,9 @@ surcharge, already included in the offer's rates; a **session fee** added to eac
 (`session_fee_msat`); and an **abandon fee** (`abandon_fee_msat`, at least the session fee) for a session
 that is set up and then ends without a request reaching the provider, for example a pre-warmed session that
 is never used. The client accepts both fees from the signed offer, checks every receipt against usage × the
-signed rates + the session fee (a 429 or 503 costs the session fee, any other 4xx the abandon fee: the
-node did the 2PC for a request the provider rejected), and sizes its
+signed rates + the session fee (a 429 or 503, or a 401/402/403 caused by the node's own provider key,
+costs the session fee, any other 4xx the abandon fee: the node did the 2PC for a request the provider
+rejected), and sizes its
 deposit to include the larger fee, which the node reserves. With an abandon fee, an armed session that is
 never used costs you that fee, so routstrd arms at most `prewarm.maxArmedWithFee` (default 6) sessions for
 such a node, and none if the
@@ -165,7 +167,9 @@ the `chat` block that describes the pinned suffix); adapt it for another OpenAI-
 `chat` block names the request keys that carry the token cap and the pins that follow (`docs/CHAT-SUFFIX.md`):
 without it the sidecar pins `max_tokens`, `max_completion_tokens`, `n`, `stream` and `stream_options` only;
 Venice's file adds `venice_parameters` to keep Venice's own system prompt and web search off the bill. The
-sidecar refuses at startup a block that clients would refuse (a pin may only switch something off). A
+sidecar refuses at startup a block that clients would refuse (a pin may only switch something off, under a
+key that is not negated or protective), and a block that does not pin `n` to 1 and both `max_tokens` and
+`max_completion_tokens`. A
 deployment that copies the offer file (for example to mount it) must add the block to its copy. **Models and prices come from the
 node:** every model the node serves through the sidecar's provider host is offered confidentially, at the
 node's normal rates (plus any surcharge). The node reserves a full-context prompt, so image inputs need no
@@ -249,7 +253,7 @@ default, let the node charge for that:
 | Setting | Effect |
 |---|---|
 | `CONFIDENTIAL_RATE_SURCHARGE_PCT` | percentage added to the per-token rates of confidential sessions (the signed offer lists the surcharged rates) |
-| `CONFIDENTIAL_SESSION_FEE_MSAT` | flat fee added to every completed request; also charged when the provider is limiting or at capacity (429/503), since the request reached it; any other 4xx is charged the abandon fee |
+| `CONFIDENTIAL_SESSION_FEE_MSAT` | flat fee added to every completed request; also charged when the provider is limiting or at capacity (429/503) or refuses the node's own key or account (401/402/403), since the request reached it; any other 4xx is charged the abandon fee |
 | `CONFIDENTIAL_ABANDON_FEE_MSAT` | charged instead when a session the sidecar accepted ends without a request reaching the provider (armed but never used, aborted, client gone); at least the session fee, and equal to it when unset. Reserved at setup |
 
 The abandon fee is the anti-DoS mechanism: together with the per-address limit above, every unused session
@@ -265,9 +269,11 @@ node; the session fee and the surcharge price the work of a request that is used
 
 The sidecar speaks only protocol v2, the two-party handshake (`--protocol 2` is optional; protocol v1 is
 retired and `--protocol 1` is refused; it remains on the `v1-poc` branch). Limits: `--max-sessions`
-(32) and `--max-body` (8 MiB). The sidecar gives an armed session 600 s from its setup to send the
-ClientHello and then a fresh 600 s; the node ends every session 600 s after accepting its WebSocket, so in
-practice the node's limit is the one that applies. Client bytes held before the credential
+(32) and `--max-body` (8 MiB). The sidecar gives a session 600 s from its connection (armed time included)
+until it releases the final body record to the provider, and a fresh 600 s from that release for the
+response, the attestation and the disclosure. The node's limits match: 600 s from its own, earlier
+WebSocket accept (so before the release the node's limit is the one that applies), and up to 600 s after
+`body_released`. Client bytes held before the credential
 record is written are capped at about the declared body length, and a client cannot raise the proof
 channel's preallocation above the sidecar's own.
 

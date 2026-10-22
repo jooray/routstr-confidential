@@ -25,6 +25,16 @@ export interface ApOut {
   hk: Uint8Array
 }
 
+/** The most node bytes held for cu-2pc unread before the session fails. */
+export const MAX_UNFLUSHED = 32 * 1024 * 1024
+
+/** A WebSocket message as bytes (a view keeps its own offset and length). */
+export function wsBytes(d: unknown): Uint8Array {
+  if (d instanceof ArrayBuffer) return new Uint8Array(d)
+  if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength)
+  throw new Error('websocket message is not binary')
+}
+
 function frame(ch: number, payload: Uint8Array): Buffer {
   const b = Buffer.alloc(5 + payload.length)
   b[0] = ch
@@ -42,6 +52,9 @@ export class TwoPc {
   private failure: Error | undefined
   private wsOpen = false
   private outbox: Buffer[] = []
+  // Bytes written to the child's stdin and not yet flushed (counted here:
+  // writableLength is not reliable on every runtime).
+  private unflushed = 0
   readonly timings: any[] = []
 
   start(url: string): void {
@@ -53,9 +66,11 @@ export class TwoPc {
       this.outbox.length = 0
     }
     this.ws.onmessage = (ev) => {
-      const d = ev.data
-      const bytes = d instanceof ArrayBuffer ? new Uint8Array(d) : new Uint8Array((d as any).buffer ?? d)
-      this.child.stdin?.write(frame(0, bytes))
+      try {
+        this.toChild(frame(0, wsBytes(ev.data)))
+      } catch (e) {
+        this.fail(e as Error)
+      }
     }
     this.ws.onerror = () => this.fail(new Error('2PC websocket error'))
     this.ws.onclose = () => {
@@ -64,6 +79,8 @@ export class TwoPc {
     }
     this.child = spawn(CU_2PC, [], { stdio: ['pipe', 'pipe', 'inherit'], env: process.env })
     this.child.on('error', (e) => this.fail(e))
+    // A write after the child is gone (EPIPE) is reported by its exit, not here.
+    this.child.stdin!.on('error', () => {})
     this.child.on('close', (code) => {
       if (code !== 0) this.fail(new Error(`cu-2pc exited ${code}`))
     })
@@ -104,11 +121,25 @@ export class TwoPc {
     } else this.queued.set(m.ev, m)
   }
 
+  /** Write to cu-2pc; a node that sends faster than it reads fails the session. */
+  private toChild(b: Buffer): void {
+    if (this.failure) return
+    this.unflushed += b.length
+    if (this.unflushed > MAX_UNFLUSHED) {
+      this.fail(new Error('2PC: more node data unread by cu-2pc than the limit'))
+      return
+    }
+    this.child.stdin?.write(b, () => {
+      this.unflushed -= b.length
+    })
+  }
+
   private fail(e: Error): void {
     if (this.failure) return
     this.failure = e
     for (const w of this.waiters.values()) w.rej(e)
     this.waiters.clear()
+    this.close()
   }
 
   private wait(ev: string, ms: number): Promise<any> {
@@ -131,7 +162,7 @@ export class TwoPc {
   }
 
   private send(cmd: object): void {
-    this.child.stdin?.write(frame(1, Buffer.from(JSON.stringify(cmd))))
+    this.toChild(frame(1, Buffer.from(JSON.stringify(cmd))))
   }
 
   /** Preprocessing plus the commit-then-open joint key share P = P_C + P_N. */
