@@ -29,7 +29,7 @@ The upstream PRs for protocol v2 are open: core
 [#855](https://github.com/Routstr/routstr-core/pull/855), SDK
 [#112](https://github.com/Routstr/routstr-sdk/pull/112), routstrd
 [#155](https://github.com/Routstr/routstrd/pull/155), from the fork branches
-above, rebased on upstream `main` (2026-10-19). The v1 PRs (core #824, SDK
+above, rebased on upstream `main` (2026-10-23). The v1 PRs (core #824, SDK
 #90, routstrd #137) are closed; their branches
 (`confidential-upstream` in core and SDK) are frozen with an "unmaintained"
 README note. Do not rebase or update them.
@@ -279,7 +279,9 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
     only while there is traffic, plus one pre-warmed proof channel per
     session (`/zk?proof=zkchan`, `cu-prover --channel`,
     `zkbench/src/channel.rs`) holding the OT/VOLE correlations for π_NK,
-    π_C2S and π_C3S; per-proof `/zk?proof=pi_*` is the fallback.
+    π_C2S and π_C3S; per-proof `/zk?proof=pi_*` is the fallback. The
+    browser library keeps one armed session and arms only after a first
+    chat request with the current key.
   - The SDK release (version bump) and routstrd's `@routstr/sdk` bump are
     the maintainers' step.
   - The sidecar and prover are not yet in any upstream repo.
