@@ -1,6 +1,6 @@
 ---
 title: "Confidential mode: what a Routstr node can and cannot see"
-geometry: "margin=0.5in"
+geometry: "margin=0.4in"
 fontsize: 9pt
 documentclass: extarticle
 ---
@@ -50,16 +50,20 @@ sees only the status and headers.
 ## What it costs, and the limits
 
 - **Speed and data:** each request first runs a two-party computation with the node: routstrd downloads
-  about 22 MB and uploads 1.2 MB. Cold, the first token takes about 14-16 s on a good home connection,
+  about 22 MB and uploads 1.2 MB for it, and with the proofs a chat request moves about 28 MB in all
+  (an image request about 26 MB). Cold, the first token takes about 14-16 s on a good home connection,
   about a minute on a slow one. While you send confidential requests, routstrd pre-warms sessions in the
   background (each costs the same download, used or not); a pre-warmed request gets its first token in about 2-3 s, mostly provider latency. The answer then streams at normal speed.
+  Image requests are never pre-warmed, so each one pays the cold cost on top of the provider's
+  generation time.
 - **Money:** from your usual balance with that node, at the rates it signed. The node holds back the
   maximum (a full-context prompt, your token limit and a small margin) and charges the usage the
-  provider reported. Its signed offer may add a session fee per request and an abandon fee for a session
+  provider reported; an image is charged the flat per-image price in the signed offer. Its signed offer may add a session fee per request and an abandon fee for a session
   that never reached the provider (such as an unused pre-warmed one); otherwise such a session, or a
   provider refusal (4xx, 503), costs nothing. If the provider got your request but the session ends
   without its usage report (another 5xx, a cut stream), the node charges the whole reservation, and you cannot prove who cut it.
-- **Providers:** chat completions, on providers that behave like Venice (others need checking). If this
+- **Providers:** chat completions and image generation, on providers that behave like Venice (others
+  need checking). If this
   mode is unavailable, a confidential request is refused, never sent openly.
 - **Not covered:** the provider still sees your prompt; the node can refuse service or keep money after a failed session (reputation is your protection). The two-party computation is new and has no
   published proof (it needs external review); a cheating node could learn at most about 2.6 bits per

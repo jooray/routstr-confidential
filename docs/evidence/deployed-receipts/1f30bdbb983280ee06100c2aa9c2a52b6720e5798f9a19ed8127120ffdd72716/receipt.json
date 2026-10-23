@@ -1,0 +1,42 @@
+{
+  "abandon_fee_msat": 2000,
+  "attestation_hash": "ed5cdeba1dc9c4128527286ac0a3254eeec69cf2e9cd97e06743edc79391a6b2",
+  "balance_msats": 295689,
+  "cost_msats": 27,
+  "model": "deepseek-v4-flash-0731",
+  "notary_pubkey": "2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7",
+  "rates": {
+    "cached_in": 34.05938411753748,
+    "in": 158.132854831424,
+    "out": 316.265709662848
+  },
+  "reserved_msats": 160151,
+  "sid": "1f30bdbb983280ee06100c2aa9c2a52b6720e5798f9a19ed8127120ffdd72716",
+  "time": 1792406621,
+  "usage": {
+    "choices": [],
+    "cost": {
+      "diem": 0.0000221,
+      "usd": 0
+    },
+    "created": 1792406620,
+    "id": "chatcmpl-04e78aa849ff42278e7014393ac15fec",
+    "model": "deepseek-v4-flash-0731",
+    "object": "chat.completion.chunk",
+    "usage": {
+      "completion_tokens": 40,
+      "completion_tokens_details": {
+        "accepted_prediction_tokens": 24,
+        "audio_tokens": 0,
+        "reasoning_tokens": 40,
+        "rejected_prediction_tokens": 61
+      },
+      "prompt_tokens": 90,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "total_tokens": 130
+    }
+  },
+  "v": 1
+}

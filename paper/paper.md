@@ -18,8 +18,8 @@ abstract: |
   proofs anchored on hashes the computation outputs show the client that the node's record matches a
   published template, and show the node that the request ends in a public suffix pinning the model and
   token cap and that the billed usage is the provider's own report. Against a live provider on one host,
-  a cold request reaches the provider after about 1.2 s; a session armed through the handshake sends
-  its body 5 ms after it is claimed, followed by the suffix proof (0.16 s with its own OT setup, less
+  a cold request reaches the provider after about 1.1 s; a session armed through the handshake sends
+  its body 1 to 2 ms after it is claimed, followed by the suffix proof (0.16 s with its own OT setup, less
   over a pre-warmed proof channel). The price is about 22 MB from the node to the client and 1.2 MB back
   per request; on a home link with a 2 Mbit/s uplink the cold two-party computation takes about 7 s, and
   pre-warming moves it off the request path. We also describe a single-party variant that needs under a
@@ -377,7 +377,7 @@ hash and decodes its outputs. Private outputs are masked inside the circuit with
 inputs, so each party decodes only a one-time-padded value of the other's output. C cannot change N's
 outputs, because that needs an inactive output label, and inactive labels need $\Delta_A$. On any failure
 both parties abort. **No output is sent to U, used to encrypt, or revealed before these checks pass.**
-Online, each phase takes about 1.5 round trips and 35 to 45 ms of computation.
+Online, each phase takes about 1.5 round trips and 33 to 49 ms of computation.
 
 **What a cheating party gains.** A cheating N can garble a different circuit, lie about a mask, a
 product or an opened bit, corrupt check rows, or run the oblivious transfer for C's inputs with a wrong
@@ -497,7 +497,8 @@ price.) $L$ must be the whole context, not the context minus the model's own com
 limit: the pinned cap $T$ is usually far below that limit, the provider accepts a prompt of up to
 $L - T$ tokens, and since the charge is capped at the reservation, any prompt tokens beyond the
 reserved bound would be free. For the case study, `deepseek-v4-flash` (a 1M-token context) with $T$ = 40
-reserved 167,308 msat for a session that cost 6 (2026-10-19). Where the node's catalogue gives the model
+reserved 167,308 msat for a session that cost 6 (local node, 2026-10-19,
+`docs/evidence/adversarial-2026-10-19/chat/control.out`). Where the node's catalogue gives the model
 two context lengths (its own and a top provider's), the larger is reserved.
 
 ## 4.7 Response and usage disclosure ($\pi_{C3S}$)
@@ -638,7 +639,7 @@ switched off), a variant may pin only a price axis (resolution, quality, format)
 offer's parameter space, and a private option that names a pinned key is refused. A pin that switched a
 provider feature on (a web search, the prompt written into the image's metadata) would otherwise act on
 C's prompt. Variants at 4K carry a count of 1: one busy 4K WebP from the case-study provider took 44 s
-and 5.9 MB of response (a 4.4 MB image), so four in one request could run past the provider CDN's idle
+and 5.9 MB of response (a 4.4 MB image; author measurement, raw log not archived), so four in one request could run past the provider CDN's idle
 limit of about 100 s and turn a paid request into a 5xx after release; the relay's 48 MiB response cap
 fits four.
 
@@ -862,7 +863,9 @@ the relay's pinned copy), and uses the full 64-bit sequence number in the nonce.
 
 ## 6.2 Component costs
 
-All component figures are from an Apple M2 Max, release builds, both parties in one process. "Local"
+All component figures are from an Apple M2 Max, release builds, both parties in one process (2PC:
+`crypto/twopc/BENCH.md`; proofs: `crypto/zkbench/BENCH-v2.md`; both 2026-10-10). The "live" figures are
+from the client runs of 2026-10-19 in `docs/evidence/measure-2026-10-19/` (section 6.3). "Local"
 has no delay. Network figures use an emulated link with a rate per direction and a fixed one-way delay.
 
 **Two-party key schedule.**
@@ -877,18 +880,19 @@ path to $c_{hs}$ and $s_{hs}$.
 
 | Step (local, C's view) | Time | C sends / receives |
 |---|---|---|
-| Preprocess (tables, MACs, checks, OT setup, OLEs) | 0.55 s in-process; 0.70-0.84 s in the live client | 1.21 MB / 22.07 MB |
+| Preprocess (tables, MACs, checks, OT setup, OLEs) | 0.55 s in-process; 0.74-0.80 s in the live client | 1.21 MB / 22.07 MB |
 | Joint key share | 2 ms | 41 B / 74 B |
 | ECtF | 5 ms | 0.2 kB / 12 kB |
-| Phase A (evaluation and check) | 33 ms (32-47 ms live) | 73 B / 8 kB |
-| Phase B (evaluation and check) | 40 ms (38-40 ms live) | 238 B / 24 kB |
+| Phase A (evaluation and check) | 33 ms (40-42 ms live) | 73 B / 8 kB |
+| Phase B (evaluation and check) | 40 ms (47-49 ms live) | 238 B / 24 kB |
 
 Of the 22 MB C downloads, 16.2 MB are the three-halves tables and 5.3 MB the 64-bit check rows; the rest
 is the mask commitments and the correlated OT. Of the 1.21 MB it uploads, 1.15 MB is its part of Ferret,
 in which C is the sender. Ferret is the only backend: KOS alone would upload almost nothing but would
 make N send 16 bytes per MAC, so that C would download 42.7 MB instead of 22.1 MB, and with N scheduling its tables around C's upload Ferret
 was faster on every link we measured. N spends about 0.5 s of CPU per session (six hash calls per AND
-gate, Ferret, the check material) and C about 0.4 s; each online phase takes 35 to 45 ms.
+gate, Ferret, the check material) and C about 0.4 s; each online phase takes 33 to 40 ms in-process and
+40 to 49 ms in the live client.
 
 Across a network the online steps take about 0.5 s at 80 ms RTT: the key share 84 ms, ECtF 170 ms,
 phase A about 126 ms and phase B about 131 ms, each phase about 1.5 round trips. Preprocessing is
@@ -917,11 +921,12 @@ steps of about 0.48 MB per direction because the OT extension runs in fixed chun
 Live sessions against api.venice.ai (`deepseek-v4-flash`, 40 tokens), client and node on one host,
 medians of 5 sessions each unless noted. The single-party variant (v1, section 7) is measured on the
 same setup. These and the other live end-to-end figures in this section are the author's measurements;
-the v2 runs of 2026-10-19 (this table and the deployed-node runs below) are in `docs/evidence/measure-2026-10-19/`. In these runs the reference
+the v2 runs of 2026-10-19 (this table and the deployed-node runs below) are in `docs/evidence/measure-2026-10-19/`.
+Figures marked "(raw log not archived)" have no archived log. In these runs the reference
 client opens the proof channel alongside the 2PC preprocessing, so the proofs on the request path run
 over it.
 
-| | v1 (single-party) | v2 (this protocol) |
+| | v1 (single-party; raw log not archived) | v2 (this protocol) |
 |---|---|---|
 | Cold: request start → body sent | 0.73 s | 1.03 s (2PC preprocessing 0.75 s; $\pi_{NK}$ 0.06 s over the proof channel) |
 | Cold: suffix proof held before U starts | 0.45 s ($\pi_{C2}$) | 0.035 s ($\pi_{C2S}$ over the proof channel) |
@@ -938,7 +943,7 @@ On one host the protocol's own path to U starting work is 1.18 s for v1 and abou
 (body sent at 1.03 s, then $\pi_{C2S}$), and 0.45 s against 0.035 s pre-warmed. The time-to-first-token figures are dominated by the provider's own
 latency, which varied by several hundred milliseconds during the runs. An earlier interleaved
 comparison of the single-party variant with a direct HTTPS call (60 tokens, n = 8) measured +1.07 s to
-first token cold and about +0.25 s pre-warmed. $\pi_{C3S}$ and settlement run after the client's stream
+first token cold and about +0.25 s pre-warmed (raw log not archived). $\pi_{C3S}$ and settlement run after the client's stream
 has ended and add no latency.
 
 **Pre-warming.** Because the garbled tables are single-use and N may write only in epoch 0, the
@@ -961,26 +966,27 @@ through the handshake and $\pi_{NK}$.)
 
 The proofs' own setup is pre-warmed too. Each proof needs OT/VOLE correlations (Chou-Orlandi base OT,
 KOS, Ferret), and generating them per proof costs about twelve round trips and up to 1.5 MB, which over a
-home uplink took 5.4 s for $\pi_{NK}$ and 3.0 s for $\pi_{C2S}$. These correlations are independent of the
+home uplink took 5.4 s for $\pi_{NK}$ and 3.0 s for $\pi_{C2S}$ (raw log not archived). These correlations are independent of the
 request, so an armed session also opens one proof channel and generates, during arming, the correlations
 for both directions (N proves $\pi_{NK}$, C proves $\pi_{C2S}$ and $\pi_{C3S}$), with a fresh $\Delta$
 per session; each correlation is used once, a failed proof closes the channel, and a session without a
 channel falls back to one connection per proof.
 
 **Against a deployed node.** We measured against a deployed node in a datacenter, which serves at more
-than 90 Mbit/s within it. Over an earlier home connection (about 2-7 Mbit/s up), with the proof channel
+than 90 Mbit/s within it. Over an earlier home connection (about 2-7 Mbit/s up; raw logs of these earlier runs not archived), with the proof channel
 pre-warmed, $\pi_{NK}$ took 0.21-0.25 s, $\pi_{C2S}$ 0.04 s and $\pi_{C3S}$ 0.06 s, against 5.4 s and 3.0 s
 for the first two with per-proof setup. With the dual-execution 2PC, a cold request from that
 connection reached its first token after about 35 s, almost all of it the client uploading its half of
 the preprocessing, and a session armed up to the key share gave a first token after 2.0-3.2 s, most of it
-the provider's own latency. With the node-only garbling, on 2026-10-19 from a home connection, a cold
+the provider's own latency. With the node-only garbling, on 2026-10-19 from a home connection (`deployed-cold.jsonl`,
+`deployed-arm.jsonl` in the evidence directory), a cold
 request reached its first token after 6.7 to 21 s (the client's half of the 2PC preprocessing took 4.6 to
 18.8 s, depending on the moment's uplink), and a session armed through $\pi_{NK}$ (5.8 to 6.6 s of
 arming) after 1.1 to 1.5 s; $\pi_{NK}$ took 0.18 s and $\pi_{C2S}$ 0.035 s over the proof channel.
 
 A second set of runs used a poor, download-limited link: a laptop on congested 2.4 GHz Wi-Fi (up to
 about 900 ms to the local router) behind a satellite connection, with only about 2-5 Mbit/s from the
-node. Node-only and dual-execution builds were run back to back in the same hour:
+node. Node-only and dual-execution builds were run back to back in the same hour (raw log not archived):
 
 | Same link, cold | Node-only (v2) | Dual execution |
 |---|---|---|
@@ -999,7 +1005,7 @@ while a pre-warmed one waits about 1 s when fully armed, or 2-3 s with the SDK's
 only up to the key share.
 
 The same laptop on a good link (5 GHz Wi-Fi, about 100 Mbit/s down, 60-80 ms to the node) gives the
-numbers a typical user should expect from node-only v2:
+numbers a typical user should expect from node-only v2 (raw log not archived):
 
 | Good home link | Node-only (v2) |
 |---|---|
@@ -1080,9 +1086,10 @@ A client that puts its own P-256 key share in the ClientHello instead of the joi
 before anything reaches the provider. The unit and integration suites of all components pass.
 
 Image sessions (section 4.10) were run live against the case-study provider and the production node
-(author measurements): a one-image request with the cheapest model completed in 10 s from the reference
+(author measurements, raw logs not archived): a one-image request with the cheapest model completed in 10 s from the reference
 client over a home connection, settled at exactly the signed per-image price, and a request the
-provider rejected with a 400 settled at zero cost from the disclosed head. In the browser client a cold
+provider rejected with a 400 settled at zero cost from the disclosed head (the same two outcomes on a
+local node are archived in `docs/evidence/adversarial-2026-10-19/images/`). In the browser client a cold
 image request took 16.7 s, of which 7.2 s was the provider generating the image and most of the rest the
 2PC preparation; every image request sets up about 26 MB of protocol traffic (the 2PC plus the proof
 channel), since image sessions are never pre-armed.
@@ -1231,11 +1238,13 @@ it were charged there; instead only waste is priced. A paying user pays exactly 
 pre-warmed session costs 2 sats; and a client opening sessions it does not use is limited to twelve at a
 time per address, each costing 2 sats. (The limit was three at first; parallel coding agents, whose
 subagents each open a session per turn, ran into it, and every session is already backed by a funded
-worst-case reservation, so money rather than the count is the main brake.) We measured both cases on the live node: a completed request was
-charged 25 msat, an abandoned session 2000 msat (re-measured on 2026-10-19: completed 40-token requests on
-two DeepSeek models were charged 6 to 27 msat, an abandoned session exactly 2000 msat). Separately, each
-request reserves the model's worst-case prompt for its duration (about 157 sats for a model with a
-1M-token context at these rates; 159 to 160 sats on 2026-10-19)
+worst-case reservation, so money rather than the count is the main brake.) On the live node a completed
+request was charged 25 msat on 2026-10-10, and completed requests of up to 40 output tokens on two DeepSeek
+models were charged 11 to 27 msat on 2026-10-19 (signed receipts in `docs/evidence/deployed-receipts/`);
+an abandoned session was charged 2000 msat (author measurement, raw log not archived). Separately, each
+request reserves the model's worst-case prompt for its duration (on 2026-10-19, 159 to 160 sats for
+`deepseek-v4-flash-0731`, with a context of about 1M tokens, and 119 sats for `deepseek-v4-flash`, in the
+same receipts)
 and releases what it does not use, so a credential needs that much balance to start a session even
 though it is not spent.
 
@@ -1252,7 +1261,7 @@ it gives prompt confidentiality and lets the API key be the node's private input
 1.2. The cost scales with the payload and there is no streaming: we measured about 5.8 s and 41.5 MB for
 a 2 KB request, 34 s and 377 MB for 32 KB, and 129 s and 1.44 GB for 128 KB (100 Mbit/s, 50 ms RTT,
 emulated; one sample per size, against TLSNotary's local TLS 1.2 test server rather than an LLM
-provider). Most of that time is preprocessing, which can run ahead; the part after the connection opens
+provider; raw log in `docs/evidence/mpc-tls-2026-10-09/`). Most of that time is preprocessing, which can run ahead; the part after the connection opens
 took 1.5 s to 15 s. Our 2PC
 moves about half the data of the 2 KB case, and it covers only the key schedule, so its cost is
 constant, can be precomputed, and the payload then streams at native speed. TLSNotary's key-exchange
@@ -1290,7 +1299,7 @@ different epoch's key in full and the payload never enters the MPC.
 **Proxy zkTLS attestors** (the "verified mode" deployed on Routstr nodes; Reclaim-style attestors). The
 node is the TLS client and an attestor checks its transcript. This gives request and response integrity
 and portable proofs, but the node and the attestor see the plaintext; we measured +10.8 s to first token
-on a live node (another node and upstream than our case study).
+on a live node (another node and upstream than our case study; author measurement, raw log not archived).
 
 **TEE (enclave) designs.** The node runs in a hardware enclave that holds the API key and processes the
 prompt in the clear, and users verify attestations. This is fast and streams, and it works with any
@@ -1328,7 +1337,7 @@ payload. Its trust rests on the provider's TLS certificate and on cryptography, 
 software. The mechanisms are a two-party TLS key schedule that gives the node the first application
 epoch and the client every other one, a proven public suffix for parameter pinning, and a proven usage
 disclosure for settlement. A complete implementation, verified against a live provider, reaches the
-provider 5 ms after a request claims a session armed through the handshake, plus a suffix proof of
+provider 1 to 2 ms after a request claims a session armed through the handshake, plus a suffix proof of
 at most 0.16 s on one host. Its cost is about 22 MB
 of precomputable tables and check data sent to the client and 1.2 MB sent back per request, because
 only the node garbles and the client checks the garbling instead of garbling a second copy; a cold

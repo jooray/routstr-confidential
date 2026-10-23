@@ -1,0 +1,40 @@
+{
+  "abandon_fee_msat": 2000,
+  "attestation_hash": "43ea88d51c7e2152bf12c130c32c482be79ce0fb6a9cc880fcc0708e25ac5886",
+  "balance_msats": 298313,
+  "cost_msats": 25,
+  "model": "deepseek-v4-flash-0731",
+  "notary_pubkey": "2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7",
+  "rates": {
+    "cached_in": 33.75972061419784,
+    "in": 156.74155999448993,
+    "out": 313.48311998897987
+  },
+  "reserved_msats": 80434,
+  "sid": "c44c02c856eae0255bcc18a9e5432e4aa8d0a21497167350c8db3b9fcf38ad26",
+  "time": 1791643375,
+  "usage": {
+    "choices": [],
+    "cost": {
+      "diem": 0.000020669999999999997,
+      "usd": 0
+    },
+    "created": 1791643374,
+    "id": "chatcmpl-RjSuW6BE15itLYg8O2vRBMPo",
+    "model": "deepseek-v4-flash-0731",
+    "object": "chat.completion.chunk",
+    "service_tier": "default",
+    "usage": {
+      "completion_tokens": 35,
+      "completion_tokens_details": {
+        "reasoning_tokens": 28
+      },
+      "prompt_tokens": 89,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "total_tokens": 124
+    }
+  },
+  "v": 1
+}

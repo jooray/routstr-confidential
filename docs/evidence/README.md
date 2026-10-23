@@ -41,3 +41,28 @@ Malicious-client gates against a local node and sidecar (one host, live api.veni
   log file at that moment (empty sid, a fee this node does not charge) fell into its time window; the
   case itself was correct and passes on its own in `images-rerun/`.
 - Image runs keep receipts, attestations and the response metadata, not the images.
+
+## deployed-receipts/
+
+Signed receipts and session attestations of confidential chat sessions against the deployed node
+routstr.cypherpunk.today (node key `2ca46ee9…`), copied unchanged from the reference client's run
+directories (`receipt.json`, `attestation.json`; responses and client logs are not included). Behind
+paper §8.1.
+
+| Date (UTC) | Model | Sessions | Charged (msat) | Reserved (msat) |
+|---|---|---|---|---|
+| 2026-10-10 | `deepseek-v4-flash-0731` | `c44c02c8…` | 25 | 80,434 |
+| 2026-10-19 | `deepseek-v4-flash-0731` | `36cecedb…`, `6dbeedfe…`, `1f30bdbb…` | 26, 27, 27 | 159,272, 159,272, 160,151 |
+| 2026-10-19 | `deepseek-v4-flash` | `68697f69…`, `2f44da07…`, `76b96697…`, `f9961e48…`, `b5eed3d6…`, `135d5942…` | 11 each | 119,256, then 119,229 |
+
+The 2026-10-19 sessions produced 35 to 40 output tokens each (`usage` in each receipt); the node's offer carried an abandon fee of 2000 msat
+(`abandon_fee_msat` in each receipt) and no session fee. No abandoned session's charge is archived.
+
+## mpc-tls-2026-10-09/
+
+`wan_100_50.txt`: the raw result lines of the MPC-TLS (TLSNotary) comparison in paper §9, one sample per
+request size (2, 8, 32 and 128 KB), prover and verifier over an emulated 100 Mbit/s link with 50 ms RTT,
+against TLSNotary's local TLS 1.2 test server with deferred decryption. `pre_ms` is the preprocessing before the
+connection opens, `resp_ms` the time after it opens until the response was available, `online_ms` the
+whole part after it opens, `total_ms` the whole session, `tot_MB` the bytes between prover and
+verifier.

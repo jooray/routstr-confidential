@@ -1,0 +1,33 @@
+{
+  "abandon_fee_msat": 2000,
+  "attestation_hash": "00e6f64c20de594b06ac07573173d3a5bc902129b6944044df2115dcc53e6df7",
+  "balance_msats": 585989,
+  "cost_msats": 11,
+  "model": "deepseek-v4-flash",
+  "notary_pubkey": "2ca46ee98f3134c4e11a638663a45983b590bfdefd31588f9c2f03455fba15e7",
+  "rates": {
+    "cached_in": 10.183645683325352,
+    "in": 117.24234630587395,
+    "out": 233.63511039214015
+  },
+  "reserved_msats": 119256,
+  "sid": "68697f69de9597ddd54eb6099603c9250a254b800e501e5dcc92a1c7b6ab2e11",
+  "time": 1792416070,
+  "usage": {
+    "choices": [],
+    "cost": {
+      "diem": 0.00001238,
+      "usd": 0
+    },
+    "created": 1792416070,
+    "id": "1a0f438f1c54b4512b41652d7a291548",
+    "model": "deepseek-v4-flash",
+    "object": "chat.completion.chunk",
+    "usage": {
+      "completion_tokens": 40,
+      "prompt_tokens": 10,
+      "total_tokens": 50
+    }
+  },
+  "v": 1
+}

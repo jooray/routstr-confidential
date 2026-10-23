@@ -1,0 +1,12 @@
+{
+  "c_commit": "e2440ea93a0ec4c342ced284e0bc45413cb2d7f38c37269cc52121b1579adaaa",
+  "cert_chain_hash": "fb4d5e1d6a630ec81e07fc1b082e8df57531e5721807426b775ff610a04aa1ff",
+  "client_records": 2,
+  "server_records": 23,
+  "sha256_recv": "b31291425837e6ff2743181d3b95aa7b27ae7268a37b50dd258e265d8ac5fc75",
+  "sha256_sent": "f422d8e1cdf47925fe45d8db55ae46e65e159da77bc15c6c60691bed6c2f659a",
+  "sid": "2f44da075f01341989cce79e24c7d74a8b73f89b25c79ba3df630f1fc16d8637",
+  "th_sf": "5b0154c827bad23fdd98333f1dc65a6eb9cb9da2897fb29d3d6e2e189e45129a",
+  "th_sh": "7be00f05f98e90eba6ca65528c71902e1822fb0ce3bed26e94ac9a96eefbbfb4",
+  "time": 1792416087
+}
