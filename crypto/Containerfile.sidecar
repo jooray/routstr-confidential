@@ -17,14 +17,13 @@
 # Both base images are pinned by digest (multi-arch index; tag in the comment).
 # To bump them, resolve the new tag's index digest, e.g.
 #   skopeo inspect --raw docker://docker.io/library/rust:1.97.1-bookworm | sha256sum
-# and keep the rust tag equal to rust-toolchain.toml. The build stage's apt
-# packages (cmake, clang) are build tools only and come from the pinned
-# image's Debian release; the runtime stage installs nothing: the sidecar
-# verifies the provider with its compiled-in webpki-roots, not the system store.
+# and keep the rust tag equal to rust-toolchain.toml. Neither stage installs
+# packages, so the digests fix what is in both images: the build needs only
+# the C compiler the rust image ships (aws-lc-sys and blake3 build with cc,
+# without cmake or clang), and the sidecar verifies the provider with its
+# compiled-in webpki-roots, not the system store.
 # rust:1.97.1-bookworm
 FROM docker.io/library/rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
-RUN apt-get update && apt-get install -y --no-install-recommends cmake clang \
-    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p cu-sidecar \
