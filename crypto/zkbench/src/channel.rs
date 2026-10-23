@@ -478,11 +478,10 @@ impl ZkChannel {
         // the exposed party: a client's honest traffic is a few hundred bytes of
         // control and a few MB per chain (preprocessing ~3 MB in all, each
         // proof ~1.5 MB), so 32 MiB per chain is more than ten times that.
+        // Preprocessing moves under 3 MB in both directions together, so the
+        // client holds the node to the same caps.
         const MIB: u64 = 1 << 20;
-        let caps: [u64; 3] = match party {
-            Party::Node => [MIB, 32 * MIB, 32 * MIB],
-            Party::Client => [u64::MAX; 3],
-        };
+        let caps: [u64; 3] = [MIB, 32 * MIB, 32 * MIB];
         let (mux, mut chans) = Mux::start(io, 3, &caps);
         let counters = mux.counters.clone();
         let cp_io = chans.pop().expect("3 channels");

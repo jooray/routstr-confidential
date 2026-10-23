@@ -666,6 +666,34 @@ const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
 const MAX_DISCLOSE_RECORDS: usize = zkbench::statements::MAX_C3S_RECORDS;
 const MAX_DISCLOSE_R: usize = 16 << 10;
 const MAX_DISCLOSE_NEED: usize = zkbench::statements::MAX_C3S_NEED;
+/// Largest control message after setup. The largest honest one is a
+/// disclosure (R ≤ 16 KiB as hex) or a body suffix (under one record, JSON
+/// escaped); parsing buffers the whole message first, so bound it here.
+const MAX_CONTROL_TEXT: usize = 256 << 10;
+/// Reads `tail_lens` but stops at one element past the limit, so a disclosure
+/// with a huge array is refused while it is parsed, not after it is allocated.
+fn disclose_tail_lens<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<usize>, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<usize>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "at most {MAX_DISCLOSE_RECORDS} record lengths")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<usize>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(x) = seq.next_element()? {
+                if out.len() == MAX_DISCLOSE_RECORDS {
+                    return Err(serde::de::Error::custom(format!(
+                        "disclosure covers more than {MAX_DISCLOSE_RECORDS} records"
+                    )));
+                }
+                out.push(x);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(V)
+}
 /// Server application-data records kept for a disclosure: the covered ones
 /// and the KeyUpdates and close_notify that may follow them.
 const SERVER_TAIL_RECORDS: usize = MAX_DISCLOSE_RECORDS + zkbench::statements::MAX_SERVER_KEY_UPDATES as usize + 1;
@@ -1170,6 +1198,7 @@ enum ClientMsg {
         r: String,
         /// Ciphertext lengths of the trailing content records that cover R
         /// (and `skip`), ordered from the end (to locate them unambiguously).
+        #[serde(deserialize_with = "disclose_tail_lens")]
         tail_lens: Vec<usize>,
         /// Content bytes between the end of R and the end of the response:
         /// 0 for a usage event; for an upstream error R is only the response
@@ -1364,6 +1393,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                     let Some(Ok(msg)) = msg else { break };
                     match msg {
                         Message::Text(t) => {
+                            if t.len() > MAX_CONTROL_TEXT {
+                                bail!("control message of {} bytes (limit {MAX_CONTROL_TEXT})", t.len());
+                            }
                             let parsed: ClientMsg = match serde_json::from_str(&t) {
                                 Ok(p) => p, Err(e) => { return Err(anyhow!("bad control: {e}")); }
                             };
@@ -3693,6 +3725,16 @@ mod disclosure_limit_tests {
         let many: Vec<_> = (0..=MAX_C3S_RECORDS).map(|_| rec(2)).collect();
         assert!(check_c3s_records(&many).is_err());
         assert!(check_c3s_records(&many[1..]).is_ok());
+    }
+
+    #[test]
+    fn a_disclosure_with_too_many_record_lengths_does_not_parse() {
+        use super::{ClientMsg, MAX_DISCLOSE_RECORDS};
+        let msg = |n: usize| format!(r#"{{"type":"disclose","r":"00","tail_lens":{:?}}}"#, vec![40usize; n]);
+        let ok: ClientMsg = serde_json::from_str(&msg(MAX_DISCLOSE_RECORDS)).unwrap();
+        assert!(matches!(ok, ClientMsg::Disclose { tail_lens, .. } if tail_lens.len() == MAX_DISCLOSE_RECORDS));
+        let e = serde_json::from_str::<ClientMsg>(&msg(MAX_DISCLOSE_RECORDS + 1)).unwrap_err();
+        assert!(e.to_string().contains("more than"), "{e}");
     }
 }
 

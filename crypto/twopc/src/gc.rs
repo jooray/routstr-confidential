@@ -262,9 +262,11 @@ pub fn and_garble3(c: &FixedKeyAes, a0: Block, b0: Block, delta: Block, gid: u12
     let g0 = t00[0] ^ t11[0];
     let g1 = t00[1] ^ t11[1];
     let g2 = t00[0] ^ t01[0];
-    debug_assert_eq!(g2, t10[0] ^ t11[0]);
-    debug_assert_eq!(g2, t00[1] ^ t10[1]);
-    debug_assert_eq!(g2, t01[1] ^ t11[1]);
+    // Three-halves identities. Every input is the garbler's own, so a failure
+    // is a garbling bug; checked in release too (three compares per gate).
+    assert_eq!(g2, t10[0] ^ t11[0]);
+    assert_eq!(g2, t00[1] ^ t10[1]);
+    assert_eq!(g2, t01[1] ^ t11[1]);
     let _ = t10;
 
     let k0l = ha0.0 ^ hx0.0 ^ t00[0];

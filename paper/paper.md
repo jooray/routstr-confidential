@@ -955,7 +955,8 @@ two once that key has seen three requests in five minutes, and at least as many 
 its requests that overlapped (at most six per key and six in total, and six in total for nodes that
 charge an abandon fee). It retires an armed session 480 s after its setup, before the node's session
 limit, and closes a key's sessions once it has had no request for ten minutes, so an idle client holds
-nothing. (The reference client's `--arm` mode, used for the local benchmarks, arms further,
+nothing. The browser library keeps at most one armed session: it arms only after a first chat request
+with the current key, and then only while the page is visible and the user is active. (The reference client's `--arm` mode, used for the local benchmarks, arms further,
 through the handshake and $\pi_{NK}$.)
 
 The proofs' own setup is pre-warmed too. Each proof needs OT/VOLE correlations (Chou-Orlandi base OT,

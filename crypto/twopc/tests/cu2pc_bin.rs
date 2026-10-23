@@ -209,3 +209,53 @@ async fn cu_2pc_reports_error_when_peer_disappears() {
     assert!(!status.success());
     assert!(evs.iter().any(|v| v["ev"] == "error"), "{evs:?}");
 }
+
+/// A node that floods a channel past the client's inbound cap (16 MiB on the
+/// N→C protocol channel) ends the process with an error instead of growing
+/// its memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn cu_2pc_refuses_a_flood_past_the_channel_cap() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cu-2pc"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = tokio::spawn(async move {
+        let mut evs = Vec::new();
+        loop {
+            let mut hdr = [0u8; 5];
+            if stdout.read_exact(&mut hdr).await.is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes(hdr[1..].try_into().unwrap()) as usize;
+            let mut d = vec![0u8; len];
+            stdout.read_exact(&mut d).await.unwrap();
+            if hdr[0] == 1 {
+                evs.push(serde_json::from_slice::<Value>(&d).unwrap());
+            }
+        }
+        evs
+    });
+    // 17 mux frames of 1 MiB on channel 3, as network bytes on stdin channel 0.
+    let mut mux_frame = vec![3u8];
+    mux_frame.extend_from_slice(&(1u32 << 20).to_be_bytes());
+    mux_frame.resize(5 + (1 << 20), 0x55);
+    for _ in 0..17 {
+        if tokio::time::timeout(std::time::Duration::from_secs(10), write_frame(&mut stdin, 0, &mux_frame))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let status = tokio::time::timeout(std::time::Duration::from_secs(20), child.wait())
+        .await
+        .expect("cu-2pc must exit")
+        .unwrap();
+    drop(stdin);
+    let evs = reader.await.unwrap();
+    assert!(!status.success());
+    assert!(evs.iter().any(|v| v["ev"] == "error"), "{evs:?}");
+}

@@ -272,6 +272,33 @@ async fn wan_cold_vs_warm() {
     assert!(served.iter().all(|(_, ok)| *ok));
 }
 
+/// A node that floods a chain past the client's inbound cap (32 MiB) fails the
+/// client's channel instead of growing its memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_refuses_a_flood_past_the_channel_cap() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    let (client_io, node_io) = tokio::io::duplex(1 << 20);
+    let (mut nr, mut nw) = tokio::io::split(node_io);
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1 << 16];
+        while matches!(nr.read(&mut buf).await, Ok(n) if n > 0) {}
+    });
+    tokio::spawn(async move {
+        let f = frame(1, &vec![0x55; 1 << 20]);
+        for _ in 0..33 {
+            if nw.write_all(&f).await.is_err() {
+                break;
+            }
+        }
+    });
+    let t = Instant::now();
+    let r = ZkChannel::open(client_io.compat(), Party::Client, Prealloc::default()).await;
+    assert!(r.is_err(), "the client accepted 33 MiB on one chain");
+    assert!(t.elapsed() < Duration::from_secs(30), "failed only by the hello timeout");
+}
+
 // --- cu-prover --channel (the client process) against an in-process node ---
 
 fn frame(ch: u8, payload: &[u8]) -> Vec<u8> {

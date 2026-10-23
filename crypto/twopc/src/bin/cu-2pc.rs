@@ -23,6 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use twopc::{ApOut, Party, Role};
+use zeroize::Zeroize;
 
 const MAX_FRAME: usize = 16 << 20;
 
@@ -45,6 +46,29 @@ type Out = mpsc::UnboundedSender<(u8, Vec<u8>)>;
 
 fn emit(out: &Out, v: Value) {
     let _ = out.send((1, serde_json::to_vec(&v).expect("json")));
+}
+
+/// Emits `{"ev":<ev>,"<k>":"<hex>",...}` built in one buffer of the final
+/// size, so the secrets exist only there; the writer zeroizes every frame once
+/// it is on stdout. (`serde_json` would leave copies in `String`s and `Value`s.)
+fn emit_secret(out: &Out, ev: &str, fields: &[(&str, &[u8])]) {
+    let len = 9 + ev.len() + fields.iter().map(|(k, v)| 6 + k.len() + 2 * v.len()).sum::<usize>();
+    let mut buf = Vec::with_capacity(len);
+    buf.extend_from_slice(b"{\"ev\":\"");
+    buf.extend_from_slice(ev.as_bytes());
+    buf.push(b'"');
+    for (k, v) in fields {
+        buf.extend_from_slice(b",\"");
+        buf.extend_from_slice(k.as_bytes());
+        buf.extend_from_slice(b"\":\"");
+        let at = buf.len();
+        buf.resize(at + 2 * v.len(), 0);
+        hex::encode_to_slice(v, &mut buf[at..]).expect("hex length");
+        buf.push(b'"');
+    }
+    buf.push(b'}');
+    debug_assert_eq!(buf.len(), len);
+    let _ = out.send((1, buf));
 }
 
 fn emit_timings(out: &Out, p: &mut Party) {
@@ -88,10 +112,8 @@ async fn run(out: Out, mut ctl: mpsc::UnboundedReceiver<Value>, io: tokio::io::D
     let th_sh: [u8; 32] = hex_arr(&cmd, "th_sh")?;
     let hs = step("handshake", STEP_TIMEOUT, p.handshake(&s, th_sh)).await?;
     emit_timings(&out, &mut p);
-    emit(
-        &out,
-        json!({"ev":"hs","c_hs":hex::encode(hs.c_hs),"s_hs":hex::encode(hs.s_hs)}),
-    );
+    emit_secret(&out, "hs", &[("c_hs", &hs.c_hs), ("s_hs", &hs.s_hs)]);
+    drop(hs);
 
     let cmd = next_cmd(&mut ctl, "app").await?;
     let th_sf: [u8; 32] = hex_arr(&cmd, "th_sf")?;
@@ -104,10 +126,10 @@ async fn run(out: Out, mut ctl: mpsc::UnboundedReceiver<Value>, io: tokio::io::D
             h1,
             h2,
             hk,
-        } => emit(
+        } => emit_secret(
             &out,
-            json!({"ev":"ap","s_ap_0":hex::encode(s_ap_0),"c_ap_1":hex::encode(c_ap_1),
-                   "h1":hex::encode(h1),"h2":hex::encode(h2),"hk":hex::encode(hk)}),
+            "ap",
+            &[("s_ap_0", s_ap_0), ("c_ap_1", c_ap_1), ("h1", h1), ("h2", h2), ("hk", hk)],
         ),
         ApOut::N { .. } => return Err("unexpected output role".into()),
     }
@@ -125,11 +147,13 @@ async fn main() {
     // stdout writer
     let writer = tokio::spawn(async move {
         let mut so = tokio::io::stdout();
-        while let Some((ch, data)) = out_rx.recv().await {
+        while let Some((ch, mut data)) = out_rx.recv().await {
             let mut hdr = [0u8; 5];
             hdr[0] = ch;
             hdr[1..].copy_from_slice(&(data.len() as u32).to_be_bytes());
-            if so.write_all(&hdr).await.is_err() || so.write_all(&data).await.is_err() {
+            let ok = so.write_all(&hdr).await.is_ok() && so.write_all(&data).await.is_ok();
+            data.zeroize();
+            if !ok {
                 break;
             }
             if out_rx.is_empty() && so.flush().await.is_err() {

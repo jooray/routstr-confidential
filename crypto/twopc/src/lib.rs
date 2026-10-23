@@ -551,12 +551,14 @@ impl Party {
         // What the peer may send per channel. N (the node) is the exposed
         // party: C's honest upload is ~1.2 MB in all (Ferret on CH_COTB), a
         // few KB of KOS/ECtF traffic and well under 4 KB of protocol messages;
-        // N→C-only channels accept nothing from C. C's own machine is not a
-        // DoS target, so it only refuses traffic on its outbound-only channel.
+        // N→C-only channels accept nothing from C. C bounds N too, so a
+        // malicious node cannot grow the client's memory: an honest N sends
+        // 4 KB on CH_COTA, 451 KB on CH_COTB, 21 KB on CH_SC, 5.5 MB on
+        // CH_N2C and 16.2 MB of tables (the circuits are fixed).
         const MIB: u64 = 1 << 20;
         let caps: [u64; N_CH] = match role {
             Role::N => [8 * MIB, 16 * MIB, 4 * MIB, 0, MIB, 0],
-            Role::C => [u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0, u64::MAX],
+            Role::C => [MIB, 4 * MIB, MIB, 16 * MIB, 0, 32 * MIB],
         };
         let (mux, mut chans) = Mux::start(io, N_CH, &[CH_TAB], &caps);
         let counters = mux.counters.clone();
