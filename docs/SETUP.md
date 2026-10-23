@@ -211,6 +211,12 @@ podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=...
   --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
 ```
 
+**Run files.** For each session that wrote a credential record, the sidecar keeps its log, attestation
+and (without `--node-settles`) receipt under `--runs-dir`, readable by its own user only. Nothing needs
+them after the session ends: the node settles from its own records and the client holds the attestation
+and receipt. They are kept 24 hours for debugging and then removed (checked every ten minutes);
+`--runs-keep-hours N` changes that, and `--runs-keep-hours 0` removes them as each session ends.
+
 **The token.** The sidecar does not check client credentials: the node checks them and reserves the payment
 before it connects to the sidecar. Anyone who reaches the sidecar directly could therefore run sessions on
 your provider key without paying. So the sidecar requires `Authorization: Bearer <token>` on every request

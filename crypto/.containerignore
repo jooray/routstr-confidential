@@ -1,5 +1,15 @@
+# The build context is crypto/; only sources, Cargo files and the offer are
+# needed. Keep build outputs, run evidence, wallets and envs out of it.
+# (.containerignore is what podman reads, .dockerignore what docker reads.)
 zkbench/target
+**/target
 client/node_modules
 client/vendor
+**/node_modules
 runs
+tools/.cashu
+**/.venv
+**/__pycache__
+**/*.log
+**/.env
 **/.git

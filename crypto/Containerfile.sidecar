@@ -9,10 +9,20 @@
 #   podman run -d --name cu-sidecar -e UPSTREAM_API_KEY=... -e CU_SIDECAR_TOKEN=... cu-sidecar \
 #     --listen 0.0.0.0:7444 --upstream api.venice.ai:443 --key-env UPSTREAM_API_KEY \
 #     --offer /etc/cu-sidecar/offer.json --node-settles --runs-dir /runs
+#     (finished sessions' run files are kept 24 h: --runs-keep-hours N, 0 = none)
 #
 # and point the node at it: CONFIDENTIAL_SIDECAR_URL=http://cu-sidecar:7444,
 # CONFIDENTIAL_SIDECAR_TOKEN=<same token>
-FROM docker.io/library/rust:1-bookworm AS build
+#
+# Both base images are pinned by digest (multi-arch index; tag in the comment).
+# To bump them, resolve the new tag's index digest, e.g.
+#   skopeo inspect --raw docker://docker.io/library/rust:1.97.1-bookworm | sha256sum
+# and keep the rust tag equal to rust-toolchain.toml. The build stage's apt
+# packages (cmake, clang) are build tools only and come from the pinned
+# image's Debian release; the runtime stage installs nothing: the sidecar
+# verifies the provider with its compiled-in webpki-roots, not the system store.
+# rust:1.97.1-bookworm
+FROM docker.io/library/rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -20,9 +30,9 @@ COPY . .
 RUN cargo build --release --locked -p cu-sidecar \
     && cp zkbench/target/release/cu-sidecar /cu-sidecar
 
-FROM docker.io/library/debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* && mkdir -p /etc/cu-sidecar /runs && chown 65534:65534 /runs
+# debian:bookworm-slim
+FROM docker.io/library/debian@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+RUN mkdir -p /etc/cu-sidecar /runs && chown 65534:65534 /runs
 COPY --from=build /cu-sidecar /usr/local/bin/cu-sidecar
 COPY relay/offer.venice.json /etc/cu-sidecar/offer.json
 USER 65534:65534

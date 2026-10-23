@@ -634,6 +634,9 @@ struct AppState {
     /// Where per-session artifacts (attestation/receipt/sidecar log) are written.
     /// `--runs-dir` overrides the default `CARGO_MANIFEST_DIR/../runs`.
     runs_dir: std::path::PathBuf,
+    /// How long a finished session's run files are kept (`--runs-keep-hours`,
+    /// default 24); zero removes them when the session ends.
+    runs_keep: std::time::Duration,
     /// When true the sidecar does *not* settle: it emits the π_C3S-verified
     /// `usage` frame and lets the node (which holds the Cashu wallet and the
     /// Nostr key) price, refund and sign the receipt.
@@ -982,6 +985,8 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runs")
         });
+    let runs_keep_hours: u64 = arg("--runs-keep-hours").map(|v| v.parse()).transpose()?.unwrap_or(24);
+    let runs_keep = std::time::Duration::from_secs(runs_keep_hours * 3600);
 
     let raw_key = std::env::var(&key_env).with_context(|| format!("{key_env} is not set"))?;
     let key = Zeroizing::new(raw_key.into_bytes());
@@ -1092,6 +1097,7 @@ async fn main() -> Result<()> {
         upstream,
         signer: Arc::new(signer),
         runs_dir,
+        runs_keep,
         node_settles,
         sessions: StdMutex::new(HashMap::new()),
         slots: Arc::new(tokio::sync::Semaphore::new(max_sessions)),
@@ -1105,6 +1111,8 @@ async fn main() -> Result<()> {
         .route("/zk", get(zk_ws))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state.clone());
+
+    tokio::spawn(prune_runs_forever(state.runs_dir.clone(), state.runs_keep));
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, token = state.token_hash.is_some(), "cu-sidecar listening");
@@ -1418,6 +1426,12 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                             }
                             SessionState::AwaitHead => buffer_client(&mut st.held_client, &data, st.body_len)?,
                             SessionState::Body => {
+                                if !st.held_client.is_empty() {
+                                    // The partial record left over from the head write.
+                                    let mut rest = std::mem::take(&mut st.held_client);
+                                    rest.append(&mut client_pending);
+                                    client_pending = rest;
+                                }
                                 buffer_client(&mut client_pending, &data, st.body_len)?;
                                 relay_body(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                             }
@@ -1589,8 +1603,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     if let Some(dir) = &st.run_dir {
         // Keep a record only of sessions that wrote a credential record: the rest
         // (abandoned armed sessions, failed setups) would pile up unbounded.
-        if matches!(st.state, SessionState::Handshake | SessionState::AwaitHead) {
-            let _ = std::fs::remove_dir_all(dir);
+        // Kept records expire after `--runs-keep-hours` (prune_runs).
+        if matches!(st.state, SessionState::Handshake | SessionState::AwaitHead) || app.runs_keep.is_zero() {
+            remove_run(dir);
         } else {
             let _ = write_private(&dir.join("sidecar.jsonl"), (st.side_log.join("\n") + "\n").as_bytes());
         }
@@ -2154,10 +2169,9 @@ async fn write_head(
     let _ = to_client.send(Message::Text(serde_json::json!({"type":"head_written"}).to_string().into()));
     let mut held = std::mem::take(&mut st.held_client);
     relay_body(st, log, &mut held, tcp_tx).await?;
-    if !held.is_empty() {
-        st.held_client = held;
-        bail!("partial client record buffered across the head write");
-    }
+    // A record split across WebSocket frames: its start stays here and the
+    // Body state completes it with the next bytes.
+    st.held_client = held;
     Ok(())
 }
 
@@ -2806,6 +2820,59 @@ fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()>
     f.write_all(contents)
 }
 
+/// The files the sidecar writes into a run directory. Pruning removes only
+/// these, so a directory shared with a local client's evidence (the default
+/// `crypto/runs`) keeps the client's files.
+const SIDECAR_RUN_FILES: [&str; 3] = ["sidecar.jsonl", "attestation.json", "receipt.json"];
+
+/// Remove the sidecar's files from a run directory, and the directory if
+/// nothing else is in it. The session's data is not needed after it ends:
+/// the node settles from its own records and the client holds the
+/// attestation and receipt.
+fn remove_run(dir: &std::path::Path) {
+    for f in SIDECAR_RUN_FILES {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Remove the run directories (named by a session id) last changed before
+/// `cutoff`. Returns how many were removed.
+fn prune_runs(root: &std::path::Path, cutoff: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else { return 0 };
+    let mut removed = 0;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let is_sid = name.to_str().is_some_and(|n| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit()));
+        let old = e.metadata().ok().filter(|m| m.is_dir()).and_then(|m| m.modified().ok()).is_some_and(|t| t < cutoff);
+        if is_sid && old {
+            remove_run(&e.path());
+            removed += usize::from(!e.path().exists());
+        }
+    }
+    removed
+}
+
+/// Prune finished runs every ten minutes. A run younger than an hour is never
+/// touched, so a live session (at most `SESSION_TIMEOUT`) keeps its files
+/// even with `--runs-keep-hours 0` (which removes them at the session's end).
+async fn prune_runs_forever(root: std::path::PathBuf, keep: std::time::Duration) {
+    let keep = keep.max(std::time::Duration::from_secs(3600));
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+    loop {
+        tick.tick().await;
+        let root = root.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            std::time::SystemTime::now().checked_sub(keep).map_or(0, |cutoff| prune_runs(&root, cutoff))
+        })
+        .await
+        .unwrap_or(0);
+        if removed > 0 {
+            info!(removed, "pruned expired run directories");
+        }
+    }
+}
+
 fn write_attestation(dir: &Option<std::path::PathBuf>, a: &serde_json::Value) {
     if let Some(dir) = dir {
         let _ = write_private(&dir.join("attestation.json"), serde_json::to_string_pretty(a).unwrap_or_default().as_bytes());
@@ -3078,6 +3145,22 @@ mod head_release_tests {
         let mut got = Vec::new();
         peer.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"HEADKU");
+        // A body record split across frames stays buffered for the Body state.
+        let (mut tx, _peer) = pair().await;
+        let mut whole = vec![23, 3, 3, 0, 20];
+        whole.extend([0; 20]);
+        let mut st3 = Session {
+            state: SessionState::AwaitHead,
+            assembled: Some(Assembled { record: b"HEAD".to_vec(), c_commit: [0; 32] }),
+            head_release: Some(b"KU".to_vec()),
+            head_proof_ok: true,
+            body_len: 100,
+            held_client: [whole.clone(), whole[..9].to_vec()].concat(),
+            ..Session::default()
+        };
+        write_head(&mut st3, &mut log, &to_client, &mut tx).await.unwrap();
+        assert_eq!(st3.state, SessionState::Body);
+        assert_eq!((st3.body_records, st3.held_client.as_slice()), (1, &whole[..9]));
         // Proof done but not requested: nothing happens.
         let (mut tx, _peer) = pair().await;
         let mut st2 = Session { head_proof_ok: true, state: SessionState::AwaitHead, ..Session::default() };
@@ -3171,6 +3254,7 @@ mod hardening_tests {
             upstream: "127.0.0.1:9".into(),
             signer: Arc::new(SigningKey::from_bytes(&[7; 32])),
             runs_dir: std::env::temp_dir(),
+            runs_keep: std::time::Duration::from_secs(3600),
             node_settles: true,
             sessions: StdMutex::new(HashMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3215,6 +3299,7 @@ mod hardening_tests {
             upstream: base.upstream.clone(),
             signer: base.signer.clone(),
             runs_dir: base.runs_dir.clone(),
+            runs_keep: base.runs_keep,
             node_settles: true,
             sessions: StdMutex::new(HashMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3752,5 +3837,38 @@ mod same_params_tests {
         assert!(!same_params(Some(&a), None));
         assert!(!same_params(None, Some(&a)));
         assert!(!same_params(None, None));
+    }
+}
+
+#[cfg(test)]
+mod run_retention_tests {
+    use super::{prune_runs, SIDECAR_RUN_FILES};
+
+    #[test]
+    fn pruning_removes_only_old_sidecar_runs() {
+        let root = std::env::temp_dir().join(format!("cu-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sid = |c: char| root.join(c.to_string().repeat(64));
+        for c in ['a', 'b'] {
+            std::fs::create_dir_all(sid(c)).unwrap();
+            for f in SIDECAR_RUN_FILES {
+                std::fs::write(sid(c).join(f), b"{}").unwrap();
+            }
+        }
+        // A run a local client shares with the sidecar, and a non-run directory.
+        std::fs::write(sid('b').join("response.txt"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("adversarial-images")).unwrap();
+        // Nothing is older than an hour ago.
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        assert_eq!(prune_runs(&root, hour_ago), 0);
+        assert!(sid('a').exists());
+        // Everything is older than a minute from now.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert_eq!(prune_runs(&root, later), 1);
+        assert!(!sid('a').exists());
+        let left: Vec<_> = std::fs::read_dir(sid('b')).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("response.txt")]);
+        assert!(root.join("adversarial-images").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

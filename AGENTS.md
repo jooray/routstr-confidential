@@ -163,7 +163,8 @@ cd /tmp/cu-mint && MINT_BACKEND_BOLT11_SAT=FakeWallet MINT_PRIVATE_KEY=TEST_PRIV
 cd $P/crypto && cargo build --release -p cu-sidecar -p zkbench
 ./zkbench/target/release/cu-sidecar --listen 127.0.0.1:7444 --upstream api.venice.ai:443 \
   --key-env VENICE_API_KEY --offer relay/offer.venice.json --node-settles &
-#   (limits: --max-sessions 32, --max-body 8388608; 15 s setup / 600 s session timeouts)
+#   (limits: --max-sessions 32, --max-body 8388608; 15 s setup / 600 s session timeouts;
+#    run files kept --runs-keep-hours 24, 0 = removed at the session's end)
 #   (on loopback no token is needed; off loopback it requires CU_SIDECAR_TOKEN, and the
 #    node sends the same value as CONFIDENTIAL_SIDECAR_TOKEN)
 # node: RELAYS points nowhere so nothing is published to Nostr
