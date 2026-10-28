@@ -1,7 +1,7 @@
 # The offer-driven chat suffix
 
 A confidential chat request ends with a public JSON suffix that pins every
-cost-relevant parameter (paper §4.4). Until 2026-10-19 its keys and values
+cost-relevant parameter (paper §4.6). Until 2026-10-19 its keys and values
 were hard-coded, identically, in the sidecar, the SDK, the browser library
 and the reference client, and one of them was Venice's `venice_parameters`.
 A second provider needed code changes in all of them.
@@ -90,6 +90,13 @@ refused session.)
    the caller and the provider default).
 8. The fixed part (everything after the caps) renders to at most 1024 bytes.
 9. `suffix_keys` equals `["model", ...cap_keys, ...fixed pin keys]`.
+
+Rules 6 and 7 are a heuristic over key names and values, not a guarantee:
+whether `false` or `"off"` switches a feature off depends on the provider's
+semantics, and a key whose name inverts its meaning without one of the listed
+prefixes (`logging_opt_out: false`, say) passes them. They narrow what a
+dishonest offer can pin; the meaning of each pinned key still rests on the
+provider's documentation.
 
 The sidecar also requires, at startup, that `fixed_pins` contains
 `["n", 1]` and that `cap_keys` contains both `max_tokens` and

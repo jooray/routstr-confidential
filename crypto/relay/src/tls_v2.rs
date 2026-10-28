@@ -204,15 +204,15 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
 }
 
 /// The first ClientHello and ServerHello messages in the relayed streams, if
-/// both have arrived complete.
-pub fn hellos(client_bytes: &[u8], server_bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+/// both have arrived complete (a ServerHello may span several records). An
+/// error for a server stream that cannot yield a ServerHello.
+pub fn hellos(client_bytes: &[u8], server_bytes: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     let (c, _) = parse_records(client_bytes);
     let (s, _) = parse_records(server_bytes);
-    let ch = c.iter().find(|r| r.ctype == CT_HANDSHAKE)?;
-    let sh = s.iter().find(|r| r.ctype == CT_HANDSHAKE)?;
-    let (cty, cmsg) = parse_handshake_messages(&ch.payload).into_iter().next()?;
-    let (sty, smsg) = parse_handshake_messages(&sh.payload).into_iter().next()?;
-    (cty == HS_CLIENT_HELLO && sty == HS_SERVER_HELLO).then_some((cmsg, smsg))
+    let Some(smsg) = crate::tls::server_hello_message(&s)? else { return Ok(None) };
+    let Some(ch) = c.iter().find(|r| r.ctype == CT_HANDSHAKE) else { return Ok(None) };
+    let Some((cty, cmsg)) = parse_handshake_messages(&ch.payload).into_iter().next() else { return Ok(None) };
+    Ok((cty == HS_CLIENT_HELLO).then_some((cmsg, smsg)))
 }
 
 /// th_SH = SHA-256(ClientHello ‖ ServerHello).

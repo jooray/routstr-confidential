@@ -109,7 +109,7 @@ fn pi_c2s_sel_len_mismatch_is_an_error() {
 
 #[test]
 fn pi_c3s_malformed_params_are_errors() {
-    use zkbench::statements::{MAX_INNER_PLAINTEXT, MAX_SERVER_KEY_UPDATES, PiC3S};
+    use zkbench::statements::{MAX_INNER_CIPHERTEXT_PAYLOAD, MAX_SERVER_KEY_UPDATES, PiC3S};
     let (params, witness) = fixtures::pi_c3s_records(&[300, 600]);
     let Params::PiC3S(p) = params else { unreachable!() };
     let cases: Vec<(&str, Box<dyn Fn(&mut PiC3S)>)> = vec![
@@ -119,7 +119,7 @@ fn pi_c3s_malformed_params_are_errors() {
         ("a later record at an offset", Box::new(|p| p.records[1].off = 16)),
         ("first offset not block-aligned", Box::new(|p| p.records[0].off = 8)),
         ("a record without content", Box::new(|p| p.records[0].ct.truncate(1))),
-        ("a record past the TLS limit", Box::new(|p| p.records[0].off = MAX_INNER_PLAINTEXT)),
+        ("a record past the TLS limit", Box::new(|p| p.records[0].off = MAX_INNER_CIPHERTEXT_PAYLOAD)),
         ("offset overflows", Box::new(|p| p.records[0].off = usize::MAX - 15)),
         ("records do not cover R plus skip", Box::new(|p| p.skip = 900)),
         ("skip overflows", Box::new(|p| p.skip = usize::MAX)),

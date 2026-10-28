@@ -30,8 +30,9 @@ one byte, the provider would reject it. Likewise your routstrd checks every piec
 calls included, so a modified answer is detected and discarded. The node writes only at the start,
 before the keys switch to ones only your routstrd holds: the request header with its API key, which a
 zero-knowledge proof shows matches a published template. It could still write other or extra records
-there unseen (another account or endpoint, a header asking the provider to retain data), but none of
-them carries or touches your content.
+there unseen (another account or endpoint, a header asking the provider to retain data). None of them
+carries or changes your content, but they could change how the provider handles it (routing, a system
+prompt, moderation, caching) where its API allows that.
 
 **2. "Can the node change the model, say to a cheaper one, or bill me for a dearer one?"** No, with one
 exception for failed sessions (under Money). The model name and token limits sit at the end of your
@@ -53,18 +54,16 @@ sees only the status and headers.
   about 22 MB and uploads 1.2 MB for it, and with the proofs a chat request moves about 28 MB in all
   (an image request about 26 MB). Cold, the first token takes about 14-16 s on a good home connection,
   about a minute on a slow one. While you send confidential requests, routstrd pre-warms sessions in the
-  background (each costs the same download, used or not); a pre-warmed request gets its first token in about 2-3 s, mostly provider latency. The answer then streams at normal speed.
-  Image requests are never pre-warmed, so each one pays the cold cost on top of the provider's
-  generation time.
+  background (each costs the same download, used or not); a pre-warmed request gets its first token in about 2-3 s, mostly provider latency, then streams at normal speed.
+  Image requests are never pre-warmed and always pay the cold cost.
 - **Money:** from your usual balance with that node, at the rates it signed. The node holds back the
   maximum (a full-context prompt, your token limit and a small margin) and charges the usage the
-  provider reported; an image is charged the flat per-image price in the signed offer. Its signed offer may add a session fee per request and an abandon fee for a session
-  that never reached the provider (such as an unused pre-warmed one); otherwise such a session, or a
-  provider refusal (4xx, 503), costs nothing. If the provider got your request but the session ends
-  without its usage report (another 5xx, a cut stream), the node charges the whole reservation, and you cannot prove who cut it.
-- **Providers:** chat completions and image generation, on providers that behave like Venice (others
-  need checking). If this
-  mode is unavailable, a confidential request is refused, never sent openly.
-- **Not covered:** the provider still sees your prompt; the node can refuse service or keep money after a failed session (reputation is your protection). The two-party computation is new and has no
-  published proof (it needs external review); a cheating node could learn at most about 2.6 bits per
-  session about single-use values.
+  provider reported (an image: the signed flat price). The offer may add a session fee per request and an abandon fee for a session
+  that never reached the provider (such as an unused pre-warmed one). A provider refusal costs the
+  session fee for a 429, 503 or 401-403, and the abandon fee for any other 4xx. If the provider got your request but no usage report comes back (another 5xx, a
+  cut stream), the node charges the whole reservation; you cannot prove who cut it.
+- **Providers:** chat and images, on Venice-like providers (others need checking); if this mode is
+  unavailable, a confidential request is refused, never sent openly.
+- **Not covered:** the provider still sees your prompt; the node can refuse service or keep money after a failed session (reputation protects you). The two-party computation is new, has no
+  published proof and needs external review; a cheating node could learn at most about 2.8 bits per
+  session about single-use values, if its semi-honest first step leaks no more.

@@ -89,6 +89,43 @@ function arg(name: string, dflt?: string): string | undefined {
   return i >= 0 ? argv[i + 1] : dflt
 }
 
+/** A Nostr pubkey as lower-case x-only hex, from 64-hex or an `npub1…`; null if neither. */
+function pubkeyHex(input: string): string | null {
+  const s = input.trim()
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return s.toLowerCase()
+  const lower = s.toLowerCase()
+  if (!lower.startsWith('npub1') || lower.length < 12) return null
+  const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
+  const data: number[] = []
+  for (const c of lower.slice(5)) {
+    const v = CHARSET.indexOf(c)
+    if (v < 0) return null
+    data.push(v)
+  }
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+  let chk = 1
+  const hrp = [...'npub'].map((c) => c.charCodeAt(0))
+  for (const v of [...hrp.map((c) => c >> 5), 0, ...hrp.map((c) => c & 31), ...data]) {
+    const top = chk >>> 25
+    chk = ((chk & 0x1ffffff) << 5) ^ v
+    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= GEN[i]!
+  }
+  if (chk !== 1) return null
+  let acc = 0
+  let bits = 0
+  const out: number[] = []
+  for (const v of data.slice(0, -6)) {
+    acc = ((acc << 5) | v) & 0xfff
+    bits += 5
+    if (bits >= 8) {
+      bits -= 8
+      out.push((acc >> bits) & 0xff)
+    }
+  }
+  if (bits >= 5 || (acc & ((1 << bits) - 1)) !== 0 || out.length !== 32) return null
+  return out.map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 const NODE = arg('--node')
 const SIDECAR = arg('--sidecar', 'http://127.0.0.1:7443')!
 const MODEL = arg('--model', 'mistral-small-3-2-24b-instruct')!
@@ -159,7 +196,23 @@ const NODE_MODE = !!NODE
 // announcement; also CU_NODE_PUBKEY). Without it the offer is only
 // self-consistent, not authentic, so it is required for a node off this host
 // unless --allow-unpinned.
-const NODE_PUBKEY = arg('--node-pubkey') ?? (process.env.CU_NODE_PUBKEY || undefined)
+const NODE_PUBKEY_RAW = arg('--node-pubkey') ?? (process.env.CU_NODE_PUBKEY || undefined)
+const NODE_PUBKEY = NODE_PUBKEY_RAW === undefined ? undefined : pubkeyHex(NODE_PUBKEY_RAW)
+if (NODE_PUBKEY_RAW !== undefined && NODE_PUBKEY === null) {
+  console.error(`[client] --node-pubkey ${shown(NODE_PUBKEY_RAW)} is neither a 64-hex key nor an npub`)
+  process.exit(2)
+}
+// Provider hosts this client will run a TLS session with: the offer's
+// upstream_host must be one of them (as the SDK's trusted hosts). The default
+// is the case-study provider; extend with --trusted-host (repeatable) or
+// CU_TRUSTED_HOSTS (comma-separated).
+const TRUSTED_HOSTS = [
+  'api.venice.ai',
+  ...(process.env.CU_TRUSTED_HOSTS ?? '').split(','),
+  ...argv.flatMap((a, i) => (a === '--trusted-host' && argv[i + 1] !== undefined ? [argv[i + 1]!] : [])),
+]
+  .map((h) => h.trim().toLowerCase())
+  .filter((h) => h !== '')
 if (NODE) {
   let url: URL | undefined
   try {
@@ -514,10 +567,12 @@ class Session {
   cCommitHex: string | undefined
 
   trackServerRecords(bytes: Uint8Array): void {
+    this.recvHash.update(bytes)
     let buf = concat(this.serverPending, bytes)
     while (buf.length >= 5) {
       const len = (buf[3]! << 8) | buf[4]!
       if (buf.length < 5 + len) break
+      this.recvRecords += 1
       if (buf[0] === 0x17) this.serverRecords.push(buf.slice(5, 5 + len))
       buf = buf.subarray(5 + len)
     }
@@ -593,11 +648,18 @@ class Session {
     return this.wsReady
   }
 
+  /** SHA-256 of every upstream byte and the count of complete upstream
+   * records (every content type), checked against the attestation. */
+  recvHash = createHash('sha256')
+  recvRecords = 0
+  /** SHA-256 of the provider's certificate DERs, concatenated in order. */
+  certChainHash: Uint8Array | undefined
+
   /** The TLS client; `external` hands its key schedule to the 2PC. */
   makeTls(external: any): void {
       this.tls = makeTLSClient({
         external,
-        host: 'api.venice.ai',
+        host: upstreamHost(),
         verifyServerCertificate: true,
         cipherSuites: ['TLS_AES_128_GCM_SHA256'],
         supportedProtocolVersions: ['TLS1_3'],
@@ -620,6 +682,10 @@ class Session {
           this.responseChunks.push(rec)
           this.responseBytes = concat(this.responseBytes, rec)
           this.responseRecordCount++
+        },
+        onRecvCertificates: ({ certificates }: { certificates: { internal: { rawData: ArrayBuffer } }[] }) => {
+          // After the fork validated the chain: checked against the attestation.
+          this.certChainHash = sha256(concat(...certificates.map((c) => new Uint8Array(c.internal.rawData))))
         },
         onTlsEnd: () => {
           this.tlsEnded = true
@@ -868,8 +934,10 @@ class Session {
       this.errP,
       timeout(600000, 'attestation'), // the node attests when the response ends: long answers take minutes
     ])
+    // The signed bytes, or the attestation as we serialize it (as the SDK):
+    // the receipt must hash exactly what we verified.
     const attJson: string = attMsg.a_json ?? JSON.stringify(attMsg.a)
-    this.attJson = attMsg.a_json
+    this.attJson = attJson
     if (OFFER_PUBKEY && this.ready.pubkey !== OFFER_PUBKEY) {
       throw new Error('session pubkey differs from the signed offer key')
     }
@@ -883,6 +951,16 @@ class Session {
     }
     if (!this.cCommitHex || a.c_commit !== this.cCommitHex) {
       throw new Error('attestation names a different head-record commitment')
+    }
+    // The rest of what we can recompute from our own records.
+    if (this.certChainHash && a.cert_chain_hash !== hex(this.certChainHash)) {
+      throw new Error('attestation names a different certificate chain')
+    }
+    if (a.server_records !== this.recvRecords) {
+      throw new Error(`attestation counts ${shown(a.server_records)} upstream records, we received ${this.recvRecords}`)
+    }
+    if (a.sha256_recv !== this.recvHash.copy().digest('hex')) {
+      throw new Error('attestation hashes different upstream bytes than we received')
     }
 
     await settleFlush(this)
@@ -983,7 +1061,11 @@ class Session {
     if (terminal.kind === 'receipt') {
       if (!okSig) throw new Error('receipt signature invalid')
       if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${shown(receipt.sid)}, not ${this.sid}`)
-      if (this.attJson !== undefined && receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))) {
+      if (
+        this.attJson === undefined ||
+        typeof receipt.attestation_hash !== 'string' ||
+        receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))
+      ) {
         throw new Error("receipt is not bound to this session's attestation")
       }
     }
@@ -1030,7 +1112,12 @@ class Session {
     const usageMatch =
       receipt.usage?.usage?.prompt_tokens === ownUsage.usage?.prompt_tokens &&
       receipt.usage?.usage?.completion_tokens === ownUsage.usage?.completion_tokens &&
-      receipt.model === ownUsage.model
+      // The node settles at the pinned model (π_C2S proved the request names
+      // it); the provider may report another spelling of it.
+      (receipt.model === MODEL || receipt.model === ownUsage.model)
+    if (ownUsage.model !== MODEL) {
+      console.log(`[client ${this.label}] note: the provider reported model ${shown(ownUsage.model)} for the pinned ${MODEL}`)
+    }
     // The node may charge less than the signed rates (cached input), never
     // more; the rates include any surcharge, the session fee comes on top.
     const rates = OFFER?.price_list?.[MODEL]
@@ -1048,7 +1135,11 @@ class Session {
 
     const modelMatch = [...text.matchAll(/"model":"([^"]+)"/g)].map((m) => m[1])
     const effective = modelMatch[modelMatch.length - 1]
-    if (effective !== MODEL) throw new Error(`effective model ${shown(effective)} != ${MODEL}`)
+    if (effective !== MODEL) {
+      // Not fatal: the request named MODEL (π_C2S) and the charge is at its
+      // rates; the provider's echo is another spelling (an alias, a canonical id).
+      console.log(`[client ${this.label}] note: the response names model ${shown(effective)}, the request pinned ${MODEL}`)
+    }
 
     this.log({ ev: 'receipt', ok_sig: okSig, receipt })
     writePrivate(`${runDir}/client.jsonl`, logLines.join('\n') + '\n')
@@ -1112,7 +1203,11 @@ class Session {
       okSig = verifySig(receiptJson, terminal.m.sig, this.ready.pubkey, terminal.m.sig_scheme)
       if (!okSig) throw new Error('receipt signature invalid')
       if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${shown(receipt.sid)}, not ${this.sid}`)
-      if (this.attJson !== undefined && receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))) {
+      if (
+        this.attJson === undefined ||
+        typeof receipt.attestation_hash !== 'string' ||
+        receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))
+      ) {
         throw new Error("receipt is not bound to this session's attestation")
       }
     } else {
@@ -1403,6 +1498,15 @@ function checkOfferVersion(offer: any): void {
     console.error(`[client] the offer is for protocol v${shown(offer.v)}; this client speaks only v${PROTO}`)
     process.exit(4)
   }
+  if (offer) {
+    const host = typeof offer.upstream_host === 'string' ? offer.upstream_host.toLowerCase() : ''
+    if (!TRUSTED_HOSTS.includes(host)) {
+      console.error(
+        `[client] the offer's upstream_host ${shown(offer.upstream_host)} is not trusted (${TRUSTED_HOSTS.join(', ')}; --trusted-host or CU_TRUSTED_HOSTS to add one)`,
+      )
+      process.exit(4)
+    }
+  }
   const problem = offer ? chatBlockProblem(offer) : null
   if (problem) {
     console.error(`[client] the offer's chat block is refused: ${termSafe(problem)}`)
@@ -1417,6 +1521,15 @@ function checkOfferVersion(offer: any): void {
       process.exit(4)
     }
   }
+}
+
+/** The provider host for the TLS session: the offer's `upstream_host`, which
+ * `checkOfferVersion` held to the trusted list. Without an offer (only in the
+ * insecure testing path, when it could not be fetched) the first trusted host. */
+function upstreamHost(): string {
+  const h = typeof OFFER?.upstream_host === 'string' ? OFFER.upstream_host.toLowerCase() : undefined
+  if (h !== undefined && !TRUSTED_HOSTS.includes(h)) throw new Error(`upstream host ${shown(h)} is not trusted`)
+  return h ?? TRUSTED_HOSTS[0]!
 }
 
 /** A token count as the node reads one (a non-negative integer, else 0). */
@@ -1481,7 +1594,7 @@ async function verifyOffer(): Promise<void> {
         `models=${Object.keys(parsed.price_list ?? {}).length} sig_ok=${ok}`,
     )
     if (!ok) throw new Error('offer signature invalid')
-    if (NODE_PUBKEY && parsed.notary_pubkey !== NODE_PUBKEY) {
+    if (NODE_PUBKEY && (typeof parsed.notary_pubkey !== 'string' || pubkeyHex(parsed.notary_pubkey) !== NODE_PUBKEY)) {
       throw new Error('offer is not signed by the pinned node key')
     }
     OFFER_PUBKEY = parsed.notary_pubkey

@@ -64,11 +64,13 @@ use crate::gadgets::{
 /// instead of silently proving membership in the wrong set.
 pub const SUPPORTED_KEY_ALPHABET: &str = "[A-Za-z0-9_-]";
 
-/// An upper bound on a TLS 1.3 record's inner plaintext (content, content
-/// type and padding): the 2^14 + 256-byte ciphertext limit of RFC 8446 §5.2,
-/// which also covers the 2^14 + 1-byte plaintext limit. Record-shaped public
-/// parameters beyond it are rejected before any circuit is built.
-pub const MAX_INNER_PLAINTEXT: usize = (1 << 14) + 256;
+/// An upper bound on the encrypted payload of a TLS 1.3 record, tag excluded
+/// (content, content type and padding): the 2^14 + 256-byte ciphertext limit
+/// of RFC 8446 §5.2, which also covers the 2^14 + 1-byte plaintext limit
+/// (`cu_crypto::aesgcm::MAX_INNER_PLAINTEXT`, a different, tighter bound).
+/// Record-shaped public parameters beyond it are rejected before any circuit
+/// is built.
+pub const MAX_INNER_CIPHERTEXT_PAYLOAD: usize = (1 << 14) + 256;
 
 /// The three proofs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,7 +432,7 @@ pub fn build_pi_nk<VM: Vm<Binary>>(
         );
     }
     if p.template.len() != p.head_len
-        || p.head_len >= MAX_INNER_PLAINTEXT
+        || p.head_len >= MAX_INNER_CIPHERTEXT_PAYLOAD
         || p.key_offsets.len() != p.key_len
         || p.key_len == 0
         || p.key_offsets.iter().any(|&o| o >= p.head_len)

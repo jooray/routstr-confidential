@@ -85,6 +85,44 @@ pub fn parse_handshake_messages(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
     out
 }
 
+/// Upper bound on the plaintext ServerHello (a TLS 1.3 one is ~100 bytes).
+const MAX_SERVER_HELLO: usize = 1 << 14;
+
+/// The ServerHello (with its 4-byte header) from the server's plaintext
+/// handshake records. It may span several records (RFC 8446 §5.1 allows a
+/// handshake message to be fragmented), which are joined; it must end at a
+/// record boundary, since the records after it are encrypted. `Ok(None)` while
+/// it is still arriving; an error for anything that cannot become one.
+pub fn server_hello_message(records: &[Record]) -> Result<Option<Vec<u8>>> {
+    if records.iter().take_while(|r| r.ctype != CT_HANDSHAKE).any(|r| r.ctype == CT_ALERT) {
+        bail!("the server sent an alert before its ServerHello");
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    for r in records.iter().skip_while(|r| r.ctype != CT_HANDSHAKE) {
+        if r.ctype != CT_HANDSHAKE {
+            bail!("ServerHello interrupted by a record of type {}", r.ctype);
+        }
+        buf.extend_from_slice(&r.payload);
+        if buf.len() < 4 {
+            continue;
+        }
+        if buf[0] != HS_SERVER_HELLO {
+            bail!("first server handshake message is type {}, not ServerHello", buf[0]);
+        }
+        let total = 4 + (((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | buf[3] as usize);
+        if total > MAX_SERVER_HELLO {
+            bail!("ServerHello of {total} bytes is too long");
+        }
+        if buf.len() == total {
+            return Ok(Some(buf));
+        }
+        if buf.len() > total {
+            bail!("ServerHello does not end at a record boundary");
+        }
+    }
+    Ok(None)
+}
+
 /// The server's decrypted handshake flight: `None` until its Finished
 /// arrived, then exactly EncryptedExtensions, Certificate, CertificateVerify
 /// and Finished, in RFC 8446 order, each once, with nothing after them.
@@ -154,20 +192,13 @@ pub fn verify_handshake(
         .iter()
         .find(|r| r.ctype == CT_HANDSHAKE)
         .ok_or_else(|| anyhow!("no ClientHello"))?;
-    let sh = server_records
-        .iter()
-        .find(|r| r.ctype == CT_HANDSHAKE)
-        .ok_or_else(|| anyhow!("no ServerHello"))?;
+    let sh_msg = server_hello_message(&server_records)?.ok_or_else(|| anyhow!("no complete ServerHello"))?;
     let ch_msgs = parse_handshake_messages(&ch.payload);
-    let sh_msgs = parse_handshake_messages(&sh.payload);
     let (ch_ty, ch_msg) = ch_msgs
         .first()
         .ok_or_else(|| anyhow!("empty ClientHello record"))?;
-    let (sh_ty, sh_msg) = sh_msgs
-        .first()
-        .ok_or_else(|| anyhow!("empty ServerHello record"))?;
-    if *ch_ty != HS_CLIENT_HELLO || *sh_ty != HS_SERVER_HELLO {
-        bail!("unexpected first handshake messages ({ch_ty}, {sh_ty})");
+    if *ch_ty != HS_CLIENT_HELLO {
+        bail!("unexpected first client handshake message ({ch_ty})");
     }
 
     let th_sh = sha256(&[ch_msg.as_slice(), sh_msg.as_slice()].concat());
@@ -476,5 +507,28 @@ mod tests {
         let mut trailing = flight(&[&ee, &cert, &cv, &fin]);
         trailing.push(0);
         assert!(server_flight(&trailing).is_err());
+    }
+
+    fn record(ctype: u8, payload: &[u8]) -> Record {
+        let n = payload.len() as u16;
+        Record { ctype, header: [ctype, 3, 3, (n >> 8) as u8, n as u8], payload: payload.to_vec() }
+    }
+
+    #[test]
+    fn a_fragmented_server_hello_is_joined() {
+        let sh = msg(HS_SERVER_HELLO, &[7u8; 90]);
+        let one = [record(CT_HANDSHAKE, &sh), record(CT_CHANGE_CIPHER_SPEC, &[1])];
+        assert_eq!(server_hello_message(&one).unwrap().unwrap(), sh);
+        // Split in three, the first piece shorter than the message header.
+        let split = [record(CT_HANDSHAKE, &sh[..2]), record(CT_HANDSHAKE, &sh[2..40]), record(CT_HANDSHAKE, &sh[40..])];
+        assert!(server_hello_message(&split[..2]).unwrap().is_none());
+        assert_eq!(server_hello_message(&split).unwrap().unwrap(), sh);
+        // Interrupted, not a ServerHello, extra bytes in its last record, an alert.
+        assert!(server_hello_message(&[record(CT_HANDSHAKE, &sh[..40]), record(CT_APPLICATION_DATA, &[0; 20])]).is_err());
+        assert!(server_hello_message(&[record(CT_HANDSHAKE, &msg(HS_CLIENT_HELLO, b"x"))]).is_err());
+        let mut long = sh.clone();
+        long.push(0);
+        assert!(server_hello_message(&[record(CT_HANDSHAKE, &long)]).is_err());
+        assert!(server_hello_message(&[record(CT_ALERT, &[2, 40])]).is_err());
     }
 }

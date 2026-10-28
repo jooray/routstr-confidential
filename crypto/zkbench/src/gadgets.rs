@@ -493,7 +493,7 @@ pub fn decrypt_window<VM: Vm<Binary>>(
         || w == 0
         || sel_len == 0
         || sel_start.checked_add(sel_len).is_none_or(|end| end > w)
-        || off.checked_add(w).is_none_or(|end| end > crate::statements::MAX_INNER_PLAINTEXT)
+        || off.checked_add(w).is_none_or(|end| end > crate::statements::MAX_INNER_CIPHERTEXT_PAYLOAD)
     {
         anyhow::bail!("decrypt_window: inconsistent window (w={w}, sel={sel_start}+{sel_len})");
     }
@@ -529,7 +529,7 @@ pub fn decrypt_record_tail<VM: Vm<Binary>>(
     if ct.len() < 2 {
         anyhow::bail!("decrypt_record_tail: record has no content");
     }
-    if off.checked_add(ct.len()).is_none_or(|end| end > crate::statements::MAX_INNER_PLAINTEXT) {
+    if off.checked_add(ct.len()).is_none_or(|end| end > crate::statements::MAX_INNER_CIPHERTEXT_PAYLOAD) {
         anyhow::bail!("decrypt_record_tail: {} bytes at offset {off} exceed a record", ct.len());
     }
     if off % 16 != 0 {

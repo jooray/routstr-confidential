@@ -77,11 +77,14 @@
 //!   C's outputs are the correct function of the inputs (C's inputs and the
 //!   transcript hash are pinned by the pointer checks against opened masks;
 //!   outputs decode with authenticated masks). What N can still do is a
-//!   *selective failure*: make C abort depending on C's private values. Per
-//!   phase N observes one of {abort, labels rejected, success}, the session
-//!   ends at the first failure, and a deviation in ECtF adds one outcome (the
-//!   server Finished failing between the phases): six outcomes, ≤ log2 6 ≈ 2.6
-//!   bits per session.
+//!   *selective failure*: make C abort depending on any function of C's
+//!   private inputs and of internal wire values (N can corrupt the check row
+//!   of any wire, internal HKDF wires included, so a leaked bit can be a bit
+//!   of `s_ap_0` or `c_ap_1`). Per phase N observes one of {abort, labels
+//!   rejected, success}, the session ends at the first failure, and ECtF adds
+//!   two outcomes (C's degenerate-share abort, and the server Finished failing
+//!   between the phases): seven outcomes, ≤ log2 7 ≈ 2.8 bits per session,
+//!   provided ECtF leaks nothing beyond its outcome (below).
 //! * **Malicious C.** C is the evaluator; it sees the tables, active labels
 //!   and pointer bits, the opened masks (its inputs, the public transcript
 //!   hash, the outputs), check rows padded by hashes of inactive labels, and
@@ -95,10 +98,12 @@
 //! * **Inputs are never revealed** by either party (nothing is opened after
 //!   the evaluation). Private outputs are XOR-masked inside the circuit by
 //!   their owner's random mask; MS by both parties' masks.
-//! * **ECtF** uses mpz2's semi-honest A2M/M2A: a deviation only shifts the
-//!   result (the TLS server Finished then fails) or causes a selective
-//!   failure. All scalars, masks, labels and Δ are fresh per session
-//!   (ChaCha12 seeded from the OS).
+//! * **ECtF** uses mpz2's A2M/M2A, which are secure against semi-honest
+//!   parties only; the leakage bound above assumes a malicious N gains
+//!   nothing from them beyond the outcome. Under that assumption a deviation
+//!   only shifts the result (the TLS server Finished then fails) or trips the
+//!   degenerate-share check (a selective failure). All scalars, masks, labels
+//!   and Δ are fresh per session (ChaCha12 seeded from the OS).
 
 pub mod circuits;
 

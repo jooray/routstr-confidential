@@ -19,7 +19,7 @@ authors' working documents and are not published:
 - `BENCH` — `docs/original/BENCHMARK-keyupdate.md`; current figures: paper §6.2
 - Code, cited by symbol rather than line number: `crypto/relay/src/main.rs`
   (the sidecar, N's TLS relay: `handle_setup`, the `Session` struct,
-  `canonical_suffix`, the `ClientMsg::BodySuffix` and `ClientMsg::Disclose`
+  `ChatSuffix::render`, the `ClientMsg::BodySuffix` and `ClientMsg::Disclose`
   handlers, `validate_r`, `validate_error_head`), `crypto/zkbench/src/statements.rs`
   (`build_pi_nk`, `build_pi_c2s`, `build_pi_c3s`; v1's `build_pi_c1`,
   `build_pi_n`, `build_pi_c2`, `build_pi_c3` and `main.rs` `assemble` are on
@@ -39,35 +39,41 @@ authors' working documents and are not published:
 > `K_0`, which the client never learns. The model-binding, transferability and
 > reservation arguments carry over unchanged.
 >
-> **Current state (integration branches, 2026-10-10).** GAP-1, GAP-2 and GAP-3
+> **Current state (integration branches, 2026-10-28).** GAP-1, GAP-2 and GAP-3
 > are **closed**; the prototype analysis that found them is kept in
 > Appendix C for the record.
 >
-> - **Q1, model binding.** The sidecar (N's TLS relay) builds the canonical
->   suffix from the setup values and accepts no other. It holds the record that
+> - **Q1, model binding.** The sidecar (N's TLS relay) renders the pinned
+>   suffix from the setup values and the signed offer's `chat` block
+>   (`docs/CHAT-SUFFIX.md`) and accepts no other. It holds the record that
 >   completes the body until π_C2S proves the suffix, so the provider never sees
->   a complete request with another model or cap. The disclosed usage must name
->   the setup model, checked in the sidecar and again by the node before it
->   charges.
+>   a complete request with another model or cap. The node prices the
+>   disclosed usage at the setup model's frozen rates; a usage event that
+>   spells the model otherwise is logged and passed on as `reported_model`,
+>   not charged as a breach (§1.5).
 > - **Q3, money.** There is no protocol-specific escrow. The client
 >   authenticates with its ordinary node credential (API key or Cashu token)
 >   and names the signed offer it verified. The node freezes that offer's rates
->   and reserves `max(min_request_msat, ⌈(prompt_limit·in + max_tokens·out)/1000⌉)`,
->   where `prompt_limit` is the model's full context length: the opaque prompt
->   is never discounted (and never reduced by the model's own completion
->   limit, which the pinned cap rarely reaches). It charges exactly the frozen-rate
->   cost of the π_C3S-verified usage. It releases the reservation if the provider
->   never received the complete request or refused it (less the session fee for a
->   429/503 or a 401/402/403, less the abandon fee for any other 4xx), and charges the
->   reservation for another 5xx or if the client withholds its disclosure.
+>   and reserves `max(min_request_msat, ⌈(prompt_limit·max(in, cache_write) +
+>   (max_tokens + margin)·out)/1000⌉)` plus the larger of the session fee f_s
+>   and the abandon fee f_a, where `prompt_limit` is the model's full context
+>   length (the opaque prompt is never discounted, nor reduced by the model's
+>   own completion limit, which the pinned cap rarely reaches) and `margin` is
+>   the signed `reserve_margin_tokens` (16 by default). It charges exactly the
+>   frozen-rate cost of the π_C3S-verified usage plus f_s, capped at the
+>   reservation. It releases the reservation if the provider never received the
+>   complete request (less f_a) or refused it (less f_s for a 429/503 or a
+>   401/402/403, or for a provider that answered and closed before the body
+>   was complete; less f_a for any other 4xx), and charges the reservation for
+>   another 5xx or if the client withholds its disclosure.
 > - **Q3, the prompt.** The node sees only ciphertext. π_C2S and π_C3S compare
 >   inside the circuit and reveal one bit; the client validates their
 >   parameters, so the node cannot aim them at other plaintext. On an upstream
 >   error the client discloses only the response head.
 >
 > The provider assumptions are re-checked live by
-> `crypto/tools/provider-profile-check.py` (A1–A12, 12/12 for Venice on
-> 2026-10-12). "Escrow" in SPEC and in Appendix C means what is now the node's
+> `crypto/tools/provider-profile-check.py` (A1–A13, 13/13 for Venice on
+> 2026-10-28). "Escrow" in SPEC and in Appendix C means what is now the node's
 > reservation.
 
 ---
@@ -84,12 +90,14 @@ never appear:
    (`confidential.py` `reserve`); model identity is not private between C and
    N, by design.
 2. **The request body (ciphertext to N).** The body is
-   `body_private ‖ suffix` under `c_ap_2`, a key N cannot derive (SPEC §5.5,
+   `body_private ‖ suffix` under `c_ap_1`, a key N cannot derive (SPEC §5.5,
    §6 row P2). Both `body_private` and the suffix may contain a `"model"` key.
    N never sees either in plaintext.
 3. **The public suffix (plaintext to N, proven in ZK).** The suffix is the
-   byte string `,"model":"<M>","max_tokens":<T>,…}` built by the sidecar's
-   `canonical_suffix` from the setup values. It is sent to C in `ready`, C
+   byte string `,"model":"<M>","max_tokens":<T>,…}` that the sidecar's
+   `ChatSuffix::render` builds from the setup values and the offer's `chat`
+   block (the cap keys and the fixed pins, `docs/CHAT-SUFFIX.md`); C renders
+   the same bytes from the signed offer. It is sent to C in `ready`, C
    sends it as `body_suffix`, and it is the public `expected` value of π_C2
    (`statements.rs` `Window.expected`, `build_pi_c2`).
 4. **The upstream usage event (disclosed at settlement).** Venice's final SSE
@@ -138,7 +146,7 @@ For this to work, the attacker must break **at least one** of three bindings:
   `NaN`, trailing commas and comments all yield 400s, i.e. no inference happens
   and no usage event exists (VENICE-TESTS "malformed JSON" rows;
   provider-profile A5).
-- π_C2 proves, in ZK, that the last `|suffix|` bytes of the epoch-2 plaintext
+- π_C2 proves, in ZK, that the last `|suffix|` bytes of the epoch-1 plaintext
   equal the public suffix (`build_pi_c2`). The comparison is inside the
   circuit; the verifier learns one bit. The proof anchors to the session key
   schedule, so it cannot be replayed from another session (`derive_session`,
@@ -158,12 +166,14 @@ So the effective model is always the suffix model. The question reduces to:
 - `handle_setup` stores `model` and `max_tokens` in the `Session` struct after
   checking them (non-empty model, `1 ≤ max_tokens ≤ cap`, body length in
   `[1, max_body]`); the node validates the same values before it reserves.
-- The `ClientMsg::BodySuffix` handler rebuilds `canonical_suffix(model,
-  max_tokens)` and refuses any `body_suffix` that is not byte-equal to it
-  ("body suffix does not match the canonical suffix for model/max_tokens").
-  That reconstruction is π_C2's public `expected` value. Because the suffix
-  pins `max_completion_tokens`, `n`, `stream`, `stream_options` and
-  `venice_parameters` too, the whole cost-parameter surface is bound at once.
+- `handle_setup` renders the session's pinned suffix once, with
+  `ChatSuffix::render(model, max_tokens)` over the offer's `chat` block. The
+  `ClientMsg::BodySuffix` handler refuses any `body_suffix` that is not
+  byte-equal to it ("body suffix does not match the session's pinned
+  suffix"). That suffix is π_C2's public `expected` value. Because the suffix
+  pins the offer's cap keys and fixed pins too (for Venice
+  `max_completion_tokens`, `n`, `stream`, `stream_options` and
+  `venice_parameters`), the whole cost-parameter surface is bound at once.
 - The record that completes the body is held until π_C2 verifies. A client
   that sends another suffix, or none, never gets a complete request to the
   provider: no inference, reservation released.
@@ -174,17 +184,22 @@ So the effective model is always the suffix model. The question reduces to:
 ### 1.5 Binding (iii): charged model ≡ effective model — SOUND (GAP-2 closed)
 
 - The `ClientMsg::Disclose` handler runs `validate_r` (chunk framing, the
-  `data: [DONE]` terminator, empty `choices`, the token counts and a `model`
-  field) and then refuses the disclosure unless the usage event's `model`
-  equals the setup model.
-- The node checks again in `_apply_settlement`: a usage event whose `model`
-  differs from the reserved model is charged the full reservation.
+  `data: [DONE]` terminator, empty `choices`, the token counts).
+- The usage event's `model` is not a condition. Bindings (i) and (ii) already
+  fix the effective model to the setup model, so the charged model is the
+  setup model by construction. A usage event that spells it otherwise (an
+  alias, a canonical id, a case change) is logged by the sidecar and passed
+  to the node as `reported_model`.
 - The charge uses the node's frozen rates for the setup model
-  (`frozen_cost_msats`), never a client-reported price or model.
+  (`frozen_cost_msats`), never a client-reported price or model, and never the
+  provider's spelling of it.
 
-The direct (no-node) deployment's Rust `settle()` stub still carries a default
-model string, but it runs only after the `Disclose` handler's check, and the
-node deployment (`--node-settles`) does not use it.
+Until 2026-10-28 a usage event naming another model was refused by the
+sidecar and charged the full reservation by the node. That added no binding
+(the request was already pinned) and turned a harmless change in the
+provider's spelling of a model id into a full-reservation charge. The node
+also offers a chat model confidentially only when its public id equals the
+provider's id, so the pinned suffix and the price list name the same model.
 
 ### 1.6 Remaining model-related attacks and their disposition
 
@@ -197,7 +212,7 @@ node deployment (`--node-settles`) does not use it.
 | 5 | `"n":3` for 3× output | **Sound.** Pinned `"n":1` in the suffix; Venice 500s on n>1 anyway (VENICE-TESTS). |
 | 6 | Cost-relevant `venice_parameters` (web search, system prompt) | **Sound.** The suffix sets the *whole* `venice_parameters` object; last-wins replaces it wholesale, so nothing inside can survive from the private part (tested: web search off, 16 vs 4675 prompt tokens; VENICE-TESTS). `include_venice_system_prompt:false` pins the ~1.7k-token system prompt (provider-profile A7). |
 | 7 | Reasoning tokens inflation | **Sound (bounded).** Reasoning counts toward completion tokens and is capped by the pinned token limit (tested, VENICE-TESTS `reasoning_effort` row; A6). `reasoning_effort` itself is not pinned and does not need to be, because its cost is bounded by `max_completion_tokens`. Any future parameter whose cost is *not* token-bounded (per-call fees) **would** need pinning — see §2.2 item C7. |
-| 8 | Cached-token pricing games | **Sound.** Cached tokens are *cheaper*; the reservation uses the uncached `in` rate, and settlement charges `min(cached, prompt)` tokens at `min(cached_in, in)` (`frozen_cost_msats`). |
+| 8 | Cached-token pricing games | **Sound.** Cached reads are *cheaper*; cache writes may be dearer (Venice prices them above `in`). The reservation prices the whole prompt at `max(in, cache_write)`, and settlement charges `min(cached, prompt)` tokens at `min(cached_in, in)` and at most `prompt − cached` written tokens at `cache_write` (`frozen_cost_msats`). This assumes the provider counts cache writes inside `prompt_tokens` (paper §3.1, item 11). |
 | 9 | Unknown/novel cost fields in the private part | **Sound, with maintenance burden.** Venice's strict schema 400s unknown fields (sampled: provider-profile A4, A10). The residual risk is *schema evolution*: Venice adding a new cost-relevant known field. The regression gate is the mitigation; the offer's `suffix_keys` must be extended whenever one appears. |
 | 10 | Endpoint swap to a differently-priced API | **Sound.** The request line (`POST /api/v1/chat/completions`) is inside N's head record, proven by π_N against the offer template (`build_pi_n`). The client cannot reach `/v1/responses`, embeddings, etc.; the SDK and routstrd also refuse any endpoint but chat completions before a credential is used. |
 | 11 | **Model aliases**: the requested name resolves server-side to a differently-priced backend while the usage event reports the requested name | **Unknown — testable, bounded by ops.** Venice's usage event reports the requested string. If Venice ever aliases across price tiers, settlement by the node's price list under-charges while Venice's bill is higher. Mitigation: node-side monitoring comparing realized `cost` against `price_list` per model. **Test:** for each offered model, diff Venice's `cost` against the published per-token price over a sample of requests; alert on drift. |
@@ -218,8 +233,9 @@ The model is bound at four points, and each is enforced:
    Last-wins makes the suffix the effective request. The upstream has an
    incomplete request until then, so a client that swaps the model or the cap,
    or withholds the suffix, gets no inference at all.
-4. **Settlement.** The π_C3-disclosed usage event must name the setup model
-   (sidecar `Disclose` handler; node `_apply_settlement`).
+4. **Settlement.** The π_C3-disclosed usage is priced at the setup model's
+   frozen rates (node `_apply_settlement`); the model the usage event names is
+   only logged.
 
 Evidence: the regression gate `crypto/tools/adversarial-model-swap.sh` runs an
 honest control and five attack cases against a live node and sidecar, with an
@@ -606,15 +622,15 @@ reservation priced: `(setup model, full context, max_tokens, pinned params)`.
 
 | ID | Status | One-liner | Where it is closed |
 |---|---|---|---|
-| GAP-1 | **CLOSED** | The suffix (incl. `model`) was client-supplied and not bound to the setup values | `crypto/relay/src/main.rs`: `handle_setup` stores model/max_tokens in `Session`; `BodySuffix` handler requires byte-equality with `canonical_suffix`; final body record held until π_C2 verifies. Node-side reservation in `confidential.py` `reserve`. Gate case `a-suffix-mismatch`. |
-| GAP-2 | **CLOSED** | The usage-event model was not checked against the session model | `main.rs` `Disclose` handler (usage `model` must equal the setup model); `confidential_ws.py` `_apply_settlement` (mismatch → reservation charged). |
+| GAP-1 | **CLOSED** | The suffix (incl. `model`) was client-supplied and not bound to the setup values | `crypto/relay/src/main.rs`: `handle_setup` stores model/max_tokens in `Session` and renders the pinned suffix (`ChatSuffix::render`); `BodySuffix` handler requires byte-equality with it; final body record held until π_C2 verifies. Node-side reservation in `confidential.py` `reserve`. Gate case `a-suffix-mismatch`. |
+| GAP-2 | **CLOSED** | The usage-event model was not checked against the session model | The charge never depends on it: `_apply_settlement` prices the setup model, which π_C2S binds; the sidecar's `Disclose` handler logs a differing usage model and passes it on as `reported_model` (until 2026-10-28 a mismatch was charged the reservation). |
 | GAP-3 | **CLOSED** | The `LEN`→token prompt bound broke under image token amplification | Full-context reservation (`confidential.py` `reserve`, `prompt_token_limit`); images settle as prompt tokens (A13). An operator can still restrict the offer to text-only models (`model_allowlist`, `regression-modality.py`). |
 | GAP-4 | **CLOSED** | A client could withhold or swap the suffix after the body reached the provider | `main.rs` `Body` state holds the record that completes the body until π_C2 verifies. |
 
 ## Appendix B — Citation index
 
 - Model choice & reservation: SPEC §5.0–5.1; `confidential.py` `reserve`; `main.rs` `handle_setup`
-- Suffix semantics & last-duplicate-key: SPEC §5.5; VENICE-TESTS; provider-profile A2–A5; `main.rs` `canonical_suffix`
+- Suffix semantics & last-duplicate-key: SPEC §5.5; VENICE-TESTS; provider-profile A2–A5; `main.rs` `ChatSuffix`; `docs/CHAT-SUFFIX.md`
 - π_C2S statement/public inputs: `statements.rs` `PiC2S`, `build_pi_c2s`, `gadgets.rs` `eq_bytes` (in-circuit equality); `main.rs` `BodySuffix` handler; client checks in `params.ts`
 - π_C3S, `R` validation, settlement: `statements.rs` `PiC3S`, `build_pi_c3s`; `main.rs` `Disclose` handler, `validate_r`, `validate_error_head`; `confidential_ws.py` `_apply_settlement`; `confidential.py` `settle`, `frozen_cost_msats`
 - Head template / π_NK / endpoint pinning: SPEC §5.4; `main.rs` `default_head_template_for`, `placeholder_head`; `statements.rs` `build_pi_nk`

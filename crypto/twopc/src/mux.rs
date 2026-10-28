@@ -240,8 +240,15 @@ impl FrameChan {
         if len > self.max_msg {
             return Err(std::io::Error::other("message too large"));
         }
-        let mut buf = vec![0u8; len];
-        self.io.read_exact(&mut buf).await?;
+        // The length is the peer's claim: grow the buffer only as the bytes
+        // arrive, a chunk at a time, rather than allocating it up front.
+        const RECV_CHUNK: usize = 1 << 20;
+        let mut buf = Vec::with_capacity(len.min(RECV_CHUNK));
+        while buf.len() < len {
+            let start = buf.len();
+            buf.resize(start + (len - start).min(RECV_CHUNK), 0);
+            self.io.read_exact(&mut buf[start..]).await?;
+        }
         Ok(buf)
     }
 

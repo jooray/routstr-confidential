@@ -360,9 +360,19 @@ impl ImagesEndpoint {
             if k.is_empty() || !keys.insert(k.clone()) {
                 bail!("images pin key {k:?} is empty or repeated");
             }
+            // As for the chat block: every party renders the suffix byte for
+            // byte, so keys and values keep to the shared pin grammar.
+            if !pin_key_ok(k) {
+                bail!("images pin key {k:?} is not an identifier");
+            }
         }
         if self.param_space.values().any(|v| v.is_empty()) {
             bail!("images param_space has a key with no allowed values");
+        }
+        for (k, v) in self.fixed_pins.iter().map(|(k, v)| (k, v)).chain(self.param_space.iter().flat_map(|(k, vs)| vs.iter().map(move |v| (k, v)))) {
+            if !pin_value_ok(v) {
+                bail!("images pin {k:?} has a value {v} that not every client renders the same way");
+            }
         }
         // A fixed pin only switches a provider extra off; clients refuse any
         // other value, so an offer carrying one would serve nobody.
@@ -953,6 +963,28 @@ impl RelayLog {
 // main
 // ---------------------------------------------------------------------------
 
+const HELP: &str = "\
+cu-sidecar: the node's TLS relay for confidential sessions (protocol v2)
+
+Options:
+  --listen ADDR           listen address (default 127.0.0.1:7443)
+  --upstream HOST:PORT    provider to relay to (default api.venice.ai:443, the
+                          case-study provider; set it for any other)
+  --host NAME             TLS server name to verify (default: the --upstream host)
+  --key-env VAR           environment variable holding the provider API key
+                          (default VENICE_API_KEY, the case-study provider's)
+  --offer FILE            sidecar offer file (head template, chat block, endpoints)
+  --node-settles          hand verified usage to the node to settle (production)
+  --token-env VAR         node token variable (default CU_SIDECAR_TOKEN; required
+                          off loopback)
+  --max-sessions N        concurrent sessions (default 32)
+  --max-body BYTES        request body cap (default 8388608)
+  --runs-dir DIR          session evidence directory (default crypto/runs)
+  --runs-keep-hours N     keep run files N hours (default 24; 0 = remove at the end)
+  --protocol 2            accepted for old scripts; v2 is the only protocol
+  -h, --help              this text
+";
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -963,6 +995,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{HELP}");
+        return Ok(());
+    }
     let arg = |flag: &str| {
         args.iter()
             .position(|a| a == flag)
@@ -1484,6 +1520,19 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         // record that can no longer be written, and the node
                         // would charge the full reservation for nothing.
                         if !st.c2_ok {
+                            // Tell the node first how much the upstream sent
+                            // after the credential record: a provider that
+                            // refused it from the head alone and closed is a
+                            // provider refusal, not a client abandon, and the
+                            // node can settle it as such. Bytes before the
+                            // head (session tickets) do not count.
+                            let response_bytes = st
+                                .recv_at_head
+                                .map_or(0, |at| log.recv_len.saturating_sub(at));
+                            let _ = to_client.send(Message::Text(
+                                serde_json::json!({"type":"upstream_closed_early","response_bytes":response_bytes}).to_string().into(),
+                            ));
+                            side(&mut st, format!("upstream closed early; {response_bytes} response bytes after the credential record"));
                             bail!("upstream closed the connection before the request was complete (nothing billed)");
                         }
                         let mut att_chain: Option<String> = None;
@@ -1675,6 +1724,10 @@ struct Session {
     c_commit: Option<[u8; 32]>,
     handshake: Option<HandshakeInfo>,
     hs_secrets: Option<HsSecrets>,
+    /// Upstream bytes received when the credential record was written: what
+    /// arrives after it (before the body is complete) is the provider's
+    /// early answer, not its post-handshake tickets.
+    recv_at_head: Option<usize>,
     /// The record completing the body, withheld from the upstream until π_C2S.
     held: Option<Vec<u8>>,
     /// SHA-256 of every byte written to the upstream (for the attestation).
@@ -1932,9 +1985,15 @@ async fn handle_control(
                     bail!("a usage disclosure must end the transcript (skip = {skip})");
                 }
                 let usage = validate_r(&r)?;
+                // π_C2S already proved the model the request names. The
+                // provider may report it under another spelling (an alias, a
+                // canonical id, a case change): that is logged and handed to
+                // the node, which settles at the pinned model.
                 let umodel = usage.get("model").and_then(|m| m.as_str()).unwrap_or("");
                 if umodel != st.model {
-                    bail!("usage event model {umodel:?} != pinned model {:?}", st.model);
+                    warn!(reported = umodel, pinned = %st.model, "usage event model differs from the pinned model");
+                    let note = format!("usage event model {umodel:?} differs from pinned model {:?}", st.model);
+                    side(st, note);
                 }
                 usage
             };
@@ -2164,6 +2223,7 @@ async fn write_head(
     st.sent.update(&out);
     let (len, commit) = (a.record.len(), hex::encode(a.c_commit));
     st.state = SessionState::Body;
+    st.recv_at_head = Some(log.recv_len);
     info!(record_len = len, "credential record + KeyUpdate written to upstream");
     side(st, format!("credential_written len={len} c_commit={commit}"));
     let _ = to_client.send(Message::Text(serde_json::json!({"type":"head_written"}).to_string().into()));
@@ -2256,7 +2316,7 @@ async fn v2_progress(
     if st.assembled.is_some() {
         return Ok(());
     }
-    let Some((ch, sh)) = tls_v2::hellos(&log.client_raw, &log.server_raw) else { return Ok(()) };
+    let Some((ch, sh)) = tls_v2::hellos(&log.client_raw, &log.server_raw)? else { return Ok(()) };
     if !st.ch_checked {
         return Ok(());
     }
@@ -2661,7 +2721,11 @@ fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
             .position(|w| w == b"\r\n")
             .ok_or_else(|| anyhow!("R: missing chunk-size CRLF"))?;
         let line = std::str::from_utf8(&r[off..off + nl]).context("R: chunk size not utf8")?;
-        let len = usize::from_str_radix(line.trim(), 16)
+        // Exactly `1*HEXDIG CRLF`: no whitespace, sign or chunk extension.
+        if line.is_empty() || line.len() > 16 || !line.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("R: bad chunk size {line:?}");
+        }
+        let len = usize::from_str_radix(line, 16)
             .with_context(|| format!("R: bad chunk size {line:?}"))?;
         off += nl + 2;
         if len == 0 {
@@ -2721,12 +2785,18 @@ fn emit_settlement(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::Unbo
     let Some(usage) = st.usage.clone() else { return };
     if app.node_settles {
         // The node holds the wallet and the Nostr key: it prices, refunds
-        // and signs. An image usage carries the pinned model; a chat usage
-        // event names its own (checked against the setup's).
-        let model = if st.images_count.is_some() {
-            st.model.clone()
+        // and signs. The model is always the pinned one (π_C2S proved the
+        // request names it); a chat usage event that reports another
+        // spelling is passed along as `reported_model`.
+        let model = st.model.clone();
+        let reported_model = if st.images_count.is_some() {
+            None
         } else {
-            usage.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string()
+            usage
+                .get("model")
+                .and_then(|m| m.as_str())
+                .filter(|m| *m != model)
+                .map(str::to_string)
         };
         // An accepted image session is charged flat; its error head (like a
         // chat one) is handed over as verified by π_C3S.
@@ -2734,14 +2804,16 @@ fn emit_settlement(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::Unbo
             (true, Some(count)) => serde_json::json!({"flat": true, "kind": "images", "count": count}),
             _ => usage,
         };
-        let _ = to_client.send(Message::Text(
-            serde_json::json!({
-                "type":"usage",
-                "sid": st.sid,
-                "model": model,
-                "usage": usage,
-            }).to_string().into(),
-        ));
+        let mut msg = serde_json::json!({
+            "type":"usage",
+            "sid": st.sid,
+            "model": model,
+            "usage": usage,
+        });
+        if let Some(rm) = reported_model {
+            msg["reported_model"] = serde_json::Value::String(rm);
+        }
+        let _ = to_client.send(Message::Text(msg.to_string().into()));
         side(st, "usage handed to the node to settle".into());
         st.state = SessionState::Settled;
     } else if let Some(receipt) = settle(app, st) {
@@ -2771,11 +2843,7 @@ fn settle(app: &Arc<AppState>, st: &Session) -> Option<serde_json::Value> {
         .pointer("/cost/usd")
         .and_then(|c| c.as_f64())
         .unwrap_or(0.0);
-    let model = usage
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or(&st.model)
-        .to_string();
+    let model = st.model.clone();
     let receipt = serde_json::json!({
         "sid": sid,
         "usage": usage,
@@ -2971,6 +3039,20 @@ mod disclosure_tests {
         assert!(validate_r(&chunked(&format!("x\n\ndata: {usage}\n\ndata: [DONE]\n\n"))).is_ok());
         // "data: " inside a line is not an event start.
         assert!(validate_r(&chunked(&format!("xdata: {usage}\n\ndata: [DONE]\n\n"))).is_err());
+    }
+
+    #[test]
+    fn chunk_size_lines_are_bare_hex() {
+        let usage = r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2},"model":"m"}"#;
+        let body = format!("data: {usage}\n\ndata: [DONE]\n\n");
+        let n = body.len();
+        assert!(validate_r(format!("{n:X}\r\n{body}\r\n0\r\n\r\n").as_bytes()).is_ok());
+        for size in [format!("+{n:x}"), format!(" {n:x}"), format!("{n:x} "), format!("{n:x};ext=1"), format!("\t{n:x}"), String::new()] {
+            let r = format!("{size}\r\n{body}\r\n0\r\n\r\n");
+            assert!(validate_r(r.as_bytes()).is_err(), "accepted chunk size {size:?}");
+        }
+        let r = format!("{n:x}\r\n{body}\r\n+0\r\n\r\n");
+        assert!(validate_r(r.as_bytes()).is_err());
     }
 }
 
@@ -3381,6 +3463,27 @@ mod hardening_tests {
             ep.fixed_pins.push((k.into(), serde_json::json!(false)));
             assert!(ep.validate("api.venice.ai", 42).is_err(), "fixed pin {k}");
         }
+    }
+
+    #[test]
+    fn an_images_block_outside_the_pin_grammar_is_refused() {
+        let mut ep = venice_images();
+        ep.count_key = "n-images".into();
+        assert!(ep.validate("api.venice.ai", 42).is_err());
+        let mut ep = venice_images();
+        ep.param_space.insert("cfg scale".into(), vec![serde_json::json!(1)]);
+        assert!(ep.validate("api.venice.ai", 42).is_err());
+        for bad in [serde_json::json!(1.0), serde_json::json!(0.5), serde_json::json!("a\"b"), serde_json::json!(null), serde_json::json!(1u64 << 53)] {
+            let mut ep = venice_images();
+            ep.param_space.insert("cfg_scale".into(), vec![serde_json::json!(1), bad.clone()]);
+            assert!(ep.validate("api.venice.ai", 42).is_err(), "param value {bad}");
+        }
+        let mut ep = venice_images();
+        ep.fixed_pins.push(("bad key".into(), serde_json::json!(false)));
+        assert!(ep.validate("api.venice.ai", 42).is_err());
+        let mut ep = venice_images();
+        ep.param_space.insert("cfg_scale".into(), vec![serde_json::json!(1), serde_json::json!(7)]);
+        assert!(ep.validate("api.venice.ai", 42).is_ok());
     }
 
     fn setup(kind: Option<&str>, extra: serde_json::Value) -> serde_json::Value {

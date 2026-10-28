@@ -231,8 +231,11 @@ on both sides and restart both.
 
 **Denial-of-service limit.** The node refuses a new confidential session (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
-unused sessions. A session counts as unused from the moment the node accepts its WebSocket, before the setup
-frame arrives, until the credential record is written (or the session ends). Pre-warmed sessions count. The limit is
+unused sessions. A session counts as unused from the moment its setup is reserved until the credential record
+is written (or the session ends). Pre-warmed sessions count. Connections that have not reserved yet (waiting for
+the setup frame, which must come within 10 s and be at most 256 KiB, or with the reservation in progress) are a
+separate pending pool: at most 4 per address (IPv6 grouped by /64) and 1024 in all; when either is full, the
+oldest connection still waiting for its setup is evicted. The limit is
 only as good as the node's idea of the client address, which depends on how the node is reached:
 
 | Deployment | What to set | Result |
@@ -259,7 +262,7 @@ default, let the node charge for that:
 | Setting | Effect |
 |---|---|
 | `CONFIDENTIAL_RATE_SURCHARGE_PCT` | percentage added to the per-token rates of confidential sessions (the signed offer lists the surcharged rates) |
-| `CONFIDENTIAL_SESSION_FEE_MSAT` | flat fee added to every completed request; also charged when the provider is limiting or at capacity (429/503) or refuses the node's own key or account (401/402/403), since the request reached it; any other 4xx is charged the abandon fee |
+| `CONFIDENTIAL_SESSION_FEE_MSAT` | flat fee added to every completed request; also charged when the provider is limiting or at capacity (429/503) or refuses the node's own key or account (401/402/403), or answers and closes before the request body is complete, since the request reached it; any other 4xx is charged the abandon fee |
 | `CONFIDENTIAL_ABANDON_FEE_MSAT` | charged instead when a session the sidecar accepted ends without a request reaching the provider (armed but never used, aborted, client gone); at least the session fee, and equal to it when unset. Reserved at setup |
 
 The abandon fee is the anti-DoS mechanism: together with the per-address limit above, every unused session
@@ -303,7 +306,8 @@ of a few minutes). Run the node's server with a long WebSocket ping timeout, e.g
 `uvicorn routstr:fastapi_app --host 0.0.0.0 --port 8000 --proxy-headers --ws-ping-interval 20
 --ws-ping-timeout 300` instead of the image's default `fastapi run routstr`: while ~22 MB of 2PC data is on
 its way to a client on a slow link, the keepalive waits behind it, and the default 20 s timeout drops the
-session.
+session. uvicorn's `--ws-max-size` (default 16 MiB) bounds each frame a client can send before it is
+authenticated; do not set it below 12 MiB, since a client may send a whole 8 MiB request body in one frame.
 
 **3. Check it.**
 

@@ -3,7 +3,7 @@ title: "Confidential and verifiable upstream inference over standard TLS 1.3"
 subtitle: "A no-trusted-hardware protocol for LLM routing nodes"
 author: '`Juraj Bednar \href{mailto:juraj@bednar.io}{<juraj@bednar.io>}\\[0.5em]\small Coauthors: Claude Opus 5.5, Claude Sonnet 5.5, Kimi K3,\\ \small DeepSeek V4.1 Flash, GPT-6 Astra, GLM-5.3 Flash`{=latex}'
 author-meta: "Juraj Bednar, with Claude Opus 5.5, Claude Sonnet 5.5, Kimi K3, DeepSeek V4.1 Flash, GPT-6 Astra, GLM-5.3 Flash"
-date: "2026-10-19"
+date: "2026-10-28"
 abstract: |
   LLM routing nodes forward user requests to upstream providers with the node's own API key, so users
   must trust the node with their prompts, and the node must keep its key from its users. Enclave-based
@@ -69,8 +69,9 @@ covers only the key schedule, a fixed workload of 31 SHA-256 compressions, never
    response run under keys only the client holds. The handshake key schedule runs as a two-party
    computation secure against a malicious peer, in which only the node garbles and the client checks
    every gate against masks the node has authenticated to it. Neither party ever reveals its inputs;
-   a cheating node can learn at most $\log_2 6 \approx 2.6$ bits per session about values used only in
-   that session, and the client uploads 1.2 MB (section 4.4).
+   a cheating node can learn at most $\log_2 7 \approx 2.8$ bits per session about values used only in
+   that session, provided the semi-honest share conversion at its start gives it nothing beyond its
+   outcome, and the client uploads 1.2 MB (section 4.4).
 2. A request-integrity construction: the client proves that its request body ends in an agreed public
    JSON suffix that pins every cost-relevant parameter, and the provider sees the complete request only
    after the proof verifies (section 4.6). The node proves that its hidden record matches a published
@@ -105,7 +106,7 @@ Goals:
 |--|------------------------------|
 | P1 | Credential confidentiality: only N knows the upstream API key. C learns nothing about it even if it sees every byte N sends to U. |
 | P2 | Content confidentiality: only C (and U) can read the prompt and the response. N sees ciphertext plus the public billing data: the usage event, or on an upstream error the response head. |
-| P3 | Integrity: C can verify that the request U received is C's own content behind the agreed public template content (not its exact wire bytes, residual risk 1), and that the response is exactly what U sent (tool calls included). |
+| P3 | Integrity: C can verify that the request U received is C's own content behind the agreed public template content (not its exact wire bytes: N's epoch-0 records can still change how U processes that content, residual risk 1), and that the response is exactly what U sent (tool calls included). |
 | P4 | Verifiable accounting: the charge is computed from the token usage the upstream itself reported in the session, verified by N (who settles) and by C (who checks the signed receipt against its own plaintext). |
 | P5 | Upstream authenticity: both parties verify that the session terminates at a server holding a valid certificate for the upstream hostname. |
 | P6 | Freshness: every session is live and bound to one payment; nothing can be reused across sessions. |
@@ -149,7 +150,8 @@ The protocol is defined for any upstream satisfying:
    system prompt. The provider must reject any other price-changing field. The size of the prompt
    needs no bound, because the node reserves for a full context window (section 4.6).
 7. **A streaming (or terminal) usage event** carrying input/output token counts and, ideally, a
-   provider-computed cost figure, emitted before the response ends.
+   provider-computed cost figure, emitted before the response ends. The shape the current parser
+   expects is item 11.
 8. **No reflection of the request head into the response.** C reads the response, so a provider that
    echoed the `Authorization` header (for example in an error body) would hand C the key.
 9. **Event framing the usage parser expects.** The streamed events use LF line endings only (no CR
@@ -165,16 +167,41 @@ The protocol is defined for any upstream satisfying:
     `Connection: close`, `Content-Length`), and an image request's fixed pins may only switch a provider
     extra off, so N cannot pick a path, header or pin that turns such a feature on. What this item covers
     is the provider's own behaviour on those requests.
+11. **Usage event shape.** These are properties of the case-study provider that the current parser (N's
+    relay and the clients) relies on; a provider without them needs a code change, not a new offer. The
+    response body uses HTTP chunked transfer encoding (R carries the chunk framing). The usage is a
+    separate final event with an empty `choices` array, directly before `data: [DONE]`, with integer
+    `prompt_tokens` and `completion_tokens`. `prompt_tokens` counts every input token, including those
+    read from and those written to the provider's prompt cache: the charge (section 4.8) bills cached
+    and written tokens as parts of the prompt count, so a provider that reported cache writes outside it
+    would be under-billed. The case-study provider's event names the model, but the parser does not need
+the name, nor that it equal the pinned id:
+    $\pi_{C2S}$ already proved that the request names the pinned model, so N settles at that model's
+    frozen rates, and N's relay logs a different reported name and passes it to N.
+12. **Nothing outside the body changes its processing.** No request header or endpoint outside the
+    template changes how U processes the body: routes it to another model or backend, adds a system
+    prompt, changes moderation, caching or retention. N can write a head of its own choosing in epoch 0
+    without C seeing it (residual risk 1), so this item bounds what such a head can do to C's request.
 
 Items (5) and (6) quantify over every field and input, which no finite test can establish. For the
-case-study provider (Appendix A) a live regression gate tests items 1 to 7 and 9 with sampled cases; the
-requirements hold as far as those samples show, and the gate is re-run after provider changes. Item 8
-is a property of the provider's error handling that the gate does not test, and item 10 is a property of
-the provider's account and API design that no request can test; for the case-study provider we found no
-such retrieval or forwarding in its published API on the two routes used. Everything except the
-specifics of items 4 to 7 and 9 is provider-generic: the epoch structure, the 2PC, the proofs and the record
+case-study provider (Appendix A) a live regression gate tests items 1 to 7 and 9 with sampled cases, and
+of item 11 the separate usage event with empty `choices`, its model and the terminator (check A7); the
+requirements hold as far as those samples show, and the gate is re-run after provider changes. The
+chunked encoding is not gated (a response without it cannot be disclosed, so the session fails
+closed), and neither is the cache accounting of item 11. Item 8
+is a property of the provider's error handling that the gate does not test, and items 10 and 12 are
+properties of the provider's account and API design that no request can test; for the case-study
+provider we found no such retrieval or forwarding (item 10) in its published API on the two routes
+used, and we have not established item 12 for it. Everything except the
+specifics of items 4 to 7, 9 and 11 is provider-generic: the epoch structure, the 2PC, the proofs and the record
 assembly do not change per provider; the head template, the pinned suffix, the price list and the usage
-parser do. In the current implementation the head template, the pinned suffix and the price list come
+parser do. The head template has fixed constraints too: N's relay and the clients accept only
+`Authorization: Bearer {KEY}` and exactly the six headers of item 10, and $\pi_{NK}$ fixes the key
+alphabet to `[A-Za-z0-9_-]`, so a provider that authenticates otherwise (another header, a query
+parameter, a key with other characters) needs a code change. The relay's defaults (upstream
+`api.venice.ai:443`, the key in `VENICE_API_KEY`, a built-in template on the `/api/v1` path) are the
+case-study provider's; another provider sets them in the relay's flags and offer file. In the current
+implementation the head template, the pinned suffix and the price list come
 from the signed offer (section 4.6); the usage parser expects an OpenAI-style streamed usage event, so a
 provider with the same streaming shape is a new sidecar offer file plus a profile run, and one with
 another usage format still needs a code change in the relay and the clients. Image generation (section
@@ -184,7 +211,7 @@ shapes the clients parse) is a new offer entry; a provider priced per megapixel,
 parameters, or answering in another shape still needs code in the node and the clients.
 
 **The image route.** Image generation uses a second route of the same provider, which must satisfy items
-1 to 5, 8 and 10 on its own: the transport (TLS 1.3, the one suite, P-256, a client KeyUpdate mid-request),
+1 to 5, 8, 10 and 12 on its own: the transport (TLS 1.3, the one suite, P-256, a client KeyUpdate mid-request),
 no processing before the complete body, a JSON parser that keeps the last duplicate key, replaces
 arrays, rejects unknown fields and malformed JSON, and no reflection of the request head. Items 6 and 7
 change form. The price of an image is a function of request parameters only (model, count, resolution
@@ -284,7 +311,8 @@ record key. Neither $K_0$ nor $IV_0$ yields $c_{ap,0}$. U sees an ordinary TLS c
 | 1 | $c_{ap,1}$ | C | the JSON request body; its final record is the public suffix, released to U by N only after $\pi_{C2S}$ |
 | Response | $s_{ap,0}$ | U | streamed response; N relays ciphertext |
 
-C writes nothing in epoch 0 and starts epoch 1 at sequence 0. N writes exactly two records, atomically.
+C writes nothing in epoch 0 and starts epoch 1 at sequence 0. An honest N writes exactly two records, atomically
+(a dishonest one can write more, residual risk 1).
 U processes epoch 0 as an ordinary client's first records followed by a KeyUpdate, and decrypts
 everything after it under $c_{ap,1}$.
 
@@ -383,24 +411,34 @@ Online, each phase takes about 1.5 round trips and 33 to 49 ms of computation.
 product or an opened bit, corrupt check rows, or run the oblivious transfer for C's inputs with a wrong
 correlation. Each of these either fails the product check, the openings, the pointer checks or the
 consistency check, or leaves C's outputs correct (section 5). What N can still do is make an abort depend
-on C's private values (selective failure). In each phase it observes one of three outcomes (C aborted,
-C's output labels were rejected, success), the session ends at the first failure, and a deviation in
-ECtF (below) shows as one more outcome, an abort between the phases when the server Finished fails, so
-there are at most six outcomes per session: N learns at most $\log_2 6 \approx 2.6$ bits. A cheating C, the
+on C's private values (selective failure). N can corrupt the check row of any wire, not only of C's input
+wires, so the abort can be any predicate of C's inputs and of the circuit's internal wire values, which
+in phase B include C's own secrets $s_{ap,0}$ and $c_{ap,1}$. In each phase N observes one of three
+outcomes (C aborted, C's output labels were rejected, success), and the session ends at the first
+failure. ECtF (below) adds two more: C's degenerate-share check (C aborts if its multiplicative share
+of $x_2 - x_1$ is zero, which a deviating N may be able to make depend on C's input), and an abort
+between the phases when a shifted Z makes the server Finished fail. So there are at most seven outcomes
+per session, and N learns at most $\log_2 7 \approx 2.8$ bits, provided ECtF reveals nothing beyond
+them (below). A cheating C, the
 evaluator, sees the tables, its active labels, uniformly random pointer bits, the opened masks of values
 it already knows or decodes (its inputs, the public transcript hash, its outputs), check rows padded by
 hashes of labels it does not hold, and $Y_N$, which it can compute itself. It learns nothing beyond its
 outputs and can only choose its own inputs, as in any 2PC. A party that feeds different MS shares or
 masks to phase B than phase A gave it only obtains keys nobody knows, which U rejects. ECtF uses
-semi-honest conversions; a deviation there only shifts Z, which the server Finished check catches. N
-can make that shift depend on C's share, which is the sixth outcome counted above.
+`mpz2`'s OLE-based A2M and M2A, which are secure against semi-honest parties only. We do not argue that
+they stay private against a malicious N (for example, that N's own OLE messages cannot extract more
+about C's share than an abort shows); the bound above is conditional on that. Within that assumption, a
+deviation there either shifts Z, which the server Finished check catches, or trips the degenerate-share
+check, and N can make either depend on C's share: the two ECtF outcomes counted above.
 
-**Why the leakage cannot accumulate.** The bits N can learn are about C's inputs to that session: its
-ECDHE scalar share, its MS share and its masks. The protocol keeps one invariant: **no 2PC input and no
+**Why the leakage cannot accumulate.** The bits N can learn are about that session's values: C's ECDHE
+scalar share, its MS share and its masks, and the key schedule's internal wires, including C's traffic
+secrets $s_{ap,0}$ and $c_{ap,1}$. The protocol keeps one invariant: **no 2PC input and no
 garbling key is ever reused across sessions.** Scalars, shares, masks, labels, $\Delta_A$, $\Delta_B$,
 the MAC keys and the salt are all drawn fresh for each session and used once, and an aborted session is
-discarded. Bits leaked in different sessions are therefore about independent values and never add up to
-any secret. The API key is never an input to the 2PC: it exists only in N's epoch-0 record.
+discarded; the traffic secrets are fresh because the ECDHE secret is. Bits leaked in different sessions
+are therefore about independent values and never add up to any secret, and 2.8 bits of a 256-bit
+traffic secret leave it out of reach within the session. The API key is never an input to the 2PC: it exists only in N's epoch-0 record.
 
 **Inputs are never opened.** Every private input enters only as a garbled input or an OLE input, and
 nothing is revealed after the session. This distinguishes the construction from 2PC-TLS designs in which
@@ -451,8 +489,14 @@ model and the token cap declared at setup, and accepts no other; C renders the s
 signed offer. Because N chooses the description, C accepts it only within a narrow policy: the cap keys
 are among `max_tokens`, `max_completion_tokens` and `max_output_tokens`; `stream` is pinned on with
 usage reporting (the usage proof needs it) and `n` to 1; every other pin switches something off
-(`false`, `"off"`, an empty list, or an object of those); values are booleans, integers, plain ASCII
-strings, lists and objects, rendered as compact JSON with sorted members. A pin cannot inject content
+(`false`, `"off"`, an empty list, or an object of those); no pin key may start with a negation such as
+`disable` or `no_` (where `false` turns a feature on) or name a protection such as `safe`, `moderat` or
+`filter` (pinning it could only switch the protection off); values are booleans, integers, plain ASCII
+strings, lists and objects, rendered as compact JSON with sorted members. The "switches something off"
+rule is a heuristic over key names and values, not a guarantee: whether `false` turns a feature off
+depends on the provider's semantics, and a key whose name inverts its meaning without one of the listed
+prefixes (`logging_opt_out: false`, say) would pass it. The policy narrows what a dishonest offer can
+pin; the client's user still has to trust the provider's documented meaning of each pinned key. A pin cannot inject content
 into C's request: a key the offer pins that C's caller also set to another value makes C refuse the
 request instead of letting the suffix silently replace it. The provider resolves the effective values
 to the suffix (section 3.1, item 5).
@@ -460,8 +504,8 @@ to the suffix (section 3.1, item 5).
 C sends the suffix as its own final record. N forwards the earlier body records but **holds the record
 that completes the body** until $\pi_{C2S}$ verifies. N enforces that the epoch-1 plaintext is exactly
 $|body|$ bytes, so that record is identifiable. Until it is released U has an incomplete request and does
-nothing (section 3.1, item 4). If the proof fails, N closes the connection: no inference ran and nothing
-is billed. A client therefore cannot run a different model or a larger cap than N reserved for.
+nothing (section 3.1, item 4). If the proof fails, N closes the connection: no inference ran, and the
+reservation is released (less the abandon fee $f_a$, if N charges one, section 4.8). A client therefore cannot run a different model or a larger cap than N reserved for.
 
 **$\pi_{C2S}$ (C to N, before U can start).**
 
@@ -492,8 +536,8 @@ in the signed offer as `reserve_margin_tokens` so C can size its balance). The m
 provider may bill a few tokens beyond the cap (Appendix A) and the charge is capped at the reservation;
 it only enlarges the hold, and the charge is still the reported usage. Overshoot beyond $M$ is N's loss.
 (Two node configurations fall outside this formula: a model without a known context length is reserved at
-its maximum per-request cost plus the margin, and a node with fixed per-request pricing reserves that
-price.) $L$ must be the whole context, not the context minus the model's own completion
+its maximum per-request cost plus the margin, and a node with fixed per-request pricing does not offer
+confidential mode at all, since a usage-based charge has no meaning there.) $L$ must be the whole context, not the context minus the model's own completion
 limit: the pinned cap $T$ is usually far below that limit, the provider accepts a prompt of up to
 $L - T$ tokens, and since the charge is capped at the reservation, any prompt tokens beyond the
 reserved bound would be free. For the case study, `deepseek-v4-flash` (a 1M-token context) with $T$ = 40
@@ -549,8 +593,10 @@ Confidential sessions use the node's ordinary billing; nothing about money is sp
    and freezes that offer's per-model
    rates for the session; an unknown or expired offer is refused (HTTP 409) and C refetches it. N
    reserves on the credential (section 4.6) before any connection to U is opened.
-2. **Charge.** N's relay parses R (dechunk, take the usage event and the terminal marker) and requires
-   the event's model to equal the setup model; N requires it again before charging. N charges exactly
+2. **Charge.** N's relay parses R (dechunk, take the usage event and the terminal marker). The event's
+   model is not a condition: $\pi_{C2S}$ proved that the request names the pinned model, so N prices the
+   usage at the pinned model's frozen rates, and a usage event that spells the model otherwise (an alias,
+   another case) is logged by N's relay and passed to N, not charged as a breach. N charges exactly
    the usage at the frozen rates,
    $\lceil (r_{in}(p - c - w) + r_{cached}\, c + r_{write}\, w + r_{out} \cdot o) / 1000 \rceil$ msat for
    $p$ prompt tokens of which $c \le p$ cached and $w \le p - c$ written to the provider's prompt cache,
@@ -603,7 +649,8 @@ rejected, is charged $f_a$: N did the 2PC
 for a request that could not run, and without the fee an invalid body would buy N's 2PC and a share of
 the provider key's rate limit for free. A session that N's relay accepted
 but that ends without a complete request reaching U (armed and never used, aborted, C gone) is charged
-$f_a$ instead of nothing. N cannot tell a pre-warmed session from a cold one and does not need to. With
+$f_a$ instead of nothing, unless U refused it first: when U sent response bytes and closed the
+connection before N released the final body record, the session is charged only $f_s$. N cannot tell a pre-warmed session from a cold one and does not need to. With
 the per-address limit on unused sessions this bounds what an idle or hostile client can make N do: each
 unused session costs its holder $f_a$. Both fees are 0 by default, and then the protocol is exactly as
 described above.
@@ -614,10 +661,18 @@ described above.
 |---|---|
 | Any 2PC check fails, the ClientHello is rejected, or the handshake does not verify | session discarded before anything is written under $K_0$; reservation released (less the abandon fee $f_a$, if N charges one) |
 | Abort before N releases the final body record (including a failed $\pi_{C2S}$, or an armed session never used) | U never received a complete request; reservation released (less $f_a$) |
+| U sent response bytes and closed the connection before the final body record was released (a refusal) | reservation released (less the session fee $f_s$) |
 | Usage disclosed | charged per section 4.8 |
 | U returned a 429, 503, 401, 402 or 403 (disclosed) | reservation released (less the session fee $f_s$) |
 | U returned another 4xx (disclosed) | reservation released (less the abandon fee $f_a$) |
 | Released, no usage disclosed (or another 5xx) | full reservation charged; C keeps its transcript and attestation |
+
+After the release U may already be running the request, so the clients never retry a node error that
+comes after it on another node (that could run and bill the request twice), and a caller that cancels
+after the release does not cut the session: the client lets it finish in the background and settle on
+the reported usage instead of leaving N to charge the reservation. When N's own session limit ends a
+session, N first reads the relay's last frames, so a disclosure the relay has already verified is still
+settled on usage.
 
 ## 4.10 Image generation
 
@@ -695,8 +750,9 @@ U are not compromised.
 only to C, masked with C's mask. N's outputs ($c_{hs}$, $s_{hs}$, $K_0$, $IV_0$, the anchors) are not
 ancestors of either. A cheating N that garbles a wrong circuit, for example one that outputs C's keys in
 a form N can read, is caught by C's consistency check before C uses any key, except with probability
-about $2^{-62}$ per session (below), and learns at most $\log_2 6 \approx 2.6$ bits about C's fresh,
-single-use inputs. The proofs that decrypt under C's keys ($\pi_{C2S}$, $\pi_{C3S}$) output one
+about $2^{-62}$ per session (below), and learns at most $\log_2 7 \approx 2.8$ bits about C's fresh,
+single-use inputs and the session's internal wires (with ECtF's semi-honest conversion as a stated
+assumption, section 4.4). The proofs that decrypt under C's keys ($\pi_{C2S}$, $\pi_{C3S}$) output one
 equality bit, on parameters C has checked against its own records, so N cannot use them as a decryption
 oracle. What N learns in plaintext is public by design: the suffix, the usage event, or on an error the
 response head.
@@ -756,11 +812,15 @@ salt are fresh per session.
 
 1. *N controls epoch 0.* N holds $K_0$, so it can write any number of records in epoch 0, not only the
    proven head, and $\pi_{NK}$ binds the head's content, not the bytes N writes. N could, for example,
-   use another account or endpoint, or add a header that enables provider-side retention. C cannot see
-   N's wire bytes and cannot detect this. The effect is bounded: epoch 0 carries none of C's data, C's
-   own records stay authenticated under $c_{ap,1}$, the response is readable only by C, and a broken
-   request shows up as a failed response. A node could always choose to misuse its own account; what
-   the protocol guarantees is that it cannot read or alter C's content in transit. Whether the provider
+   use another account or endpoint, or add a header that enables provider-side retention. Such a head
+   can also change how U processes C's body wherever the provider offers a header or endpoint that does
+   so: route it to another backend, add a system prompt, change moderation or caching (profile item 12).
+   C cannot see N's wire bytes and cannot detect this. The effect is bounded: epoch 0 carries none of
+   C's data, C's own records stay authenticated under $c_{ap,1}$, the suffix still sets the parameters
+   that are in the body, the response is readable only by C, and a broken request shows up as a failed
+   response. A node could always choose to misuse its own account; what
+   the protocol guarantees is that it cannot read or alter C's content in transit; how U treats that
+   content rests on profile items 10 and 12. Whether the provider
    keeps a copy that the account owner can read, or forwards content on its behalf, is profile item 10,
    not something the protocol can rule out.
 2. *The 2PC is a new, unpublished variant.* The garbler-only authenticated garbling, its consistency
@@ -770,12 +830,15 @@ salt are fresh per session.
    evaluator's matrices taken from a public reimplementation, and it is checked exhaustively for
    correctness. Correctness does not depend on those matrices but the privacy argument does, so they
    must be checked against Rosulek and Roy's paper. The MAC layer assumes that `mpz2`'s Ferret and KOS
-   are secure against a malicious receiver (here N). ECtF is semi-honest, as in TLSNotary. The
+   are secure against a malicious receiver (here N). ECtF is semi-honest, as in TLSNotary, and the
+   leakage bound of risk 3 assumes that it gives a malicious N nothing beyond its outcome. The
    dual-execution version (section 6.6) rests on a simpler, better-studied construction, and the
    single-party variant (section 7) avoids the 2PC altogether.
-3. *Selective failure.* Each 2PC session can leak at most $\log_2 6 \approx 2.6$ bits about the client's
-   ECDHE share, MS share and masks through the abort pattern. No 2PC input or garbling key is reused
-   across sessions, so the bits never accumulate on any secret, and the API key is not a 2PC input. A node
+3. *Selective failure.* Each 2PC session can leak at most $\log_2 7 \approx 2.8$ bits through the abort
+   pattern: N chooses the predicate, which can be any function of the client's private inputs (ECDHE
+   share, MS share, masks) and of the circuit's internal wires, including $s_{ap,0}$ and $c_{ap,1}$. The
+   bound assumes ECtF leaks nothing beyond its outcome (risk 2). No 2PC input, garbling key or traffic
+   secret is reused across sessions, so the bits never accumulate on any secret, and the API key is not a 2PC input. A node
    that aborts sessions on purpose is visible to its clients.
 4. *P-256.* The key exchange uses P-256, as most TLS clients still offer; X25519 cannot be used with an
    additive joint share.
@@ -786,14 +849,18 @@ salt are fresh per session.
    exposure; compared with "ciphertext only", it is more than volume and timing. The prompt side can
    be padded inside the JSON body; the response side needs provider-side padding or batching.
 6. *DoS and limits.* The node and its relay validate the setup and reserve before opening any connection
-   to U, bound concurrent sessions (32), the time to setup (15 s), the session lifetime (600 s from the
-   node's WebSocket accept), the 2PC
+   to U, bound concurrent sessions (32), the time to setup (10 s at the node, 15 s at the relay), the
+   setup frame (256 KiB at the node), the session lifetime (600 s from the node's WebSocket accept until
+   the final body record is released, then a fresh 600 s for the response and the disclosure), the 2PC
    (180 s) and the body (8 MiB); before the credential record is written the relay buffers no more of
    C's bytes than the declared body needs, and C cannot make N preallocate more proof-channel
    correlations than N asks for itself. The 2PC's preprocessing makes a session expensive for N (about 22 MB of
    upload and 0.5 s of CPU each), which a reservation per session limits, but per-client limits must also
-   bound it; the node refuses new sessions from a client address with twelve unused ones (connected but
-   with no credential record written yet).
+   bound it. The node counts a session as unused from its reservation until the credential record is
+   written, and refuses a new one from a client address that holds twelve; connections that have not
+   reserved yet (no setup, or its reservation in progress) are a separate pool of 4 per address (IPv6
+   grouped by /64) and 1024 in total, where the oldest connection still waiting for its setup is evicted
+   first.
 7. *Error metadata.* On an upstream error N learns the status line, the response headers and the body
    length, but not the body.
 8. *Endpoint hygiene.* Keys live in C's process; N holds the API key in memory. C's certificate
@@ -1111,7 +1178,7 @@ It worked and was deployed, but each party had to garble 656,179 AND gates and s
 background upload for every pre-warmed session. Node-only garbling removes that upload. Dual execution
 remains a sound alternative: it is simpler, it rests on better-studied constructions (half-gates
 garbling and the dual-execution equality check), it leaks less (about 1.6 bits per session against
-about 2.6), it is faster on fast symmetric links, and it needs no Ferret. It is kept as the tag
+about 2.8), it is faster on fast symmetric links, and it needs no Ferret. It is kept as the tag
 `v2-symmetric` in the three repositories (routstr-confidential `0876b5e`, routstr-core `dd9e51a5`,
 routstr-sdk `b5d16f0`).
 
@@ -1181,8 +1248,9 @@ else stays the deployment's own code. Negotiation is per request and stateless:
 4. **Billing** is the node's ordinary billing (section 4.8). The client's credential, reservation,
    settlement, balance and refunds are the existing ones. In the reference integration the node adds a
    WebSocket route and an offer; the client SDK adds one transport branch beside its other transports,
-   so credential acquisition, top-ups, failover and balance accounting are unchanged; the daemon adds a
-   configuration block and passes the opt-in through.
+   so credential acquisition, top-ups, failover and balance accounting are unchanged, except that a node
+   error after the final body record is released is not retried on another node (section 4.9); the
+   daemon adds a configuration block and passes the opt-in through.
 5. **Response.** The client streams the decrypted body to the application as records arrive, or folds the
    stream into one completion object if the caller did not ask for streaming (the pinned suffix always
    requests streaming, because the usage event only exists there). Checks that complete after the
@@ -1207,11 +1275,16 @@ being used. We therefore layer several limits, from free and always on to priced
    it contacts the relay; the relay validates the setup before it starts the 2PC. A client without funds
    gets no garbled circuit.
 3. **Global and per-address caps.** N serves at most a fixed number of concurrent sessions (32 by
-   default), each limited to 600 s from the node's WebSocket accept, with 15 s to send its setup. (The
-   relay has its own 600 s limit, counted from its own connection accept and including the time a
-   session waits armed, so in practice the node's limit is the one that ends a session.) N also refuses a new session
-   from a client address that already holds a set number of unused sessions, counted from the WebSocket
-   accept, before the setup arrives, until the credential record is written (12 by default; HTTP 429).
+   default), each limited to 600 s from the node's WebSocket accept until the final body record is
+   released and a fresh 600 s after the release, with 10 s to send its setup (at most 256 KiB). (The
+   relay has its own limits: 15 s to the setup, and 600 s counted from its own connection accept,
+   including the time a session waits armed, then a fresh 600 s after the release; before the release
+   the node's limit, which starts earlier, is the one that ends a session.) N also refuses a new session
+   from a client address that already holds a set number of unused sessions (12 by default; HTTP 429),
+   counted from the session's reservation until the credential record is written. Connections whose
+   setup is not reserved yet are a separate pool: at most 4 per address and 1024 in all, and when either
+   is full the oldest connection still waiting for its setup is evicted, so idle sockets cannot keep a
+   paying setup out.
    The address is the TCP peer, or, only for peers configured as trusted reverse proxies, the rightmost `X-Forwarded-For` entry, so a remote
    client cannot name its own address. No proxy is trusted by default, so behind a reverse proxy that is
    not configured all clients share the proxy's address. A trusted loopback proxy lets a process on N's
@@ -1284,7 +1357,8 @@ both directions, than garbling twice, and the compressed preprocessing of DILO a
 (block correlated OT or subfield VOLE with many keys) that `mpz2` does not provide. We keep the masks
 with the garbler and authenticate them to the evaluator. That needs only correlated OT and a
 QuickSilver-style product check, and its batched per-wire check follows CWYY's, but it accepts a
-selective-failure leakage of at most 2.6 bits per session. Its soundness argument is our own (section
+selective-failure leakage of at most 2.8 bits per session (given a semi-honest share conversion that
+leaks nothing beyond its outcome). Its soundness argument is our own (section
 5). Three-halves garbling (Rosulek and Roy 2021) cuts N's tables by about a quarter against half-gates.
 
 **DiStefano** (Celi et al., 2023) runs the TLS 1.3 handshake as a 2PC with fully authenticated garbling,
@@ -1342,7 +1416,7 @@ at most 0.16 s on one host. Its cost is about 22 MB
 of precomputable tables and check data sent to the client and 1.2 MB sent back per request, because
 only the node garbles and the client checks the garbling instead of garbling a second copy; a cold
 two-party computation takes about 7 s on a home link with a 2 Mbit/s uplink. The price of that
-asymmetry is a selective-failure leakage of at most 2.6 bits per session about values that are never
+asymmetry is a selective-failure leakage of at most 2.8 bits per session about values that are never
 reused. The single-party variant needs under a quarter of the bandwidth where the node can keep its
 egress private.
 
@@ -1401,7 +1475,7 @@ the provider-specific parameters pinned off to keep web search and system-prompt
 bill. Another provider's offer leaves out `venice_parameters` and pins its own extras off instead.
 
 **A.3 Other providers.** The generic pieces (epochs, 2PC, proofs) port unchanged. The open questions per
-provider are profile items 4 to 6, 8 and 9, plus whether HTTP/1.1, P-256 and a mid-request KeyUpdate are
+provider are profile items 4 to 6, 8, 9, 11 and 12, plus whether HTTP/1.1, P-256 and a mid-request KeyUpdate are
 accepted (some CDNs pin HTTP/2). Where a provider fails, the fallbacks are MPC-TLS for confidentiality or
 the existing integrity-only path. Per-provider assessments are in the project's `docs/ADVERSARIAL-QA.md`.
 

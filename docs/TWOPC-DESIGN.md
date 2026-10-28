@@ -76,7 +76,7 @@ C sends nothing in epoch 0. There is no π_C1 and no KU0/KU1 from C.
     never from C. A tag check would not help, since C holds s_ap_0 and can compute valid server tags itself.
 12. Attestation, settlement and receipt as in v1. When U closes the connection, N's relay signs (with a
     per-process Ed25519 key) an attestation binding the sid, the certificate-chain hash, both handshake
-    transcript hashes, the record count and the SHA-256 of all bytes in each direction, `c_commit` (a
+    transcript hashes, the record counts (the client's body records and all server records) and the SHA-256 of all bytes in each direction, `c_commit` (a
     hash of the credential record as written) and the time; the node re-signs it with its Nostr key, and
     C checks that signature and that the sid and transcript hashes are its own.
 
@@ -130,11 +130,14 @@ session. There is one version; nothing is negotiated.
   transcript hash, the corrections for C's inputs) shift by amounts N already knows, so they carry no
   information about C. The test `check_rows_bound_to_session_salt` covers this.
 - *Leakage: selective failure only.* N can make C abort depending on C's private values: corrupted tables,
-  rows or OT correlations make the abort a predicate of C's inputs. Per phase N observes one of {C aborted, C's
-  output labels rejected, success}, and the session ends at the first failure; a deviation in ECtF adds one
-  more observable outcome (the server Finished failing between the phases). That is at most log2 6 ≈ 2.6
-  bits per session about fresh, single-use values (the ECDHE share, the MS share, the masks). Dual execution
-  leaked log2 3 ≈ 1.6. Removing this leakage needs evaluator-shared masks (WRK17/KRRW18-style triples), which
+  rows or OT correlations make the abort a predicate of C's inputs, and since N can corrupt the check row of
+  any wire, including internal HKDF wires, also of internal wire values (in phase B these include C's own
+  outputs s_ap_0 and c_ap_1). Per phase N observes one of {C aborted, C's output labels rejected, success},
+  and the session ends at the first failure. ECtF adds two more observable outcomes: C's degenerate-share
+  abort (C's multiplicative share of x2 − x1 is zero) and the server Finished failing between the phases
+  after a shifted Z. That is at most seven outcomes, log2 7 ≈ 2.8 bits per session about fresh, single-use
+  values (the ECDHE share, the MS share, the masks, the session's traffic secrets), **provided ECtF gives a
+  malicious N nothing beyond its outcome** (below). Dual execution leaked log2 3 ≈ 1.6. Removing this leakage needs evaluator-shared masks (WRK17/KRRW18-style triples), which
   cost more than dual execution's bandwidth.
 
 **Malicious C (protects the node's K_0, IV_0 and the API key):** C sees the tables, its active labels and
@@ -144,8 +147,11 @@ padded by hashes of inactive labels (which need Δ_A), and Y_N, which C can comp
 stay masked by m_N and MS by r_N. C cannot report a wrong output to N. Its own input choice is free, as in
 any 2PC. Inconsistent MS shares across phases yield a key nobody knows.
 
-**ECtF**: semi-honest M2A/A2M over OLE/OT, unchanged. A deviation only shifts the result (wrong ECDHE), which
-the TLS handshake detects (the server Finished under s_hs fails), or causes a selective failure. Every session
+**ECtF**: mpz2's OLE-based A2M/M2A, proven secure against semi-honest parties only. We do not argue that it
+stays private against a malicious N (that N's own OLE messages cannot extract more about C's share than an
+abort shows); the leakage bound above is conditional on that. Under that assumption a deviation either shifts
+the result (wrong ECDHE), which the TLS handshake detects (the server Finished under s_hs fails), or trips C's
+degenerate-share check, and N can make either depend on C's share: the two ECtF outcomes counted above. Every session
 uses fresh ephemeral scalars, shares, masks, labels, Δ_A and Δ_B.
 
 **What is proven, what is argued, what is assumed:**
@@ -155,10 +161,10 @@ uses fresh ephemeral scalars, shares, masks, labels, Δ_A and Δ_B.
 | QuickSilver product check, IT-MAC openings | standard (QuickSilver/Wolverine soundness), GF(2^128) |
 | three-halves garbling privacy and authenticity | Rosulek–Roy proof, under their hash assumption (instantiated, as in mpz2, with fixed-key-AES TCCR) |
 | AND-gate consistency check with garbler-held masks, 64-bit projection, salt | argued above; **no published proof** for this garbler-only variant |
-| leakage bound (≤ log2 6 bits per session) | counting argument above |
+| leakage bound (≤ log2 7 bits per session) | counting argument above, conditional on ECtF (next rows) |
 | Ferret/KOS against a malicious receiver (N), KOS consistency-check leakage of a few Δ bits with negligible probability (Δ_B for the MAC COTs, where C is the sender; Δ_A for C's input labels, where C is the KOS receiver and N the sender: harmless, since an inactive label needs all 128 bits) | assumed from mpz2 |
 | Ferret/KOS against a malicious sender (N is the RCOT sender for C's proofs π_C2S/π_C3S, so their zero knowledge relies on it; the SPCOT consistency check is in the pinned mpz2) | assumed from mpz2 |
-| ECtF | semi-honest only, as before |
+| ECtF | semi-honest only, as before; no argument for a malicious N |
 | external review | **none yet** |
 
 **Cost** (`crypto/twopc/BENCH.md`): per session the client uploads 1.21 MB (Ferret) and downloads 22.1 MB

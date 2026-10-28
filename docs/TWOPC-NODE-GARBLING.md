@@ -211,9 +211,12 @@ Assumptions:
   - C's verdict, which N can make value-dependent by corrupting rows, check rows or the OT correlation (selective
     failure).
   - N's own output-label check, if N engineers non-standard labels that still pass C's check.
-  - Per phase N sees one of {C aborts, labels rejected, success}, and the session stops at the first failure. A
-    deviation in ECtF adds one outcome (the server Finished failing between the phases). That is six outcomes,
-    ≤ log2 6 ≈ 2.6 bits per session, against log2 3 ≈ 1.6 for dual execution.
+  - The predicate can involve internal wires, not only C's inputs: N can corrupt the check row of any wire,
+    including internal HKDF wires, so a leaked bit can be a bit of s_ap_0 or c_ap_1.
+  - Per phase N sees one of {C aborts, labels rejected, success}, and the session stops at the first failure.
+    ECtF adds two outcomes (C's degenerate-share abort, and the server Finished failing between the phases).
+    That is seven outcomes, ≤ log2 7 ≈ 2.8 bits per session, against log2 3 ≈ 1.6 for dual execution,
+    assuming ECtF's semi-honest A2M/M2A gives a malicious N nothing beyond its outcome (`TWOPC-DESIGN.md`).
   - All shares, masks and scalars are fresh per session, and the session is discarded on abort, as
     `TWOPC-DESIGN.md` argues for dual execution.
   - Removing this leakage entirely needs evaluator-shared masks (option (a), §1).
@@ -354,7 +357,7 @@ Effort:
 
 ## 7. Risks
 
-- **Leakage class.** Selective failure remains: up to about 2.6 bits per session against about 1.6 for dual
+- **Leakage class.** Selective failure remains: up to about 2.8 bits per session (conditional on ECtF) against about 1.6 for dual
   execution. That fits the v2 model but is not CWYY's no-leakage guarantee. Fixing it means evaluator-shared masks, a
   larger separate project.
 - **Proof.** The soundness argument is a sketch, and this garbler-held-mask variant has no published proof.

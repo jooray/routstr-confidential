@@ -11,14 +11,25 @@ pub const BRIDGE_BUF: usize = 4 * 1024 * 1024;
 /// The outbound (duplex → WebSocket) pump. `finish` waits for it to drain the
 /// final bytes into the socket; without that, returning from the proof handler
 /// drops the socket and can lose the last protocol message, stalling the peer.
+/// The inbound (WebSocket → duplex) task ends with the bridge: `finish` (or a
+/// drop) aborts it once the outbound pump has drained, so a finished proof
+/// connection holds no task waiting on the peer.
 pub struct WsBridge {
     out: tokio::task::JoinHandle<()>,
+    inbound: tokio::task::AbortHandle,
 }
 
 impl WsBridge {
-    pub async fn finish(self) {
+    pub async fn finish(mut self) {
         // The peer may be gone; never block a teardown forever.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.out).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.out).await;
+        // `Drop` aborts the inbound task.
+    }
+}
+
+impl Drop for WsBridge {
+    fn drop(&mut self) {
+        self.inbound.abort();
     }
 }
 
@@ -29,7 +40,7 @@ pub fn ws_duplex(ws: WebSocket) -> (Compat<tokio::io::DuplexStream>, WsBridge) {
     let (mut br, mut bw) = tokio::io::split(b);
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    tokio::spawn(async move {
+    let inbound = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
                 Message::Binary(data) => {
@@ -59,12 +70,15 @@ pub fn ws_duplex(ws: WebSocket) -> (Compat<tokio::io::DuplexStream>, WsBridge) {
                         .await
                         .is_err()
                     {
-                        break;
+                        return;
                     }
                 }
             }
         }
+        // The protocol side is done: close the socket (the peer's read then
+        // ends too) instead of leaving it open until the connection drops.
+        let _ = ws_tx.send(Message::Close(None)).await;
     });
 
-    (a.compat(), WsBridge { out })
+    (a.compat(), WsBridge { out, inbound: inbound.abort_handle() })
 }

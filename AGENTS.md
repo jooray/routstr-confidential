@@ -106,15 +106,21 @@ app ──OpenAI API──► routstrd ──routeRequests(confidential)──�
    its own.
 7. *Settlement.* π_C3S proves the disclosed usage event (or, for an upstream
    HTTP error, only the response head; the body stays private). The node
-   charges the usage at the frozen offer rates (EHBP's
-   `finalize_ehbp_actual_cost_payment`), or releases the reservation for an
+   charges the usage at the pinned model's frozen offer rates (EHBP's
+   `finalize_ehbp_actual_cost_payment`; a usage event naming another model
+   id is logged by the sidecar and passed on as `reported_model`, not
+   refused, since π_C2S bound the model), or releases the reservation for an
    upstream refusal (less the session fee for 429/503 and for 401/402/403,
    the node's own provider key or account; less the abandon fee for any other
    4xx), and returns a signed receipt bound to the sid and attestation.
    π_C2S/π_C3S compare inside the circuit (the node learns one bit), and the
    client checks every proof parameter against its own records (`params.ts`).
 8. *Abort.* Before the final body record is released: release (less any
-   abandon fee). After it, with no disclosure: charge the reservation.
+   abandon fee; less only the session fee if the provider sent response
+   bytes and closed first, a refusal). After it, with no disclosure: charge
+   the reservation. After the release the clients do not retry a node error
+   on another node, and a caller abort lets the session settle on the
+   reported usage in the background.
 
 **Image sessions** (`kind: "images"`, `docs/CONFIDENTIAL-IMAGES.md`, §0 has
 the binding decisions). Same steps and circuits, with these differences: the
@@ -274,8 +280,9 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
 - **Open items.**
   - v2's 2PC costs ~22 MB node→client and ~1.2 MB
     client→node per request (cold ~7.4 s on a 2/50 Mbit/s link), and a
-    cheating node can learn ≤ log2 6 ≈ 2.6 bits per session about fresh,
-    single-use values. The garbler-only variant has no published proof and
+    cheating node can learn ≤ log2 7 ≈ 2.8 bits per session about fresh,
+    single-use values (inputs and internal wires), assuming ECtF's
+    semi-honest share conversion leaks nothing beyond its outcome. The garbler-only variant has no published proof and
     needs external review (`docs/TWOPC-DESIGN.md`, "Security model").
   - Pre-warming (SDK `client/confidential/prewarm.ts`, routstrd
     `confidentialUpstream.prewarm`) arms sessions up to the joint key share

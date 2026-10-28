@@ -33,8 +33,10 @@ The client is the TLS 1.3 client of the provider *through* the node. Client and 
 
 ## Routstr integration (branches)
 
-The upstream pull requests are closed while this is tested on fork branches; they will be reopened after
-user testing. To try it: [`docs/SETUP.md`](docs/SETUP.md).
+The protocol v2 pull requests are open upstream, from the fork branches below: core
+[#855](https://github.com/Routstr/routstr-core/pull/855), SDK
+[#112](https://github.com/Routstr/routstr-sdk/pull/112), routstrd
+[#155](https://github.com/Routstr/routstrd/pull/155). To try it: [`docs/SETUP.md`](docs/SETUP.md).
 
 | Repo | Branch | What |
 |---|---|---|
