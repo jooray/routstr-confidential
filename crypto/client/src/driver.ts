@@ -21,7 +21,7 @@
 // See docs/TWOPC-DESIGN.md and docs/APPROACH.md.
 
 import { createHash, createPublicKey, randomUUID, verify as cryptoVerify } from 'node:crypto'
-import { mkdirSync, realpathSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { argv } from 'node:process'
 import { fileURLToPath } from 'node:url'
@@ -94,6 +94,10 @@ const SIDECAR = arg('--sidecar', 'http://127.0.0.1:7443')!
 const MODEL = arg('--model', 'mistral-small-3-2-24b-instruct')!
 const MAX_TOKENS = Number(arg('--max-tokens', '12'))
 const PROMPT = arg('--prompt', 'Say hi in three words.')!
+// Chat with an image input: --attach PATH puts the file in the private body as
+// a data URI image part (the node never sees it; the provider bills it as
+// prompt tokens, provider-profile-check.py A13). Needs a vision model.
+const ATTACH = arg('--attach')
 // Image generation (docs/CONFIDENTIAL-IMAGES.md): --image [--count N]
 // [--variant <id>] (node offer) or [--resolution 1K|2K|4K] (direct sidecar).
 const IMAGE = argv.includes('--image')
@@ -225,7 +229,15 @@ const SUFFIX_MODEL = ADV_SUFFIX_MODEL ?? MODEL
 // setup (the body is what the upstream sees; the suffix check is what would
 // catch it, so this matters only when the suffix is withheld).
 const BODY_MAX_TOKENS = Number(arg('--adv-body-max-tokens', String(MAX_TOKENS)))
-let priv = `{"messages":[{"role":"user","content":${JSON.stringify(PROMPT)}}]`
+const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }
+function userContent(): unknown {
+  if (!ATTACH) return PROMPT
+  const mime = IMAGE_MIME[ATTACH.split('.').pop()!.toLowerCase()]
+  if (!mime) throw new Error(`--attach: not an image file (${Object.keys(IMAGE_MIME).join(', ')}): ${ATTACH}`)
+  const url = `data:${mime};base64,${readFileSync(ATTACH).toString('base64')}`
+  return [{ type: 'text', text: PROMPT }, { type: 'image_url', image_url: { url } }]
+}
+let priv = `{"messages":[{"role":"user","content":${JSON.stringify(userContent())}}]`
 if (DECOY) priv += `,"model":${JSON.stringify(DECOY)}`
 // Test hook: extra private JSON members (e.g. a field the provider rejects, to
 // exercise the upstream-error path).

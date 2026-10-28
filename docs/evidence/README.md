@@ -9,6 +9,7 @@ the API key.
 | `provider-profile-check-self-test-2026-10-19.txt` | the same script with `--self-test` (mocked transport, 13/13 negative controls) |
 | `regression-modality-2026-10-19.{txt,json}` | `crypto/tools/regression-modality.py` on 8 text models (8 PASS) |
 | `manual-provider-checks-2026-10-19.txt` | `manual-provider-checks.py`: token-cap overshoot, the system-prompt pin, a prompt asking for fake usage events |
+| `provider-profile-check-2026-10-28.txt` | the same gate with A13 (a vision model bills an image as prompt tokens), 13 PASS |
 | `provider-profile-check-images-2026-10-19.txt` | `provider-profile-check.py --images`, the image route (`/api/v1/image/generate`, z-image-turbo), checks I1-I9 (10 PASS, three paid images) |
 | `image-session-direct-2026-10-19.txt` | a confidential image session through a local sidecar in direct mode (`driver.ts --image`, stub settlement), client and sidecar logs, local paths shortened |
 

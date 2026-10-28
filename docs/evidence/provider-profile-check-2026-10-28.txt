@@ -1,0 +1,19 @@
+provider profile check  2026-10-28T00:15:18Z
+  provider: https://api.venice.ai/api/v1/chat/completions  build: outerface-api-server-us-east1-07807-dgl (probe 200)
+  models: cheap=mercury-2 reasoning=mercury-2 text_only=deepseek-v4-flash vision=mistral-small-3-2-24b-instruct
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+PASS         A9 TLS 1.3 / AES-128-GCM only / X25519 / ALPN http/1.1: offered only TLS_AES_128_GCM_SHA256+X25519+http/1.1 -> TLSv1.3 TLS_AES_128_GCM_SHA256 group=X25519 alpn=http/1.1 verify=0
+PASS         A11 client KeyUpdate mid-body; complete answer; server closes: keyupdate_sent=True TLSv1.3 TLS_AES_128_GCM_SHA256 -> 200 complete_stream=True server_closed=True conn_hdr=close
+PASS         A1 waits for the full body: 0 bytes in 8 s with body incomplete; then 200 complete=True
+PASS         A2 duplicate keys: last wins: bad-then-good model -> 200 (mercury-2); good-then-bad -> 404 '{"error":"Specified model not found: no-such-model'; max_tokens 200 then 8 -> 11 tokens
+PASS         A3 later object replaces earlier (no merge): bad character then clean object -> 200; bad character alone -> 404 '{"error":"No character could be found from the provided char'
+PASS         A4 unknown top-level field rejected: control -> 200; with field -> 400 '{"details":{"_errors":["Unrecognized key(s) in object: \'no_such_field_'
+PASS         A5 suffix cannot land inside a nested object or string: control -> 200; open object -> 400 '{"error":"Invalid JSON request"}'; open string -> 400 '{"error":"Invalid JSON request"}'
+PASS         A6 max_completion_tokens caps output incl. reasoning: -> 200, completion_tokens=19 (reasoning 19) with cap 20, margin 16
+PASS         A7 last event carries usage + model, then [DONE]: -> 200 model=mercury-2 usage=7+7 (body 230 bytes) choices=[] done=True
+PASS         A12 SSE framing: LF-only, one data: line per event: -> 200, 4 events, LF-only
+PASS         A8 text-only model (deepseek-v4-flash) rejects image parts: control -> 200; with image_url -> 400 'Image content is not supported by this model. Plea'
+PASS         A13 vision model (mistral-small-3-2-24b-instruct) bills an image as prompt tokens: control -> 200 prompt_tokens=6; with a 256x256 data URI -> 200 prompt_tokens=116
+PASS         A10 unpinned price-changing fields rejected: control -> 200; service_tier -> 400; web_search_options -> 400; prediction -> 400
+summary: 13 PASS, 0 FAIL, 0 INCONCLUSIVE of 13
+exit 0

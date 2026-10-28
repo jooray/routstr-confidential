@@ -1377,9 +1377,15 @@ there too. The outputs of that day's runs are in `docs/evidence/`.
   prompt tokens. Without the pin the provider injects about 1.7k tokens of system prompt.
 - **Unpinned price fields (sampled):** `service_tier`, `web_search_options` and `prediction` are
   rejected.
-- **Images:** the eight text models we checked reject image parts, both `image_url` and data URIs
-  (`crypto/tools/regression-modality.py`, 8/8). This is no longer load-bearing: the reservation covers a
-  full-context prompt, so an image part cannot raise the cost above it.
+- **Image input:** vision models accept image parts in the private body (a remote `image_url` or an
+  inline data URI) and report the image as prompt tokens: a 256x256 PNG adds about 70 to 110 on
+  mistral-small and qwen3-vl and about 1,090 on gemini-3-flash-preview. On 2026-10-26 the account balance fell by exactly the reported tokens at the
+  listed rates for 15 image requests and 15 text requests (qwen3-vl-235b-a22b), so the settlement at
+  the frozen input rate covers images; the full-context reservation bounds them before the answer.
+  Gate check A13 (added 2026-10-27; 13/13 on 2026-10-28) asserts that an image raises `prompt_tokens` and that the usage
+  event carries nothing the node does not price. Text-only models reject image parts with a 400;
+  the provider refuses images under 64x64 on every model, so an earlier data-URI check that sent a
+  1x1 PNG proved nothing (`crypto/tools/regression-modality.py` now sends 64x64).
 - **Usage event:** the terminal event carries usage, cost and model with empty `choices`, followed by
   `[DONE]`.
 - **Event framing:** the dechunked stream uses LF line endings only, and every event is one

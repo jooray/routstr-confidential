@@ -201,7 +201,7 @@ node deployment (`--node-settles`) does not use it.
 | 9 | Unknown/novel cost fields in the private part | **Sound, with maintenance burden.** Venice's strict schema 400s unknown fields (sampled: provider-profile A4, A10). The residual risk is *schema evolution*: Venice adding a new cost-relevant known field. The regression gate is the mitigation; the offer's `suffix_keys` must be extended whenever one appears. |
 | 10 | Endpoint swap to a differently-priced API | **Sound.** The request line (`POST /api/v1/chat/completions`) is inside N's head record, proven by π_N against the offer template (`build_pi_n`). The client cannot reach `/v1/responses`, embeddings, etc.; the SDK and routstrd also refuse any endpoint but chat completions before a credential is used. |
 | 11 | **Model aliases**: the requested name resolves server-side to a differently-priced backend while the usage event reports the requested name | **Unknown — testable, bounded by ops.** Venice's usage event reports the requested string. If Venice ever aliases across price tiers, settlement by the node's price list under-charges while Venice's bill is higher. Mitigation: node-side monitoring comparing realized `cost` against `price_list` per model. **Test:** for each offered model, diff Venice's `cost` against the published per-token price over a sample of requests; alert on drift. |
-| 12 | Multimodal token amplification (image URL in `messages` → thousands of image tokens from ~100 body bytes) | **Bounded by the reservation (GAP-3 closed).** The reservation covers the model's full context at the input rate, whatever the body bytes. The offer also lists only models that reject image parts; `regression-modality.py` enforces both `image_url` and data-URI rejection (8/8 live). |
+| 12 | Multimodal token amplification (image URL in `messages` → thousands of image tokens from ~100 body bytes) | **Bounded by the reservation (GAP-3 closed), and billed.** The reservation covers the model's full context at the input rate, whatever the body bytes, so vision models are offered (the shipped `model_allowlist` is empty). The provider reports the image as prompt tokens, which π_C3S discloses and the node charges at the frozen input rate; `provider-profile-check.py` A13 checks that, and on 2026-10-26 Venice's balance moved by exactly tokens x rate for image requests. `regression-modality.py` remains for operators who want text-only models. |
 | 13 | Malicious *node* downgrading the model to pocket the spread | **Sound.** The node writes only the head (no model field); the body is sealed under keys it never holds (SPEC §6 P2). It cannot alter the suffix or the private part. |
 
 ### 1.7 Q1 verdict
@@ -584,7 +584,7 @@ reservation priced: `(setup model, full context, max_tokens, pinned params)`.
 | Huge prompt | reservation covers the full context window | **Sound** (by construction) |
 | Cached tokens | cheaper, not dearer | **Sound** |
 | Schema-novel cost fields | strict-schema 400s (sampled, A4/A10) + per-provider regression gate | **Sound, maintained** |
-| Multimodal amplification | full-context reservation; the offer also lists only models that reject image parts | **Sound** (`regression-modality.py`, `image_url` and data URI, 8/8) |
+| Multimodal amplification | full-context reservation; images billed as prompt tokens at the input rate | **Sound** (A13; balance check 2026-10-26) |
 | Alias/routing to a dearer backend | ops monitoring vs Venice `cost` (§1.6 row 11) | **Unknown — testable** |
 
 ### 3.5 Q3 verdict
@@ -608,7 +608,7 @@ reservation priced: `(setup model, full context, max_tokens, pinned params)`.
 |---|---|---|---|
 | GAP-1 | **CLOSED** | The suffix (incl. `model`) was client-supplied and not bound to the setup values | `crypto/relay/src/main.rs`: `handle_setup` stores model/max_tokens in `Session`; `BodySuffix` handler requires byte-equality with `canonical_suffix`; final body record held until π_C2 verifies. Node-side reservation in `confidential.py` `reserve`. Gate case `a-suffix-mismatch`. |
 | GAP-2 | **CLOSED** | The usage-event model was not checked against the session model | `main.rs` `Disclose` handler (usage `model` must equal the setup model); `confidential_ws.py` `_apply_settlement` (mismatch → reservation charged). |
-| GAP-3 | **CLOSED** | The `LEN`→token prompt bound broke under image token amplification | Full-context reservation (`confidential.py` `reserve`, `prompt_token_limit`); the offer lists only text-only models, enforced at setup (`text_only_ok`) and by `regression-modality.py`. |
+| GAP-3 | **CLOSED** | The `LEN`→token prompt bound broke under image token amplification | Full-context reservation (`confidential.py` `reserve`, `prompt_token_limit`); images settle as prompt tokens (A13). An operator can still restrict the offer to text-only models (`model_allowlist`, `regression-modality.py`). |
 | GAP-4 | **CLOSED** | A client could withhold or swap the suffix after the body reached the provider | `main.rs` `Body` state holds the record that completes the body until π_C2 verifies. |
 
 ## Appendix B — Citation index
@@ -643,8 +643,9 @@ revision of `main.rs` that no longer exists.
   bounded the prompt by body bytes (`prompt_tokens ≤ LEN` plus a margin, at
   the `in` rate). A probe confirmed that a ~50-byte `image_url` can expand to
   over 1,000 prompt tokens on vision models (`crypto/runs/modality/`), which
-  breaks that bound. The integration reserves for the full context instead and
-  offers only models that reject image parts.
+  breaks that bound. The integration reserves for the full context instead, so
+  vision models can be offered: the image is charged as the prompt tokens the
+  provider reports (A13).
 - **Escrow stub.** `escrow_e` was a client-declared integer hashed into `sid`
   and never priced; settlement used Venice's own `cost.usd` against a
   hard-coded pseudo-escrow. The node's ordinary reservation replaced it.

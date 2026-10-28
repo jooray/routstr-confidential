@@ -5,7 +5,12 @@ content parts, by URL *and* by data URI?
 Since 2026-10-10 this is no longer a gate: the node reserves a full-context
 prompt, which bounds image parts too, and the sidecar offer's optional
 ``model_allowlist`` is empty by default. Kept for operators who want to
-restrict confidential mode to text-only models. The history:
+restrict confidential mode to text-only models. Vision models are served
+confidentially and are expected to FAIL here: the image arrives in the private
+body and is billed as prompt tokens (provider-profile-check.py A13). Until
+2026-10-27 the data-URI probe was a 1x1 PNG, which Venice rejects on every
+model for its size (minimum 64x64), so that half of the check proved nothing;
+it is now a 64x64 PNG. The history:
 
 Why: a model that *accepts* an ``image_url`` part is not bounded by body bytes:
 the client picks the image, so one ~50-byte URL (or a small inline data URI)
@@ -38,6 +43,7 @@ never printed.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as _dt
 import json
 import os
@@ -50,10 +56,24 @@ from typing import Callable
 API = "https://api.venice.ai/api/v1/chat/completions"
 DEFAULT_OFFER = os.path.join(os.path.dirname(__file__), "..", "relay", "offer.venice.json")
 IMAGE_URL = "https://www.gstatic.com/webp/gallery/1.jpg"
-DATA_URI = (
-    "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAen63NgAAAAASUVORK5CYII="
-)
+
+
+def _png(w: int = 64, h: int = 64) -> bytes:
+    """A small RGB gradient PNG. Venice refuses images under 64x64 ("images
+    must be at least 64x64 pixels"), so a 1x1 image is rejected by *every*
+    model, vision or not, and would pass this check for the wrong reason."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    rows = b"".join(b"\0" + bytes(c for x in range(w) for c in (x * 255 // w, y * 255 // h, 128)) for y in range(h))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b"")
+
+
+DATA_URI = "data:image/png;base64," + base64.b64encode(_png()).decode()
 REJECT = (400, 422)
 RETRIES = int(os.environ.get("CU_RETRIES", "2"))
 BACKOFF = [2.0, 6.0, 15.0]

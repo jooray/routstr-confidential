@@ -183,9 +183,11 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 `x-routstr-verify: confidential`.
 
 **Checks.**
-- `crypto/tools/provider-profile-check.py`: the provider assumptions A1–A12,
-  live (12/12; A12 = the LF-only SSE framing the usage proof parses); `--self-test` proves the negative controls.
-- `crypto/tools/regression-modality.py`: image/data-URI rejection per model (only relevant if you restrict models with the sidecar offer's `model_allowlist`; the shipped offer leaves it empty, since the node reserves a full-context prompt).
+- `crypto/tools/provider-profile-check.py`: the provider assumptions A1–A13,
+  live (A12 = the LF-only SSE framing the usage proof parses; A13 = a vision
+  model bills an image as prompt tokens, so chat with image input settles
+  correctly); `--self-test` proves the negative controls.
+- `crypto/tools/regression-modality.py`: image/data-URI rejection per model (only relevant if you restrict models with the sidecar offer's `model_allowlist`; the shipped offer leaves it empty, since the node reserves a full-context prompt). Vision models are served and FAIL it by design: chat with image input works (`driver.ts --attach`, the PWA's Image button).
 - `crypto/tools/adversarial-model-swap.sh` (with `AUTH=… CU_NODE=…
   NODE_LOG=routstr-core/logs/app_<date>.log` on a dedicated node): the
   model/cap swap attacks plus an honest control, as a gate (exit ≠ 0 on any

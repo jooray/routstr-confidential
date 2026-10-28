@@ -40,6 +40,13 @@ Assumptions (paper section 3.1):
   A7  the terminal usage event names the model and precedes [DONE], and with
       the pinned venice_parameters the prompt tokens stay below the body bytes
   A8  text-only models reject image parts (400, image not supported)
+  A13 a vision model bills an image part as prompt tokens: an inline (data
+      URI) image raises prompt_tokens over the same request without it, and
+      the usage event reports nothing besides the token counts the node prices
+      (prompt, completion, cached reads, cache writes), so the settlement at
+      the frozen rates covers the image. Whether the provider's own charge is
+      tokens x rate is not visible in the API; it was measured on Venice
+      against the account balance (crypto/PROGRESS-CONFIDENTIAL.md)
   A9  TLS 1.3 handshake succeeds when the client offers only
       TLS_AES_128_GCM_SHA256 + X25519 + ALPN http/1.1, and negotiates exactly that
   A10 price-changing request fields outside the pinned suffix are rejected
@@ -64,6 +71,7 @@ exercises both.
 
 from __future__ import annotations
 
+import base64
 import datetime as _dt
 import json
 import os
@@ -84,6 +92,7 @@ KEY = os.environ.get("VENICE_API_KEY", "")
 CHEAP = os.environ.get("CU_CHEAP_MODEL", "mercury-2")
 REASONING = os.environ.get("CU_REASONING_MODEL", "mercury-2")
 TEXT_ONLY = os.environ.get("CU_TEXT_ONLY_MODEL", "deepseek-v4-flash")
+VISION = os.environ.get("CU_VISION_MODEL", "mistral-small-3-2-24b-instruct")
 # The completion margin the node reserves beyond max_tokens (routstr-core
 # CONFIDENTIAL_RESERVE_MARGIN_TOKENS, 16 by default, published in the offer as
 # reserve_margin_tokens). Set CU_OUTPUT_MARGIN to the node's value if it differs.
@@ -681,6 +690,53 @@ def a10_price_fields() -> None:
     check("A10 unpinned price-changing fields rejected", all_ok, f"{ev_c}; " + "; ".join(parts))
 
 
+def _png(w: int = 64, h: int = 64) -> bytes:
+    """A small RGB gradient PNG (Venice refuses images under 64x64)."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    rows = b"".join(b"\0" + bytes(c for x in range(w) for c in (x * 255 // w, y * 255 // h, 128)) for y in range(h))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b"")
+
+
+# The usage members the node prices (routstr-core confidential.py
+# frozen_cost_msats; the top-level cache_* members repeat prompt_tokens_details,
+# as Venice reports them for Gemini); anything else in a vision answer could be
+# a charge the settlement never sees.
+BILLED_USAGE = {"prompt_tokens", "completion_tokens", "total_tokens", "prompt_tokens_details",
+                "completion_tokens_details", "cache_creation_input_tokens", "cache_read_input_tokens"}
+# A 256x256 image: a few dozen to a few hundred tokens depending on the
+# model's patching (a 64x64 one was only 12 on mistral-small-3-2-24b-instruct).
+IMAGE_SIDE = 256
+IMAGE_MIN_TOKENS = 16
+
+
+def a13_image_billed_as_prompt() -> None:
+    text = '{"type":"text","text":"Describe."}'
+    img = json.dumps({"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(_png(IMAGE_SIDE, IMAGE_SIDE)).decode()}})
+    tail = f',"model":"{VISION}","max_tokens":4,' + STREAM + "}"
+    rc = request('{"messages":[{"role":"user","content":[' + text + "]}]" + tail, "A13 control")
+    ri = request('{"messages":[{"role":"user","content":[' + text + "," + img + "]}]" + tail, "A13")
+    uc = usage_of(rc.text).get("usage") or {}
+    ui = usage_of(ri.text).get("usage") or {}
+    pc, pi = uc.get("prompt_tokens"), ui.get("prompt_tokens")
+    extra = sorted(set(ui) - BILLED_USAGE)
+    total_ok = "total_tokens" not in ui or ui.get("total_tokens") == (pi or 0) + (ui.get("completion_tokens") or 0)
+    counted = isinstance(pc, int) and isinstance(pi, int) and pi - pc >= IMAGE_MIN_TOKENS
+    check(
+        f"A13 vision model ({VISION}) bills an image as prompt tokens",
+        stream_ok(rc, VISION) and stream_ok(ri, VISION) and counted and not extra and total_ok,
+        f"control -> {rc.status} prompt_tokens={pc}; with a {IMAGE_SIDE}x{IMAGE_SIDE} data URI -> {ri.status} prompt_tokens={pi}"
+        + ("" if counted else f", image added fewer than {IMAGE_MIN_TOKENS} tokens")
+        + (f", unpriced usage members {extra}" if extra else "")
+        + ("" if total_ok else f", total_tokens={ui.get('total_tokens')} != prompt+completion"),
+    )
+
+
 CHECKS = [
     a9_transport,
     a11_keyupdate_mid_request,
@@ -693,6 +749,7 @@ CHECKS = [
     a7_usage_event,
     a12_sse_framing,
     a8_text_only_rejects_images,
+    a13_image_billed_as_prompt,
     a10_price_fields,
 ]
 
@@ -867,16 +924,17 @@ class MockProvider:
 
     ALLOWED = {"messages", "model", "max_tokens", "max_completion_tokens", "n", "stream",
                "stream_options", "venice_parameters", "response_format", "user"}
-    MODELS = {CHEAP, REASONING, TEXT_ONLY}
+    MODELS = {CHEAP, REASONING, TEXT_ONLY, VISION}
 
     def __init__(self, status: int | None = None, lenient: bool = False, cipher: str = SUITE,
                  hs_refuse: bool = False, timeout: bool = False, early: bool = False,
                  no_close: bool = False, no_ku: bool = False, crlf: bool = False,
-                 pretty: bool = False) -> None:
+                 pretty: bool = False, image_free: bool = False, image_fee: bool = False) -> None:
         self.status, self.lenient, self.cipher = status, lenient, cipher
         self.hs_refuse, self.timeout, self.early = hs_refuse, timeout, early
         self.no_close, self.no_ku = no_close, no_ku
         self.crlf, self.pretty = crlf, pretty
+        self.image_free, self.image_fee = image_free, image_fee
 
     def _answer(self, body: str) -> Resp:
         if self.timeout:
@@ -901,6 +959,10 @@ class MockProvider:
         cap = min(d.get("max_completion_tokens") or 10**6, d.get("max_tokens") or 10**6)
         ct = min(cap, 10)
         u = {"model": d["model"], "choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": ct}}
+        if isinstance(content, list) and any(p.get("type") == "image_url" for p in content):
+            u["usage"]["prompt_tokens"] += 0 if self.image_free else 80
+            if self.image_fee:
+                u["usage"]["image_cost"] = 0.001
         usage = json.dumps(u, indent=1) if self.pretty else json.dumps(u, separators=(",", ":"))
         text = 'data: {"model":"%s","choices":[{"delta":{"content":"hi"}}]}\n\ndata: %s\n\ndata: [DONE]\n\n' % (d["model"], usage)
         if self.crlf:
@@ -974,6 +1036,10 @@ def self_test() -> int:
          lambda v, rc: rc == 1 and v.get("A12") == "FAIL"),
         ("multi-line (pretty-printed) usage event fails A12", MockProvider(pretty=True),
          lambda v, rc: rc == 1 and v.get("A12") == "FAIL"),
+        ("image not counted in prompt_tokens fails A13", MockProvider(image_free=True),
+         lambda v, rc: rc == 1 and v.get("A13") == "FAIL"),
+        ("image billed outside the token counts fails A13", MockProvider(image_fee=True),
+         lambda v, rc: rc == 1 and v.get("A13") == "FAIL"),
     ]
     bad = 0
     try:
@@ -1000,7 +1066,7 @@ def main() -> int:
     now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"provider profile check  {now}")
     print(f"  provider: https://{HOST}{PATH}  build: {provider_build()}")
-    print(f"  models: cheap={CHEAP} reasoning={REASONING} text_only={TEXT_ONLY}")
+    print(f"  models: cheap={CHEAP} reasoning={REASONING} text_only={TEXT_ONLY} vision={VISION}")
     print(f"  openssl: {find_openssl() or 'NOT FOUND'}  retries={RETRIES}")
     if "--images" in sys.argv[1:]:
         print(f"  image route: {IMAGE_PATH} model={IMAGE_MODEL} (three paid images)")

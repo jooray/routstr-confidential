@@ -27,7 +27,7 @@ The client is the TLS 1.3 client of the provider *through* the node. Client and 
 | `crypto/zkbench` | VOLE-ZK circuits (mpz2) for π_NK, π_C2S, π_C3S and the **`cu-prover`** binary used by clients |
 | `crypto/cu-crypto` | TLS 1.3 key schedule and AES-GCM record math (RFC 8448 / NIST vectors) |
 | `crypto/client` | reference TypeScript client (`driver.ts`) |
-| `crypto/tools` | validation gates, each exits non-zero on any deviation: `provider-profile-check.py` (live provider-profile gate A1–A12, incl. the pinned TLS suite, a mid-request KeyUpdate and the LF-only SSE framing), `regression-modality.py` (every offered model rejects image URL and data-URI parts), `adversarial-model-swap.sh` (malicious-client attack cases plus an honest control), `stall-repro.sh` (N cold sessions, success-rate threshold). Also `probe-modality.py` (exploratory modality/token-amplification probe) and `cu_cashu.py` (test-mint helper: mint, balance, redeem) |
+| `crypto/tools` | validation gates, each exits non-zero on any deviation: `provider-profile-check.py` (live provider-profile gate A1–A13, incl. the pinned TLS suite, a mid-request KeyUpdate and the LF-only SSE framing), `regression-modality.py` (optional: the given models reject image URL and data-URI parts, for a text-only offer), `adversarial-model-swap.sh` (malicious-client attack cases plus an honest control), `stall-repro.sh` (N cold sessions, success-rate threshold). Also `probe-modality.py` (exploratory modality/token-amplification probe) and `cu_cashu.py` (test-mint helper: mint, balance, redeem) |
 | `paper/` | the paper (`paper.md` → `build.sh`) |
 | `docs/` | `APPROACH.md` (engineering overview), `ADVERSARIAL-QA.md`, `REVIEW-2026-10-09.md` (findings and fixes), `ONE-PAGER.md` |
 

@@ -559,3 +559,51 @@ Billing in this section supersedes the
   `tsc --noEmit` clean (the Bun-only file fails under vitest, as on `main`);
   routstrd 477 pass, 0 fail; `cargo test` for zkbench (incl. 4 one-bit
   disclosure tests), cu-crypto and cu-sidecar pass.
+
+## Image input in chat (2026-10-26/27)
+
+Confidential chat accepts image parts already: the node reserves a full-context
+prompt and the shipped offer has an empty `model_allowlist`, so nothing in the
+sidecar, node or SDK refuses them; the body is opaque to both.
+
+**Evidence (live Venice, 2026-10-26).**
+- With the pinned suffix, `mistral-small-3-2-24b-instruct` and
+  `qwen3-vl-235b-a22b` answer an `image_url` part and a 44 KB JPEG data URI
+  with 200 (prompt tokens 10 → 304 and 14 → 220). A 1x1 PNG data URI is
+  refused on every model ("images must be at least 64x64 pixels"), which is why
+  `regression-modality.py` used to report data URIs as rejected; it now sends
+  64x64.
+- Billing: 15 image requests (qwen3-vl, 3,300 prompt + 60 completion tokens)
+  moved the DIEM balance by 0.00080700, exactly tokens x listed rates
+  ($0.21/M in, $1.9/M out); 15 text requests matched the same way. (A first
+  round was polluted by charges from earlier requests posting late; an idle
+  window then showed no movement.) The usage event carries only
+  `prompt_tokens`, `completion_tokens`, `total_tokens`, so the node's
+  settlement at the frozen input rate covers the image.
+
+**Changes (2026-10-27).** `provider-profile-check.py` A13 (an image raises
+`prompt_tokens`; no usage members the node does not price; self-test 15/15),
+`regression-modality.py` 64x64 probe, `driver.ts --attach PATH`, PWA 0.1.32
+Image button (downscale to ≤ 1568 px JPEG, data URI only, follows the node's
+`input_modalities`).
+
+**Live (2026-10-28).**
+- `provider-profile-check.py` 13/13 (`docs/evidence/provider-profile-check-2026-10-28.txt`);
+  A13 also passes on qwen3-vl-235b-a22b and gemini-3-flash-preview. The first
+  run used a 64x64 image, which mistral counts as only 12 tokens (under the
+  16-token floor); A13 now sends 256x256. Gemini's usage repeats the cache
+  counts at the top level (`cache_read_input_tokens`), which A13 accepts.
+- `regression-modality.py`: deepseek-v4-flash PASS (both probes 400 now that
+  the data URI is 64x64); the vision models FAIL as expected.
+- Local node + sidecar + test mint, `driver.ts --attach` (44 KB JPEG,
+  gemini-3-flash-preview): prompt 1,089 tokens, completion 56, cost 893 msat,
+  receipt signature, usage match and cost bound true. Venice's own `cost` in the
+  usage event (0.0009723) equals 1,089 x $0.7/M + 56 x $3.75/M.
+- PWA 0.1.32 against the same node: the image answer was correct
+  (1,089/28 tokens, 787 msat, verified); the follow-up turn re-sent the image
+  from history (1,128 prompt tokens, 1,118 cached, 75 msat, verified). The run
+  found the attachment strip shown with no attachment (CSS `display` over
+  `hidden`), fixed before release.
+- Browser library 1ba5316: the pre-warmer sizes the next armed session for the
+  latest body instead of the largest one ever seen, so one image no longer pads
+  every later prepared session.
