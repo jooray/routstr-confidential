@@ -43,8 +43,14 @@ cd routstrd
 bun install
 # use the SDK branch instead of the npm release
 rm -rf node_modules/@routstr/sdk && ln -s "$PWD/../routstr-sdk" node_modules/@routstr/sdk
-bun link            # puts `routstrd` on your PATH
+bun run build       # after the link: dist/ bundles the SDK
+bun link            # installs dist/index.js as `routstrd` in ~/.bun/bin
 ```
+
+`~/.bun/bin` (`$BUN_INSTALL/bin`) has to be on your `PATH`. Without the build, `bun link` reports success but
+installs no `routstrd`. Without the SDK link, the daemon fails at startup (`Export named
+'closeConfidentialPrewarm' not found`), because no npm release of the SDK has the confidential transport yet.
+After updating either checkout, run `npm run build` in `routstr-sdk`, then `bun run build` in `routstrd`.
 
 **Configure.** Set up and fund routstrd as usual (`routstrd onboard`, then `routstrd receive <cashu token>`
 or `routstrd receive <sats>` for Lightning). Then add to `~/.routstrd/config.json`:

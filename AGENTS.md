@@ -29,7 +29,8 @@ The upstream PRs for protocol v2 are open: core
 [#855](https://github.com/Routstr/routstr-core/pull/855), SDK
 [#112](https://github.com/Routstr/routstr-sdk/pull/112), routstrd
 [#155](https://github.com/Routstr/routstrd/pull/155), from the fork branches
-above, rebased on upstream `main` (2026-10-23). The v1 PRs (core #824, SDK
+above, rebased on upstream `main` (2026-11-05). routstrd's CI (`validate`) stays
+red until an SDK with the transport is on npm: it installs the published SDK. The v1 PRs (core #824, SDK
 #90, routstrd #137) are closed; their branches
 (`confidential-upstream` in core and SDK) are frozen with an "unmaintained"
 README note. Do not rebase or update them.
@@ -173,15 +174,23 @@ cd $P/crypto && cargo build --release -p cu-sidecar -p zkbench
 #    run files kept --runs-keep-hours 24, 0 = removed at the session's end)
 #   (on loopback no token is needed; off loopback it requires CU_SIDECAR_TOKEN, and the
 #    node sends the same value as CONFIDENTIAL_SIDECAR_TOKEN)
-# node: RELAYS points nowhere so nothing is published to Nostr
+# node: RELAYS points nowhere so nothing is published to Nostr. Unset OPENAI_API_KEY,
+# ANTHROPIC_API_KEY and the like first: each one seeds its provider.
 cd $P/routstr-core && DATABASE_URL=sqlite+aiosqlite:////tmp/node.db NSEC=<test nsec> \
   CONFIDENTIAL_SIDECAR_URL=http://127.0.0.1:7444 CASHU_MINTS=http://127.0.0.1:3338 \
   UPSTREAM_BASE_URL=https://api.venice.ai/api/v1 UPSTREAM_API_KEY=$VENICE_API_KEY \
   HTTP_URL=http://127.0.0.1:8010 RELAYS='["ws://127.0.0.1:9"]' ENABLE_ANALYTICS_SHARING=false \
   .venv/bin/uvicorn routstr.core.main:app --host 127.0.0.1 --port 8010 &
-# reference client (credential: sk- key from /v1/balance/create, or a Cashu token)
+# UPSTREAM_BASE_URL seeds a `custom` provider, whose offer has 0 models (its public ids differ
+# from the provider's). No env selects `venice`: stop the node after its first start, run this,
+# and start it again; the offer's price_list then has the models.
+sqlite3 /tmp/node.db "delete from upstream_providers where base_url not like '%venice%'; update upstream_providers set provider_type='venice';"
+# credit without a mint (the key is <hex>, the credential sk-<hex>)
+sqlite3 /tmp/node.db "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('<hex>',200000000,0,0,0);"
+# reference client (credential: sk- key from /v1/balance/create, or a Cashu token);
+# take a model from `curl -s http://127.0.0.1:8010/v1/confidential/offer` (price_list)
 cd $P/crypto/client && CU_PROVER=../zkbench/target/release/cu-prover node --experimental-strip-types \
-  src/driver.ts --node http://127.0.0.1:8010 --model hermes-3-llama-3.1-405b --max-tokens 40 --auth <sk-…|cashu…>
+  src/driver.ts --node http://127.0.0.1:8010 --model <model from price_list> --max-tokens 40 --auth <sk-…|cashu…>
 ```
 
 For routstrd, use a scratch `ROUTSTRD_DIR` and add a `confidentialUpstream`
@@ -201,10 +210,16 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 - `crypto/tools/stall-repro.sh`: repeated sessions, fails below a success rate.
 - Unit tests:
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
-  - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`
+  - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`, `bun test tests/bun` (vitest
+    reports those two files as failed: it cannot load `bun:test`)
   - `routstrd`: `bun test`
 - Under a sandbox, some routstrd tests fail the same way on `origin/main`
   (subprocess and network tests).
+- After a rebase on upstream, run all the unit tests and a live session (the
+  reference driver and the SDK's `fetchConfidential`). Upstream changes can break
+  this code without a conflict: `_get_pricing_rates` gained a return value,
+  `usable_price_entry` read the resulting error as "unpriced", and the offer had
+  no models.
 
 ## Protocol v2 (branch `twopc-v2`)
 
@@ -269,7 +284,13 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
   `ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`.
 - **Rebuild after SDK changes.** routstrd uses the SDK via a
   `node_modules/@routstr/sdk` symlink to `../routstr-sdk`, which loads
-  `dist/`, so rebuild it (`npm run build`).
+  `dist/`, so rebuild it (`npm run build`), then routstrd's own `dist/`
+  (`bun run build`), which bundles the SDK.
+- **Test a routstrd bundle with `start` or `daemon`, not `--version`.** The CLI
+  imports the daemon lazily, so a load-time failure shows only there. The
+  `reflect-metadata` import at the top of both entry points must stay first:
+  `@peculiar/x509` needs it before tsyringe loads, and in `dist/` its own import
+  of it runs too late.
 - **Each SDK entrypoint is its own bundle.** The confidential transport is
   registered on a `globalThis` symbol by the Bun/Node entrypoints; the
   browser-safe bundle never imports it.
