@@ -29,7 +29,7 @@ The upstream PRs for protocol v2 are open: core
 [#855](https://github.com/Routstr/routstr-core/pull/855), SDK
 [#112](https://github.com/Routstr/routstr-sdk/pull/112), routstrd
 [#155](https://github.com/Routstr/routstrd/pull/155), from the fork branches
-above, rebased on upstream `main` (2026-11-05). routstrd's CI (`validate`) stays
+above, rebased on upstream `main` (2026-11-09). routstrd's CI (`validate`) stays
 red until an SDK with the transport is on npm: it installs the published SDK. The v1 PRs (core #824, SDK
 #90, routstrd #137) are closed; their branches
 (`confidential-upstream` in core and SDK) are frozen with an "unmaintained"
