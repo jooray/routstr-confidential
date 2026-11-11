@@ -16,6 +16,10 @@ path = "src/bin/cu-2pc.rs"
 name = "bench"
 path = "examples/bench.rs"
 
+[[example]]
+name = "procbench"
+path = "examples/procbench.rs"
+
 [dependencies]
 mpz-circuits = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141", features = ["sha2"] }
 mpz-common = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
@@ -42,4 +46,5 @@ zeroize = { version = "1", features = ["derive"] }
 cu-crypto = { path = "../cu-crypto" }
 # WAN emulation for the benchmark (`zkbench::transport::emulated_link`).
 zkbench = { path = "../zkbench" }
-
+# getrusage in the `procbench` example.
+libc = "0.2"
