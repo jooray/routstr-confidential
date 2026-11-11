@@ -1,5 +1,9 @@
 # zkbench: v2 statements vs v1
 
+> Historical. Protocol v3 removed π_C2S: π_WIN over the whole suffix record proves the same thing with the
+> same circuit size (7 SHA-256 compressions, 15 AES blocks for the 230-byte suffix), and `cu-prover --bench`
+> now runs π_NK, π_WIN (that shape) and π_C3S. The π_C2S rows below are from the run described here.
+
 Measured 2026-10-10 on an Apple M2 Max, release build, with real OT (Chou-Orlandi, KOS, Ferret). Command:
 `zkbench/target/release/cu-prover --bench` (it runs π_NK, π_C2S and π_C3S). Protocol v1 is retired: its
 rows (π_C1, π_N, π_C2, π_C3) are kept from the same run for comparison only, and its proofs are no longer in

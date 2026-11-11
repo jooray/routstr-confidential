@@ -1,15 +1,16 @@
-//! The v2 session's long-lived proof channel (pre-warmed VOLE correlations).
+//! A connection's long-lived proof channel (pre-warmed VOLE correlations).
 //!
 //! A cold proof ([`crate::proofs::run_io`]) opens its own connection and runs
 //! base OT (Chou-Orlandi) → KOS → one Ferret extension before QuickSilver even
 //! starts: several round trips and ~1 MB, almost all of it independent of the
-//! statement. A [`ZkChannel`] does that setup once per session, while the
-//! session is armed, and keeps the correlations for the session's proofs:
+//! statement. A [`ZkChannel`] does that setup once per connection, while it
+//! is armed, and keeps the correlations for the connection's proofs:
 //!
-//! * chain **nk** (node proves, client verifies): π_NK. The client is the
-//!   RCOT sender and holds this chain's Δ.
-//! * chain **cp** (client proves, node verifies): π_C2S then π_C3S. The node
-//!   is the RCOT sender and holds this chain's Δ.
+//! * chain **nk** (node proves, client verifies): π_NK, once. The client is
+//!   the RCOT sender and holds this chain's Δ.
+//! * chain **cp** (client proves, node verifies): π_WIN and π_C3S, each any
+//!   number of times (per request; in framing `"2"` also per control record).
+//!   The node is the RCOT sender and holds this chain's Δ.
 //!
 //! Both chains and a small control conversation share one connection
 //! ([`crate::mux`], three channels). At claim time each proof is one control
@@ -23,8 +24,8 @@
 //! * Correlations and Δ are generated fresh per channel (= per session) and are
 //!   never reused across sessions; each correlation is consumed exactly once
 //!   (the Ferret buffer hands out disjoint ranges).
-//! * One Δ for π_C2S and π_C3S is the same as one QuickSilver VM proving both
-//!   statements: VOLE-ZK soundness rests on Δ being unknown to the prover and
+//! * One Δ for every π_WIN and π_C3S of a chain is the same as one QuickSilver
+//!   VM proving all those statements: VOLE-ZK soundness rests on Δ being unknown to the prover and
 //!   on fresh correlations per gate/check, both of which hold. Each proof
 //!   keeps its own Fiat-Shamir transcript.
 //! * The two chains are independent instances (different directions, different
@@ -354,20 +355,29 @@ impl Chain {
 pub struct Prealloc {
     /// Chain nk (π_NK).
     pub nk: usize,
-    /// Chain cp (π_C2S + π_C3S).
+    /// Chain cp (π_WIN and π_C3S).
     pub cp: usize,
 }
 
 impl Default for Prealloc {
-    /// Sized from the circuits (`ot_demand_with` on the fixtures: π_NK ≈ 231k
-    /// for a 190-byte head, π_C2S ≈ 256k for the 230-byte production suffix,
-    /// π_C3S ≈ 403k for a 600-byte tail) with margin. A Ferret iteration is
-    /// coarse (n = 256k, 512k, 1024k, …), so these pick n = 512k for nk
-    /// (≈ 473k usable: heads up to ~1 kB) and n = 1024k for cp (≈ 967k usable:
-    /// π_C2S plus a tail of over 1 kB).
-    /// Anything larger extends online.
+    /// Sized for one framing `"1.1"` request without an online extension,
+    /// from the circuits (`ot_demand_with` on the fixtures, checked by
+    /// `tests/channel.rs`):
+    ///
+    /// * nk: π_NK over a 190-byte head needs 231 184.
+    /// * cp: π_WIN over the whole 231-byte suffix record (230-byte production
+    ///   suffix and the content type, 15 AES blocks) needs 256 370, π_C3S
+    ///   over a 1 kB tail record 575 418 (402 618 for a 600-byte one):
+    ///   831 788 in all.
+    ///
+    /// Each value is the demand plus a margin of 20 to 30 %. A Ferret
+    /// iteration is coarse, so the chains actually hold more after
+    /// preprocessing: 457 246 on nk (heads up to about 1 kB) and 1 195 758 on
+    /// cp (the suffix record plus a tail of about 1.9 kB), the same Ferret
+    /// step and the same 2.96 MB of setup traffic as the former cp = 800 000.
+    /// A second request on the channel, or anything larger, extends online.
     fn default() -> Self {
-        Self { nk: 300_000, cp: 800_000 }
+        Self { nk: 300_000, cp: 1_000_000 }
     }
 }
 
@@ -429,18 +439,13 @@ fn chain_of(proof: &str) -> Result<bool> {
     // true = chain nk (node proves), false = chain cp (client proves).
     match proof {
         "pi_nk" => Ok(true),
-        "pi_c2s" | "pi_c3s" | "pi_win" => Ok(false),
+        "pi_win" | "pi_c3s" => Ok(false),
         other => bail!("proof {other} is not served on the proof channel"),
     }
 }
 
 fn params_name(params: &Params) -> &'static str {
-    match params {
-        Params::PiNK(_) => "pi_nk",
-        Params::PiC2S(_) => "pi_c2s",
-        Params::PiC3S(_) => "pi_c3s",
-        Params::PiWin(_) => "pi_win",
-    }
+    params.proof().name()
 }
 
 /// How long `open` waits for the peer's hello. Both parties open the channel
@@ -458,12 +463,11 @@ pub struct ZkChannel {
     cp: Chain,
     mux: Option<Mux>,
     counters: Arc<Counters>,
-    /// Proofs already run (each at most once per channel, unless `multi`).
-    done: Vec<String>,
-    /// An `http: 2` session (protocol v3): π_WIN and π_C3S run once per
-    /// request or control record, so they may repeat. Each still consumes
-    /// fresh correlations, and a failure still poisons the channel.
-    multi: bool,
+    /// π_NK ran: the connection has one credential record, so it runs at
+    /// most once per channel. π_WIN and π_C3S run once per request (or
+    /// control record), so they repeat; each run consumes fresh correlations,
+    /// and a failure poisons the channel.
+    nk_done: bool,
     /// Set by any failure: the channel never runs another proof.
     poisoned: bool,
     timings: Vec<Timing>,
@@ -528,8 +532,7 @@ impl ZkChannel {
             cp,
             mux: Some(mux),
             counters,
-            done: Vec::new(),
-            multi: false,
+            nk_done: false,
             poisoned: false,
             timings: vec![Timing { step: "hello".into(), ms: hello_ms.as_secs_f64() * 1e3, bytes_sent: 0, bytes_recv: 0 }],
             last: (0, 0),
@@ -559,12 +562,6 @@ impl ZkChannel {
         (self.nk.available(), self.cp.available())
     }
 
-    /// Let π_WIN and π_C3S run more than once (an `http: 2` session). Both
-    /// ends must agree, or the second request is refused by the strict one.
-    pub fn set_multi(&mut self, multi: bool) {
-        self.multi = multi;
-    }
-
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -574,13 +571,11 @@ impl ZkChannel {
             bail!("proof channel is closed after a failure");
         }
         let nk = chain_of(proof)?;
-        let repeatable = self.multi && matches!(proof, "pi_win" | "pi_c3s");
-        if self.done.iter().any(|p| p == proof) {
-            if !repeatable {
+        if nk {
+            if self.nk_done {
                 bail!("{proof} already ran on this channel");
             }
-        } else {
-            self.done.push(proof.to_string());
+            self.nk_done = true;
         }
         Ok(nk)
     }
@@ -590,7 +585,7 @@ impl ZkChannel {
         chain.run(ctx, params, witness).await
     }
 
-    /// Client: run `params`' proof on the channel (π_NK: verify; π_C2S/π_C3S:
+    /// Client: run `params`' proof on the channel (π_NK: verify; π_WIN/π_C3S:
     /// prove with `witness`). The node serves it with [`ZkChannel::serve`].
     pub async fn request(&mut self, params: &Params, witness: Option<&Witness>) -> Result<Vec<CheckResult>> {
         if self.party != Party::Client {
@@ -624,7 +619,7 @@ impl ZkChannel {
         }
     }
 
-    /// Node: run its side of `proof` (π_NK: prove with `witness`; π_C2S/π_C3S:
+    /// Node: run its side of `proof` (π_NK: prove with `witness`; π_WIN/π_C3S:
     /// verify) against the node's own `params`.
     pub async fn serve(&mut self, proof: &str, params: &Params, witness: Option<&Witness>) -> Result<Vec<CheckResult>> {
         if self.party != Party::Node {

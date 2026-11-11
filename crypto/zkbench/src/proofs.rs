@@ -257,14 +257,10 @@ pub struct Stats {
 
 /// Count SHA-256 compressions and AES blocks a statement performs.
 pub fn stats(params: &Params) -> Stats {
-    // π_C2S/π_C3S: SHA256(secret) + keyed ipad/opad + key + iv = 1 + 2 + 2 + 2
+    // π_WIN/π_C3S: SHA256(secret) + keyed ipad/opad + key + iv = 1 + 2 + 2 + 2
     // = 7 compressions.
     let mut aes_blocks = 0usize;
     let sha256_compressions = match params {
-        Params::PiC2S(p) => {
-            aes_blocks += (p.off % 16 + p.w).div_ceil(16);
-            7
-        }
         Params::PiC3S(p) => {
             for r in &p.records {
                 aes_blocks += r.ct.len().div_ceil(16);

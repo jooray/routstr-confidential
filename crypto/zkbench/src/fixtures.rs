@@ -9,7 +9,7 @@ use cu_crypto::hex;
 use cu_crypto::keyschedule::KeySchedule;
 
 use crate::statements::{
-    Params, PiC2S, PiC3S, PiNK, PiWin, SUPPORTED_KEY_ALPHABET, TailRecord, WinWindow, Witness,
+    Params, PiC3S, PiNK, PiWin, SUPPORTED_KEY_ALPHABET, TailRecord, WinWindow, Witness,
 };
 
 /// The RFC 8448 handshake secret; the fixture's traffic secrets derive from it.
@@ -31,32 +31,9 @@ fn xor(a: &[u8], b: &[u8]) -> Vec<u8> {
 }
 
 /// The pinned suffix in production shape (the sidecar's `canonical_suffix`
-/// for this model and max_tokens = 12): the statement size of π_C2S.
+/// for this model and max_tokens = 12): the statement size of the framing
+/// `"1.1"` π_WIN ([`pi_win_suffix`]).
 pub const SUFFIX: &[u8] = b",\"model\":\"mistral-small-3-2-24b-instruct\",\"max_tokens\":12,\"max_completion_tokens\":12,\"n\":1,\"stream\":true,\"stream_options\":{\"include_usage\":true},\"venice_parameters\":{\"enable_web_search\":\"off\",\"include_venice_system_prompt\":false}}";
-
-fn window_params(h1: [u8; 32], key: [u8; 16], iv: [u8; 12], seq: u64, inner: &[u8], target: &[u8]) -> PiC2S {
-    let stream = aesgcm::ctr_keystream(&key, &iv, seq, inner.len());
-    let ct = xor(inner, &stream);
-    let tlen = target.len();
-    let w = (tlen + 1 + 13).min(inner.len());
-    let off = inner.len() - w;
-    let sel_start = w - 1 - tlen;
-    assert_eq!(&inner[off + sel_start..off + sel_start + tlen], target);
-    // As the sidecar builds it: the compared range runs through the inner
-    // content type byte at the record's end.
-    let mut expected = target.to_vec();
-    expected.push(0x17);
-    PiC2S {
-        h1,
-        seq,
-        ct_window: ct[off..off + w].to_vec(),
-        off,
-        w,
-        sel_start,
-        sel_len: expected.len(),
-        expected,
-    }
-}
 
 /// The usage event plus the end of a chunked SSE stream: the disclosure `R`.
 const USAGE_R: &[u8] = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":12}}\n\ndata: [DONE]\n\n\r\n0\r\n\r\n";
@@ -95,26 +72,6 @@ pub fn v2_secrets() -> V2Secrets {
         k0: ks.c_ap_0.key(),
         iv0: ks.c_ap_0.iv(),
     }
-}
-
-/// π_C2S: the pinned suffix as the final epoch-1 body record (seq 3; the
-/// client sends it as a record of its own).
-pub fn pi_c2s() -> (Params, Witness) {
-    pi_c2s_after(0)
-}
-
-/// π_C2S on a record that carries `prefix` private bytes ('x') before the suffix.
-pub fn pi_c2s_after(prefix: usize) -> (Params, Witness) {
-    let v = v2_secrets();
-    let secret = cu_crypto::keyschedule::Secret::new(v.c_ap_1);
-    let suffix = SUFFIX.to_vec();
-    let mut inner = vec![b'x'; prefix];
-    inner.extend_from_slice(&suffix);
-    inner.push(0x17);
-    (
-        Params::PiC2S(window_params(v.h1(), secret.key(), secret.iv(), 3, &inner, &suffix)),
-        Witness::Secret(v.c_ap_1),
-    )
 }
 
 /// π_C3S: the usage disclosure on the tail server record under s_ap_0.
@@ -319,8 +276,8 @@ pub fn win_record(secret: &[u8; 32], seq: u64, content: &[u8], ctype: u8, pad: u
     xor(&inner, &ks)
 }
 
-/// The windows the sidecar proves for one client record of an `http: 2`
-/// request (`PROTOCOL-V3-DESIGN.md` A.4): the first `head` content bytes
+/// The windows the sidecar proves for one client record of a framing `"2"`
+/// request (`PROTOCOL-V3.md` §12.6): the first `head` content bytes
 /// (the frame header, or the whole frame), and the record's last bytes
 /// (`tail` content bytes, then the inner content type 0x17). `content` is
 /// the honest plaintext the windows expect; `ct` the record as relayed.
@@ -362,7 +319,7 @@ pub fn pi_win_frames(body: usize) -> Vec<Vec<u8>> {
     vec![h2_frame(1, 4, 3, block), h2_frame(0, 0, 3, &private), h2_frame(0, 1, 3, &last)]
 }
 
-/// π_WIN: one `http: 2` request under `c_ap_1` (epoch-1 records 0..2): the
+/// π_WIN: one framing `"2"` request under `c_ap_1` (epoch-1 records 0..2): the
 /// HEADERS record in full, each DATA record's frame header and last byte,
 /// and the pinned suffix at the end of the last one.
 pub fn pi_win() -> (Params, Witness) {
@@ -385,11 +342,39 @@ pub fn pi_win_body(body: usize) -> (Params, Witness) {
     (Params::PiWin(PiWin { anchor: v.h1(), key_updates: 0, windows }), Witness::Secret(v.c_ap_1))
 }
 
-/// All three statements.
+/// The epoch-1 sequence number of the suffix record in [`pi_win_suffix`]
+/// (the client sends the pinned suffix as the final body record, on its own).
+pub const SUFFIX_SEQ: u64 = 3;
+
+/// π_WIN as the sidecar builds it in framing `"1.1"` for a final body record
+/// whose content is `content` when the pinned suffix is `suffix`: one window,
+/// the record's whole ciphertext from offset 0, compared from its first byte
+/// with `suffix ‖ 0x17`. For an honest record `content == suffix`, and the
+/// window is [`WinWindow::whole_record`]; for any other length the sidecar
+/// refuses before proving (the lengths are public), and this builds the
+/// parameters it would otherwise have sent.
+pub fn pi_win_suffix_record(seq: u64, content: &[u8], suffix: &[u8]) -> (Params, Witness) {
+    let v = v2_secrets();
+    let ct = win_record(&v.c_ap_1, seq, content, 0x17, 0);
+    let mut expected = suffix.to_vec();
+    expected.push(0x17);
+    let window = WinWindow { seq, off: 0, ct, sel_start: 0, expected };
+    (Params::PiWin(PiWin { anchor: v.h1(), key_updates: 0, windows: vec![window] }), Witness::Secret(v.c_ap_1))
+}
+
+/// π_WIN in the framing `"1.1"` shape: the pinned suffix ([`SUFFIX`], 230
+/// bytes) as the final epoch-1 body record (seq [`SUFFIX_SEQ`]), the whole
+/// record compared with `SUFFIX ‖ 0x17` under `h1`.
+pub fn pi_win_suffix() -> (Params, Witness) {
+    pi_win_suffix_record(SUFFIX_SEQ, SUFFIX, SUFFIX)
+}
+
+/// The three statements of a framing `"1.1"` request: π_NK, π_WIN over the
+/// suffix record, π_C3S.
 pub fn all() -> Vec<(&'static str, Params, Witness)> {
     vec![
         ("pi_nk", pi_nk().0, pi_nk().1),
-        ("pi_c2s", pi_c2s().0, pi_c2s().1),
+        ("pi_win", pi_win_suffix().0, pi_win_suffix().1),
         ("pi_c3s", pi_c3s().0, pi_c3s().1),
     ]
 }

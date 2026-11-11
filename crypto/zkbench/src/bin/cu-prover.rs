@@ -8,15 +8,15 @@
 //!   (`--job-stdin`: a 4-byte big-endian length and the JSON job, before the
 //!   mpz bytes, so the witness never touches the disk) or from a JSON file
 //!   (`--proof-file`).
-//! * **channel** (`--channel`, protocol v2): one long-lived process per
-//!   session holding the session's proof channel (`zkbench::channel`). stdin
+//! * **channel** (`--channel`): one long-lived process per
+//!   connection holding its proof channel (`zkbench::channel`). stdin
 //!   and stdout carry frames `[1 byte channel][4 bytes BE length][payload]`:
 //!   channel 0 = network bytes to/from the node's `/zk?proof=zkchan`
 //!   WebSocket, channel 1 = control JSON, one object per frame:
 //!
 //!   ```text
 //!   out {"ev":"ready","timings":[..],"avail":[nk,cp]}      after preprocessing
-//!   in  {"cmd":"verify"|"prove","id":n,"proof":"pi_nk"|"pi_c2s"|"pi_c3s"|"pi_win",
+//!   in  {"cmd":"verify"|"prove","id":n,"proof":"pi_nk"|"pi_win"|"pi_c3s",
 //!        "params":{..},"witness":{..}}                        (witness: prove only)
 //!   out {"ev":"done","id":n,"proof":..,"ok":true,"checks":[{"label","ok"}],
 //!        "ms":..,"bytes_sent":..,"bytes_recv":..}
@@ -25,9 +25,9 @@
 //!   out {"ev":"error","msg":..} and exit 1 on a channel failure
 //!   ```
 //!
-//!   Witnesses arrive on stdin only and are never written anywhere. With
-//!   `--multi` (an `http: 2` session, protocol v3) `pi_win` and `pi_c3s` may
-//!   run any number of times on the channel.
+//!   Witnesses arrive on stdin only and are never written anywhere. `pi_nk`
+//!   runs once on the channel, `pi_win` and `pi_c3s` any number of times.
+//!   `--multi` (once the switch for that) is accepted and ignored.
 //! * **bench**: runs every statement over the `local` and `wan` (25 ms
 //!   one-way = 50 ms RTT, 100 Mbit/s) transports.
 //!
@@ -278,12 +278,10 @@ async fn channel_loop(
     mut ctl: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
     io: tokio::io::DuplexStream,
     prealloc: zkbench::channel::Prealloc,
-    multi: bool,
 ) -> Result<()> {
     use serde_json::json;
     use zkbench::channel::{Party, ZkChannel};
     let mut ch = ZkChannel::open(io.compat(), Party::Client, prealloc).await?;
-    ch.set_multi(multi);
     let timings = emit_timings(&out, &mut ch);
     let (nk, cp) = ch.available();
     emit(&out, json!({"ev":"ready","timings":timings,"avail":[nk,cp]}));
@@ -434,7 +432,7 @@ async fn run_channel(args: &[String]) -> Result<()> {
         let _ = bw.shutdown().await;
     });
 
-    let res = channel_loop(out_tx.clone(), ctl_rx, party_io, prealloc, args.iter().any(|a| a == "--multi")).await;
+    let res = channel_loop(out_tx.clone(), ctl_rx, party_io, prealloc).await;
     if let Err(e) = &res {
         emit(&out_tx, serde_json::json!({"ev":"error","msg":format!("{e:#}")}));
     }

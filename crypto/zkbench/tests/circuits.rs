@@ -9,7 +9,6 @@ use zkbench::statements::Params;
 async fn mutation_fails(mut params: Params, witness: zkbench::Witness) {
     match &mut params {
         Params::PiNK(p) => p.c_commit[0] ^= 1,
-        Params::PiC2S(p) => p.expected[0] ^= 1,
         Params::PiC3S(p) => p.expected[0] ^= 1,
         Params::PiWin(p) => p.windows[0].expected[0] ^= 1,
     }

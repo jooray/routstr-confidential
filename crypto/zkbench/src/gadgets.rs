@@ -473,47 +473,6 @@ pub fn ctr_block<VM: Vm<Binary>>(
     Ok(out.try_into().expect("16-byte counter block"))
 }
 
-/// Decrypt `w` bytes of a record starting at inner-plaintext offset `off`,
-/// producing exactly the bytes at `[sel_start, sel_start+sel_len)`.
-///
-/// `ct_window` is the public ciphertext window `ct[off .. off+w]`.
-#[allow(clippy::too_many_arguments)]
-pub fn decrypt_window<VM: Vm<Binary>>(
-    vm: &mut VM,
-    key: &Array<U8, 16>,
-    iv: &Array<U8, 12>,
-    seq: u64,
-    ct_window: &Vector<U8>,
-    off: usize,
-    w: usize,
-    sel_start: usize,
-    sel_len: usize,
-) -> anyhow::Result<Vector<U8>> {
-    if ct_window.len() != w
-        || w == 0
-        || sel_len == 0
-        || sel_start.checked_add(sel_len).is_none_or(|end| end > w)
-        || off.checked_add(w).is_none_or(|end| end > crate::statements::MAX_INNER_CIPHERTEXT_PAYLOAD)
-    {
-        anyhow::bail!("decrypt_window: inconsistent window (w={w}, sel={sel_start}+{sel_len})");
-    }
-    let block_start = off / 16;
-    let prefix = off % 16;
-    let nblocks = (prefix + w).div_ceil(16);
-
-    let mut ks_blocks: Vec<Vector<U8>> = Vec::with_capacity(nblocks);
-    for j in 1..=nblocks {
-        // J0 has counter field 1; keystream block `j` has counter `block_start + j + 1`.
-        let ctr = ctr_block(vm, iv, seq, (block_start + j + 1) as u32)?;
-        let ks = aes_block(vm, key, &ctr)?;
-        ks_blocks.push(ks.into());
-    }
-    let ks_all = concat(vm, &ks_blocks)?;
-    let ks_used = select(vm, &ks_all, prefix, w)?;
-    let pt = xor_bytes(vm, ct_window, &ks_used)?;
-    select(vm, &pt, sel_start, sel_len)
-}
-
 /// Decrypt the tail of a record, from block-aligned inner-plaintext offset
 /// `off` to its end (`ct` is that tail's ciphertext), and return its content
 /// and, separately, its last byte: the inner content type of an unpadded

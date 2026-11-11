@@ -1,6 +1,8 @@
-//! The v2 proof channel (`zkbench::channel`): correlations preprocessed while
-//! armed, then π_NK, π_C2S and π_C3S on the same connection; online extension
-//! when the preallocation is short; tampering still fails; channel loss.
+//! The proof channel (`zkbench::channel`): correlations preprocessed while
+//! armed, then π_NK, π_WIN and π_C3S on the same connection (π_WIN in the
+//! framing `"1.1"` shape: the whole suffix record); π_WIN and π_C3S repeat,
+//! π_NK runs once; online extension when the preallocation is short;
+//! tampering still fails; channel loss.
 
 use std::time::{Duration, Instant};
 
@@ -12,12 +14,18 @@ use zkbench::transport::{Endpoint, emulated_link};
 
 struct Session {
     nk: (Params, Witness),
-    c2s: (Params, Witness),
+    win: (Params, Witness),
     c3s: (Params, Witness),
 }
 
 fn session() -> Session {
-    Session { nk: fixtures::pi_nk(), c2s: fixtures::pi_c2s(), c3s: fixtures::pi_c3s() }
+    Session { nk: fixtures::pi_nk(), win: fixtures::pi_win_suffix(), c3s: fixtures::pi_c3s() }
+}
+
+/// The request `Prealloc::default()` is sized for: the suffix record and a
+/// usage disclosure whose covered tail record holds 1 kB.
+fn session_1k_tail() -> Session {
+    Session { c3s: fixtures::pi_c3s_records(&[1024]), ..session() }
 }
 
 async fn open_pair(a: Endpoint, b: Endpoint, pre: Prealloc) -> (ZkChannel, ZkChannel) {
@@ -26,8 +34,7 @@ async fn open_pair(a: Endpoint, b: Endpoint, pre: Prealloc) -> (ZkChannel, ZkCha
     (c.await.unwrap().expect("client open"), n.await.unwrap().expect("node open"))
 }
 
-/// Node: serve requests until the client closes, with the node's own params
-/// (`tamper` replaces the expected suffix of π_C2S on the node side only).
+/// Node: serve requests until the client closes, with the node's own params.
 fn spawn_node(node: ZkChannel, s: Session) -> tokio::task::JoinHandle<Vec<(String, bool)>> {
     spawn_node_notify(node, s, None)
 }
@@ -47,7 +54,7 @@ fn spawn_node_notify(
             };
             let (params, witness) = match req.proof.as_str() {
                 "pi_nk" => (s.nk.0.clone(), Some(s.nk.1.clone())),
-                "pi_c2s" => (s.c2s.0.clone(), None),
+                "pi_win" => (s.win.0.clone(), None),
                 "pi_c3s" => (s.c3s.0.clone(), None),
                 _ => break,
             };
@@ -68,21 +75,22 @@ fn spawn_node_notify(
 
 async fn client_all(client: &mut ZkChannel, s: &Session) -> [anyhow::Result<()>; 3] {
     let a = client.request(&s.nk.0, None).await.map(|c| assert!(c.iter().all(|x| x.ok)));
-    let b = client.request(&s.c2s.0, Some(&s.c2s.1)).await.map(|_| ());
+    let b = client.request(&s.win.0, Some(&s.win.1)).await.map(|_| ());
     let c = client.request(&s.c3s.0, Some(&s.c3s.1)).await.map(|_| ());
     [a, b, c]
 }
 
 #[test]
 fn demand_fits_default_prealloc() {
-    let s = session();
+    let s = session_1k_tail();
     let nk = ot_demand_with(&s.nk.0, &s.nk.1).unwrap();
-    let c2 = ot_demand_with(&s.c2s.0, &s.c2s.1).unwrap();
+    let win = ot_demand_with(&s.win.0, &s.win.1).unwrap();
     let c3 = ot_demand_with(&s.c3s.0, &s.c3s.1).unwrap();
-    eprintln!("ot demand: pi_nk={nk} pi_c2s={c2} pi_c3s={c3}");
+    let c3_600 = ot_demand_with(&session().c3s.0, &session().c3s.1).unwrap();
+    eprintln!("ot demand: pi_nk={nk} pi_win(suffix record)={win} pi_c3s(1 kB tail)={c3} pi_c3s(600 B tail)={c3_600}");
     let d = Prealloc::default();
     assert!(nk <= d.nk, "pi_nk {nk} > {}", d.nk);
-    assert!(c2 + c3 <= d.cp, "pi_c2s+pi_c3s {} > {}", c2 + c3, d.cp);
+    assert!(win + c3 <= d.cp, "pi_win+pi_c3s {} > {}", win + c3, d.cp);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -93,8 +101,9 @@ async fn preprocess_then_prove_all_three() {
     // Armed: idle a little before the claim.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let (nk_avail, cp_avail) = client.available();
-    let node_task = spawn_node(node, session());
-    let s = session();
+    // The request the default is sized for (a 1 kB tail).
+    let node_task = spawn_node(node, session_1k_tail());
+    let s = session_1k_tail();
     let t = Instant::now();
     let r = client_all(&mut client, &s).await;
     let claim = t.elapsed();
@@ -106,7 +115,7 @@ async fn preprocess_then_prove_all_three() {
     let served = node_task.await.unwrap();
     assert_eq!(
         served,
-        vec![("pi_nk".into(), true), ("pi_c2s".into(), true), ("pi_c3s".into(), true)]
+        vec![("pi_nk".into(), true), ("pi_win".into(), true), ("pi_c3s".into(), true)]
     );
     let claim_bytes = counters.total() - after_setup;
     eprintln!(
@@ -163,13 +172,13 @@ async fn tampered_proof_fails_and_poisons() {
     let node_task = spawn_node(node, session());
     let s = session();
     client.request(&s.nk.0, None).await.expect("pi_nk");
-    // The client proves π_C2S from the wrong secret (s_ap_0 instead of c_ap_1).
+    // The client proves π_WIN from the wrong secret (s_ap_0 instead of c_ap_1).
     let wrong = fixtures::pi_c3s().1;
-    let _ = client.request(&s.c2s.0, Some(&wrong)).await;
+    let _ = client.request(&s.win.0, Some(&wrong)).await;
     // Whatever the client saw, the node rejected it and closed the channel.
     let served = tokio::time::timeout(Duration::from_secs(30), node_task).await.unwrap().unwrap();
     assert_eq!(served[0], ("pi_nk".into(), true));
-    assert_eq!(served[1], ("pi_c2s".into(), false), "{served:?}");
+    assert_eq!(served[1], ("pi_win".into(), false), "{served:?}");
     assert_eq!(served.len(), 2);
     // No further proof runs on this channel.
     let r = tokio::time::timeout(Duration::from_secs(30), client.request(&s.c3s.0, Some(&s.c3s.1))).await;
@@ -205,10 +214,73 @@ async fn channel_loss_then_per_proof_fallback() {
     assert!(r.is_err(), "a proof cannot run over a dead channel");
     assert!(client.is_poisoned());
     // Fallback: the per-proof path (fresh OT per proof) still works.
-    for (p, w) in [s.nk, s.c2s, s.c3s] {
+    for (p, w) in [s.nk, s.win, s.c3s] {
         let out = run_pair_transport(Duration::ZERO, f64::INFINITY, &p, &w).await.unwrap();
         assert!(out.ok);
     }
+}
+
+/// π_WIN and π_C3S run once per request, so they repeat on one channel (in any
+/// order, any number of times); each run consumes fresh correlations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn win_and_c3s_run_twice_on_one_channel() {
+    let (a, b, _) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
+    let (mut client, node) = open_pair(a, b, Prealloc::default()).await;
+    let node_task = spawn_node(node, session());
+    let s = session();
+    client.request(&s.nk.0, None).await.expect("pi_nk");
+    let mut cp = client.available().1;
+    for round in 0..2 {
+        for (name, (p, w)) in [("pi_win", &s.win), ("pi_c3s", &s.c3s)] {
+            client.request(p, Some(w)).await.unwrap_or_else(|e| panic!("{name} round {round}: {e:#}"));
+        }
+        // Round 0 fits the preallocation and only consumes; round 1 extends
+        // the chain online and still verifies.
+        let now = client.available().1;
+        if round == 0 {
+            assert!(now < cp, "round 0 consumed nothing ({cp} -> {now})");
+        }
+        cp = now;
+    }
+    assert!(!client.is_poisoned());
+    client.close().await;
+    let served = node_task.await.unwrap();
+    let want: Vec<(String, bool)> =
+        ["pi_nk", "pi_win", "pi_c3s", "pi_win", "pi_c3s"].iter().map(|p| (p.to_string(), true)).collect();
+    assert_eq!(served, want);
+}
+
+/// A connection has one credential record: π_NK runs once per channel, and
+/// each end refuses a second run on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pi_nk_runs_once() {
+    let (a, b, _) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
+    let (mut client, mut node) = open_pair(a, b, Prealloc::default()).await;
+    let s = session();
+    let (nk_p, nk_w) = s.nk.clone();
+    let node_task = tokio::spawn(async move {
+        let req = node.next_request().await.unwrap().unwrap();
+        let first = node.serve(&req.proof, &nk_p, Some(&nk_w)).await.is_ok();
+        // The node end refuses a second π_NK before any protocol byte.
+        let second = node.serve("pi_nk", &nk_p, Some(&nk_w)).await;
+        let msg = second.err().map(|e| e.to_string()).unwrap_or_default();
+        // The refusal is not a proof failure: the channel still serves.
+        let poisoned = node.is_poisoned();
+        let req = node.next_request().await.unwrap().unwrap();
+        let (win_p, _) = fixtures::pi_win_suffix();
+        let win_ok = node.serve(&req.proof, &win_p, None).await.is_ok();
+        node.close().await;
+        (first, msg, poisoned, win_ok)
+    });
+    client.request(&s.nk.0, None).await.expect("pi_nk");
+    let again = client.request(&s.nk.0, None).await;
+    assert!(again.unwrap_err().to_string().contains("already ran"));
+    client.request(&s.win.0, Some(&s.win.1)).await.expect("pi_win after the refused pi_nk");
+    client.close().await;
+    let (first, msg, poisoned, win_ok) = node_task.await.unwrap();
+    assert!(first && win_ok);
+    assert!(msg.contains("already ran"), "{msg}");
+    assert!(!poisoned);
 }
 
 /// Emulated home uplink (25 ms one way; client→node 20 Mbit/s, node→client
@@ -224,9 +296,9 @@ async fn wan_cold_vs_warm() {
     eprintln!("link: {:?} one way, up {} Mbit/s, down {} Mbit/s", delay, up * 8.0 / 1e6, down * 8.0 / 1e6);
     let s = session();
     // Cold: one fresh connection + full OT setup per proof. In π_NK the client
-    // is the verifier, in π_C2S/π_C3S the prover; a = prover end.
+    // is the verifier, in π_WIN/π_C3S the prover; a = prover end.
     let mut cold = Vec::new();
-    for (name, (p, w), client_proves) in [("pi_nk", s.nk.clone(), false), ("pi_c2s", s.c2s.clone(), true), ("pi_c3s", s.c3s.clone(), true)] {
+    for (name, (p, w), client_proves) in [("pi_nk", s.nk.clone(), false), ("pi_win", s.win.clone(), true), ("pi_c3s", s.c3s.clone(), true)] {
         let (pr_rate, vr_rate) = if client_proves { (up, down) } else { (down, up) };
         let (ep_p, ep_v, counters) = emulated_link(delay, pr_rate, vr_rate);
         let t = Instant::now();
@@ -250,17 +322,17 @@ async fn wan_cold_vs_warm() {
     let before = counters.total();
     let t = Instant::now();
     let mut each = Vec::new();
-    for (p, w) in [(&s.nk.0, None), (&s.c2s.0, Some(&s.c2s.1)), (&s.c3s.0, Some(&s.c3s.1))] {
+    for (p, w) in [(&s.nk.0, None), (&s.win.0, Some(&s.win.1)), (&s.c3s.0, Some(&s.c3s.1))] {
         let t1 = Instant::now();
         client.request(p, w).await.unwrap();
         let client_done = t1.elapsed();
-        // The proof is done when both sides are: the node verifies π_C2S and
+        // The proof is done when both sides are: the node verifies π_WIN and
         // π_C3S (the client only sends), the client verifies π_NK.
         let node_done = nrx.recv().await.unwrap().duration_since(t1);
         each.push(client_done.max(node_done));
     }
     eprintln!(
-        "warm proofs (both sides done): pi_nk {:.1} ms, pi_c2s {:.1} ms, pi_c3s {:.1} ms (total {:.1} ms, {} B)",
+        "warm proofs (both sides done): pi_nk {:.1} ms, pi_win {:.1} ms, pi_c3s {:.1} ms (total {:.1} ms, {} B)",
         each[0].as_secs_f64() * 1e3,
         each[1].as_secs_f64() * 1e3,
         each[2].as_secs_f64() * 1e3,
@@ -318,8 +390,9 @@ async fn cu_prover_channel_mode() {
     use tokio::process::Command;
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
+    // `--multi` was the switch for repeated proofs; it is accepted and ignored.
     let mut child = Command::new(env!("CARGO_BIN_EXE_cu-prover"))
-        .arg("--channel")
+        .args(["--channel", "--multi"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -389,7 +462,7 @@ async fn cu_prover_channel_mode() {
     let s = session();
     let cmds = [
         serde_json::json!({"cmd":"verify","id":1,"proof":"pi_nk","params":s.nk.0}),
-        serde_json::json!({"cmd":"prove","id":2,"proof":"pi_c2s","params":s.c2s.0,"witness":s.c2s.1}),
+        serde_json::json!({"cmd":"prove","id":2,"proof":"pi_win","params":s.win.0,"witness":s.win.1}),
         serde_json::json!({"cmd":"prove","id":3,"proof":"pi_c3s","params":s.c3s.0,"witness":s.c3s.1}),
     ];
     // A wrong command for the role is refused without touching the channel.
@@ -401,14 +474,38 @@ async fn cu_prover_channel_mode() {
     // So are params for another proof than the one named; the channel stays
     // usable for every proof afterwards.
     for bad in [
-        serde_json::json!({"cmd":"verify","id":-1,"proof":"pi_nk","params":s.c2s.0}),
-        serde_json::json!({"cmd":"prove","id":-2,"proof":"pi_c2s","params":s.c3s.0,"witness":s.c3s.1}),
+        serde_json::json!({"cmd":"verify","id":-1,"proof":"pi_nk","params":s.win.0}),
+        serde_json::json!({"cmd":"prove","id":-2,"proof":"pi_win","params":s.c3s.0,"witness":s.c3s.1}),
     ] {
         to_child_tx.send(frame(1, bad.to_string().as_bytes())).unwrap();
         let r = next_ctl(&mut ctl_rx).await;
         assert_eq!((r["id"].clone(), r["ok"].as_bool()), (bad["id"].clone(), Some(false)), "{r}");
         assert!(r["err"].as_str().unwrap().contains("params are for"), "{r}");
     }
+    // The retired pi_c2s is refused as any unknown proof is, with or without
+    // (old-shape) params, and leaves the channel usable.
+    for (i, bad) in [
+        serde_json::json!({"cmd":"prove","id":-3,"proof":"pi_c2s","params":s.win.0,"witness":s.win.1}),
+        serde_json::json!({"cmd":"prove","id":-4,"proof":"pi_c2s","params":{"PiC2S":{}},"witness":s.win.1}),
+        serde_json::json!({"cmd":"prove","id":-5,"proof":"pi_bogus","params":s.win.0,"witness":s.win.1}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        to_child_tx.send(frame(1, bad.to_string().as_bytes())).unwrap();
+        let r = next_ctl(&mut ctl_rx).await;
+        assert_eq!((r["id"].clone(), r["ok"].as_bool()), (bad["id"].clone(), Some(false)), "{r}");
+        assert!(r["err"].as_str().unwrap().contains("is not served on the proof channel"), "case {i}: {r}");
+    }
+    // The last two run a second time: pi_win and pi_c3s repeat on a channel.
+    let cmds: Vec<serde_json::Value> = cmds
+        .iter()
+        .cloned()
+        .chain(cmds[1..].iter().cloned().map(|mut c| {
+            c["id"] = serde_json::json!(c["id"].as_i64().unwrap() + 10);
+            c
+        }))
+        .collect();
     for c in cmds {
         to_child_tx.send(frame(1, c.to_string().as_bytes())).unwrap();
         let r = next_ctl(&mut ctl_rx).await;
@@ -416,12 +513,18 @@ async fn cu_prover_channel_mode() {
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(r["id"], c["id"]);
     }
+    // pi_nk does not: the client end refuses a second run.
+    to_child_tx
+        .send(frame(1, serde_json::json!({"cmd":"verify","id":20,"proof":"pi_nk","params":s.nk.0}).to_string().as_bytes()))
+        .unwrap();
+    let r = next_ctl(&mut ctl_rx).await;
+    assert_eq!((r["id"].as_i64(), r["ok"].as_bool()), (Some(20), Some(false)), "{r}");
+    assert!(r["err"].as_str().unwrap().contains("already ran"), "{r}");
     to_child_tx.send(frame(1, br#"{"cmd":"close"}"#)).unwrap();
     let served = tokio::time::timeout(Duration::from_secs(30), node_task).await.unwrap().unwrap();
-    assert_eq!(
-        served,
-        vec![("pi_nk".into(), true), ("pi_c2s".into(), true), ("pi_c3s".into(), true)]
-    );
+    let want: Vec<(String, bool)> =
+        ["pi_nk", "pi_win", "pi_c3s", "pi_win", "pi_c3s"].iter().map(|p| (p.to_string(), true)).collect();
+    assert_eq!(served, want);
     let status = tokio::time::timeout(Duration::from_secs(10), child.wait()).await.unwrap().unwrap();
     assert!(status.success());
 }

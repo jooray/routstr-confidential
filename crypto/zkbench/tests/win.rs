@@ -1,4 +1,4 @@
-//! π_WIN (protocol v3, `http: 2`): several record windows under one traffic
+//! π_WIN in the framing `"2"` shape: several record windows under one traffic
 //! secret. Completeness, the one-bit result, and the attacks the sidecar's
 //! windows are there to stop (a frame hidden in a DATA record, TLS padding
 //! that moves the frame boundary, a wrong suffix, a wrong header block).
@@ -332,17 +332,14 @@ fn demand_grows_with_records_not_bytes() {
     assert!(d_big < 600_000);
 }
 
-// --- the proof channel in multi mode ----------------------------------------
+// --- the proof channel: π_WIN and π_C3S repeat -------------------------------
 
-async fn open_pair(multi: (bool, bool)) -> (ZkChannel, ZkChannel) {
+async fn open_pair() -> (ZkChannel, ZkChannel) {
     let (a, b, _) = zkbench::transport::emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
     let pre = Prealloc { nk: 0, cp: 300_000 };
     let c = tokio::spawn(async move { ZkChannel::open(a, Party::Client, pre).await });
     let n = tokio::spawn(async move { ZkChannel::open(b, Party::Node, pre).await });
-    let (mut c, mut n) = (c.await.unwrap().unwrap(), n.await.unwrap().unwrap());
-    c.set_multi(multi.0);
-    n.set_multi(multi.1);
-    (c, n)
+    (c.await.unwrap().unwrap(), n.await.unwrap().unwrap())
 }
 
 fn serve(mut node: ZkChannel, params: Vec<Params>) -> tokio::task::JoinHandle<Vec<bool>> {
@@ -362,11 +359,11 @@ fn serve(mut node: ZkChannel, params: Vec<Params>) -> tokio::task::JoinHandle<Ve
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_channel_repeats_win_and_c3s_only_in_multi_mode() {
+async fn the_channel_repeats_win_and_c3s() {
     let (win_p, win_w) = fixtures::pi_win();
     let (c3_p, c3_w) = fixtures::pi_c3s();
     let seq = vec![win_p.clone(), win_p.clone(), c3_p.clone(), win_p.clone(), c3_p.clone()];
-    let (mut client, node) = open_pair((true, true)).await;
+    let (mut client, node) = open_pair().await;
     let task = serve(node, seq.clone());
     for p in &seq {
         let w = if matches!(p, Params::PiWin(_)) { &win_w } else { &c3_w };
@@ -374,29 +371,14 @@ async fn the_channel_repeats_win_and_c3s_only_in_multi_mode() {
     }
     client.close().await;
     assert_eq!(task.await.unwrap(), vec![true; 5]);
-
-    // Without multi mode the client end refuses the second run itself.
-    let (mut client, node) = open_pair((false, false)).await;
-    let task = serve(node, vec![win_p.clone(), win_p.clone()]);
-    client.request(&win_p, Some(&win_w)).await.unwrap();
-    assert!(client.request(&win_p, Some(&win_w)).await.is_err());
-    client.close().await;
-    assert_eq!(task.await.unwrap(), vec![true]);
-
-    // A strict node refuses a multi client's second run.
-    let (mut client, node) = open_pair((true, false)).await;
-    let task = serve(node, vec![win_p.clone(), win_p.clone()]);
-    client.request(&win_p, Some(&win_w)).await.unwrap();
-    assert!(client.request(&win_p, Some(&win_w)).await.is_err());
-    assert_eq!(task.await.unwrap(), vec![true, false]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_failed_win_poisons_the_channel_in_multi_mode() {
+async fn a_failed_win_poisons_the_channel() {
     let (win_p, win_w) = fixtures::pi_win();
     let mut bad = win(win_p.clone());
     bad.windows[0].expected[3] ^= 1;
-    let (mut client, node) = open_pair((true, true)).await;
+    let (mut client, node) = open_pair().await;
     // The node's own (honest) view differs from what the client's record holds.
     let task = serve(node, vec![Params::PiWin(bad.clone()), win_p.clone()]);
     let _ = client.request(&Params::PiWin(bad), Some(&win_w)).await;
