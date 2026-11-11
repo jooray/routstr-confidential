@@ -1,7 +1,32 @@
 # Protocol v3 (draft): one two-party handshake per connection, not per request
 
-Status: **analysis and proposal, 2026-11-11. Nothing here is implemented.** One mechanism was checked live
-against api.venice.ai (§3.6); everything else is design on paper and is marked where it is unverified.
+Status: **decided and built, 2026-11-11.** This file is the analysis that led to protocol v3 and is kept
+as the reasoning; it is not the specification. **The normative text is `PROTOCOL-V3.md`.** Where the two
+differ, `PROTOCOL-V3.md` wins. What was decided:
+
+- **Proposal A (§3) and proposal B (§4) are combined as protocol v3.** A: one two-party handshake per
+  HTTP/2 connection, the credential written once in epoch 0 and named by HPACK index afterwards (framing
+  `"2"`). B: the smaller key schedule, in the variant with **public inner states** ("public IS": the inner
+  HMAC states are public outputs and the inner digests are computed in the clear; `split-public-1`, 22
+  garbled compressions, 16.38 MB down). The variant that proves the inner digests in zero knowledge was
+  not adopted.
+- **HTTP/1.1 stays as framing `"1.1"`** inside the same connection lifecycle, for providers without
+  usable HTTP/2, and as the client's fallback on the same node.
+- **v2 is retired.** Nodes and clients speak v3 only (`upgrade_required`, `node_protocol_outdated`); §7's
+  "v2 stays for HTTP/1.1-only providers" was replaced by framing `"1.1"`.
+- The statement called π_REQ below was built as **π_WIN** (several windows over several records) and also
+  replaces π_C2S. The connection deposit, the per-request reservation, the idle rule and `reuseScope` are
+  as proposed in §3.3 and §3.5, with the details in `PROTOCOL-V3.md` §8 and §9.
+- Of the live checks listed as "Not checked yet" in §3.6, these were done against Venice: a KeyUpdate on
+  an HTTP/2 connection is accepted, `HEADER_TABLE_SIZE = 0` is honoured, an index-only `authorization` is
+  valid after 150 s of idle, the probe request followed by RST_STREAM loads the table, and no credential
+  bytes appeared in eight response paths. Not done: a second provider; the provider's idle limit and
+  GOAWAY behaviour beyond what the node's own idle timeout and `max_requests` cover.
+- Still open from §8: external review of the new statement, the frame rules and the key schedule; a
+  second provider.
+
+The text below is unchanged from the proposal, so its "not implemented", "suggested" and "open" wording
+describes the state before the decision. Baseline at the time: protocol v2.
 Baseline: protocol v2 as in `docs/TWOPC-DESIGN.md`, `docs/TWOPC-NODE-GARBLING.md` and `paper/paper.md` §4-§6.
 
 ## 1. Summary

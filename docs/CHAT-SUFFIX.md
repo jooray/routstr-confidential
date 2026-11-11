@@ -1,5 +1,9 @@
 # The offer-driven chat suffix
 
+*Protocol v3 note (2026-11-11). The offer block, the rendering and the policy
+below are unchanged in v3. What changed is where the suffix sits in the
+lifecycle and which proof covers it; see "In the v3 lifecycle" at the end.*
+
 A confidential chat request ends with a public JSON suffix that pins every
 cost-relevant parameter (paper §4.6). Until 2026-10-19 its keys and values
 were hard-coded, identically, in the sidecar, the SDK, the browser library
@@ -61,8 +65,8 @@ With the Venice block above, `M = "m"`, `T = 5`:
 
 (Before this change `venice_parameters` rendered in the other member order,
 so clients older than this change refuse sessions with a sidecar that has
-it: their suffix differs from the one in `ready`. That costs nothing but a
-refused session.)
+it: their suffix differs from the one the node sends (v2: in `ready`; v3: in
+`request_ok`). That costs nothing but a refused request.)
 
 ## Policy (sidecar at startup, every client on every offer)
 
@@ -112,3 +116,36 @@ private part, as before. Any other key the offer pins is dropped when the
 caller's value equals the pinned value; when it differs, the client refuses
 the request (`pinned_parameter`, HTTP 400 in routstrd) rather than send it
 with the caller's choice silently replaced.
+
+## In the v3 lifecycle
+
+- **Per request, not per setup.** The `setup` of a connection names no
+  model and no cap. Each `request` names `model` and `max_tokens`; the node
+  renders the suffix for it from the chat block of the offer the request
+  names and returns it in `request_ok`. The client renders it too and
+  refuses a difference. On an HTTP/2 connection every request has its own
+  suffix, so the model and cap can differ from request to request.
+- **The offer the suffix comes from.** A request names an offer by its
+  signature. Its connection-level fields must equal those of the offer the
+  connection was opened on (`offer_changed` otherwise). The chat block is
+  read from the offer the request names.
+- **The proof is π_WIN** (π_C2S no longer exists). The node writes nothing
+  of the request's final bytes to the provider before it verifies.
+  - Framing `"1.1"`: as before, the suffix is its own final TLS record;
+    π_WIN has one window, the whole record = suffix ‖ `0x17`.
+  - Framing `"2"`: the body travels in DATA frames, one frame per TLS
+    record. The suffix is the **tail of the last DATA frame** (the one with
+    END_STREAM). π_WIN shows that record's frame header, that its tail
+    equals suffix ‖ `0x17`, and for every other record of the request the
+    frame header and last byte, and the whole HEADERS record. The node
+    holds every record until the proof that covers it verifies.
+- **Last-wins still carries the argument.** The suffix closes the JSON
+  object, so its keys are the last ones the provider parses. On HTTP/2 the
+  proven frame headers add that the stream ends with that record
+  (END_STREAM only there), so no body bytes can follow the suffix.
+- **Size.** The fixed part's 1024-byte limit (rule 8) keeps the suffix
+  inside one record and inside π_WIN's limits (64 KiB of ciphertext per
+  proof).
+- **Images** use the same mechanism with the images suffix
+  (`CONFIDENTIAL-IMAGES.md`, section 0a).
+- The shared vectors (`chat-suffix-vectors.json`) are unchanged.

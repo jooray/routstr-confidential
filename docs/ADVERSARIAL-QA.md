@@ -30,51 +30,68 @@ authors' working documents and are not published:
   clients' parameter checks in `routstr-sdk/client/confidential/params.ts` and
   `crypto/client/src/params.ts`.
 
-> **Protocol v1 is retired.** This review was written against protocol v1;
-> the implementation now speaks only protocol v2 (two-party handshake,
-> `TWOPC-DESIGN.md`), and v1 lives on the `v1-poc` branch. Read v1's proofs
-> as their v2 counterparts: π_N → π_NK, π_C2 → π_C2S, π_C3 → π_C3S. v2 has no
-> π_C1 and no client KeyUpdates: the KU0 → credential record → KU1 dance is
-> replaced by the node writing epoch 0 (credential record + KeyUpdate) under
-> `K_0`, which the client never learns. The model-binding, transferability and
-> reservation arguments carry over unchanged.
+> **Protocols v1 and v2 are retired; the protocol is v3** (`PROTOCOL-V3.md`,
+> 2026-11-11). This review was first written against v1 and updated for v2.
+> Sections Q1 to Q3 keep their v2 wording. Read them for v3 as follows:
 >
-> **Current state (integration branches, 2026-10-28).** GAP-1, GAP-2 and GAP-3
-> are **closed**; the prototype analysis that found them is kept in
-> Appendix C for the record.
+> | In Q1–Q3 | In v3 |
+> |---|---|
+> | session | a **request** `(sid, n)` on a **connection**; one connection carries one request (framing `"1.1"`, HTTP/1.1) or many sequential ones (framing `"2"`, HTTP/2) |
+> | setup (model, `max_tokens`, body length, fees) | the `request` message; the `setup` names only the framing and the credential |
+> | reservation at the setup | a **connection deposit** at the setup, the full-context reservation at each `request` |
+> | π_C2S (the final record is the suffix) | **π_WIN** (windows over the client's records: on HTTP/2 each frame header and last byte, the whole HEADERS record and the suffix; on HTTP/1.1 the suffix record) |
+> | π_N, π_C3 / π_NK, π_C3S | π_NK (once per connection), π_C3S (per request) |
+> | π_C1, the client's KeyUpdates (v1) | gone since v2: the node writes epoch 0 under `K_0`, which the client never learns |
+> | session fee per session | once per connection, with request 1 |
+> | "HTTP/1.1 is required" (Q2) | required for framing `"1.1"` only; framing `"2"` needs H1–H8 (`PROTOCOL-V3.md` §5.6) |
+>
+> The model-binding, transferability and reservation arguments carry over.
+> What v3 adds (the credential in the provider's HPACK table, many requests
+> on one connection, the deposit) is answered in **Q4**.
+>
+> **Current state (protocol v3, 2026-11-11).** GAP-1, GAP-2 and GAP-3 are
+> **closed**; the prototype analysis that found them is kept in Appendix C
+> for the record.
 >
 > - **Q1, model binding.** The sidecar (N's TLS relay) renders the pinned
->   suffix from the setup values and the signed offer's `chat` block
->   (`docs/CHAT-SUFFIX.md`) and accepts no other. It holds the record that
->   completes the body until π_C2S proves the suffix, so the provider never sees
->   a complete request with another model or cap. The node prices the
->   disclosed usage at the setup model's frozen rates; a usage event that
->   spells the model otherwise is logged and passed on as `reported_model`,
->   not charged as a breach (§1.5).
+>   suffix from the `request` values and the signed offer's `chat` block
+>   (`docs/CHAT-SUFFIX.md`) and accepts no other. It holds the client's
+>   records until π_WIN verifies: on HTTP/1.1 the record that completes the
+>   body, on HTTP/2 every record of the request. The provider never sees a
+>   complete request with another model or cap, and on HTTP/2 no frame the
+>   node did not expect. The node prices the disclosed usage at the request
+>   model's frozen rates; a usage event that spells the model otherwise is
+>   logged and passed on as `reported_model`, not charged as a breach (§1.5).
 > - **Q3, money.** There is no protocol-specific escrow. The client
 >   authenticates with its ordinary node credential (API key or Cashu token)
->   and names the signed offer it verified. The node freezes that offer's rates
->   and reserves `max(min_request_msat, ⌈(prompt_limit·max(in, cache_write) +
->   (max_tokens + margin)·out)/1000⌉)` plus the larger of the session fee f_s
->   and the abandon fee f_a, where `prompt_limit` is the model's full context
->   length (the opaque prompt is never discounted, nor reduced by the model's
->   own completion limit, which the pinned cap rarely reaches) and `margin` is
->   the signed `reserve_margin_tokens` (16 by default). It charges exactly the
->   frozen-rate cost of the π_C3S-verified usage plus f_s, capped at the
->   reservation. It releases the reservation if the provider never received the
->   complete request (less f_a) or refused it (less f_s for a 429/503 or a
->   401/402/403, or for a provider that answered and closed before the body
->   was complete; less f_a for any other 4xx), and charges the reservation for
->   another 5xx or if the client withholds its disclosure.
-> - **Q3, the prompt.** The node sees only ciphertext. π_C2S and π_C3S compare
+>   and names the signed offer it verified. At the `setup` the node reserves
+>   the connection deposit (`connection_deposit_msat`, signed in the offer;
+>   by default at least 1 sat). At each `request` it freezes that offer's
+>   rates and reserves `max(min_request_msat, ⌈(prompt_limit·max(in,
+>   cache_write) + (max_tokens + margin)·out)/1000⌉)`, where `prompt_limit`
+>   is the model's full context length (the opaque prompt is never
+>   discounted) and `margin` is the signed `reserve_margin_tokens` (16 by
+>   default). It charges exactly the frozen-rate cost of the π_C3S-verified
+>   usage, capped at the reservation, plus the session fee f_s once per
+>   connection (with request 1). It releases the reservation if the provider
+>   never received the complete request (less the abandon fee f_a) or refused
+>   it (less f_s for a 429/503 or a 401/402/403; less f_a for any other 4xx),
+>   and charges the reservation for another 5xx or if the client withholds
+>   its disclosure. The deposit is released with the first settled request
+>   and charged when a connection is opened and wasted (Q4.4).
+> - **Q3, the prompt.** The node sees only ciphertext. π_WIN and π_C3S compare
 >   inside the circuit and reveal one bit; the client validates their
->   parameters, so the node cannot aim them at other plaintext. On an upstream
+>   parameters (every window must lie in a range that is public for that
+>   record), so the node cannot aim them at other plaintext. On an upstream
 >   error the client discloses only the response head.
+> - **Not reviewed.** π_WIN, the HTTP/2 frame rules and the key schedule
+>   `split-public-1` have had no external review. One provider (Venice) was
+>   tested.
 >
 > The provider assumptions are re-checked live by
 > `crypto/tools/provider-profile-check.py` (A1–A13, 13/13 for Venice on
-> 2026-10-28). "Escrow" in SPEC and in Appendix C means what is now the node's
-> reservation.
+> 2026-10-28; `--h2` checks H1–H8 for framing `"2"`). "Escrow" in SPEC and in
+> Appendix C means what is now the node's reservation.
 
 ---
 
@@ -443,6 +460,14 @@ these, the answer is §2.6.
 
 ### 2.5 The HTTP/1.1 + KeyUpdate landscape
 
+*v3 note. This section is about framing `"1.1"`. Since v3 a provider can
+also be served over HTTP/2 (framing `"2"`), where the record boundaries are
+the frame boundaries and the client's public bytes are proven by π_WIN. An
+HTTP/2-only provider is no longer excluded; it must meet H1–H8
+(`PROTOCOL-V3.md` §5.6, `provider-profile-check.py --h2`). Only Venice has
+been checked. A KeyUpdate from the node right after the first flight is
+needed in both framings.*
+
 The record-level choreography requires HTTP/1.1 (record boundaries the client
 controls) and no response compression (C2). Current landscape:
 
@@ -615,6 +640,185 @@ reservation priced: `(setup model, full context, max_tokens, pinned params)`.
   settlement charges the provider-reported usage at the same rates.
 - The cost cannot exceed the reservation for any of the drivers above except
   model aliasing, which is an operational check, not a protocol property.
+
+---
+
+## Q4. Protocol v3: the kept connection
+
+v3 writes the credential once per connection and, with framing `"2"`,
+lets the client send many requests that name it by HPACK index. These are
+the questions that raises. References are to `PROTOCOL-V3.md`.
+
+### 4.1 Can the client read the provider key back out of the HPACK table?
+
+No, as far as the protocol goes; one condition is the provider's.
+
+- The client never had the bytes. The record that carries
+  `authorization: Bearer <KEY>` is encrypted under `K_0`, which only the
+  node holds (two-party key schedule). Recording the node's traffic gives
+  ciphertext.
+- An HPACK entry is a (name, value) pair. The indexed form emits the whole
+  pair to the **server's** decoder; the name-reference form reuses only
+  the name. No encoding puts a stored value under another name or sends it
+  back.
+- Tables are per direction. A response header block is decoded against the
+  response table, which the head sets to size 0 (`HEADER_TABLE_SIZE = 0`,
+  honoured by Venice in the live check). A response cannot point into the
+  request table.
+- HPACK matches whole fields, so there is no "does my guess share a prefix"
+  oracle, and the client cannot add entries at all: a header block that
+  changes the dynamic table is refused, and the client's HEADERS record is
+  proven byte for byte by π_WIN before the node writes it. The compression
+  side channels known from CRIME-style attacks need
+  attacker-chosen headers next to the secret in one compressed context;
+  HPACK has no cross-field compression, and the client chooses no header.
+- Server push is disabled in the head.
+- What remains: the provider's **application** copying the request's
+  `authorization` value into a response (an echo or debug endpoint, an
+  error page). The client cannot choose the path (its header block is
+  pinned to the offer's chat or images path), so the exposure is those
+  paths and their error responses. This is the same condition as on
+  HTTP/1.1 (provider profile; H7). Live against Venice: no credential bytes
+  in eight response paths. For another provider it is **unknown** until
+  `provider-profile-check.py --h2` is run against it.
+
+Residual: a provider-side bug or feature that reflects request headers on
+the pinned paths. No external review of this argument.
+
+### 4.2 Can the client smuggle a second request on the connection?
+
+A second request would spend the node's key without a reservation, so
+this is the attack that matters to the node. The rules (§5.1) and why
+each is there:
+
+| Attempt | What stops it |
+|---|---|
+| A second HEADERS frame hidden among the DATA frames | one frame per TLS record; for **every** record π_WIN proves bytes 0–8 equal the frame header the node expects (type, flags, stream, length = record length − 10) |
+| TLS padding to shift where the frame ends, so a later "payload" starts a new frame | π_WIN proves the record's last plaintext byte is the content type `0x17`: no padding, the frame fills the record |
+| A HEADERS record with another path, method or an extra header | the whole HEADERS record is proven equal to the public block built from the offer |
+| A second stream while one is open; a request without `request_ok` | the node expects exactly the frames of request `n` on stream `2n + 1`; anything else ends the connection |
+| Control frames as a vehicle (CONTINUATION, PRIORITY, a SETTINGS with values, a PUSH_PROMISE) | only SETTINGS ACK, PING ACK, WINDOW_UPDATE on stream 0 and RST_STREAM on the current stream are allowed, each announced and proven |
+| A header block that adds or resizes table entries | refused; the block is public and fixed |
+| A KeyUpdate from the client, to move to keys the proof does not anchor | not allowed; π_WIN is anchored on `SHA256(c_ap_1)` with a public update count |
+| Sending the body beyond what was proven | the node holds every record until a π_WIN that covers it verifies, and never writes beyond the client's `release` mark |
+| Changing the model or cap in the body | the suffix is the tail of the last DATA record (END_STREAM only there) and is proven, as in v2 |
+| A second request inside the JSON body | not possible at the HTTP layer: one stream, one request; the body is one JSON document whose last keys are the pinned ones |
+
+A failed proof or an unexpected frame ends the connection. Before
+`body_released` the request's reservation is released; if the connection
+had no settled request yet, the deposit is charged (Q4.4), otherwise the
+abandon fee is kept. The gates `v3-h2-check.sh` and
+`v3-h2-node-check.sh` run attack cases of this kind and check the node's
+balance afterwards. The frame rules are new and **not externally
+reviewed**; that is the main open item of v3.
+
+In framing `"1.1"` the question does not arise: `Connection: close` and
+`Content-Length` are in the head the node wrote, and the connection
+carries one request.
+
+### 4.3 What does the provider learn from a kept connection (linkability)?
+
+- Requests on one HTTP/2 connection share a TCP connection and a TLS
+  session, so the provider knows they come from one client of the node.
+  In v2 every request was a new connection from the node's address, under
+  the node's key: linkable only by timing and content.
+- The provider does not learn who the client is: the connection comes
+  from the node's address and carries the node's key, as before.
+- A non-confidential client of a provider is linkable by its API key
+  anyway. Behind a routstr node the key is shared by all the node's users,
+  so the kept connection does take away a property v2 had.
+- The client controls it. The pool key is (node, credential,
+  `reuseScope`), and a scope never shares a connection with another.
+  routstrd derives the scope from the local API key by default
+  (`confidentialUpstream.http2.reuse: "per-client" | "shared" | "none"`).
+  `none`, or framing `"1.1"`, gives v2's behaviour at v2's cost (a
+  two-party handshake per request).
+- The node learns the same grouping (which requests share a connection).
+  It already knows the credential that pays for each request, so for the
+  node this is new only when one-off Cashu tokens pay for requests on one
+  connection; those default to a connection per token.
+
+### 4.4 What does a wasted connection cost, and who pays?
+
+A connection costs the node a two-party handshake: garbling (457 MiB peak
+memory per run), 16.38 MB of upload and a session slot. v2 charged the
+abandon fee for an unused session. v3:
+
+| How the connection ends | Deposit | Who bears the cost of the handshake |
+|---|---|---|
+| It settled at least one request (usage, `accept`, or an error head) | released with that settlement; the session fee is charged once, with request 1 | the client, through the session fee, if the node charges one |
+| Opened and never used: the client left, the idle timeout, `head_written` not reached within 600 s, only refused requests | **charged** (`unused`, `idle`, `setup_timeout`) | the client |
+| A failed handshake or π_NK, a protocol error, the provider closing during the handshake | **charged** (`unused`) | the client |
+| A request was accepted and the connection ended before its `body_released` (a failed π_WIN, the client left) | **charged** (`request_abandoned`); the request's reservation is released in full, so the abandon fee is not taken on top | the client |
+| No session slot, the sidecar unreachable or refusing the setup | released (`not_started`) | the node |
+| The provider unreachable, `h2` not selected, framing `"2"` withdrawn | released (`provider_unreachable`) | the node |
+| The sidecar failed | released (`sidecar_failure`) | the node |
+| The provider closed the open, idle connection before any request | released (`provider_closed`) | the node |
+| The node refused a request with a 5xx, or a billing write failed | released (`node_failure`) | the node |
+| A request was written in full and never settled | released; that request's reservation is charged | the client, through the reservation |
+| The provider answered a request and closed before its body was complete | released; the request keeps the session fee | the client, through the session fee |
+
+A refused request (`request_refused`, for example a 402) costs nothing
+by itself; the connection stays ready and the deposit follows how the
+connection ends. The full table, first matching row, is `PROTOCOL-V3.md`
+§12.10.
+
+The deposit is `connection_deposit_msat` in the signed offer (node
+setting; default the abandon fee, at least the session fee and at least
+1 sat). The client refuses an offer whose deposit exceeds its configured
+maximum. The outcome is in `closed.deposit` and, when a settlement
+released it, in that request's receipt.
+
+Limits of this answer. A client cannot prove that a failure was the
+node's; a dishonest node can keep the deposit, as it can keep any
+reservation after a failed request. That is the business-honesty trust
+the model leaves with the node, now bounded per connection by a small
+amount instead of a full-context reservation. On the node's side, a
+deposit below the real cost of a handshake leaves a cheap way to make it
+work; the per-address limit on unused connections and the session slots
+bound that. Whether the default covers an operator's cost is the
+operator's calculation: `[TO MEASURE]` (node CPU seconds per handshake
+under load).
+
+### 4.5 What if my provider's HTTP/2 misbehaves?
+
+Framing `"2"` depends on provider behaviour that no standard guarantees
+(H1–H8): it accepts a KeyUpdate after the first flight, keeps the request
+table large enough for the credential entry, honours
+`HEADER_TABLE_SIZE = 0`, authenticates an index-only `authorization` (also
+after idle), and ends streams the way the usage proof parses them.
+
+- **Before offering it.** The operator runs
+  `provider-profile-check.py --h2`. Nothing is probed at run time; the
+  operator's offer file is the switch.
+- **A provider that changes later.** Failures show before any body is
+  released: ALPN not selected, the provider closing on the head, GOAWAY,
+  a 401 on the first request. The sidecar stops offering `"2"` after 5
+  consecutive connections that fail before their first response began, and
+  offers it again after 10 minutes. A client marks `"2"` bad for that node
+  for 10 minutes and serves the request on `"1.1"` on the same node, when
+  the offer lists it.
+- **A provider that shrinks the table.** The node ends the connection when
+  the provider's SETTINGS put `HEADER_TABLE_SIZE` below the credential
+  entry's size. (`h2_table_size`). The client reports the SETTINGS it saw; a client that lies
+  only makes its own next request unauthenticated.
+- **A provider that evicts or forgets the entry mid-connection.** The
+  request is answered 401. The client discloses the error head, the node
+  settles it by v2's error rule (the session fee at most, for a 401) and
+  the connection closes.
+- **Money.** The deposit is released when the sidecar reports the fault
+  as the provider's (unreachable, `h2` not selected, framing `"2"`
+  withdrawn) or the provider closes an idle connection before any request.
+  It is charged when the provider closes during the handshake (Q4.4; see
+  the table in `PROTOCOL-V3.md` §12.10 for the exact rows). A failure
+  after `body_released` follows the per-request rules; the client does not
+  retry elsewhere.
+- **No HTTP/2 at all.** The operator lists `["1.1"]`. Every request then
+  pays a two-party handshake, as in v2, with the smaller key schedule.
+- Unknown: the behaviour of any provider other than Venice, and of
+  Venice's edge under load (when it sends GOAWAY, its own idle limit past
+  150 s). The node's `max_requests`, `max_lifetime_s` and `idle_timeout_s`
+  bound how long the protocol relies on one connection.
 
 ---
 

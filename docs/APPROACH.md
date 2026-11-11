@@ -1,113 +1,219 @@
 # The confidential-upstream approach
 
-*2026-10-10, updated 2026-10-28. This document is the engineering overview. The protocol as implemented is specified in the paper (`../paper/paper.md`, section 4; `../paper/paper.pdf`), with the two-party handshake in `TWOPC-DESIGN.md`. The authors' original working documents (the first protocol spec, implementation plan, wiring spec and benchmarks, `original/*`) are local only and not published; the code has moved on from them.*
+*2026-10-10, rewritten 2026-11-11 for protocol v3. This document is the engineering overview. The normative specification is `../PROTOCOL-V3.md` (wire format in its §12); the reasoning behind v3 is in `../PROTOCOL-V3-DRAFT.md`, the two-party handshake in `TWOPC-DESIGN.md` and `TWOPC-NODE-GARBLING.md`, the threat model and guarantees in the paper (`../paper/paper.md`). The authors' original working documents (`original/*`) are local only and not published.*
 
-*Protocol versions. The implemented and deployed protocol is **v2** (two-party handshake, `TWOPC-DESIGN.md`): the client and the node run the TLS key schedule as a two-party computation, so the client never holds the key of the credential record. **Protocol v1**, where the client runs the handshake alone, **is retired**: the code no longer speaks it (it is kept on the `v1-poc` branch here and the `confidential-upstream` branches of routstr-core and routstr-sdk). "The idea", some latency figures and parts of the known limits below still describe v1, as the design v2 grew from; they are marked. The section "Protocol v2" lists what changes. Trade-offs: `V1-V2-ONE-PAGER.md`.*
+*Protocol versions. The protocol is **v3**: a two-party TLS handshake per **connection**, and one or many requests on that connection. **v2** (one two-party handshake per request, HTTP/1.1 only) and **v1** (the client ran the handshake alone) are retired. v2's code is on the branches `twopc-v2` (this repo) and `confidential-2pc` (routstr-core, routstr-sdk); v1's on `v1-poc`. What changed from v2: `V2-V3-ONE-PAGER.md`. From v1 to v2: `V1-V2-ONE-PAGER.md` (historical).*
 
 ## The problem
 
-A routstr node forwards a user's LLM request to an upstream provider (Venice, OpenRouter, …) using the node's own API key. Today the node is a full man-in-the-middle: it reads every prompt, it can alter requests and responses, and the user must trust its accounting. The existing "verified mode" (TLSN/MPC-TLS, see `original/REPORT-proverd-update.md`) fixes only part of this, at enormous cost (3–66 s per request, hundreds of MB), and it still cannot hide the prompt from the node.
+A routstr node forwards a user's LLM request to an upstream provider (Venice, OpenRouter, …) using the node's own API key. Without this protocol the node is a full man-in-the-middle: it reads every prompt, it can alter requests and responses, and the user must trust its accounting. MPC-TLS ("verified mode", TLSNotary) fixes only part of this, at a high cost per request, and it still cannot hide the prompt from the node.
 
-## The idea (v1)
+## The idea
 
-Flip the TLS client: the **user (C) is the TLS 1.3 client of the upstream**, and the node (N) is only a TCP relay. C does a normal TLS 1.3 handshake with the upstream through N, and then keeps all application keys to itself. For exactly one key epoch, C hands N the *record material* (CTR keystream, GHASH key, tag mask) for one sequence number, and proves in interactive ZK (VOLE-based, TLSNotary's mpz) that this material is correctly derived from the session's handshake secret. With it, N can write exactly **one** TLS record: the HTTP request head containing its `Authorization` header. C never receives that record's ciphertext, so the API key stays N's. C then rotates keys twice (TLS 1.3 `KeyUpdate`), so N's material is useless for everything that follows: the prompt body and the streamed response run under keys only C holds, at native speed, streamed live.
+Flip the TLS client: the **user (C) is the TLS 1.3 client of the upstream (U)**, and the node (N) relays TLS records. Three mechanisms make this safe for both sides.
 
-Verification is symmetric:
+1. **A two-party handshake.** C and N run the TLS 1.3 key schedule as a two-party computation over a joint P-256 key share. C gets the handshake secrets, the response secret `s_ap_0` and its own write secret `c_ap_1`. N gets only the key of the first client key epoch, `K_0, IV_0`. Nobody holds the master secret.
+2. **The node writes epoch 0, the client writes everything after it.** N writes one record with its API key under `K_0`, then a TLS KeyUpdate. From then on the client's direction runs under `c_ap_1`, which only C holds. C cannot decrypt the credential record even if it records the node's traffic, and N cannot read or change anything C writes or U answers.
+3. **One-bit zero-knowledge proofs pin what each side wrote.** N proves its record matches the published template with only the key bytes free (π_NK). C proves that the public parts of its own records are what the offer says (π_WIN), and N holds C's records back until that proof verifies. C proves the provider's usage report (π_C3S), and the node bills from it.
 
-- **N verifies the upstream** from the disclosed *handshake* secrets: certificate chain to Mozilla roots, hostname, CertificateVerify, server and client Finished. (Application secrets cannot be derived from handshake secrets, so this disclosure costs nothing.)
-- **C verifies the request and the bill**: N proves in ZK that the head it wrote matches the published template with only its key bytes free (π_N); C proves the last bytes of its body equal the agreed public JSON suffix that pins every cost-relevant parameter (π_C2); and C proves the upstream's final usage/cost SSE event is authentic (π_C3). The node charges the usage the upstream itself reported, at the rates of the offer the client verified.
+There is no MPC over the payload. The cryptographic work is the key schedule (once per connection) and a few AES blocks per proof. Prompt and response are ordinary TLS at line speed.
 
-π_C2 and π_C3 compare the decrypted range with the public expected bytes *inside* the circuit; the verifier decodes one bit (equal or not), never the decrypted bytes, even when a proof fails. The client also checks every proof parameter the node sends before proving (`params.ts` in the SDK and the reference client): π_C1 must cover exactly the material it sent, π_C2 a window ending at the end of its own final body record with its own suffix as the expected value, and π_C3 the final server records exactly as it received them (one trailing close_notify allowed) with its own disclosure as the expected value. The node therefore cannot point a proof, or even its one-bit result, at other plaintext.
+v3 adds one thing to this: **the credential is written once per connection and reused.** With the HTTP/2 framing the head that N writes loads the credential into the provider's HPACK table, and each later request, written by C, names it by a one-byte index. So the two-party handshake is paid once per connection instead of once per request.
 
-Why it is fast: there is **no MPC over the payload**. The only ZK work is the TLS key schedule (tens of SHA-256 compressions) and a handful of AES blocks, per session. Everything else is ordinary TLS at line speed.
+The three legs, to avoid confusion about "HTTP versions":
 
-## Protocol v2 (implemented)
+```
+app ──HTTP/1.1, OpenAI API──► routstrd ──WebSocket──► node ──► sidecar ──TCP──► provider
+                                 └────────── TLS 1.3, framing "2" or "1.1" ─────────────┘
+```
 
-v2 keeps the relay, the suffix hold, the one-bit proofs and the billing, and changes who holds which key:
-
-- C and N run the TLS 1.3 key schedule as a two-party computation over a joint P-256 key share (N garbles, C evaluates; `crypto/twopc`, `docs/TWOPC-NODE-GARBLING.md`). C gets the handshake secrets, the response secret `s_ap_0` and its body secret `c_ap_1`; N gets only the epoch-0 key `K_0, IV_0`. Neither side holds the full secret, so P1 no longer rests on the client never seeing the N→U ciphertext.
-- N writes epoch 0 itself: the credential record and a KeyUpdate. There is no π_C1 and no KeyUpdate from C. N proves the credential record against the template with **π_NK** (anchored on `hk = SHA256(K_0 ‖ IV_0)`); C's proofs are **π_C2S** and **π_C3S** (anchored on `h1 = SHA256(c_ap_1)` and `h2 = SHA256(s_ap_0)`).
-- The sidecar speaks only v2 (`--protocol 2` is optional; `--protocol 1` is refused), checks that the ClientHello carries exactly the joint share, and dials the provider only when the ClientHello arrives. The node's offer advertises `v = min_v = max_v = 2`, and clients refuse an offer without v2.
-- Cost: about 22 MB node→client and 1.2 MB client→node of 2PC data per session; the client's half of the cold preprocessing took 4.6 to 18.8 s against the deployed node from a home connection (paper §6.4), and longer on a slow downlink. Pre-warming (below) moves it off the request path.
+The local OpenAI API of routstrd is unchanged. The framing is a property of the inner TLS connection only; an application never sees it.
 
 ## Properties
 
 | Property | Mechanism |
 |---|---|
-| Credential confidentiality | v2: C never holds `K_0`, the key of the credential record (two-party key schedule). v1: key appears only in N's one record; C never receives its ciphertext; the material is ZK-proven before use; rests on no observer of the N→U ciphertext colluding with C (paper §5) |
-| Content confidentiality | C alone holds application secrets; N sees ciphertext only |
-| Integrity | Head template *content* proven by π_N (v2: π_NK; not the exact wire bytes, see Known limits); body suffix proven by π_C2 (v2: π_C2S) *before* the upstream gets the complete request (N holds the final body record until it verifies); response GCM tags verified natively by C |
-| Verifiable accounting | π_C3 (v2: π_C3S) binds the upstream's usage/cost event to the session; signed receipt + attestation |
-| Upstream authenticity | Both sides verify the certificate/finished messages |
-| Freshness | Session id binds fresh nonces + the node's one-time reservation id; fresh TLS randoms |
+| Credential confidentiality | C never holds `K_0`, the key of the record that carries the credential (two-party key schedule). With framing `"2"` C's requests name the credential by HPACK index; no HPACK encoding returns a stored value to the client (`PROTOCOL-V3.md` §5.5) |
+| Content confidentiality | C alone holds the secrets of its requests and of the responses; N sees ciphertext only |
+| Integrity of the request | N's head: content proven by π_NK (not the exact wire bytes, see Known limits). C's public parts (frame headers, the HTTP/2 header block, the suffix with model and caps) proven by π_WIN **before** N writes the record to U. Response GCM tags verified by C |
+| Verifiable accounting | π_C3S binds the provider's usage event to the request; signed attestation and receipt per request |
+| Upstream authenticity | C and N both verify the certificate chain, hostname, CertificateVerify and Finished |
+| Freshness | The connection id binds fresh nonces; fresh TLS randoms; requests are numbered `(sid, n)` |
 
-No trusted hardware, no enclave attestation, no model-weight proofs, no hiding of traffic volume — stated non-goals.
+No trusted hardware, no enclave attestation, no model-weight proofs, no hiding of traffic volume: stated non-goals.
 
-## Components (as built)
-
-```
-crypto/cu-crypto    Rust  native TLS 1.3 key schedule, GCM record math (GHASH), RFC 8448 + NIST vectors
-crypto/twopc        Rust  v2 two-party key schedule (ECtF + node-only authenticated garbling), cu-2pc binary
-crypto/zkbench      Rust  mpz2 VOLE-ZK circuits: π_NK, π_C2S, π_C3S (v1's π_C1, π_N, π_C2, π_C3: branch v1-poc);
-                          cu-prover/verifier, the pre-warmed proof channel, benches
-crypto/relay        Rust  cu-sidecar: WS control/relay/zk endpoints, TCP relay, handshake verification,
-                          credential-record assembly, attestation; settlement is in the node (Python)
-crypto/client       TS    reference client: fork of @reclaimprotocol/tls + session driver (spawns cu-prover)
-```
-
-Integration (branch `confidential-2pc` in routstr-core and routstr-sdk, `confidential-upstream` in routstrd; the retired v1 integration is the `confidential-upstream` branch of routstr-core and routstr-sdk):
+## Components
 
 ```
-routstr-core  Python   /v1/confidential/offer (Nostr-signed), WS proxies to the sidecar, billing through
-                       the node's normal reservation/settlement, receipt signing, additive /v1/models field
-routstr-sdk   TS       client/confidential/*: offer verify, session driver, prover backend, and a transport
-                       that RoutstrClient uses instead of fetch() for opted-in requests
-routstrd      TS/Bun   config block (trusted hosts with wildcards, node pins, prover path, pre-warming) +
-                       passing the x-routstr-verify: confidential opt-in into the normal routeRequests
-                       call; fails closed (HTTP 400) when the mode is off or the endpoint is not chat
-                       completions or image generation
+crypto/cu-crypto    Rust  TLS 1.3 key schedule, GCM record math (GHASH), RFC 8448 + NIST vectors
+crypto/twopc        Rust  two-party key schedule split-public-1 (ECtF + node-only authenticated garbling),
+                          cu-2pc binary for the client
+crypto/zkbench      Rust  mpz2 VOLE-ZK circuits: π_NK, π_WIN, π_C3S; cu-prover, the pre-warmed proof channel
+crypto/relay        Rust  cu-sidecar: connection state machine, TCP relay, handshake verification, the
+                          connection head (HTTP/2 or HTTP/1.1), record hold, HTTP/2 framing and HPACK,
+                          attestation. Settlement is in the node (Python)
+crypto/client       TS    reference client: fork of @reclaimprotocol/tls + driver (spawns cu-prover, cu-2pc)
 ```
 
-## Negotiation and billing (stateless, per request)
+Integration:
 
-1. Node publishes a Nostr-signed offer: `GET /v1/confidential/offer` (version range, `upstream_host`, the session WebSocket URL, the node's signing key (`notary_pubkey`), `max_tokens_cap`, key length and alphabet, `head_template`, the `chat` suffix block and `suffix_keys`, `price_list`, mints, fees and `reserve_margin_tokens` when set, and the `images` block on nodes that sell images). The trusted upstream hostnames are the client's own list, not an offer field. A node with fixed per-request pricing offers no confidential mode, and it offers a chat model only when the model's public id equals the provider's id.
-2. `/v1/models` gains one additive field per model pointing at the offer, only for models with a signed price entry; older clients ignore it.
-3. Client opts in per request if: user-enabled ∧ version range ∧ signature verifies with a pinned node key ∧ **upstream hostname matches its trusted list (wildcards allowed; an empty or missing list refuses every host)**; it routes only to nodes advertising the model confidentially. The offer cache re-applies these checks under each call's own policy. `POST /v1/chat/completions` is carried, and image generation (`POST /v1/images/generations`, `/v1/image/generate`) on nodes whose signed offer lists `capabilities: ["chat", "images"]`; any other endpoint is refused before a credential or deposit is touched.
-4. Billing is the node's ordinary path. The setup carries the client's usual bearer (API key or Cashu token) and `offer_sig`, the signature of the offer it verified. The node keeps a signed offer for 10 minutes after it last served it (at most 512 offers) and freezes that offer's rates for the session (unknown or expired → 409 `offer_expired`; the SDK refetches and retries once). It reserves `max(min_request_msat, ⌈(prompt_limit·max(in, cache_write) + (max_tokens + margin)·out)/1000⌉)` msats (plus the larger of the session and abandon fees, if the node charges them) with `pay_for_request`, where `prompt_limit` is the model's full context length: the prompt is opaque, so it is never discounted (nor reduced by the model's own completion limit, which the pinned cap rarely reaches). `margin` is `CONFIDENTIAL_RESERVE_MARGIN_TOKENS` (default 16), signed in the offer as `reserve_margin_tokens`: a provider may bill a few tokens beyond `max_tokens` and the charge is capped at the reservation, so the margin enlarges the hold only; overshoot beyond it is the node's loss. It charges exactly the frozen-rate cost of the π_C3S-verified usage at the setup model's rates (cached reads at `cached_in`, prompt-cache writes at `cache_write`) plus the session fee, capped at the reservation, through the node's existing finalize path; a usage event that names the model otherwise is logged, not refused, since π_C2S already bound the model. It releases the reservation if the upstream never got the request (less the abandon fee, if any) or refused it (less the session fee for a 429/503 or a 401/402/403 (the node's own provider key or account), or when the provider sent response bytes and closed before the final body record was released; less the abandon fee for any other 4xx: the node did the 2PC for a request the provider rejected), and charges it in full for another 5xx or when the client withholds its disclosure. After the release, the SDK does not retry a node error on another node, and a caller abort lets the session finish and settle on the reported usage in the background. No other model or cap can run: the sidecar releases the final body record (the pinned suffix) only after π_C2S verifies.
-5. The attestation is the sidecar's record of the session, made when the provider closes the connection: the sid, the certificate-chain hash, both handshake transcript hashes, the record counts (the client's body records and all server records) and the SHA-256 of all bytes in each direction, `c_commit` and the time. The sidecar signs it with a per-process Ed25519 key and the node re-signs it with its Nostr key; the client checks the node's signature and that the sid and transcript hashes are its own. The signed receipt carries `sid`, model, usage, cost, reservation, balance, rates and the hash of the attestation. The client requires its signature, reads every field from the signed bytes, checks `sid` and the attestation hash against its own session, and checks the usage and `cost ≤ usage × signed rates + session fee`.
-6. Images (`docs/CONFIDENTIAL-IMAGES.md`): the offer's `images` block lists per-model variants (resolution tier, WebP) with a signed `msat_per_image`. The suffix pins model, count (1-4), the provider's paid extras (off) and the variant, so π_C2S proves every price input; the prompt and other options stay private. The node reserves `msat_per_image × count` plus the larger fee, and on a 2xx the client sends `accept` (no usage proof) and the node charges exactly that plus the session fee, which the client checks against the receipt. Errors use the error-head path below. Image sessions are never armed.
-7. Upstream errors: for a status ≥ 400 the client discloses only the response head (status line and headers); π_C3S proves it sits the given number of bytes before the end of the response, so the error body stays private.
-8. Limits: both the node and the sidecar validate the setup (model; `max_tokens` an integer in [1, cap]; body length in [1, 8 MiB]) and reserve before any provider connection opens; the node allows 10 s to the setup and refuses a setup frame over 256 KiB, the sidecar allows 15 s; 600 s per session up to the release of the final body record and a fresh 600 s after it, 32 concurrent sessions each; every refusal is an explicit error frame. The node counts its first 600 s from the WebSocket accept, before the sidecar's connection, so its limit ends a session that was never released; after `body_released` both allow up to 600 s for the response and the disclosure. When its limit ends a session, the node first reads the sidecar's last frames, so a disclosure already verified is settled on usage. The node also refuses a client address that already holds 12 unused sessions (`CONFIDENTIAL_MAX_UNUSED_PER_IP`), counted from the session's reservation until the credential record is written. Connections that have not reserved yet are a separate pending pool: at most 4 per address (IPv6 grouped by /64) and 1024 in all, evicting the oldest connection still waiting for its setup.
+```
+routstr-core  Python   /v1/confidential/offer (Nostr-signed), WebSocket proxy to the sidecar, the connection
+                       deposit, per-request reservation and settlement through the node's normal billing,
+                       receipt signing, additive /v1/models field
+routstr-sdk   TS       client/confidential/*: offer verification, connection and request driver, the
+                       HTTP/2 pool, pre-warm, and a transport RoutstrClient uses instead of fetch()
+routstrd      TS/Bun   config block (trusted hosts, node pins, prover path, pooling, pre-warm) and the
+                       x-routstr-verify: confidential opt-in; fails closed (HTTP 400) when the mode is off
+                       or the endpoint is not chat completions or image generation
+```
 
-## Latency: pre-warmed sessions
+Browser: the same client in WebAssembly (`routstr-confidential-web`, demo PWA `routstr-confidential-pwa`).
 
-**Pre-warming (routstrd and the SDK).** Most of a cold request is the 2PC preprocessing. The SDK (`client/confidential/prewarm.ts`) and routstrd (`confidentialUpstream.prewarm`) therefore arm sessions in the background while there is traffic: setup and reservation, the preprocessing and the joint key share, plus one proof channel with the correlations for π_NK, π_C2S and π_C3S. An armed session holds no provider connection. Per (node, model, `max_tokens`, credential) the pool keeps one armed session while the key is active, two after 3 requests in 5 minutes, and at least the peak number of overlapping requests; at most 6 per key, 6 in total and 6 for nodes that charge an abandon fee. A key with no request for 10 minutes keeps none, and an armed session is retired 480 s after its setup. A request that claims one waits only for the online 2PC, the handshake, π_NK, the body and π_C2S (about 2-3 s to the first token on the live node, mostly the provider's latency).
+## The framing and how it is negotiated
 
-**v1 (retired; historical).** The critical path was: KeyUpdate → |head| exchange → **π_C1** (~0.47 s, of which most is VOLE setup and proof transport) → credential record → body → **π_C2** on the held final record (~0.4 s) → upstream starts. Two facts make it compressible:
+A connection has one of two framings.
 
-1. **The VOLE/OT correlation is input-independent** — it depends only on circuit sizes, not on secrets or the request. It can be computed before a request exists (mpz2 separates setup from extend).
-2. **Everything up to the request-bound part can be pre-done**: the TLS handshake with the upstream, handshake verification by the node, the first KeyUpdate (a fixed 22-byte record), the derivation of `c_ap_1`/`K1`/`IV1`/`H1`/`T0`, and the proof correlation. Only `|head|` (depends on the body-length digits) and the request-bound proof remain for the arrive path.
+| | Framing `"2"` (HTTP/2) | Framing `"1.1"` (HTTP/1.1) |
+|---|---|---|
+| Requests per connection | up to `h2.max_requests` (default 100), sequential | exactly 1 |
+| What N writes in epoch 0 | preface, SETTINGS, WINDOW_UPDATE, a probe request (a cheap authenticated GET) that carries the credential, RST_STREAM | the request head of request 1 with the credential |
+| How a request names the credential | HPACK index 62, one byte | it is in the head N wrote |
+| What π_WIN covers | each record's frame header and last byte, the whole HEADERS record, the suffix at the tail of the last DATA record | the final record = the suffix |
+| When a request must be known | after the connection is ready | before the ClientHello (the head names path and `Content-Length`) |
 
-So a client can keep **armed sessions** ready: setup, handshake, KU0, π_C1 and π_N done ahead, with a reservation on its credential. An arriving request claims one, sends the credential record, the body and π_C2 (which depends on the prompt and cannot be pre-done), and returns tokens with about +0.3 s added instead of about +1.1 s. A discarded armed session releases its reservation (the upstream never got a request). The v1 reference client implemented arming (`--arm`, `--pool`).
+Negotiation:
 
-## Running it
+1. **The operator states it.** The sidecar offer file lists `"http": ["2", "1.1"]` in the operator's order of preference; `"2"` needs an `h2` block (`probe_path`, `max_requests`, `max_lifetime_s`). Nothing is probed or assumed. Absent: `["1.1"]`. `crypto/tools/provider-profile-check.py --h2` checks what framing `"2"` needs from a provider (H1–H8, `PROTOCOL-V3.md` §5.6) and is what an operator runs before listing `"2"`.
+2. **The node signs it.** `GET /v1/confidential/offer` carries `v: 3`, `http`, `h2`, `twopc: "split-public-1"`, `connection_deposit_msat`, `idle_timeout_s` and everything v2's offer had (`upstream_host`, `head_template`, the `chat` block, `images`, `price_list`, fees, `max_tokens_cap`).
+3. **The client chooses.** It verifies the offer (signature with a pinned node key, trusted upstream hostname, `v == 3`, a key schedule it implements, the `h2` block in range, the deposit at most its configured maximum) and takes the first entry of `http` it supports. `confidential.http` can force `"2"` or `"1.1"`; the default is `auto`.
+4. **Fallback.** If an HTTP/2 connection fails before the body of its first request was released (handshake, ALPN, the connection head, the provider closing), the client marks `"2"` bad for this node for 10 minutes and serves the request on `"1.1"` on the same node, when the offer lists it. After a body was released there is no retry elsewhere. The sidecar itself stops offering `"2"` after 5 consecutive early failures and offers it again after 10 minutes.
 
-Prototype (unchanged from the verified build): `crypto/PROGRESS.md` has exact commands. Integration branches: `docs/confidential-upstream.md` in routstr-core and routstrd, `client/confidential/README.md` in routstr-sdk; the PRs are listed in `README.md`.
+## Connection lifecycle
+
+One state machine for both framings (`PROTOCOL-V3.md` §3).
+
+1. **Setup.** C sends `setup` with `v: 3`, the framing, a nonce, its node credential and the signature of the offer it verified. It names no model, cap, body length or kind. The node checks the framing is offered, the offer is one it signed, the credential is valid, and **reserves the connection deposit**; only then does it dial the sidecar. Not enough balance: 402, nothing garbled.
+2. **Preprocessing and key share.** N garbles the key schedule and streams it to C; both run the joint P-256 key share. An **armed** connection stops here. The sidecar holds no provider connection yet, and an armed connection lives at most 10 minutes.
+3. **Handshake.** C's ClientHello must carry exactly the joint share (ALPN `h2` for framing `"2"`); the sidecar dials the provider only now. The key schedule runs jointly in five stages. N verifies the certificate chain, hostname, CertificateVerify and both Finished messages; C verifies the same with its own TLS stack.
+4. **Connection head.** N builds the head record under `K_0`, π_NK proves it against the template of the framing, and on C's `release_head` N writes it and a KeyUpdate in one write. C sends no record before `head_written`.
+5. **Request.** C sends `request` with `n`, kind, model, `max_tokens` (or image variant and count), body length, its credential, the offer signature and the fees it accepts. The node does what a v2 setup did: it checks the model and price against the named offer, validates the credential and **reserves the request** (chat: a full-context prompt plus `max_tokens`; images: `msat_per_image × count`). It answers `request_ok` with the canonical suffix. A refused request (`request_refused`, for example 402) leaves the connection ready when C has sent no record for it. In framing `"1.1"` step 5 comes before step 3.
+6. **Records, proof, release.** C sends the request's records. N holds them as the framing says, C proves π_WIN, N writes them to U and sends `body_released`. From here the reservation is at stake.
+7. **End of the request.** Chat 2xx: C discloses the usage event, π_C3S, the node charges the usage at the frozen rates. Images 2xx: C sends `accept`, the node charges the flat price. Status ≥ 400: C discloses only the response head (π_WIN under `s_ap_0` on HTTP/2, π_C3S head mode on HTTP/1.1) and v2's error rules apply by status. N sends the attestation and the receipt, both per request and bound to `(sid, n)`.
+8. **Next request or close.** Framing `"2"` returns to ready after a settled 2xx; an error head closes the connection. Framing `"1.1"` closes (`done`). The node also closes on idle, `max_requests`, `max_lifetime_s` or the provider closing, and reports the deposit's outcome in `closed`.
+
+HTTP/2 rules for what C may write (`PROTOCOL-V3.md` §5.1): one frame per TLS record, no TLS padding; only SETTINGS ACK, PING ACK, WINDOW_UPDATE on stream 0, RST_STREAM on the current stream, and per request one HEADERS and its DATA frames; no KeyUpdate from C, no header block that changes the dynamic table, no second stream while one is open. Anything else ends the connection. Requests are sequential; parallel requests use separate connections.
+
+## Key schedule: `split-public-1`
+
+The construction is v2's node-only authenticated garbling (N garbles with three-halves tables, its wire masks are authenticated to C by IT-MACs over Ferret COTs, C checks every AND gate with a salted 64-bit row before it uses an output). The change is in what is garbled. `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))`, and every HMAC message of the TLS 1.3 key schedule is public. The circuit computes only the pad states of the four secret keys, the outer compressions and the three anchors. The inner state `IS_k` is a public output of its stage and both parties compute the inner digest in the clear; `OS_k` never leaves the circuit.
+
+| | v2 | v3 (`split-public-1`) |
+|---|---|---|
+| Garbled SHA-256 compressions | 31 | 22 |
+| Node → client | 22.12 MB | 16.38 MB |
+| Client → node | 1.21 MB | 1.13 MB |
+| Cold, simulated 2 Mbit/s up, 50 down | 7.42 s | 7.02 s |
+| Cold, simulated 2 up, 10 down | 20.12 s | 15.61 s |
+| Cold, local | 0.67 s | 0.45 s |
+| Online round trips | 1 + 1 | 3 + 1.5 |
+| Node peak memory per run | 517 MiB | 457 MiB |
+
+New and mandatory: **label-check pairs**. For every output wire C reports to N, N sends in preprocessing the salted hashes of both candidate labels, and C checks its label against the pair before it reveals anything. A cheating node learns at most 3 bits per connection about fresh, single-use values (eight observable outcomes), under v2's conditions. Both parties see `IS_k`, so the argument uses two assumptions beyond "HMAC-SHA256 is a PRF": the compression function keyed by its chaining input is a PRF, and `OS_k` is pseudorandom given `IS_k`. There is no published proof and no external review (`TWOPC-DESIGN.md`).
+
+## Money
+
+Billing is the node's ordinary reservation and settlement path. The client's credential is its usual bearer (API key or Cashu token).
+
+| Item | When | Amount |
+|---|---|---|
+| Connection deposit | reserved at the `setup` | `connection_deposit_msat` from the signed offer (node setting; default the abandon fee, at least the session fee and at least 1 sat) |
+| Request reservation | at each `request` | chat: `max(min_request_msat, ⌈(prompt_limit·max(in, cache_write) + (max_tokens + margin)·out)/1000⌉)` with `prompt_limit` the model's full context; images: `msat_per_image × count` |
+| Session fee | once per connection, with the settlement of request 1 | `session_fee_msat`; requests 2… pay usage only |
+| Abandon fee | per request dropped after its reservation and before `body_released`, unless the deposit is charged for it | `abandon_fee_msat` |
+| Usage | per settled chat request | the π_C3S-verified usage at the rates of the offer the request named, capped at the reservation |
+
+The deposit:
+
+- It is **released when the first request of the connection reaches a settlement** (usage, `accept` or an error head: any request the provider received). The receipt of that request says so (`deposit_released_msat`).
+- A connection that was opened and ends with no settled request is **wasted**, and the deposit is **charged**: the client left, the idle timeout, `head_written` not reached within 600 s, a failed handshake or π_NK, a protocol error, only refused requests, or a request that was accepted and abandoned before its `body_released` (that request's reservation is then released in full). This is what makes an unused two-party handshake cost something.
+- It is **released** when the end was not the client's doing: no session slot, the sidecar unreachable or failing, the provider unreachable or not selecting `h2`, framing `"2"` withdrawn, the provider closing an idle connection before any request, a node-side 5xx. It is also released when a request was written in full and never settled (the reservation is charged instead). The full table is `PROTOCOL-V3.md` §12.10.
+- The outcome is signed by the node in the connection's last frame (`closed` or `error`, field `deposit`).
+- After its first settlement an idle connection holds no reservation.
+
+Rates are frozen per request from the offer the request names. The node remembers a signed offer for 10 minutes after it last served it or while a connection opened on it is alive. The connection-level fields of the named offer must equal those of the offer the connection was opened on, else `offer_changed` and the client opens a new connection.
+
+The outcomes per request are v2's per session: the reservation is released if the provider never got the request (less the abandon fee) or refused it (less the session fee for a 429/503 or 401/402/403, the abandon fee for any other 4xx), and charged in full for another 5xx or when the client withholds its disclosure after the release. A usage event that names another model id is logged, not refused: π_WIN already bound the model.
+
+Idle: the node closes a connection with no request in flight `idle_timeout_s` after `head_written` or the last settlement. A connection takes one of the node's session slots for its life and counts against its address's unused-connection limit until its first `body_released`.
+
+## Latency: pooling and pre-warm
+
+**Pooling (framing `"2"`).** The client keeps HTTP/2 connections open and reuses them. The pool key is (node, credential, `reuseScope`). A request takes an idle connection of its key, else opens one (up to `maxConnections` per key and `maxTotal`). Parallel requests use separate connections. The client's idle time is shorter than the node's, so the client closes first.
+
+Requests on one connection are linkable for the provider: same TCP connection, same TLS session. Requests under one API key are already linkable for a non-confidential client. `reuseScope` is the caller's tool to separate what must not be linked; a scope never shares a connection with another. routstrd derives it from the local API key (`confidentialUpstream.http2.reuse: "per-client" | "shared" | "none"`, default per client). One-off Cashu bearers use framing `"1.1"` or `"2"` without reuse.
+
+**Pre-warm.** One mechanism: an **armed connection** (deposit held, preprocessing and key share done, no provider connection), bound to the credential only. It is no longer bound to a model, `max_tokens`, a body length or a request kind, and it holds no full-context reservation.
+
+- Framing `"1.1"`: armed connections play the role of v2's armed sessions.
+- Framing `"2"`: a kept connection replaces pre-warming for a client that is already talking to a node. The client may keep one armed connection per pool key while there is traffic and every open connection is busy, so a burst does not wait for a 2PC.
+- The pre-warmed proof channel holds correlations for π_NK and the first π_WIN and π_C3S; on a kept connection it is topped up while idle.
+
+Measured (loopback, Apple M2 Max, provider Venice). The HTTP/2 figures were taken with the v2-size key schedule, before `split-public-1` was merged:
+
+| | Data | Time |
+|---|---|---|
+| Opening an HTTP/2 connection | 23.7 MB down, 2.6 MB up (with `split-public-1` about 6 MB less down: `[TO MEASURE]`) | 1.0–1.1 s |
+| A later chat request on it | 0.5–1.0 MB down, about 85 kB up | |
+| An image request on an open connection | image + about 9 kB down, 36 kB up | |
+| Time to first token through routstrd, opening request | | 2.0 s |
+| Time to first token through routstrd, reused connection | | 0.46–1.26 s |
+| v2, pre-warmed session, for comparison | about 28 MB per request | 0.9–1.5 s |
+
+Not measured yet: an HTTP/2 open with `split-public-1` end to end `[TO MEASURE]`; a framing `"1.1"` request under v3 `[TO MEASURE]`; any of this against a remote node over a home link `[TO MEASURE]`.
+
+## Upgrade
+
+v3 only. There is no v2 fallback in clients or nodes.
+
+- A v3 node offers `v: 3`. To a socket with `v=2` (or none) it answers `{"type":"error","status":426,"reason":"upgrade_required","min_v":3,…}` and closes.
+- A v3 client that reads an offer with `v < 3` does not use the node for confidential requests and reports `node_protocol_outdated` (routstrd: logged once per node per day, and in the error body when no other node can serve the request). It requests offers as `/v1/confidential/offer?v=3`, so an old node's access log shows that v3 clients are asking.
+- The node's Nostr listing carries `confidential: 3`, so clients can filter before fetching offers.
+- The 2PC channel starts with the tag `routstr-2pc/split-public-1`; a peer with another key schedule ends with `twopc_version_mismatch`.
+
+Operator: update the node and the sidecar together; add `http` (and `h2`, after `provider-profile-check.py --h2` passes) to the sidecar offer file; set the deposit and the idle timeout or keep the defaults. Client: update routstrd (or the SDK, or the web library) and `cu-2pc`/`cu-prover`; no configuration change is needed. Steps: `SETUP.md`; side by side with v2: `V2-V3-ONE-PAGER.md`.
+
+## Limits and timeouts
+
+Both the node and the sidecar validate the `setup` and every `request` (model; `max_tokens` an integer in [1, cap]; body length in [1, 8 MiB]) and reserve before any record for it is accepted. Every refusal is an explicit `error` or `request_refused` frame.
+
+| Limit | Value |
+|---|---|
+| setup frame after the socket opens | 15 s (sidecar), 10 s (node) |
+| 2PC preprocessing and key share | 180 s |
+| socket accept to `head_written`, armed time included | 600 s |
+| `request_ok` to `body_released`; `body_released` to settlement | 600 s each |
+| idle, no request in flight | `idle_timeout_s` |
+| request body | 8 MiB |
+| response | chat 64 MiB; images `images.max_response_bytes`; an HTTP/2 connection 1 GiB in all |
+| π_WIN | 2 200 windows, 64 KiB of ciphertext per proof |
+| requests per HTTP/2 connection, lifetime | `h2.max_requests` (1..1000, default 100), `h2.max_lifetime_s` (60..86400, default 3600) |
+| connections | 32 per process; 12 unused per client address, counted until the first `body_released` |
 
 ## Status / evidence
 
-- v2's three proofs (and, before its retirement, v1's four) verified against real `api.venice.ai`; full sessions with receipt + attestation: `crypto/PROGRESS-CONFIDENTIAL.md`, `crypto/runs/`.
-- v1 proof cost locally (historical): π_C1, π_C2, π_C3 ≈ 0.4–0.5 s and ≈ 1.6 MB each; π_N ≈ 0.09 s and ≈ 0.95 MB; ≈ 5.9 MB per session in both directions. Added time to first token vs direct HTTPS: **about +1.1 s cold, +0.25–0.3 s pre-warmed** (medians, one host; the paper §6.3 has the breakdown).
-- Validation gates (`crypto/tools/`, each exits non-zero on any deviation): `provider-profile-check.py` re-checks the provider assumptions live (A1–A13, 13/13 for Venice on 2026-10-28, incl. LF-only SSE framing; 429/5xx/timeouts count as inconclusive, never as a pass); A13 checks that a vision model bills an image as prompt tokens and reports nothing the node does not price; `regression-modality.py` (optional, for text-only offers) requires the given models to reject both `image_url` and data-URI parts; `adversarial-model-swap.sh` runs the swap attacks plus an honest control and asserts the money outcome in the node log; `stall-repro.sh` fails below a success threshold.
+- Built on the branch `v3-h2` here and `confidential-v3` in routstr-core, routstr-sdk and routstrd: the statement π_WIN, the sidecar's HTTP/2 mode, the reference driver, the node, the SDK pool and routstrd's pass-through. The repository `README.md` has the current state of each piece.
+- Live against Venice: a TLS KeyUpdate on an HTTP/2 connection is accepted; `HEADER_TABLE_SIZE = 0` is honoured for response headers; a request that names `authorization` by index only is authenticated, also after 150 s of idle; no credential bytes appeared in eight response paths.
+- Gates (`crypto/tools/`, each exits non-zero on any deviation): `provider-profile-check.py` (A1–A13; `--h2` for H1–H8; `--images` for I1–I9), `v3-h2-check.sh` (honest cases, attacks, against its own sidecar), `v3-h2-node-check.sh` (every case's money outcome in the node's database), `v3-h2-routstrd-check.sh` (through a scratch routstrd), `adversarial-model-swap.sh`, `stall-repro.sh`.
 
-## Known limits (honest list)
+## Known limits
 
-- v1 only: P1 (the API key stays N's) rests on the client never seeing the N→U ciphertext of the credential record: an observer on N's egress path colluding with C, or an upstream that reflects request bytes, would expose the key. v2's two-party handshake removes the assumption; its own costs and the bound on what a cheating node can learn are in `TWOPC-DESIGN.md` ("Security model").
-- v2 only: N holds `K_0`, so it can write any number of epoch-0 records, not only one head of fixed length (`TWOPC-DESIGN.md`, "Residual differences vs v1"). Epoch 0 carries no C data.
-- v1 only: the key commitment sent to C is `SHA256(header ‖ C1)` without a salt; its safety rests on the API key's entropy (42 random characters for Venice).
-- Interactive, designated-verifier proofs: N must be online (it is the proxy) and there is no artifact a third party can check. A non-interactive proof backend alone would not change this, because C holds the server's application keys and could forge server records; that needs an independent transcript attestation or MPC-TLS.
-- π_N (v2: π_NK) binds the head *content* and length, not the exact wire bytes, which C cannot see. N could write a different head of the same length (another account, another endpoint, a header that changes how the provider processes the body); C cannot detect it. Harm is bounded by C's own authenticated records and response/usage verification, and by what the provider lets headers and endpoints change (paper §3.1, item 12).
-- N sees timing and record sizes (the token-length sequence of a streamed response), the body length, the usage event, and on an upstream error the status line, response headers and body length.
-- Provider profile must hold (HTTP/1.1, TLS 1.3 AES-GCM, KeyUpdate accepted, strict JSON, streaming usage in the case-study provider's shape: chunked encoding, a separate final usage event with empty `choices`, cache writes counted in `prompt_tokens`; a `Bearer` key from `[A-Za-z0-9_-]`; no header or endpoint outside the template that changes how the body is processed). Not universal; see the paper's §3.1 and Appendix A.
+- **No external review** of π_WIN, the HTTP/2 frame rules, the usage interval rule or `split-public-1`. The garbler-only 2PC has no published proof. A cheating node can learn at most 3 bits per connection about single-use values, assuming ECtF's semi-honest share conversion leaks nothing beyond its outcome.
+- **One provider tested** (Venice). The design is for any OpenAI-compatible upstream that meets the provider profile; framing `"2"` additionally needs H1–H8. A provider that changes its HTTP/2 behaviour breaks framing `"2"`; this is detected (the sidecar stops offering it, clients fall back to `"1.1"`).
+- **Linkability.** Requests on one HTTP/2 connection are linkable for the provider. `reuseScope` separates them at the cost of more connections.
+- N holds `K_0`, so it can write any number of epoch-0 records, not only the proven head. π_NK binds the head's content and length, not the exact wire bytes, which C cannot see. N could write another head of the same length (another account, another path for the probe, a header that changes how the provider handles the connection). Epoch 0 carries no client data, and with framing `"2"` C's own header blocks are proven in full.
+- The provider's application could copy the request's `authorization` header into a response. This is the same condition on both framings (provider profile; H7).
+- Interactive, designated-verifier proofs: N must be online and there is no artifact a third party can check.
+- N sees timing and record sizes (the token-length sequence of a streamed response), the body length, the usage event, on an upstream error the status and response headers, and with framing `"2"` which requests share a connection.
 - The client's TLS validator implements RFC 5280 path validation against the WebPKI roots; it does no revocation or certificate-policy checking.
-- The sidecar trusts its peer to be the node. It holds the provider key but does not check client credentials (the node does, and reserves, before dialing it), so whoever reaches the sidecar spends the key without paying. Off loopback it requires the node's bearer token (`CU_SIDECAR_TOKEN` / `CONFIDENTIAL_SIDECAR_TOKEN`); on loopback without a token any local process can use it. The node→sidecar link is plain HTTP/WebSocket, so the token is cleartext on that wire: keep it on a private network (same host or container network) or in an encrypted tunnel, and never publish the port (`SETUP.md`).
+- The sidecar trusts its peer to be the node. It holds the provider key but does not check client credentials (the node does, and reserves, before dialing it). Off loopback it requires the node's bearer token (`CU_SIDECAR_TOKEN` / `CONFIDENTIAL_SIDECAR_TOKEN`); the node→sidecar link is plain HTTP/WebSocket, so keep it on a private network and never publish the port (`SETUP.md`).

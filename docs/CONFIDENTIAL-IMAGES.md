@@ -1,6 +1,12 @@
 # Confidential image generation: feasibility and specification
 
-Status: implemented and deployed (2026-10-19), with the decisions in section 0. The study sections
+**Protocol v3 (2026-11-11).** The image rules of this document hold under protocol v3: the offer's `images`
+block, the variants and prices, the byte-exact suffix, what the client checks, `accept`, the flat charge
+and the error rules. The lifecycle around them changed. Section "0a. Under protocol v3" says how; where it
+differs from sections 0 to 8, which were written for protocol v2, section 0a wins. The normative text is
+`PROTOCOL-V3.md`.
+
+Status: implemented and deployed under protocol v2 (2026-10-19), with the decisions in section 0. The study sections
 below were written before the implementation, so their code references are to `twopc-v2` (this repo),
 `confidential-2pc` (routstr-core, routstr-sdk), the web library at `2af9a79` and the PWA at `ec06e83`;
 where they differ from section 0 or from the notes in this paragraph, those win:
@@ -16,9 +22,9 @@ shapes need code. Clients take nothing in the offer's images block on trust: a f
 lowercased, docs/CHAT-SUFFIX.md rule 7), a variant pins only resolution, quality or format to a `param_space` value, a private option that names
 a pinned key is refused, the head template must be the image path with exactly the six fixed headers, and
 the numbers stay in range (integer prices, `max_count` 1..4, unique variant ids, `response_idle_s` 30..600).
-On a node whose offer lists `images` in `h2.kinds`, an image request can also run as one more request on an
-`http: 2` connection (protocol v3 prototype, `PROTOCOL-V3-DESIGN.md` A.13): same suffix, same price, `accept`
-on success, the error head otherwise; the `armed`/pre-arm rules below concern the v2 flow only.
+Under protocol v3 an image is a `request` on a connection (section 0a); on a node whose offer lists `images`
+in `h2.kinds` it is one more request on an open HTTP/2 connection: same suffix, same price, `accept`
+on success, the error head otherwise. The `armed`/pre-arm rules below concern the v2 flow only.
 Errors: a 429 or 503 (capacity) or a 401, 402 or 403 (the node's provider key or account) costs the
 session fee, any other 4xx the abandon fee, other 5xx up to the reservation;
 an image error receipt carries the session's kind, model, variant and count.
@@ -56,7 +62,8 @@ and the PWA.
 6. **5xx after release:** the chat rule (charge the reservation) for now; the live gate records
    whether Venice bills failed generations, and the rule changes only if it does not.
 7. **No pre-arm for images, ever.** The node refuses `armed: true` for `kind: "images"`; clients never
-   pool image sessions and never call the chat pre-warm `setTarget` for an image model.
+   pool image sessions and never call the chat pre-warm `setTarget` for an image model. (v2 only. Under
+   v3 a connection is not bound to a kind; section 0a.)
 8. **PWA on mobile:** allowed; the image button shows the per-image data cost (~26 MB) and warns once
    when `navigator.connection` reports a metered or `saveData` connection. The PWA re-encodes the
    received WebP client-side (canvas, ≤1200 px, WebP 0.75, JPEG 0.8 fallback) before storing it.
@@ -65,6 +72,42 @@ and the PWA.
    not pinned).
 10. Later phases: an offer-driven suffix for chat (done 2026-10-19, docs/CHAT-SUFFIX.md), and
     token-metered image models (not planned).
+
+## 0a. Under protocol v3
+
+What stays: decisions 1 to 6, 9 and 10 of section 0, the offer's `images` block (§5.1), the suffix and its
+test vector, the client's policy for the block, the response limits, the flat price, the error rules.
+
+What changes:
+
+| Topic | v2 (sections 0 to 8) | v3 |
+|---|---|---|
+| Where `kind`, `model`, `variant`, `count`, `body_len` and the fees go | the `setup` | the **`request`** message. The `setup` names only the framing and the credential; a setup that names a request term is refused |
+| Reservation | `msat_per_image × count + max(f_s, f_a)` at the setup | the connection deposit at the `setup`; `msat_per_image × count` at the `request` |
+| Suffix | rendered by the node, sent in `ready` | rendered by the node, sent in `request_ok`; the sidecar checks it byte-exactly, as before |
+| Proof of the suffix | π_C2S on the final record | **π_WIN**. Framing `"1.1"`: one window, the final record = suffix ‖ `0x17`. Framing `"2"`: the whole HEADERS record (the offer's images path, the credential by index), each DATA record's frame header and last byte, and the tail of the last DATA record = suffix ‖ `0x17` |
+| Head with the credential | the images head template, per session | framing `"1.1"`: `images.head_template` with `Content-Length`, so the image `request` precedes the ClientHello. Framing `"2"`: the connection head is the same for every kind; the image request's HEADERS block names the images path |
+| Success | `accept` | `accept` with `n` (framing `"2"`: after END_STREAM of the request's stream, with the server record count). No usage proof. The response is one JSON body, in DATA frames on HTTP/2 |
+| Charge | `msat_per_image × count + f_s` (`settle_flat`) | `msat_per_image × count`, plus the session fee only when this is the connection's first settled request |
+| Error | error head, π_C3S head mode | framing `"1.1"`: the same. Framing `"2"`: `disclose_head`, π_WIN under `s_ap_0` over the response HEADERS frame; the connection closes after it is settled |
+| Receipt | per session | per request, bound to `(sid, n)`; the first settled request's receipt carries `deposit_released_msat` |
+| Pre-arm (decision 7) | never for images | the rule is gone with its reason. An armed connection is bound to the credential only, so it can serve an image request. On HTTP/2 an image usually runs on a connection that is already open |
+| After the request | the session ends | framing `"2"`: the connection returns to ready and can carry a chat or another image request; framing `"1.1"`: `closed`, `done` |
+| Which framings carry images | HTTP/1.1 | `"1.1"` always (when the offer has an `images` block); `"2"` when the offer's `h2.kinds` lists `images`. A client on an HTTP/2 connection whose offer does not list it uses a `"1.1"` connection for the image |
+
+Cost of an image request (decision 8 and §5.8 give v2's figures, about 26 MB per image):
+
+- On an open HTTP/2 connection: 36 kB up, the image plus about 9 kB down (measured, loopback). No two-party
+  handshake.
+- On a new connection, either framing: one two-party handshake (16.38 MB down, 1.13 MB up) plus the proofs
+  and the image. Total per framing: `[TO MEASURE]`.
+- The PWA's per-image data warning (decision 8) should use these figures once the web library speaks v3;
+  the web library has not been moved to v3 yet.
+
+Live checks: `provider-profile-check.py --images` (I1 to I9) is unchanged. Image cases over HTTP/2 are in
+`crypto/tools/v3-h2-check.sh` (`h2-image`, a tampered image suffix), `v3-h2-node-check.sh` (image, chat
+then image, image suffix, with exact balances) and `v3-h2-routstrd-check.sh`; the reference driver runs
+them with `--http2 --image`.
 
 ## 1. What exists today
 
