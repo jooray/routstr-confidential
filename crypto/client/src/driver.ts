@@ -82,7 +82,7 @@ import { checkHeadTemplate, checkPiC2SParams, checkPiC3SParams, serverTailEpoch,
 import { TwoPc, type ApOut } from './twopc.ts'
 import { ZkChan } from './zkchan.ts'
 import { H2Conn, runHttp2, type H2Ctx } from './driver-h2.ts'
-import { MAX_DATA_IN_RECORD, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
+import { MAX_DATA_IN_RECORD, chatPath, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
 
 setCryptoImplementation(webcryptoCrypto)
 
@@ -187,6 +187,11 @@ const H2_CHUNK = Number(arg('--h2-chunk', String(MAX_DATA_IN_RECORD)))
 const ADV_H2 = arg('--adv-h2')
 const ADV_H2_AT = Number(arg('--adv-at', ADV_H2 === 'replay-usage' ? '2' : '1'))
 const ADV_H2_PATH = arg('--adv-h2-path', '/api/v1/api_keys/abcdefg')
+// --h2-kinds chat,images,…: the kind of each request on the connection
+// (default: `images` for every request with --image, else `chat`). An image
+// request uses --image-model (default: --model with --image), --variant, --count.
+const H2_KINDS = (arg('--h2-kinds') ?? '').split(',').filter(Boolean)
+const H2_IMAGE_MODEL = arg('--image-model')
 // --linger-ms N: after the last request (or with --requests 0, after the
 // connection opened) wait up to N ms for the node to close the idle connection.
 const H2_LINGER_MS = Number(arg('--linger-ms', '0'))
@@ -1756,7 +1761,7 @@ async function main() {
 
 /** `--http2`: one connection, `--requests N` sequential chat requests. */
 async function mainHttp2(): Promise<void> {
-  if (IMAGE || POOL > 0 || ABANDON) throw new Error('--http2 serves chat requests on one connection (no --image, --pool, --abandon)')
+  if (POOL > 0 || ABANDON) throw new Error('--http2 serves its requests on one connection (no --pool, --abandon)')
   if (!ZKCHAN) throw new Error('--http2 needs the proof channel (no --no-zkchan)')
   const bases = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
   // Refuse before any setup if the verified offer does not list http 2.
@@ -1769,6 +1774,25 @@ async function mainHttp2(): Promise<void> {
     throw new Error(`the node's connection deposit of ${H2_BLOCK.connection_deposit_msat} msat exceeds --max-deposit ${H2_MAX_DEPOSIT}`)
   }
   const enc = new TextEncoder()
+  // Image requests on the connection (A.13): the variant, its price and the
+  // images route come from the offer's images block.
+  const kindOf = (n: number): string => H2_KINDS[n - 1] ?? (IMAGE ? 'images' : 'chat')
+  const anyImages = Array.from({ length: H2_REQUESTS }, (_, i) => kindOf(i + 1)).includes('images')
+  let image: { model: string; variant?: string; count: number; pins: [string, unknown][]; msat: number; path: string; im: any } | undefined
+  if (anyImages) {
+    if (!H2_BLOCK.kinds.includes('images')) throw new Error('offer_no_http2_images: the offer serves no image requests over http 2')
+    const im = imagesOffer()
+    const model = H2_IMAGE_MODEL ?? (IMAGE ? MODEL : undefined)
+    if (!model) throw new Error('an image request needs --image-model')
+    const variants: any[] | undefined = im.price_list?.[model]
+    const v = variants ? (IMAGE_VARIANT ? variants.find((x) => x.id === IMAGE_VARIANT) : variants[0]) : undefined
+    if (variants && !v) throw new Error(`no offered variant ${IMAGE_VARIANT ?? ''} for ${model}`)
+    const maxCount = Math.min(im.max_count, v?.max_count ?? im.max_count)
+    if (!(Number.isSafeInteger(IMAGE_COUNT) && IMAGE_COUNT >= 1 && IMAGE_COUNT <= maxCount)) throw new Error(`--count must be 1..${maxCount}`)
+    // Without a node (a sidecar's own offer has no variants): WebP at the default tier.
+    const pins: [string, unknown][] = v ? v.pins : [...(IMAGE_RESOLUTION ? [['resolution', IMAGE_RESOLUTION] as [string, unknown]] : []), ['format', 'webp']]
+    image = { model, variant: v?.id, count: IMAGE_COUNT, pins, msat: v?.msat_per_image ?? 0, path: chatPath(im.head_template), im }
+  }
   const ctx: H2Ctx = {
     offer: OFFER,
     h2: H2_BLOCK,
@@ -1779,6 +1803,19 @@ async function mainHttp2(): Promise<void> {
     lingerMs: H2_LINGER_MS,
     chunk: H2_CHUNK,
     buildBody: (n: number) => {
+      if (kindOf(n) === 'images') {
+        const im = image!
+        const wrong = ADV_H2 === 'suffix' && ADV_H2_AT === n
+        const canonicalSuffix = renderImagesSuffix(im.im, im.model, im.count, im.pins)
+        // The attack: the body ends in a suffix that orders more images than the request pays for.
+        const sfx = wrong ? renderImagesSuffix(im.im, im.model, ADV_IMAGE_COUNT ?? im.count + 1, im.pins) : canonicalSuffix
+        let p = `{"prompt":${JSON.stringify(PROMPT)}`
+        if (PRIVATE_EXTRA && (H2_PRIVATE_EXTRA_AT === 0 || H2_PRIVATE_EXTRA_AT === n)) p += `,${PRIVATE_EXTRA}`
+        return {
+          model: im.model, maxTokens: 0, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix,
+          image: { variant: im.variant, count: im.count, path: im.path, responseShape: im.im.response_shape, msatPerImage: im.msat },
+        }
+      }
       const model = H2_MODELS[n - 1] ?? MODEL
       const wrong = ADV_H2 === 'suffix' && ADV_H2_AT === n
       const canonicalSuffix = renderChatSuffix(OFFER.chat, model, MAX_TOKENS)
@@ -1808,6 +1845,19 @@ async function mainHttp2(): Promise<void> {
         if ([401, 402, 403, 429, 503].includes(q.status)) bound = SESSION_FEE
         else if (q.status < 500) bound = Math.max(SESSION_FEE, ABANDON_FEE)
         else bound = Math.max(SESSION_FEE, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
+      } else if (q.image) {
+        // A flat charge: exactly the signed price per image × count + the session fee.
+        const want = q.image.msatPerImage * q.image.count + SESSION_FEE
+        const ok =
+          receipt.http === 2 && receipt.kind === 'images' && receipt.usage?.flat === true && receipt.model === q.model &&
+          receipt.variant === q.image.variant && receipt.count === q.image.count &&
+          receipt.msat_per_image === q.image.msatPerImage && receipt.cost_msats === want
+        console.log(
+          `[client ${s.label}] receipt ${q.n}: images variant=${shown(receipt.variant)} count=${shown(receipt.count)} cost_msats=${shown(receipt.cost_msats)} ` +
+            `reserved_msats=${shown(receipt.reserved_msats)} balance_msats=${shown(receipt.balance_msats)} want_msats=${want} cost_ok=${ok}`,
+        )
+        if (!ok) throw new Error(`image receipt ${q.n} is not ${q.image.count} × ${shown(q.image.variant)} at ${q.image.msatPerImage} msat + fee (${want} msat)`)
+        return
       } else {
         // At most the usage at the signed rates (the node may charge less,
         // for cached input) plus the session fee.

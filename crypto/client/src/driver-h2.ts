@@ -26,21 +26,30 @@ export interface H2Ctx {
   /** Node mode: fields every `request` carries (credential, offer signature, fees). */
   requestExtras: Record<string, unknown>
   /** Node mode: check a request's signed receipt (the charge against our own usage or the error status); throws. */
-  checkReceipt?: (receipt: any, q: { n: number; model: string; status: number; usage: any }) => void
+  checkReceipt?: (receipt: any, q: { n: number; model: string; status: number; usage: any; image?: H2Image }) => void
   requests: number
   pauseMs: number
   /** After the last request: wait this long for the node to close the idle connection. */
   lingerMs?: number
   /** Largest DATA payload per record. */
   chunk: number
-  /** The body of request `n`: model, cap, bytes and the pinned suffix. */
-  buildBody: (n: number) => { model: string; maxTokens: number; body: Uint8Array; suffix: Uint8Array; canonicalSuffix: string }
+  /** The body of request `n`: model, cap, bytes and the pinned suffix; `image` for an image request (A.13). */
+  buildBody: (n: number) => { model: string; maxTokens: number; body: Uint8Array; suffix: Uint8Array; canonicalSuffix: string; image?: H2Image }
   /** Adversarial mode and the request it applies to. */
   adv?: { mode: string; at: number; path?: string }
   verifySig: (json: string, sig: string | undefined, pub: string, scheme: string | undefined) => boolean
   shown: (v: unknown, max?: number) => string
   writePrivate: (path: string, data: string | Uint8Array) => void
   log: (o: unknown) => void
+}
+
+/** The terms of an image request: the offered variant (a node's offer), the count, the images route and the price. */
+export interface H2Image {
+  variant?: string
+  count: number
+  path: string
+  responseShape: string
+  msatPerImage: number
 }
 
 /** One record this client sent after the handshake. */
@@ -374,7 +383,7 @@ export class H2Conn {
     if (adv) this.advActive = true
     const stream = requestStream(n)
     const host: string = ctx.offer.upstream_host
-    const path = adv === 'path' ? ctx.adv!.path! : chatPath(ctx.offer.head_template)
+    const path = adv === 'path' ? ctx.adv!.path! : b.image ? b.image.path : chatPath(ctx.offer.head_template)
     const suffixLen = b.suffix.length
 
     // The records of the request: HEADERS, then DATA frames.
@@ -429,7 +438,14 @@ export class H2Conn {
     // `request` first, then the records: the node opens the request, takes
     // any SETTINGS acknowledgement and the records as one π_WIN batch.
     this.requestOpen = true
-    s.sendText({ type: 'request', n, kind: 'chat', model: b.model, max_tokens: b.maxTokens, body_len: bodyLen, ...ctx.requestExtras })
+    if (b.image) {
+      // An image request: a node takes the variant and renders the suffix
+      // itself; a sidecar without a node is handed the suffix.
+      const terms = ctx.nodeMode ? { variant: b.image.variant, count: b.image.count } : { count: b.image.count, suffix: b.canonicalSuffix }
+      s.sendText({ type: 'request', n, kind: 'images', model: b.model, ...terms, body_len: bodyLen, ...ctx.requestExtras })
+    } else {
+      s.sendText({ type: 'request', n, kind: 'chat', model: b.model, max_tokens: b.maxTokens, body_len: bodyLen, ...ctx.requestExtras })
+    }
     while (this.unackedSettings > 0) {
       this.unackedSettings--
       void this.sendCtl('settings_ack', new Uint8Array(0))
@@ -453,7 +469,12 @@ export class H2Conn {
     let receipt: any
     let ownUsage: any
     let text = ''
-    if (status >= 200 && status < 300) {
+    let imageOut: any
+    if (status >= 200 && status < 300 && b.image) {
+      await this.until(() => cur.ended, 'the end of the stream', 600000)
+      receipt = await this.settleAccept(cur)
+      imageOut = this.imageResult(cur, b.image)
+    } else if (status >= 200 && status < 300) {
       await this.until(() => cur.ended, 'the end of the stream', 600000)
       ;({ receipt, ownUsage, text } = await this.settleUsage(cur))
     } else if (status >= 400) {
@@ -465,7 +486,7 @@ export class H2Conn {
     } else {
       throw new Error(`request ${n}: status ${status} is neither a success nor a disclosable error`)
     }
-    ctx.checkReceipt?.(receipt, { n, model: b.model, status, usage: ownUsage?.usage })
+    ctx.checkReceipt?.(receipt, { n, model: b.model, status, usage: ownUsage?.usage, image: b.image })
     const tEnd = Date.now()
     if (receipt.deposit_released_msat !== undefined) {
       // The connection's first settled request: its (signed) receipt returns the deposit.
@@ -493,6 +514,7 @@ export class H2Conn {
       n,
       stream,
       model: b.model,
+      ...(b.image ? { kind: 'images', variant: b.image.variant, count: b.image.count, ...imageOut } : {}),
       status,
       body_len: bodyLen,
       records: plan.length,
@@ -612,6 +634,59 @@ export class H2Conn {
       if (receipt.model !== cur.model) throw new Error('receipt names another model than the request pinned')
       return { receipt, ownUsage: d.ownUsage, text: d.text }
     }
+  }
+
+  /**
+   * A successful image response (A.13): `accept` names the server records we
+   * have seen, the node closes the request's interval there, attests it and
+   * settles at the flat price. Nothing is disclosed and nothing proven.
+   */
+  private async settleAccept(cur: Cur): Promise<any> {
+    const { s } = this
+    for (let attempt = 0; ; attempt++) {
+      await this.drained()
+      const serverRecords = this.recvCount()
+      s.sendText({ type: 'accept', n: cur.n, server_records: serverRecords })
+      const next = await Promise.race([
+        this.wait('accept_retry', 60000).then((m: any) => ({ retry: m })),
+        this.wait('attestation', 60000).then((m: any) => ({ att: m })),
+      ])
+      if ('retry' in next) {
+        // More server records reached the node than we had parsed: catch up.
+        if (attempt >= 20) throw new Error('the node keeps asking for a newer accept')
+        const want = next.retry.server_records
+        await this.until(() => this.recvCount() >= want, 'the server records the node counts', 15000)
+        continue
+      }
+      const attJson = await this.checkAttestation(next.att, cur, serverRecords)
+      const receipt = await this.receipt(cur, attJson)
+      if (receipt.usage?.flat !== true) throw new Error('the settlement of an accepted image request is not flat')
+      if (receipt.model !== cur.model) throw new Error('receipt names another model than the request pinned')
+      return receipt
+    }
+  }
+
+  /** The images of an accepted response: the body is the DATA payloads up to END_STREAM, one JSON object. */
+  private imageResult(cur: Cur, image: H2Image): any {
+    const { s, ctx } = this
+    const bodyBytes = concat(...cur.parts.map((p) => p.data))
+    const warnings: string[] = []
+    let json: any = {}
+    try {
+      json = JSON.parse(Buffer.from(bodyBytes).toString('utf8'))
+    } catch (e) {
+      warnings.push(`response body is incomplete or not JSON: ${String(e)}`)
+    }
+    const images: string[] = image.responseShape === 'venice' ? json.images ?? [] : (json.data ?? []).map((d: any) => d.b64_json)
+    if (images.length !== image.count) warnings.push(`${images.length} of ${image.count} images returned`)
+    const files = images.map((b64, i) => {
+      const f = `${s.runDir}/image-${cur.n}-${i}.webp`
+      ctx.writePrivate(f, Buffer.from(b64, 'base64'))
+      return f
+    })
+    for (const w of warnings) console.log(`[client ${s.label}] warning: ${w}`)
+    console.log(`[client ${s.label}] request ${cur.n}: images ${images.length} of ${image.count} (${files.join(', ')}) response_bytes=${bodyBytes.length} frames=${cur.parts.length}`)
+    return { images: images.length, files, response_bytes: bodyBytes.length, response_frames: cur.parts.length, warnings }
   }
 
   /** The error head (A.7): the response HEADERS frame, which must start a record. */
