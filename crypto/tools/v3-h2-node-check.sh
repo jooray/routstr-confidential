@@ -9,7 +9,9 @@
 #   VENICE_API_KEY=... crypto/tools/v3-h2-node-check.sh
 #
 # The node announces nothing (its relay list points nowhere) and runs with a
-# clean environment, so no other provider key seeds a provider. Credits are
+# clean environment, so no other provider key seeds a provider. Its database
+# holds the provider key while it runs, so it is removed at the end (the test
+# keys' final balances are kept in api_keys.tsv). Credits are
 # written into its scratch database (one fresh key per case); no mint is
 # needed. Every request is small (max_tokens 20).
 #
@@ -99,6 +101,13 @@ stop() {
 cleanup() {
   stop "$NODE_PID"; NODE_PID=""
   stop "$SIDECAR_PID"; SIDECAR_PID=""
+  # The node stores its provider key in its database (provider row and
+  # settings): keep the keys' final balances as evidence and remove it.
+  if [ -f "$DB" ]; then
+    sqlite3 -header -separator $'\t' "$DB" \
+      "select hashed_key, balance, reserved_balance, total_spent, total_requests from api_keys;" > "$OUT/api_keys.tsv" 2>/dev/null || true
+    rm -f "$DB" "$DB-wal" "$DB-shm"
+  fi
 }
 trap cleanup EXIT
 
