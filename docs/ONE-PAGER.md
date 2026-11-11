@@ -58,9 +58,8 @@ when it sees everything. On a provider error it sees only the status and headers
   downloads about 16 MB and uploads about 1.1 MB (v2: 22 MB and 1.2 MB, for every request). Where the
   node offers HTTP/2, routstrd keeps the connection and sends your next requests on it: each moves about
   0.5-1 MB down and under 0.1 MB up, and the first token came in 0.5-1.3 s in our tests (2 s on the
-  request that opened the connection; one host, so add your network). Parallel requests open more
-  connections. Where the node offers only HTTP/1.1, every request pays the opening; routstrd prepares
-  connections in the background while you send requests.
+  request that opened the connection; one host, so add your network). Where the node offers only
+  HTTP/1.1, every request pays the opening; routstrd prepares connections in the background.
 - **Money:** from your usual balance with that node, at the rates it signed. Opening a connection holds
   a small deposit (by default at least 1 sat), returned with your first settled request and kept if you
   open a connection and never use it. Per request the node holds back the maximum (a full-context

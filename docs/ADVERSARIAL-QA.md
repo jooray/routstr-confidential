@@ -791,13 +791,15 @@ after idle), and ends streams the way the usage proof parses them.
 - **Before offering it.** The operator runs
   `provider-profile-check.py --h2`. Nothing is probed at run time; the
   operator's offer file is the switch.
-- **A provider that changes later.** Failures show before any body is
-  released: ALPN not selected, the provider closing on the head, GOAWAY,
-  a 401 on the first request. The sidecar stops offering `"2"` after 5
-  consecutive connections that fail before their first response began, and
-  offers it again after 10 minutes. A client marks `"2"` bad for that node
-  for 10 minutes and serves the request on `"1.1"` on the same node, when
-  the offer lists it.
+- **A provider that changes later.** Most failures show before any body
+  is released: ALPN not selected, the provider closing on the head,
+  GOAWAY. The sidecar stops offering `"2"` after 5 consecutive connections
+  that fail before their first response began, and offers it again after
+  10 minutes. A client marks `"2"` bad for that node for 10 minutes and
+  serves the request on `"1.1"` on the same node, when the offer lists it.
+  A failure that shows only in the response (a 401 because the index no
+  longer authenticates) comes after the body was released: that request
+  is settled as an error and is not retried.
 - **A provider that shrinks the table.** The node ends the connection when
   the provider's SETTINGS put `HEADER_TABLE_SIZE` below the credential
   entry's size. (`h2_table_size`). The client reports the SETTINGS it saw; a client that lies
