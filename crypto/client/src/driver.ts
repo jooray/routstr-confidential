@@ -857,8 +857,16 @@ function cryptoRandom(n: number): Uint8Array {
   return b
 }
 
+/**
+ * Rejects after `ms`. The timer is never cleared (the waits race it), so it is
+ * unref'd: a wait that already ended must not keep the process alive for the
+ * rest of its timeout. While a connection runs, its sockets do.
+ */
 function timeout(ms: number, what: string): Promise<never> {
-  return new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout waiting for ${what}`)), ms))
+  return new Promise((_, rej) => {
+    const t = setTimeout(() => rej(new Error(`timeout waiting for ${what}`)), ms)
+    t.unref?.()
+  })
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
