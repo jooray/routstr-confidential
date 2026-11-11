@@ -115,8 +115,8 @@ an instruction to the provider's HTTP/2 stack and the node cannot read it.
 
 Parties:
 
-- **C, client** (a user's daemon or app). TLS 1.3 client of the upstream session; the only holder of the
-  body and response traffic secrets; payer of the node.
+- **C, client** (a user's daemon or app). TLS 1.3 client of the upstream connection; the only holder of the
+  request and response traffic secrets; payer of the node.
 - **N, node.** Holds the upstream API key; owns the TCP connection to the upstream and relays it; the
   only holder of the first application epoch's key; bills C through its ordinary accounts.
 - **U, upstream** (any provider whose profile, section 3.1, is satisfied). Unmodified.
@@ -131,14 +131,14 @@ Goals:
 | P1 | Credential confidentiality: only N knows the upstream API key. C learns nothing about it even if it sees every byte N sends to U. |
 | P2 | Content confidentiality: only C (and U) can read the prompt and the response. N sees ciphertext plus the public billing data: the usage event, or on an upstream error the response head. |
 | P3 | Integrity: C can verify that the request U received is C's own content behind the agreed public template content (not its exact wire bytes: N's epoch-0 records can still change how U processes that content, residual risk 1), and that the response is exactly what U sent (tool calls included). |
-| P4 | Verifiable accounting: the charge is computed from the token usage the upstream itself reported in the session, verified by N (who settles) and by C (who checks the signed receipt against its own plaintext). |
-| P5 | Upstream authenticity: both parties verify that the session terminates at a server holding a valid certificate for the upstream hostname. |
+| P4 | Verifiable accounting: the charge is computed from the token usage the upstream itself reported for the request, verified by N (who settles) and by C (who checks the signed receipt against its own plaintext). |
+| P5 | Upstream authenticity: both parties verify that the connection terminates at a server holding a valid certificate for the upstream hostname. |
 | P6 | Freshness: every connection is live and every request on it is bound to one payment; nothing can be reused across connections or requests. |
 
 Non-goals: hiding the prompt from U (U processes it by definition); proving which model weights ran;
 hiding traffic volume and timing from N (section 5); hiding from U that the requests on one
 connection belong together (residual risk 16); and third-party verifiability. The proofs convince
-the two parties of the session, which is what settlement needs. They are interactive and
+the two parties of the connection, which is what settlement needs. They are interactive and
 designated-verifier, and C, holding the server's application key, could forge server records for
 anyone but N. A receipt is N's signed statement, not a proof to outsiders.
 
@@ -218,7 +218,7 @@ Items (5) and (6) quantify over every field and input, which no finite test can 
 case-study provider (Appendix A) a live regression gate tests items 1 to 7 and 9 with sampled cases, and
 of item 11 the separate usage event with empty `choices`, its model and the terminator (check A7); the
 requirements hold as far as those samples show, and the gate is re-run after provider changes. The
-chunked encoding is not gated (a response without it cannot be disclosed, so the session fails
+chunked encoding is not gated (a response without it cannot be disclosed, so the request fails
 closed), and neither is the cache accounting of item 11. Item 8
 is a property of the provider's error handling that the gate does not test, and items 10 and 12 are
 properties of the provider's account and API design that no request can test; for the case-study
@@ -305,7 +305,7 @@ the receiver updates likewise. Sequence numbers restart in each epoch.
 
 **VOLE-based zero knowledge.** We use the interactive QuickSilver-style ZK of TLSNotary's `mpz2`, where
 SHA-256 (as a compression-function circuit) and AES-128 are available as gadgets. Both parties are
-online during the session, so interactivity costs only round trips. Every plaintext comparison in our
+online during the connection, so interactivity costs only round trips. Every plaintext comparison in our
 statements is done inside the circuit and only a single equality bit is decoded.
 
 **Garbled circuits.** A garbler encodes a Boolean circuit so that an evaluator who holds one label per
@@ -971,7 +971,7 @@ gains nothing. `accept` itself proves nothing: the relay cannot read the respons
 honest C accepts only a 2xx. A dishonest C that accepts after a 5xx pays the flat charge instead of the
 reservation and so saves at most $\max(f_s, f_a) - f_s$; it gets no image for it. N gains nothing by
 refusing to charge, and C knows the charge in advance; a refund is the only outcome that needs a proof. The receipt adds the kind, the variant, $k$ and $m_v$, and C
-checks $cost = \lceil k \cdot m_v + f_s \rceil$ exactly. The attestation is unchanged.
+checks $cost = \lceil k \cdot m_v + f_s \rceil$ exactly (without $f_s$ after the connection's first request). The attestation is unchanged.
 
 **What N learns.** The model, the variant (tier and format) and the count, as it learns the model and
 token cap of a chat request; the body length; the response size and timing, which for an image is a
@@ -1207,10 +1207,10 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
     balance and, by sampling the counters across its own sessions, roughly how many requests other
     clients sent through the same key. The protocol cannot hide them from C; the clients drop them before
     handing headers to an application.
-15. *Proof-channel admission.* N admits a connection to a live session's proof and 2PC channels by its
+15. *Proof-channel admission.* N admits a socket to a live connection's proof and 2PC channels by its
     sid and a random token N gives only C (in `ready`; unlike the sid it is in no receipt or
     attestation, and N's logs drop it). Whoever learns both from C could take a channel before C does and
-    so end the session; after the final body record is released that charges the reservation, as an
+    so end the connection; after a body is released that charges the reservation, as an
     abort by N would. Such a party cannot read C's channel (each channel has one peer) or prove anything
     for C.
 16. *Linkability on a kept connection.* Requests on one HTTP/2 connection are linkable for the provider:
@@ -1417,7 +1417,7 @@ before the provider received the request:
 - a usage event replayed from an earlier request of the same connection;
 - a tampered image suffix.
 
-A v2-style control and an honest control run in the same gates. The attacks v2's gate covered (a
+An honest control and a v2 control run in the same gates. The attacks v2's gate covered (a
 pricier model in the body with the suffix withheld, another model's suffix, a client's own key share
 in the ClientHello) fail for the same reasons as before; the adversarial model-swap gate has not been
 re-run on the final v3 build: `[TO MEASURE]`.
@@ -1531,13 +1531,14 @@ record of fixed length.
 | Suffix proof on the request path | 0.47 s local | 39-66 ms over the proof channel |
 
 v1's bandwidth advantage holds only for one-request connections. On a kept HTTP/2 connection v3 moves
-less data per request than v1 did from about the fifth request on.
+less data per request than v1 did from about the fifth request on (with the connection open as
+measured in section 6.3).
 
 # 8. Deployment pattern
 
 Confidential mode plugs into an existing routing deployment as an alternative *transport*; everything
-else stays the deployment's own code. Three legs are involved, and only the last one is the subject of
-this paper:
+else stays the deployment's own code. Three legs are involved, and the framing of section 4.2 is a
+property of the inner TLS connection only; the application's HTTP does not change:
 
 ```
 app --HTTP/1.1, OpenAI API--> client daemon --WebSocket--> node --> relay --TCP--> provider
