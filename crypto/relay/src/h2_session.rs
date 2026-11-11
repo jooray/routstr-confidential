@@ -1,4 +1,4 @@
-//! An `http: 2` session (protocol v3, option A; `PROTOCOL-V3-DESIGN.md` A):
+//! A framing-"2" connection (`PROTOCOL-V3.md` §5, §12.6, §12.8):
 //! one two-party handshake, N writes the HTTP/2 connection head with the
 //! credential once in epoch 0, and C then sends sequential requests that
 //! refer to it by HPACK index.
@@ -21,8 +21,6 @@ use std::collections::VecDeque;
 use super::*;
 use crate::h2::{self, Ctl};
 
-/// Longest life of one `http: 2` connection, whatever its traffic.
-pub(crate) const H2_CONN_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
 /// Upstream bytes after which a connection is closed at its next settlement:
 /// its receive window (2^31-1, set by the connection head) is never
 /// replenished, so it is retired long before the window can run out.
@@ -103,7 +101,7 @@ struct Req {
     attestation: Option<serde_json::Value>,
 }
 
-/// Per-connection state of an `http: 2` session.
+/// Per-connection state of a framing-"2" connection.
 pub(crate) struct H2 {
     cfg: h2::H2Block,
     /// The request path (the chat route of the offer's head template), and
@@ -126,6 +124,13 @@ pub(crate) struct H2 {
     /// Set to end the session in order (the loop sends `closed`).
     pub(crate) closing: Option<&'static str>,
     conn_end: Option<tokio::time::Instant>,
+    /// When the connection head was written.
+    head_at: Option<std::time::Instant>,
+    /// The client reported the provider's SETTINGS (`settings_seen`).
+    settings_seen: bool,
+    /// The first request's response began (told to the offer guard once).
+    responded: bool,
+    responded_told: bool,
 }
 
 impl H2 {
@@ -145,7 +150,22 @@ impl H2 {
             tcp_closed: false,
             closing: None,
             conn_end: None,
+            head_at: None,
+            settings_seen: false,
+            responded: false,
+            responded_told: false,
         }
+    }
+
+    /// True once, when the first response of the connection began.
+    pub(crate) fn first_response(&mut self) -> bool {
+        self.responded && !std::mem::replace(&mut self.responded_told, true)
+    }
+
+    /// The provider closed the connection on its head: soon after it was
+    /// written, with no response to a request yet.
+    pub(crate) fn open_failed(&self) -> bool {
+        !self.responded && self.head_at.is_some_and(|t| t.elapsed() < H2_OPEN_WINDOW)
     }
 
     /// No request in flight: an expired deadline is the idle limit.
@@ -175,6 +195,7 @@ impl H2 {
             q.recv.update(&r.payload);
             q.recv_records += 1;
             q.recv_bytes += 5 + r.payload.len();
+            self.responded = true;
             if q.recv_bytes > q.cap {
                 bail!("the response to request {} exceeds {} bytes", q.n, q.cap);
             }
@@ -215,17 +236,7 @@ pub(crate) fn chat_path(head_template: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("the head template names no usable request path"))
 }
 
-/// Whether a setup's `http` selects option A. Missing or 1.1: protocol v2.
-pub(crate) fn wants_h2(http: Option<&serde_json::Value>) -> Result<bool> {
-    match http {
-        None | Some(serde_json::Value::Null) => Ok(false),
-        Some(v) if v.as_str() == Some("1.1") || v.as_f64() == Some(1.1) => Ok(false),
-        Some(v) if v.as_str() == Some("2") || v.as_u64() == Some(2) => Ok(true),
-        Some(other) => bail!("unsupported http version {other}"),
-    }
-}
-
-/// The setup of an `http: 2` session: no request terms, only the connection.
+/// The setup of a framing-"2" connection: no request terms, only the connection.
 pub(crate) fn handle_setup(
     app: &Arc<AppState>,
     shared: &Arc<SessionShared>,
@@ -243,15 +254,14 @@ pub(crate) fn handle_setup(
     st.body_len = 0;
     st.head_len = head.len();
     st.h2 = Some(Box::new(H2::new(cfg.clone(), chat_path(&app.offer.head_template)?, images_path(&app.offer)?)));
-    shared.multi.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = shared;
     st.run_dir = Some(init_run_dir(app, &sid)?);
     app.sessions.lock().unwrap().insert(sid.clone(), shared.clone());
     side(st, format!("setup sid={sid} http=2 armed={armed} node_settles={}", app.node_settles));
     let _ = to_client.send(Message::Text(
         serde_json::json!({
-            "type":"ready","nonce_n":hex::encode(nonce_n),"sid":sid,
-            "pubkey":app.offer.notary_pubkey,"head_len":head.len(),
-            "armed": armed, "v": app.offer.v, "http": 2, "h2": cfg,
+            "type":"ready","v":3,"http":"2","sid":sid,"nonce_n":hex::encode(nonce_n),
+            "pubkey":app.offer.notary_pubkey,"armed":armed,"head_len":head.len(),"h2":cfg,
         })
         .to_string()
         .into(),
@@ -268,7 +278,8 @@ pub(crate) fn head_template(app: &AppState, h: &H2) -> Result<(Vec<u8>, Vec<usiz
 /// open and idle.
 pub(crate) fn head_written(st: &mut Session) {
     let Some(h) = st.h2.as_mut() else { return };
-    h.conn_end = Some(tokio::time::Instant::now() + H2_CONN_MAX);
+    h.conn_end = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(h.cfg.max_lifetime_s));
+    h.head_at = Some(std::time::Instant::now());
     st.deadline = Some(h.idle_deadline());
 }
 
@@ -290,7 +301,7 @@ pub(crate) fn on_request(
         bail!("request before the connection head was written");
     }
     let sid = st.sid.clone().unwrap_or_default();
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("request on a session that is not http: 2"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("request on a session that is not framing 2"))?;
     if h.req.is_some() {
         bail!("a request is already in flight (requests are sequential)");
     }
@@ -300,16 +311,19 @@ pub(crate) fn on_request(
     if n != h.requests + 1 {
         bail!("request number {n}, expected {}", h.requests + 1);
     }
+    if !h.settings_seen {
+        bail!("request before settings_seen (the provider's HEADER_TABLE_SIZE)");
+    }
     if n > h.cfg.max_requests {
         bail!("request {n} exceeds max_requests {}", h.cfg.max_requests);
     }
     let images = match kind {
         None | Some("chat") => false,
         Some("images") => true,
-        Some(other) => bail!("unknown request kind {other:?}"),
+        Some(other) => refuse!("unknown request kind {other:?}"),
     };
     if !app.offer.model_allowlist.is_empty() && !app.offer.model_allowlist.contains(&model) {
-        bail!("model {model:?} is not in the offer's model_allowlist");
+        refuse!("model {model:?} is not in the offer's model_allowlist");
     }
     // The suffix the request's last record must end with, its path, the
     // image count (an image request) and the response cap.
@@ -317,32 +331,32 @@ pub(crate) fn on_request(
         // An image request (A.13): the node rendered the suffix from its
         // signed offer; it is checked here as for a v2 image setup.
         let (Some(path), Some(ep)) = (h.images_path.as_ref(), app.offer.endpoints.images.as_ref()) else {
-            bail!("this connection serves no image requests");
+            refuse!("this connection serves no image requests");
         };
         if model.is_empty() || max_tokens != 0 {
-            bail!("an image request needs a model and no max_tokens");
+            refuse!("an image request needs a model and no max_tokens");
         }
-        let suffix = suffix.ok_or_else(|| anyhow!("an image request needs the node's suffix"))?;
-        let c = ep.check_suffix(&model, suffix)?;
+        let Some(suffix) = suffix else { refuse!("an image request needs the node's suffix") };
+        let c = ep.check_suffix(&model, suffix).map_err(|e| Refused(e.to_string()))?;
         if count.is_some_and(|x| x != c) {
-            bail!("request count {count:?} differs from the suffix's count {c}");
+            refuse!("request count {count:?} differs from the suffix's count {c}");
         }
         (suffix.to_string(), path.clone(), Some(c), ep.max_response_bytes)
     } else {
         if model.is_empty() || max_tokens == 0 {
-            bail!("a request needs a model and max_tokens >= 1");
+            refuse!("a request needs a model and max_tokens >= 1");
         }
         if max_tokens > app.offer.max_tokens_cap {
-            bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
+            refuse!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
         }
         let canonical = app.offer.chat.render(&model, max_tokens);
         if suffix.is_some_and(|s| s != canonical) || count.is_some() {
-            bail!("a chat request's suffix is the canonical one and it has no count");
+            refuse!("a chat request's suffix is the canonical one and it has no count");
         }
         (canonical, h.path.clone(), None, MAX_SERVER_BYTES)
     };
     if body_len <= canonical.len() || body_len > app.max_body {
-        bail!("declared body length {body_len} outside {}..={}", canonical.len() + 1, app.max_body);
+        refuse!("declared body length {body_len} outside {}..={}", canonical.len() + 1, app.max_body);
     }
     let stream = h2::request_stream(n);
     let block = h2::request_block(&app.offer.upstream_host, &path);
@@ -382,12 +396,32 @@ pub(crate) fn on_request(
     Ok(())
 }
 
+/// `settings_seen`: the provider's `SETTINGS_HEADER_TABLE_SIZE` as the
+/// client read it (`None`: not sent, the default 4096). Below the size of the
+/// credential's entry the provider no longer holds it: the connection ends
+/// (`PROTOCOL-V3.md` §5.6, H3 at run time). The value is the client's claim;
+/// a lying client only harms its own next request.
+pub(crate) fn on_settings_seen(app: &Arc<AppState>, st: &mut Session, header_table_size: Option<u64>) -> Result<()> {
+    if st.state != SessionState::Body {
+        bail!("settings_seen before the connection head was written");
+    }
+    let need = h2::credential_entry_size(app.key.len());
+    if let Some(size) = header_table_size.filter(|s| *s < need) {
+        warn!(size, need, "the provider's HEADER_TABLE_SIZE (as the client reports it) is below the credential entry: framing \"2\" does not work with it");
+        st.code = Some("h2_table_size");
+        bail!("the provider's HEADER_TABLE_SIZE {size} is below the credential entry's {need} bytes");
+    }
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("settings_seen on a connection that is not framing 2"))?;
+    h.settings_seen = true;
+    Ok(())
+}
+
 /// `ctl`: the client's next record is this control frame.
 pub(crate) fn on_ctl(st: &mut Session, frame: &str) -> Result<()> {
     if st.state != SessionState::Body {
         bail!("ctl before the connection head was written");
     }
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("ctl on a session that is not http: 2"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("ctl on a session that is not framing 2"))?;
     let c = Ctl::from_name(frame).ok_or_else(|| anyhow!("unknown control frame {frame:?}"))?;
     if h.next_ctl.is_some() || !h.pending.is_empty() {
         bail!("ctl must come right before its record");
@@ -399,7 +433,7 @@ pub(crate) fn on_ctl(st: &mut Session, frame: &str) -> Result<()> {
 /// `release`: the first `upto` records of request `n` may go to the upstream
 /// once proven. The limit only grows.
 pub(crate) fn on_release(st: &mut Session, n: u32, upto: usize) -> Result<()> {
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("release on a session that is not http: 2"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("release on a session that is not framing 2"))?;
     let q = h.req.as_mut().filter(|q| q.n == n).ok_or_else(|| anyhow!("release names no request in flight"))?;
     if upto > max_records(q.body_len) {
         bail!("release upto {upto} exceeds what the request can hold");
@@ -411,7 +445,7 @@ pub(crate) fn on_release(st: &mut Session, n: u32, upto: usize) -> Result<()> {
 /// Client bytes after the head: complete records are classified and queued.
 /// Nothing is written to the upstream here.
 pub(crate) fn client_bytes(st: &mut Session, data: &[u8]) -> Result<()> {
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     if h.pending.len() + h.held + data.len() > h.buffer_limit() {
         bail!("client sent more than the {} bytes this connection may hold unreleased", h.buffer_limit());
     }
@@ -504,7 +538,7 @@ async fn flush(
 ) -> Result<()> {
     loop {
         let deadline = st.deadline;
-        let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+        let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
         let Some(front) = h.queue.front() else { break };
         if !front.proven {
             break;
@@ -555,7 +589,7 @@ async fn flush(
 /// half received), fix the parameters of the next one and send them.
 fn next_batch(shared: &Arc<SessionShared>, to_client: &mpsc::UnboundedSender<Message>, st: &mut Session) -> Result<()> {
     let h1 = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?.h1;
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     if h.win.is_some() || h.req.as_ref().is_some_and(|q| !q.complete) {
         return Ok(());
     }
@@ -609,7 +643,7 @@ pub(crate) async fn proof_done(
     if !same_params(proven, shared.params.lock().unwrap().get(proof)) {
         bail!("{proof} parameters changed after the proof started");
     }
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     match (proof, h.win.take()) {
         ("pi_win", Some(WinInflight::Records(count))) => {
             let mut left = count;
@@ -654,7 +688,7 @@ pub(crate) fn on_disclose(
 ) -> Result<()> {
     let hs_records = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?.server_handshake_records;
     let anchor = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?.h2;
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     let q = h.req.as_mut().filter(|q| Some(q.n) == n).ok_or_else(|| anyhow!("disclose names no request in flight"))?;
     if !q.released || q.usage.is_some() {
         bail!("disclose out of order or repeated");
@@ -663,11 +697,11 @@ pub(crate) fn on_disclose(
         bail!("an image request settles on accept or on an error head, never on a usage disclosure");
     }
     if skip != 0 || trailing.is_some() {
-        bail!("an http: 2 usage disclosure ends at the last server record (no skip, no trailing records)");
+        bail!("a framing-2 usage disclosure ends at the last server record (no skip, no trailing records)");
     }
     // R must run to the last server record N holds. If more arrived since
     // the client built it, the client rebuilds.
-    let upto = server_records.ok_or_else(|| anyhow!("an http: 2 disclosure names the server records it has seen (server_records)"))?;
+    let upto = server_records.ok_or_else(|| anyhow!("a framing-2 disclosure names the server records it has seen (server_records)"))?;
     if upto > log.server_app_records {
         bail!("the disclosure counts {upto} server records, the node received {}", log.server_app_records);
     }
@@ -754,7 +788,7 @@ pub(crate) fn on_disclose_head(
 ) -> Result<()> {
     let hs_records = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?.server_handshake_records;
     let anchor = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?.h2;
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     // One π_WIN at a time: the client's records are proven first.
     if h.win.is_some() || h.queue.iter().any(|x| !x.proven) {
         bail!("disclose_head while client records are unproven");
@@ -822,7 +856,7 @@ pub(crate) fn on_accept(
     n: Option<u32>,
     server_records: Option<usize>,
 ) -> Result<()> {
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     if h.win.is_some() || h.queue.iter().any(|x| !x.proven) {
         bail!("accept while client records are unproven");
     }
@@ -833,7 +867,7 @@ pub(crate) fn on_accept(
     }
     // The interval ends at the last server record the client has: if more
     // arrived since, the client catches up first (as for a disclosure).
-    let upto = server_records.ok_or_else(|| anyhow!("an http: 2 accept names the server records it has seen (server_records)"))?;
+    let upto = server_records.ok_or_else(|| anyhow!("a framing-2 accept names the server records it has seen (server_records)"))?;
     if upto > log.server_app_records {
         bail!("the accept counts {upto} server records, the node received {}", log.server_app_records);
     }
@@ -862,7 +896,7 @@ fn attest(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
     q.interval_open = false;
     let a = serde_json::json!({
         "sid": sid,
-        "http": 2,
+        "http": "2",
         "n": q.n,
         "stream": q.stream,
         "s_k": q.s_k,
@@ -892,12 +926,12 @@ fn attest(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
 fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSender<Message>, proof: &str, recv_len: usize) -> Result<()> {
     let sid = st.sid.clone();
     let run_dir = st.run_dir.clone();
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     let q = h.req.take().filter(|q| q.settle_on == Some(proof)).ok_or_else(|| anyhow!("{proof} verified with no disclosure waiting for it"))?;
     let usage = q.usage.clone().ok_or_else(|| anyhow!("no disclosed usage"))?;
     let error = usage.get("error_status").is_some();
     if app.node_settles {
-        let mut msg = serde_json::json!({"type":"usage","sid":sid,"http":2,"n":q.n,"model":q.model,"usage":usage});
+        let mut msg = serde_json::json!({"type":"usage","sid":sid,"http":"2","n":q.n,"model":q.model,"usage":usage});
         if let Some(rm) = usage.get("model").and_then(|m| m.as_str()).filter(|m| *m != q.model) {
             msg["reported_model"] = rm.into();
         }
@@ -906,7 +940,7 @@ fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
         let cost_usd = usage.pointer("/cost/usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
         let receipt = serde_json::json!({
             "sid": sid,
-            "http": 2,
+            "http": "2",
             "n": q.n,
             "usage": usage,
             "model": q.model,
@@ -936,7 +970,7 @@ fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
     } else if recv_len >= H2_CONN_SOFT_BYTES {
         h.closing = Some("max_bytes");
     } else if h.conn_end.is_some_and(|end| end <= tokio::time::Instant::now()) {
-        h.closing = Some("connection_lifetime");
+        h.closing = Some("max_lifetime");
     }
     let idle = h.idle_deadline();
     st.deadline = Some(idle);
@@ -948,7 +982,7 @@ fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
 /// ends in order; a request that never fully reached the upstream ends it
 /// with nothing at stake; a released request may still be disclosed.
 pub(crate) fn tcp_closed(st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) -> Result<()> {
-    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     h.tcp_closed = true;
     match &h.req {
         None => h.closing = Some("upstream_closed"),
@@ -970,19 +1004,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_field_selects_the_mode() {
-        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
-        assert!(!wants_h2(None).unwrap());
-        assert!(!wants_h2(Some(&j("1.1"))).unwrap());
-        assert!(!wants_h2(Some(&j("\"1.1\""))).unwrap());
-        assert!(wants_h2(Some(&j("2"))).unwrap());
-        assert!(wants_h2(Some(&j("\"2\""))).unwrap());
-        for bad in ["3", "\"h2\"", "true", "[2]", "1"] {
-            assert!(wants_h2(Some(&j(bad))).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
     fn chat_path_of_the_template() {
         let t = "POST /api/v1/chat/completions HTTP/1.1\r\nHost: h\r\n\r\n";
         assert_eq!(chat_path(t).unwrap(), "/api/v1/chat/completions");
@@ -992,7 +1013,8 @@ mod tests {
 
     fn session_with_request(body_len: usize, suffix: &str) -> Session {
         let mut st = Session { state: SessionState::Body, ..Session::default() };
-        let mut h = H2::new(h2::H2Block { probe_path: "/p".into(), idle_secs: 300, max_requests: 3, kinds: vec!["chat".into()] }, "/api/v1/chat/completions".into(), None);
+        let mut h = H2::new(h2::H2Block { probe_path: "/p".into(), idle_secs: 300, max_requests: 3, max_lifetime_s: 3600, kinds: vec!["chat".into()] }, "/api/v1/chat/completions".into(), None);
+        h.settings_seen = true;
         h.requests = 1;
         h.req = Some(Req {
             n: 1,
@@ -1148,7 +1170,7 @@ mod tests {
     // --- disclosures, proofs and the write gate, against a loopback "upstream" ---
 
     fn app_state(node_settles: bool) -> Arc<AppState> {
-        let offer: Offer = serde_json::from_str(include_str!("../offer.venice.h2.json")).unwrap();
+        let offer: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
         Arc::new(AppState {
             key: Arc::new(Zeroizing::new(b"k".repeat(42))),
             offer: Arc::new(offer),
@@ -1162,6 +1184,7 @@ mod tests {
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
             max_body: 1 << 20,
             token_hash: None,
+            h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None),
         })
     }
 
@@ -1177,7 +1200,6 @@ mod tests {
             zkchan_taken: std::sync::atomic::AtomicBool::new(false),
             zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             proofs_run: StdMutex::new(Default::default()),
-            multi: std::sync::atomic::AtomicBool::new(true),
             fresh: StdMutex::new(Default::default()),
         });
         (s, rx)
@@ -1466,7 +1488,7 @@ mod tests {
         assert_eq!(m.iter().map(|x| x["type"].as_str().unwrap()).collect::<Vec<_>>(), vec!["attestation", "zk_params"]);
         let a = &m[0]["a"];
         assert_eq!((a["n"].as_u64(), a["stream"].as_u64(), a["s_k"].as_u64(), a["server_records"].as_u64(), a["client_records"].as_u64()), (Some(1), Some(3), Some(3), Some(5), Some(2)));
-        assert_eq!(a["http"], 2);
+        assert_eq!(a["http"], "2");
         let Params::PiC3S(p) = serde_json::from_value(m[1]["params"].clone()).unwrap() else { panic!() };
         assert_eq!(p.h2, [0x22; 32]);
         assert_eq!(p.expected, r);
@@ -1496,6 +1518,7 @@ mod tests {
         let mut st = open_session(300);
         let h = st.h2.as_mut().unwrap();
         *h = Box::new(H2::new(app.offer.h2.clone().unwrap(), chat_path(&app.offer.head_template).unwrap(), images_path(&app.offer).unwrap()));
+        h.settings_seen = true;
         st
     }
 
@@ -1632,7 +1655,7 @@ mod tests {
         let a = &m[0]["a"];
         assert_eq!((a["n"].as_u64(), a["stream"].as_u64(), a["s_k"].as_u64(), a["server_records"].as_u64(), a["client_records"].as_u64()), (Some(1), Some(3), Some(3), Some(3), Some(2)));
         assert_eq!(m[1]["usage"], serde_json::json!({"flat": true, "kind": "images", "count": 1}));
-        assert_eq!((m[1]["n"].as_u64(), m[1]["model"].as_str(), m[1]["http"].as_u64()), (Some(1), Some("img"), Some(2)));
+        assert_eq!((m[1]["n"].as_u64(), m[1]["model"].as_str(), m[1]["http"].as_str()), (Some(1), Some("img"), Some("2")));
         // Settled: the connection is idle, and a second accept has no request.
         let h = st.h2.as_ref().unwrap();
         assert!(h.req.is_none() && h.closing.is_none());
@@ -1726,7 +1749,7 @@ mod tests {
         // With a node that settles: the usage frame, per request.
         let m = texts(&mut rx);
         let u = m.iter().find(|x| x["type"] == "usage").unwrap();
-        assert_eq!((u["n"].as_u64(), u["http"].as_u64(), u["model"].as_str()), (Some(1), Some(2), Some("m")));
+        assert_eq!((u["n"].as_u64(), u["http"].as_str(), u["model"].as_str()), (Some(1), Some("2"), Some("m")));
         // Request 2 on the same connection, released; no response yet.
         on_request(&app, &tx, &mut st, 2, None, "m".into(), 20, 400, None, None).unwrap();
         let block = st.h2.as_ref().unwrap().req.as_ref().unwrap().block.len();

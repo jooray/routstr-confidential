@@ -1,23 +1,30 @@
-//! `cu-sidecar` — the node (N) side of the confidential-upstream protocol.
+//! `cu-sidecar` — the node (N) side of the confidential-upstream protocol,
+//! version 3 (`PROTOCOL-V3.md`; §12 is the wire format).
 //!
-//! One WebSocket per session carries the control channel and the relayed TLS
-//! records; a second WebSocket per proof carries the mpz VOLE protocol.
+//! One WebSocket per connection carries the control channel and the relayed
+//! TLS records; further WebSockets carry the two-party key schedule and the
+//! proofs (mpz VOLE).
 //!
-//! Security-critical ordering (protocol v2, docs/TWOPC-DESIGN.md):
-//!   SETUP → 2PC preprocessing → joint key share (armed; no provider
-//!   connection) → ClientHello (exactly the joint P-256 share; the upstream
-//!   is dialed now) → 2PC handshake and application phases → AWAIT_HEAD
-//!   (client records held) → HS_VERIFIED → credential record assembled
-//!   under K_0, π_NK params → π_NK run (the client verifies it; N, the
-//!   prover, learns no verdict) → RELEASE_HEAD (the client's acceptance) →
-//!   [credential record ‖ KeyUpdate] (atomic, epoch 0) → BODY (final suffix
-//!   record held until π_C2S verifies) → CLOSE → ATTESTED → π_C3S → SETTLED.
-//!   Everything up to the release of the final body record must happen
-//!   within 600 s of the connection; the release starts a fresh 600 s for
-//!   the response, the attestation and the disclosure.
+//! One lifecycle, two framings of the inner connection to the provider:
+//!   SETUP (no request terms) → 2PC preprocessing → joint key share (armed;
+//!   no provider connection) → [framing "1.1": REQUEST 1] → ClientHello
+//!   (exactly the joint P-256 share; the upstream is dialed now) → joint key
+//!   schedule → HS_VERIFIED → head record assembled under K_0, π_NK params →
+//!   π_NK (the client verifies it; N, the prover, learns no verdict) →
+//!   RELEASE_HEAD (the client's acceptance) → [head record ‖ KeyUpdate]
+//!   (atomic, epoch 0) → requests.
+//!   Framing "2" (`h2_session`): the head is the HTTP/2 connection head;
+//!   every client record waits for a π_WIN that covers it.
+//!   Framing "1.1" (this file): the head is request 1's HTTP/1.1 head; body
+//!   records are relayed, the final record (the pinned suffix, alone) is
+//!   held until a one-window π_WIN verifies; the provider closes; ATTESTED →
+//!   π_C3S (or `accept`) → SETTLED → `closed`.
+//!   Everything up to the release of a request's last record must happen
+//!   within 600 s; the release starts a fresh 600 s for the response and
+//!   the disclosure.
 //!
 //! The API key lives only in memory, is never logged (only its length), and
-//! appears only inside the single credential record written to the upstream.
+//! appears only inside the single head record written to the upstream.
 
 mod h2;
 mod h2_session;
@@ -59,10 +66,13 @@ use crate::wsio::ws_duplex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Offer {
-    /// Protocol version: always 2 (two-party handshake, docs/TWOPC-DESIGN.md).
-    /// Protocol v1 was retired; an offer that names it is refused at startup.
+    /// Protocol version: always 3 (`PROTOCOL-V3.md`). An offer file that
+    /// names another is refused at startup.
     #[serde(default = "default_protocol")]
     v: u8,
+    /// The two-party key schedule (`PROTOCOL-V3.md` §4). Set at startup.
+    #[serde(default)]
+    twopc: String,
     upstream_host: String,
     #[serde(default)]
     head_template: String,
@@ -98,13 +108,14 @@ struct Offer {
     /// Further request kinds beside chat completions (absent: chat only).
     #[serde(default, skip_serializing_if = "Endpoints::is_empty")]
     endpoints: Endpoints,
-    /// The HTTP versions a session may ask for (`setup.http`): `"1.1"` always
-    /// (protocol v2 as it is), `"2"` when the offer file has an `h2` block
-    /// (protocol v3 option A, `PROTOCOL-V3-DESIGN.md`). Set at startup.
+    /// The framings a connection may ask for (`setup.http`), in the
+    /// operator's order of preference: `"2"` (needs the `h2` block) and
+    /// `"1.1"`. Absent: `["1.1"]`. `GET /offer` leaves `"2"` out while it is
+    /// withdrawn (`H2Guard`).
     #[serde(default)]
     http: Vec<String>,
-    /// HTTP/2 sessions: one handshake per connection, the credential by
-    /// HPACK index, sequential requests. Absent: not offered.
+    /// Framing `"2"`: one handshake per connection, the credential by HPACK
+    /// index, sequential requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     h2: Option<h2::H2Block>,
 }
@@ -499,8 +510,11 @@ fn de_model_allowlist<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Stri
 }
 
 fn default_protocol() -> u8 {
-    2
+    3
 }
+
+/// The two-party key schedule this sidecar runs (`PROTOCOL-V3.md` §4).
+const TWOPC_PROTOCOL: &str = "split-public-1";
 
 fn default_key_alphabet() -> String {
     "[A-Za-z0-9_-]".to_string()
@@ -615,7 +629,74 @@ fn host_of(upstream: &str) -> String {
 /// `GET /offer` — the static offer the node fetches, augments with its own
 /// price list/notary key and re-serves (signed) from `/v1/confidential/offer`.
 async fn offer_http(State(app): State<Arc<AppState>>) -> impl IntoResponse {
-    axum::Json((*app.offer).clone())
+    let mut offer = (*app.offer).clone();
+    // Framing "2" is left out while it is withdrawn (its block stays).
+    if app.h2_guard.withdrawn() {
+        offer.http.retain(|h| h != "2");
+    }
+    axum::Json(offer)
+}
+
+/// Run-time guard of framing `"2"` (`PROTOCOL-V3.md` §2.1): after
+/// `H2_FAILS_TO_WITHDRAW` consecutive HTTP/2 connections that failed before
+/// their first request's response began, `"2"` is withdrawn from the offer
+/// (and refused at the setup) for `retry`, then offered again.
+struct H2Guard {
+    fails: std::sync::atomic::AtomicU32,
+    until: StdMutex<Option<std::time::Instant>>,
+    retry: std::time::Duration,
+    /// Test hook (`CU_TEST_H2_FAIL_FILE`, loopback only): while this file
+    /// exists every framing-"2" open is failed at its ClientHello.
+    fail_file: Option<std::path::PathBuf>,
+}
+
+const H2_FAILS_TO_WITHDRAW: u32 = 5;
+const H2_WITHDRAW_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+/// A provider that closes an HTTP/2 connection this soon after the head,
+/// with no response to a request yet, failed the open.
+const H2_OPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl H2Guard {
+    fn new(retry: std::time::Duration, fail_file: Option<std::path::PathBuf>) -> Self {
+        H2Guard { fails: Default::default(), until: StdMutex::new(None), retry, fail_file }
+    }
+
+    /// Whether `"2"` is withdrawn now; the withdrawal ends by itself.
+    fn withdrawn(&self) -> bool {
+        let mut until = self.until.lock().unwrap_or_else(|e| e.into_inner());
+        match *until {
+            Some(t) if t > std::time::Instant::now() => true,
+            Some(_) => {
+                *until = None;
+                self.fails.store(0, std::sync::atomic::Ordering::SeqCst);
+                info!("framing \"2\" is offered again");
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// An HTTP/2 connection failed before its first response began.
+    fn failed(&self, why: &str) {
+        let n = self.fails.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        warn!(consecutive = n, why, "an HTTP/2 connection failed to open");
+        if n >= H2_FAILS_TO_WITHDRAW {
+            let mut until = self.until.lock().unwrap_or_else(|e| e.into_inner());
+            if until.is_none() {
+                *until = Some(std::time::Instant::now() + self.retry);
+                warn!(for_secs = self.retry.as_secs(), "framing \"2\" withdrawn from the offer: {n} consecutive HTTP/2 connections failed");
+            }
+        }
+    }
+
+    /// The first response of an HTTP/2 connection began.
+    fn opened(&self) {
+        self.fails.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn forced_failure(&self) -> bool {
+        self.fail_file.as_ref().is_some_and(|f| f.exists())
+    }
 }
 
 /// The advertised template with `{KEY:L}` replaced by zero placeholders and
@@ -672,6 +753,7 @@ struct AppState {
     /// The sidecar does not check client credentials (the node does, before
     /// it dials), so anyone who reaches it spends the provider key.
     token_hash: Option<[u8; 32]>,
+    h2_guard: H2Guard,
 }
 
 /// A session must send its `setup` this soon after connecting.
@@ -726,7 +808,7 @@ const SERVER_TAIL_RECORDS: usize = MAX_DISCLOSE_RECORDS + zkbench::statements::M
 /// (4-byte header + request_update, inner type, 16-byte tag).
 const MAX_TRAILING_RECORD: usize = 4 + 1 + 1 + 16;
 
-/// Most client bytes a v2 session buffers before relaying them (during the 2PC
+/// Most client bytes a connection buffers before relaying them (during the 2PC
 /// preprocessing and until the credential record is written): the ClientHello,
 /// CCS and Finished, then a body of `body_len` bytes in full-size records with
 /// the suffix in its own record. Anything beyond is not an honest client.
@@ -833,8 +915,8 @@ struct SessionShared {
     k0_iv0: StdMutex<Option<Zeroizing<Vec<u8>>>>,
     key: Arc<Zeroizing<Vec<u8>>>,
     evt: mpsc::UnboundedSender<Ev>,
-    /// Serializes the ZK proofs of one session. The client may run π_C2S
-    /// concurrently with generation and start π_C3S before π_C2S has finished;
+    /// Serializes the ZK proofs of one session. The client may run π_WIN
+    /// concurrently with generation and start π_C3S before π_WIN has finished;
     /// running two mpz proofs at once on one node stalls (the VOLE/rayon paths
     /// contend). Proofs are per-session independent, so serializing inside a
     /// session costs nothing on the critical path and removes the contention.
@@ -846,24 +928,23 @@ struct SessionShared {
     /// Proofs that started running (on the channel or their own connection):
     /// each runs at most once per session.
     proofs_run: StdMutex<std::collections::HashSet<String>>,
-    /// An `http: 2` session: π_WIN and π_C3S run once per stored parameter
-    /// set (`fresh`) instead of once per session.
-    multi: std::sync::atomic::AtomicBool,
+    /// π_WIN and π_C3S run once per stored parameter set (`set_params`);
+    /// every other proof once per connection.
     fresh: StdMutex<std::collections::HashSet<String>>,
 }
 
 impl SessionShared {
-    /// Store the parameters of the next run of `proof` (an `http: 2` session:
-    /// they may be proven once).
+    /// Store the parameters of the next run of `proof` (π_WIN, π_C3S): they
+    /// may be proven once.
     fn set_params(&self, proof: &str, params: Params) {
         self.params.lock().unwrap().insert(proof.to_string(), params);
         self.fresh.lock().unwrap().insert(proof.to_string());
     }
 
-    /// Claim `proof`'s one run, refusing a second one. In an `http: 2`
-    /// session π_WIN and π_C3S run once per stored parameter set.
+    /// Claim `proof`'s one run, refusing a second one. π_WIN and π_C3S run
+    /// once per stored parameter set.
     fn claim_proof(&self, proof: &str) -> Result<()> {
-        if self.multi.load(std::sync::atomic::Ordering::SeqCst) && matches!(proof, "pi_win" | "pi_c3s") {
+        if matches!(proof, "pi_win" | "pi_c3s") {
             if !self.fresh.lock().unwrap().remove(proof) {
                 bail!("{proof}: no unproven parameters for this session");
             }
@@ -915,7 +996,7 @@ struct RelayLog {
     recv: cu_crypto::transcript::Transcript,
     recv_len: usize,
     /// Client body records relayed, and the last of them (the held final
-    /// record π_C2S reads): earlier records are not kept.
+    /// record π_WIN reads): earlier records are not kept.
     client_app_records: usize,
     client_app_last: Option<Record>,
     /// Server records received (every content type), for the attestation.
@@ -994,7 +1075,7 @@ impl RelayLog {
 // ---------------------------------------------------------------------------
 
 const HELP: &str = "\
-cu-sidecar: the node's TLS relay for confidential sessions (protocol v2)
+cu-sidecar: the node's TLS relay for confidential connections (protocol v3)
 
 Options:
   --listen ADDR           listen address (default 127.0.0.1:7443)
@@ -1003,8 +1084,9 @@ Options:
   --host NAME             TLS server name to verify (default: the --upstream host)
   --key-env VAR           environment variable holding the provider API key
                           (default VENICE_API_KEY, the case-study provider's)
-  --offer FILE            sidecar offer file (head template, chat block, endpoints;
-                          an h2 block offers HTTP/2 sessions, protocol v3 option A)
+  --offer FILE            sidecar offer file (head template, chat block, endpoints,
+                          http: the framings served, in order of preference,
+                          e.g. [2, 1.1] as strings; 2 needs the h2 block)
   --node-settles          hand verified usage to the node to settle (production)
   --token-env VAR         node token variable (default CU_SIDECAR_TOKEN; required
                           off loopback)
@@ -1012,7 +1094,10 @@ Options:
   --max-body BYTES        request body cap (default 8388608)
   --runs-dir DIR          session evidence directory (default crypto/runs)
   --runs-keep-hours N     keep run files N hours (default 24; 0 = remove at the end)
-  --protocol 2            accepted for old scripts; v2 is the only protocol
+
+Test hooks (loopback only): CU_TEST_H2_FAIL_FILE=<path> fails every framing-2
+open while the file exists; CU_TEST_H2_RETRY_SECS=<n> shortens the 600 s after
+which a withdrawn framing 2 is offered again.
   -h, --help              this text
 ";
 
@@ -1089,7 +1174,8 @@ async fn main() -> Result<()> {
         serde_json::from_str::<Offer>(&text).with_context(|| format!("parsing {path}"))?
     } else {
         Offer {
-            v: 2,
+            v: default_protocol(),
+            twopc: String::new(),
             upstream_host: host.clone(),
             head_template: default_head_template_for(&host, key.len()),
             key_alphabet: default_key_alphabet(),
@@ -1107,18 +1193,18 @@ async fn main() -> Result<()> {
     };
     offer.node_settles = node_settles;
     if !node_settles {
-        warn!("running WITHOUT --node-settles: the stub settlement signs its own receipts; a node in front of this sidecar would charge every session its full reservation");
+        warn!("running WITHOUT --node-settles: the stub settlement signs its own receipts; a node in front of this sidecar would charge every request its full reservation");
     }
-    // Protocol v2 is the only one; `--protocol 2` is still accepted so existing
-    // deploy scripts keep working.
-    match arg("--protocol").as_deref() {
-        None | Some("2") => {}
-        Some("1") => bail!("protocol v1 is retired (branch v1-poc); run with --protocol 2 or without --protocol"),
-        Some(other) => bail!("unsupported --protocol {other}"),
+    if arg("--protocol").is_some() {
+        bail!("--protocol is gone: this sidecar speaks protocol v3 only (v2: branch twopc-v2)");
     }
-    if offer.v != 2 {
-        bail!("the offer names protocol v{}; only v2 is supported (v1 is retired)", offer.v);
+    if offer.v != 3 {
+        bail!("the offer names protocol v{}; this sidecar speaks v3 only", offer.v);
     }
+    if !offer.twopc.is_empty() && offer.twopc != TWOPC_PROTOCOL {
+        bail!("the offer names the key schedule {:?}; this sidecar runs {TWOPC_PROTOCOL:?}", offer.twopc);
+    }
+    offer.twopc = TWOPC_PROTOCOL.to_string();
     if offer.upstream_host.is_empty() {
         offer.upstream_host = host.clone();
     }
@@ -1142,15 +1228,29 @@ async fn main() -> Result<()> {
         let host = offer.upstream_host.clone();
         images.validate(&host, key.len())?;
     }
-    // HTTP/2 sessions are offered only with an `h2` block; the list is the
-    // sidecar's, whatever the offer file says.
-    offer.http = vec!["1.1".to_string()];
-    if let Some(block) = &offer.h2 {
+    // The framings are the operator's statement about the upstream, in their
+    // order of preference; nothing is probed.
+    crate::check_http_list(&mut offer)?;
+    if let Some(block) = offer.h2.as_ref().filter(|_| offer.http.iter().any(|h| h == "2")) {
         block.validate(&offer.upstream_host, key.len()).context("the offer's h2 block")?;
         h2_session::chat_path(&offer.head_template).context("the offer's h2 block")?;
         h2_session::images_path(&offer).context("the offer's h2 block")?;
-        offer.http.push("2".to_string());
-        info!(probe_path = %block.probe_path, idle_secs = block.idle_secs, max_requests = block.max_requests, kinds = ?block.kinds, "http: 2 sessions offered");
+        info!(probe_path = %block.probe_path, idle_secs = block.idle_secs, max_requests = block.max_requests, max_lifetime_s = block.max_lifetime_s, kinds = ?block.kinds, "framing \"2\" offered");
+    }
+    info!(http = ?offer.http, "framings offered, in order of preference");
+    // Test hooks, never off loopback: a gate forces HTTP/2 opens to fail and
+    // shortens the time after which a withdrawn "2" is offered again.
+    let fail_file = std::env::var("CU_TEST_H2_FAIL_FILE").ok().filter(|v| !v.is_empty());
+    let retry_secs = std::env::var("CU_TEST_H2_RETRY_SECS").ok().filter(|v| !v.is_empty());
+    if (fail_file.is_some() || retry_secs.is_some()) && !is_loopback(&listen) {
+        bail!("CU_TEST_H2_FAIL_FILE / CU_TEST_H2_RETRY_SECS are test hooks: refused on a sidecar listening on {listen} (not loopback)");
+    }
+    let h2_retry = match retry_secs {
+        Some(v) => std::time::Duration::from_secs(v.parse().context("CU_TEST_H2_RETRY_SECS")?),
+        None => H2_WITHDRAW_FOR,
+    };
+    if fail_file.is_some() || h2_retry != H2_WITHDRAW_FOR {
+        warn!(fail_file = ?fail_file, retry_secs = h2_retry.as_secs(), "TEST HOOKS for framing \"2\" are active");
     }
     // The π_NK membership circuit is a fixed-size check over one alphabet. An
     // offer demanding another alphabet must fail here rather than let the
@@ -1182,6 +1282,7 @@ async fn main() -> Result<()> {
         slots: Arc::new(tokio::sync::Semaphore::new(max_sessions)),
         max_body,
         token_hash,
+        h2_guard: H2Guard::new(h2_retry, fail_file.map(std::path::PathBuf::from)),
     });
 
     let app = Router::new()
@@ -1196,6 +1297,30 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, token = state.token_hash.is_some(), "cu-sidecar listening");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The offer's `http` list: non-empty (default `["1.1"]`), distinct, known
+/// values; `"2"` needs the `h2` block.
+fn check_http_list(offer: &mut Offer) -> Result<()> {
+    if offer.http.is_empty() {
+        offer.http = vec!["1.1".to_string()];
+    }
+    for (i, h) in offer.http.iter().enumerate() {
+        if h != "2" && h != "1.1" {
+            bail!("the offer's http lists {h:?}; the framings are \"2\" and \"1.1\"");
+        }
+        if offer.http[..i].contains(h) {
+            bail!("the offer's http lists {h:?} twice");
+        }
+    }
+    let wants_h2 = offer.http.iter().any(|h| h == "2");
+    if wants_h2 && offer.h2.is_none() {
+        bail!("the offer's http lists \"2\" but there is no h2 block");
+    }
+    if !wants_h2 && offer.h2.is_some() {
+        warn!("the offer has an h2 block but its http does not list \"2\": framing \"2\" is not offered");
+    }
     Ok(())
 }
 
@@ -1251,41 +1376,42 @@ async fn session_ws(ws: WebSocketUpgrade, State(app): State<Arc<AppState>>) -> i
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMsg {
+    /// `setup`: the connection, no request terms (`PROTOCOL-V3.md` §12.3).
     Setup {
+        /// Must be 3.
+        #[serde(default)]
+        v: Option<serde_json::Value>,
         nonce_c: String,
-        #[serde(default)]
-        model: String,
-        #[serde(default)]
-        max_tokens: u64,
-        #[serde(default)]
-        len: usize,
-        /// `2` selects an HTTP/2 session (protocol v3 option A): the setup
-        /// then names no request terms. Absent or `1.1`: protocol v2.
+        /// The framing: `"2"` or `"1.1"`.
         #[serde(default)]
         http: Option<serde_json::Value>,
-        /// `chat` (default) or `images`; any other kind is refused.
-        #[serde(default)]
-        kind: Option<String>,
-        /// The node's rendered suffix for an image request (checked against
-        /// the offer's images endpoint).
-        #[serde(default)]
-        suffix: Option<String>,
-        #[serde(default)]
-        count: Option<u64>,
         #[serde(default)]
         escrow_e: u64,
-        /// The client's Cashu escrow token (node-settles mode). The sidecar
-        /// never redeems it; it only hashes it into `sid` per SPEC §5.1 so both
-        /// sides agree on the session id.
+        /// What makes the sid unique (the node passes its deposit's
+        /// reservation id); only hashed into `sid`.
         #[serde(default)]
         escrow: Option<String>,
-        /// Pre-warm: the session was armed before a request existed. The
-        /// escrow (or account reservation) is supplied by the later `claim`.
+        /// Pre-warm: the client stops after the key share and waits. The
+        /// sidecar does nothing differently (it dials at the ClientHello).
         #[serde(default)]
         armed: bool,
-    },
-    BodySuffix {
-        suffix: String,
+        /// Request terms do not belong to a setup: any of these is refused.
+        #[serde(default)]
+        model: Option<serde_json::Value>,
+        #[serde(default)]
+        max_tokens: Option<serde_json::Value>,
+        #[serde(default)]
+        len: Option<serde_json::Value>,
+        #[serde(default)]
+        body_len: Option<serde_json::Value>,
+        #[serde(default)]
+        kind: Option<serde_json::Value>,
+        #[serde(default)]
+        suffix: Option<serde_json::Value>,
+        #[serde(default)]
+        count: Option<serde_json::Value>,
+        #[serde(default)]
+        variant: Option<serde_json::Value>,
     },
     Disclose {
         r: String,
@@ -1310,7 +1436,7 @@ enum ClientMsg {
         /// size. Absent: one trailing close_notify-sized record may be skipped.
         #[serde(default)]
         trailing: Option<usize>,
-        /// `http: 2` only: the request the disclosure is for, and the number
+        /// The request the disclosure is for, and (framing "2") the number
         /// of server application-data records the client had received when
         /// it built R (R runs to the end of the last of them).
         #[serde(default)]
@@ -1318,8 +1444,8 @@ enum ClientMsg {
         #[serde(default)]
         server_records: Option<usize>,
     },
-    /// `http: 2`: the terms of the next request on the connection (the
-    /// fields a v2 setup carries; the node reserves on it).
+    /// The terms of the next request on the connection (the node reserves
+    /// on it). Framing "1.1": request 1, before the ClientHello.
     Request {
         n: u32,
         #[serde(default)]
@@ -1334,23 +1460,38 @@ enum ClientMsg {
         #[serde(default)]
         count: Option<u64>,
     },
-    /// `http: 2`: the client's next record is this control frame
+    /// Framing "2": the client's next record is this control frame
     /// (`settings_ack`, `ping_ack`, `window_update`, `rst_stream`).
     Ctl {
         frame: String,
     },
-    /// `http: 2`: the first `upto` records of request `n` may be written to
+    /// Framing "2": the provider's `SETTINGS_HEADER_TABLE_SIZE` as the
+    /// client read it (`null`: never sent, the default 4096).
+    SettingsSeen {
+        #[serde(default)]
+        header_table_size: Option<u64>,
+    },
+    /// Framing "2": the first `upto` records of request `n` may be written to
     /// the upstream once proven (flow control is the client's to follow).
     Release {
         n: u32,
         upto: usize,
     },
-    /// `http: 2`: the response head of a refused request: one HEADERS frame
-    /// at the start of server application-data record `record`.
+    /// The response head of a request the provider refused. Framing "2":
+    /// one HEADERS frame at the start of server application-data record
+    /// `record`. Framing "1.1": the HTTP/1.1 response head, located like a
+    /// usage disclosure (`tail_lens`, `skip` = the body after it, `trailing`).
     DiscloseHead {
         n: u32,
-        record: usize,
+        #[serde(default)]
+        record: Option<usize>,
         r: String,
+        #[serde(default, deserialize_with = "disclose_tail_lens")]
+        tail_lens: Vec<usize>,
+        #[serde(default)]
+        skip: usize,
+        #[serde(default)]
+        trailing: Option<usize>,
         #[serde(default)]
         key_updates: u32,
         #[serde(default)]
@@ -1359,10 +1500,10 @@ enum ClientMsg {
     /// The client accepts π_NK (it verified it) and claims the session; N
     /// writes the credential record and the KeyUpdate under K_0.
     ReleaseHead {},
-    /// Image sessions: the client accepts a successful response. The charge
-    /// is the flat price fixed at setup, so nothing is disclosed. On an
-    /// `http: 2` connection it names the request and the server records the
-    /// client has seen (the end of the request's interval).
+    /// An image request: the client accepts a successful response. The
+    /// charge is the flat price fixed by the request, so nothing is
+    /// disclosed. It names the request and (framing "2") the server records
+    /// the client has seen (the end of the request's interval).
     Accept {
         #[serde(default)]
         n: Option<u32>,
@@ -1410,7 +1551,6 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         zkchan_taken: std::sync::atomic::AtomicBool::new(false),
         zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         proofs_run: StdMutex::new(Default::default()),
-        multi: std::sync::atomic::AtomicBool::new(false),
         fresh: StdMutex::new(Default::default()),
     });
 
@@ -1452,9 +1592,6 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     };
     let setup: ClientMsg = serde_json::from_str(&first).map_err(|e| anyhow!("bad setup: {e}"))?;
     handle_setup(setup, &app, &shared, &to_client, &mut st)?;
-    if st.images_count.is_some() {
-        log.max_server_bytes = app.offer.endpoints.images.as_ref().map(|e| e.max_response_bytes);
-    }
     if st.h2.is_some() {
         // A connection carries many responses: each request has its own cap
         // (`h2_session`), the connection a larger one.
@@ -1471,7 +1608,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         tokio::pin!(prep);
         let armed = tokio::time::sleep_until(session_end);
         tokio::pin!(armed);
-        // Wait for a ClientHello that passes the v2 checks: a client that
+        // Wait for a ClientHello that passes the checks: a client that
         // sends anything else never makes the sidecar dial the provider.
         while !check_hello(&mut st, &client_pending)? {
             tokio::select! {
@@ -1482,20 +1619,58 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         st.joint = Some(p);
                         side(&mut st, "2pc key share ready".into());
                     }
-                    Some(Ev::ZkDone { proof, err, .. }) => bail!("{proof} failed before the handshake: {err:?}"),
+                    Some(Ev::ZkDone { proof, err, .. }) => {
+                        if err.as_deref().is_some_and(|e| e.contains(twopc::VERSION_MISMATCH)) {
+                            st.code = Some(twopc::VERSION_MISMATCH);
+                        }
+                        bail!("{proof} failed before the handshake: {err:?}")
+                    }
                     Some(other) => bail!("unexpected event before the key share: {other:?}"),
                     None => bail!("session events closed"),
                 },
                 msg = ws_rx.next() => match msg {
                     Some(Ok(Message::Binary(data))) => {
+                        if st.framing11 && !st.req1 {
+                            bail!("framing 1.1: a record before request_ok (request 1 precedes the ClientHello)");
+                        }
                         buffer_client(&mut client_pending, &data, st.body_len)?;
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => bail!("client left before the handshake"),
+                    // Framing "1.1": request 1 comes before the ClientHello,
+                    // because the head N commits to names its path and length.
+                    Some(Ok(Message::Text(t))) if st.framing11 => {
+                        if t.len() > MAX_CONTROL_TEXT {
+                            bail!("control message of {} bytes (limit {MAX_CONTROL_TEXT})", t.len());
+                        }
+                        match serde_json::from_str::<ClientMsg>(&t).map_err(|e| anyhow!("bad control: {e}"))? {
+                            ClientMsg::Request { n, kind, model, max_tokens, body_len, suffix, count } => {
+                                if !client_pending.is_empty() {
+                                    bail!("framing 1.1: a request after the ClientHello");
+                                }
+                                match request_11(&app, &to_client, &mut st, n, kind.as_deref(), model, max_tokens, body_len, suffix.as_deref(), count) {
+                                    Err(e) if e.is::<Refused>() => send_refused(&to_client, &mut st, n, &e),
+                                    other => other?,
+                                }
+                                if st.images_count.is_some() {
+                                    log.max_server_bytes = app.offer.endpoints.images.as_ref().map(|e| e.max_response_bytes);
+                                }
+                            }
+                            _ => bail!("framing 1.1: only request 1 may precede the ClientHello"),
+                        }
+                    }
                     Some(Ok(Message::Text(_))) => bail!("unexpected control message during 2PC preprocessing"),
                     _ => {}
                 },
             }
         }
+    }
+
+    // Test hook: a forced failure of this HTTP/2 open, before anything is dialed.
+    if st.h2.is_some() && app.h2_guard.forced_failure() {
+        app.h2_guard.failed("test hook");
+        st.fault = Some("upstream");
+        st.code = Some("h2_not_selected");
+        bail!("test hook: this HTTP/2 open is forced to fail");
     }
 
     // The session deadline (`SESSION_TIMEOUT` from the connection) covers
@@ -1507,11 +1682,13 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     // A failure to reach the upstream is nobody's protocol error: the error
     // frame says so (`fault`), and the node does not hold the client to it.
     st.fault = Some("upstream");
+    st.code = Some("upstream_unreachable");
     let tcp = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(&app.upstream))
         .await
         .map_err(|_| anyhow!("connecting to {} timed out after {}s", app.upstream, UPSTREAM_CONNECT_TIMEOUT.as_secs()))?
         .with_context(|| format!("connecting to {}", app.upstream))?;
     st.fault = None;
+    st.code = None;
     let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
     {
         let evt = evt_tx.clone();
@@ -1543,8 +1720,14 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     v2_pump_client(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
 
         loop {
+            if let Some(reason) = st.closing11.take() {
+                let _ = to_client.send(Message::Text(serde_json::json!({"type":"closed","reason":reason}).to_string().into()));
+                side(&mut st, format!("connection closed: {reason}"));
+                break;
+            }
+            final_record_params(&shared, &to_client, &mut st, &log)?;
             if let Some(h) = st.h2.as_mut() {
-                // An `http: 2` connection ends in order (idle, its request
+                // A framing-"2" connection ends in order (idle, its request
                 // limit, a settled error), and its deadline moves with its
                 // requests.
                 if let Some(reason) = h.closing.take() {
@@ -1594,7 +1777,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 buffer_client(&mut client_pending, &data, st.body_len)?;
                                 v2_pump_client(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                             }
-                            SessionState::AwaitHead if st.h2.is_some() => bail!("http: 2: a client record before the connection head was written"),
+                            SessionState::AwaitHead if st.h2.is_some() => bail!("framing 2: a client record before the connection head was written"),
                             SessionState::AwaitHead => buffer_client(&mut st.held_client, &data, st.body_len)?,
                             SessionState::Body if st.h2.is_some() => {
                                 h2_session::client_bytes(&mut st, &data)?;
@@ -1629,6 +1812,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                             if let Some(h) = st.h2.as_mut() { h.server_record(&r)?; }
                             log.server_record(r);
                         }
+                        if st.h2.as_mut().is_some_and(|h| h.first_response()) {
+                            app.h2_guard.opened();
+                        }
                         server_pending.drain(..used);
                         if to_client.send(Message::Binary(bytes.into())).is_err() { break; }
                         v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
@@ -1655,6 +1841,15 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                     }
                     Ev::TcpClosed if st.h2.is_some() => {
                         info!("upstream closed the connection");
+                        // A failed open (§2.1): no ServerHello at all, or the
+                        // provider closing on the connection head.
+                        if log.recv_len == 0 || st.h2.as_ref().is_some_and(|h| h.open_failed()) {
+                            app.h2_guard.failed("the provider closed the connection");
+                            st.fault = Some("upstream");
+                        }
+                        if st.state != SessionState::Body {
+                            bail!("the provider closed the connection during the handshake");
+                        }
                         h2_session::tcp_closed(&mut st, &to_client)?;
                     }
                     Ev::TcpClosed => {
@@ -1662,10 +1857,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         // Before the final body record was released the upstream
                         // never had a complete request: end the session here, so
                         // the node releases the reservation. Letting it go on
-                        // would let a later π_C2S send `body_released` for a
+                        // would let a later π_WIN send `body_released` for a
                         // record that can no longer be written, and the node
                         // would charge the full reservation for nothing.
-                        if !st.c2_ok {
+                        if !st.released {
                             // Tell the node first how much the upstream sent
                             // after the credential record: a provider that
                             // refused it from the head alone and closed is a
@@ -1676,7 +1871,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 .recv_at_head
                                 .map_or(0, |at| log.recv_len.saturating_sub(at));
                             let _ = to_client.send(Message::Text(
-                                serde_json::json!({"type":"upstream_closed_early","response_bytes":response_bytes}).to_string().into(),
+                                serde_json::json!({"type":"upstream_closed_early","n":1,"response_bytes":response_bytes}).to_string().into(),
                             ));
                             side(&mut st, format!("upstream closed early; {response_bytes} response bytes after the credential record"));
                             bail!("upstream closed the connection before the request was complete (nothing billed)");
@@ -1685,6 +1880,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         if let (Some(sid), Some(hs)) = (st.sid.as_ref(), st.handshake.as_ref()) {
                             let a = serde_json::json!({
                                 "sid": sid,
+                                "http": "1.1",
+                                "n": 1,
                                 "cert_chain_hash": hex::encode(hs.cert_chain_hash),
                                 "th_sh": hex::encode(hs.th_sh),
                                 "th_sf": hex::encode(hs.th_sf),
@@ -1697,7 +1894,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                             });
                             let sig = app.signer.sign(a.to_string().as_bytes());
                             let _ = to_client.send(Message::Text(
-                                serde_json::json!({"type":"attestation","a":a,"sig":hex::encode(sig.to_bytes())}).to_string().into(),
+                                serde_json::json!({"type":"attestation","n":1,"a":a,"sig":hex::encode(sig.to_bytes())}).to_string().into(),
                             ));
                             st.attestation = Some(a.clone());
                             att_chain = Some(hex::encode(hs.cert_chain_hash));
@@ -1718,6 +1915,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                             if st.state == SessionState::Settled {
                                 continue;
                             }
+                            if err.as_deref().is_some_and(|e| e.contains(twopc::VERSION_MISMATCH)) {
+                                st.code = Some(twopc::VERSION_MISMATCH);
+                            }
                             bail!("proof {proof} failed: {err:?}");
                         }
                         if st.h2.is_some() && matches!(proof.as_str(), "pi_win" | "pi_c3s") {
@@ -1736,38 +1936,39 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                     write_head(&mut st, &mut log, &to_client, &mut tcp_tx).await?;
                                 }
                             }
-                            "pi_c2s" => {
-                                let same = same_params(proven.as_ref(), shared.params.lock().unwrap().get(proof.as_str()));
-                                if same && !st.c2_ok {
-                                    st.c2_ok = true;
-                                    // Suffix proven: release the final body record.
-                                    let held = st.held.take().ok_or_else(|| anyhow!("π_C2S verified but no held body record"))?;
-                                    // A failed write ends the session without
-                                    // `body_released`: the upstream never got a
-                                    // complete record, so nothing is at stake.
-                                    write_upstream(&mut tcp_tx, &held, st.deadline).await?;
-                                    st.sent.update(&held);
-                                    // The upstream has the full request: the node
-                                    // must now treat the escrow as at stake (it
-                                    // drains these frames even if the client leaves).
-                                    let _ = to_client.send(Message::Text(
-                                        serde_json::json!({"type":"body_released"}).to_string().into(),
-                                    ));
-                                    // A released request gets a fresh session
-                                    // window to finish and be disclosed.
-                                    let deadline_at = tokio::time::Instant::now() + SESSION_TIMEOUT;
-                                    st.deadline = Some(deadline_at);
-                                    deadline.as_mut().reset(deadline_at);
-                                    info!("π_C2S verified; final body record released to the upstream");
-                                    side(&mut st, "pi_c2s verified; final body record released".into());
+                            "pi_win" => {
+                                // Framing "1.1": the final record is the
+                                // pinned suffix; release it.
+                                if !same_params(proven.as_ref(), shared.params.lock().unwrap().get(proof.as_str())) {
+                                    bail!("π_WIN parameters changed after the proof started");
                                 }
+                                if st.released {
+                                    bail!("π_WIN verified with nothing waiting for it");
+                                }
+                                let held = st.held.take().ok_or_else(|| anyhow!("π_WIN verified but no held body record"))?;
+                                st.released = true;
+                                // A failed write ends the connection without
+                                // `body_released`: the upstream never got a
+                                // complete request, so nothing is at stake.
+                                write_upstream(&mut tcp_tx, &held, st.deadline).await?;
+                                st.sent.update(&held);
+                                // The upstream has the full request: the node
+                                // treats the reservation as at stake from here.
+                                let _ = to_client.send(Message::Text(
+                                    serde_json::json!({"type":"body_released","n":1}).to_string().into(),
+                                ));
+                                let deadline_at = tokio::time::Instant::now() + SESSION_TIMEOUT;
+                                st.deadline = Some(deadline_at);
+                                deadline.as_mut().reset(deadline_at);
+                                info!("π_WIN verified; final body record released to the upstream");
+                                side(&mut st, "pi_win verified; final body record released".into());
                             }
                             "pi_c3s" => {
                                 if st.state == SessionState::Settled {
                                     continue;
                                 }
-                                if !st.c2_ok {
-                                    bail!("π_C3S before π_C2S verified: the suffix (model, caps) is not proven");
+                                if !st.released {
+                                    bail!("π_C3S before the request was released: the suffix (model, caps) is not proven");
                                 }
                                 let same = same_params(proven.as_ref(), shared.params.lock().unwrap().get(proof.as_str()));
                                 if !same {
@@ -1800,6 +2001,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         let mut frame = serde_json::json!({"type":"error","reason":e.to_string()});
         if let Some(fault) = st.fault.or((e.to_string() == INTERNAL_ERROR).then_some("node")) {
             frame["fault"] = fault.into();
+        }
+        if let Some(code) = st.code {
+            frame["code"] = code.into();
         }
         let _ = to_client.send(Message::Text(frame.to_string().into()));
     }
@@ -1885,7 +2089,7 @@ struct Session {
     /// arrives after it (before the body is complete) is the provider's
     /// early answer, not its post-handshake tickets.
     recv_at_head: Option<usize>,
-    /// The record completing the body, withheld from the upstream until π_C2S.
+    /// The record completing the body, withheld from the upstream until π_WIN.
     held: Option<Vec<u8>>,
     /// SHA-256 of every byte written to the upstream (for the attestation).
     sent: cu_crypto::transcript::Transcript,
@@ -1902,15 +2106,23 @@ struct Session {
     /// Body (epoch 1) accounting: records and content bytes relayed.
     body_records: usize,
     body_bytes: usize,
-    c2_requested: bool,
-    c2_ok: bool,
+    win_requested: bool,
+    released: bool,
     disclosed: bool,
     attestation: Option<serde_json::Value>,
     usage: Option<serde_json::Value>,
     run_dir: Option<std::path::PathBuf>,
     side_log: Vec<String>,
-    /// `Some` for an `http: 2` session (protocol v3 option A).
+    /// `Some` for a framing-"2" connection.
     h2: Option<Box<h2_session::H2>>,
+    /// A framing-"1.1" connection, and whether its one request was accepted
+    /// (`request_ok`; it precedes the ClientHello).
+    framing11: bool,
+    req1: bool,
+    /// Framing "1.1": set to end the connection in order (`closed`).
+    closing11: Option<&'static str>,
+    /// The machine-readable `code` of the error frame, when the failure has one.
+    code: Option<&'static str>,
     /// Set while a failure would not be the client's doing (reaching the
     /// upstream): the error frame then carries it as `fault`.
     fault: Option<&'static str>,
@@ -1925,8 +2137,34 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-/// The session's first frame. Validated and bound to a sid before the
-/// sidecar opens any connection to the upstream.
+/// A request the sidecar does not serve, refused before any of its records
+/// were sent: answered with `request_refused`, and the connection stays.
+#[derive(Debug)]
+pub(crate) struct Refused(pub(crate) String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+macro_rules! refuse {
+    ($($arg:tt)*) => { return Err(Refused(format!($($arg)*)).into()) };
+}
+pub(crate) use refuse;
+
+fn send_refused(to_client: &mpsc::UnboundedSender<Message>, st: &mut Session, n: u32, e: &anyhow::Error) {
+    let reason = e.to_string();
+    side(st, format!("request n={n} refused: {reason}"));
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"request_refused","n":n,"status":400,"reason":reason}).to_string().into(),
+    ));
+}
+
+/// The connection's first frame. Validated and bound to a sid before the
+/// sidecar opens any connection to the upstream. It names no request.
 fn handle_setup(
     msg: ClientMsg,
     app: &Arc<AppState>,
@@ -1934,87 +2172,154 @@ fn handle_setup(
     to_client: &mpsc::UnboundedSender<Message>,
     st: &mut Session,
 ) -> Result<()> {
-    let send = |v: serde_json::Value| {
-        let _ = to_client.send(Message::Text(v.to_string().into()));
-    };
-    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed, kind, suffix, count, http } = msg else {
+    let ClientMsg::Setup { v, nonce_c, http, escrow_e, escrow, armed, model, max_tokens, len, body_len, kind, suffix, count, variant } = msg else {
         bail!("expected a setup frame");
     };
     if st.sid.is_some() || st.state != SessionState::Handshake {
         bail!("duplicate setup");
     }
-    if h2_session::wants_h2(http.as_ref())? {
-        if kind.is_some() || !model.is_empty() || max_tokens != 0 || len != 0 || suffix.is_some() || count.is_some() {
-            bail!("an http: 2 setup names no kind, model, max_tokens, length, suffix or count: they belong to its requests");
+    if v.as_ref().and_then(|v| v.as_u64()) != Some(3) {
+        st.code = Some("upgrade_required");
+        bail!("upgrade_required: this sidecar speaks routstr-confidential v3 (setup.v must be 3)");
+    }
+    if [&model, &max_tokens, &len, &body_len, &kind, &suffix, &count, &variant].iter().any(|x| x.is_some()) {
+        bail!("a setup names no kind, model, max_tokens, variant, count, length or suffix: they belong to its requests");
+    }
+    let framing = match http.as_ref().and_then(|h| h.as_str()) {
+        Some("2") => "2",
+        Some("1.1") => "1.1",
+        _ => bail!("setup.http must be \"2\" or \"1.1\""),
+    };
+    if !app.offer.http.iter().any(|h| h == framing) {
+        bail!("this sidecar does not offer framing {framing:?}");
+    }
+    if framing == "2" {
+        if app.h2_guard.withdrawn() {
+            st.fault = Some("upstream");
+            st.code = Some("h2_withdrawn");
+            bail!("framing \"2\" is withdrawn: the provider's HTTP/2 connections failed; use \"1.1\"");
         }
         return h2_session::handle_setup(app, shared, to_client, st, &nonce_c, escrow.as_deref(), escrow_e, armed);
     }
-    let images = match kind.as_deref() {
-        None | Some("chat") => false,
-        Some("images") => true,
-        Some(other) => bail!("unknown session kind {other:?}"),
-    };
-    let images_count = if images {
-        let ep = app.offer.endpoints.images.as_ref().ok_or_else(|| anyhow!("this sidecar offers no images endpoint"))?;
-        if model.is_empty() || max_tokens != 0 || armed {
-            bail!("an image setup needs a model, no max_tokens, and is never armed");
-        }
-        let suffix = suffix.as_deref().ok_or_else(|| anyhow!("an image setup needs the node's suffix"))?;
-        let n = ep.check_suffix(&model, suffix)?;
-        if count.is_some_and(|c| c != n) {
-            bail!("setup count {count:?} differs from the suffix's count {n}");
-        }
-        st.suffix = suffix.to_string();
-        st.head_template = ep.head_template.clone();
-        Some(n)
-    } else {
-        if model.is_empty() || max_tokens == 0 {
-            bail!("setup needs a model and max_tokens >= 1");
-        }
-        let canonical = app.offer.chat.render(&model, max_tokens);
-        if suffix.as_deref().is_some_and(|s| s != canonical) || count.is_some() {
-            bail!("a chat setup's suffix is the canonical one and it has no count");
-        }
-        st.suffix = canonical;
-        st.head_template = app.offer.head_template.clone();
-        None
-    };
-    if len == 0 || len > app.max_body {
-        bail!("declared body length {len} outside 1..={}", app.max_body);
-    }
-    if max_tokens > app.offer.max_tokens_cap {
-        bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
-    }
-    // The operator's optional allowlist (empty = all; the node applies the same list).
-    if !app.offer.model_allowlist.is_empty() && !app.offer.model_allowlist.contains(&model) {
-        bail!("model {model:?} is not in the offer's model_allowlist");
-    }
     let (sid, nonce_n) = session_id(&nonce_c, escrow.as_deref(), escrow_e)?;
     st.sid = Some(sid.clone());
-    st.body_len = len;
+    st.framing11 = true;
+    st.run_dir = Some(init_run_dir(app, &sid)?);
+    app.sessions.lock().unwrap().insert(sid.clone(), shared.clone());
+    side(st, format!("setup sid={sid} http=1.1 armed={armed} node_settles={}", app.node_settles));
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({
+            "type":"ready","v":3,"http":"1.1","sid":sid,"nonce_n":hex::encode(nonce_n),
+            "pubkey":app.offer.notary_pubkey,"armed":armed,
+        })
+        .to_string()
+        .into(),
+    ));
+    Ok(())
+}
+
+/// Framing "1.1": `request` 1, before the ClientHello. Its terms fix the
+/// head N will write (path, `Content-Length`) and the suffix the final body
+/// record must be.
+#[allow(clippy::too_many_arguments)]
+fn request_11(
+    app: &Arc<AppState>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    n: u32,
+    kind: Option<&str>,
+    model: String,
+    max_tokens: u64,
+    body_len: usize,
+    suffix: Option<&str>,
+    count: Option<u64>,
+) -> Result<()> {
+    if st.req1 {
+        bail!("framing 1.1 carries exactly one request");
+    }
+    if n != 1 {
+        bail!("request number {n}, expected 1");
+    }
+    let images = match kind {
+        None | Some("chat") => false,
+        Some("images") => true,
+        Some(other) => refuse!("unknown request kind {other:?}"),
+    };
+    // The operator's optional allowlist (empty = all; the node applies the same list).
+    if !app.offer.model_allowlist.is_empty() && !app.offer.model_allowlist.contains(&model) {
+        refuse!("model {model:?} is not in the offer's model_allowlist");
+    }
+    let (canonical, template, images_count) = if images {
+        let Some(ep) = app.offer.endpoints.images.as_ref() else { refuse!("this sidecar offers no images endpoint") };
+        if model.is_empty() || max_tokens != 0 {
+            refuse!("an image request needs a model and no max_tokens");
+        }
+        let Some(suffix) = suffix else { refuse!("an image request needs the node's suffix") };
+        let c = ep.check_suffix(&model, suffix).map_err(|e| Refused(e.to_string()))?;
+        if count.is_some_and(|x| x != c) {
+            refuse!("request count {count:?} differs from the suffix's count {c}");
+        }
+        (suffix.to_string(), ep.head_template.clone(), Some(c))
+    } else {
+        if model.is_empty() || max_tokens == 0 {
+            refuse!("a request needs a model and max_tokens >= 1");
+        }
+        if max_tokens > app.offer.max_tokens_cap {
+            refuse!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
+        }
+        let canonical = app.offer.chat.render(&model, max_tokens);
+        if suffix.is_some_and(|s| s != canonical) || count.is_some() {
+            refuse!("a chat request's suffix is the canonical one and it has no count");
+        }
+        (canonical, app.offer.head_template.clone(), None)
+    };
+    if body_len <= canonical.len() || body_len > app.max_body {
+        refuse!("declared body length {body_len} outside {}..={}", canonical.len() + 1, app.max_body);
+    }
+    let (head, _) = placeholder_head(&template, app.key.len(), body_len)?;
+    st.req1 = true;
+    st.body_len = body_len;
     st.model = model.clone();
     st.max_tokens = max_tokens;
     st.images_count = images_count;
-    let (head, _) = placeholder_head(&st.head_template, app.key.len(), len)?;
+    st.suffix = canonical.clone();
+    st.head_template = template;
     st.head_len = head.len();
-    st.run_dir = Some(init_run_dir(app, &sid)?);
-    app.sessions.lock().unwrap().insert(sid.clone(), shared.clone());
-    side(
-        st,
-        format!("setup sid={} model={} len={} max_tokens={} armed={} node_settles={}", sid, model, len, max_tokens, armed, app.node_settles),
-    );
-    let mut ready = serde_json::json!({
-        "type":"ready","nonce_n":hex::encode(nonce_n),"sid":sid,
-        "pubkey":app.offer.notary_pubkey,"head_len":head.len(),
-        "suffix": st.suffix,
-        "armed": armed,
-        "v": app.offer.v,
-    });
-    if let Some(n) = images_count {
-        ready["kind"] = "images".into();
-        ready["count"] = n.into();
+    side(st, format!("request n=1 model={model} body_len={body_len} max_tokens={max_tokens} images={images_count:?}"));
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"request_ok","sid":st.sid,"n":1,"suffix":canonical,"head_len":head.len()}).to_string().into(),
+    ));
+    Ok(())
+}
+
+/// Framing "1.1": once the final body record (the pinned suffix, alone) is
+/// held, fix the parameters of its π_WIN (one window: the whole record) and
+/// send them. The client proves; `ZkDone` releases the record.
+fn final_record_params(
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &RelayLog,
+) -> Result<()> {
+    if !st.framing11 || st.win_requested || st.held.is_none() {
+        return Ok(());
     }
-    send(ready);
+    let last = log.client_app_last.as_ref().ok_or_else(|| anyhow!("no body record"))?;
+    // Epoch-1 sequence of the final body record (the body starts at 0).
+    let seq = (st.body_records - 1) as u64;
+    let ap = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?;
+    let windows = h2::windows_for(seq, &last.payload, st.suffix.as_bytes(), &[])?;
+    if windows.len() != 1 {
+        bail!("the final body record is not the pinned suffix alone");
+    }
+    let p = zkbench::statements::PiWin { anchor: ap.h1, key_updates: 0, windows };
+    zkbench::statements::check_pi_win(&p).context("the final body record exceeds one π_WIN")?;
+    let params = Params::PiWin(p);
+    shared.set_params("pi_win", params.clone());
+    st.win_requested = true;
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"zk_params","proof":"pi_win","purpose":"records","first_seq":seq,"count":1,"params":params}).to_string().into(),
+    ));
     Ok(())
 }
 
@@ -2056,11 +2361,22 @@ async fn handle_control(
         // Handled once, before the upstream connection exists (handle_setup).
         ClientMsg::Setup { .. } => bail!("duplicate setup"),
         ClientMsg::Request { n, kind, model, max_tokens, body_len, suffix, count } => {
-            h2_session::on_request(app, to_client, st, n, kind.as_deref(), model, max_tokens, body_len, suffix.as_deref(), count)?;
+            if st.h2.is_none() {
+                bail!("framing 1.1 carries one request, sent before the ClientHello");
+            }
+            match h2_session::on_request(app, to_client, st, n, kind.as_deref(), model, max_tokens, body_len, suffix.as_deref(), count) {
+                Err(e) if e.is::<Refused>() => send_refused(to_client, st, n, &e),
+                other => other?,
+            }
         }
         ClientMsg::Ctl { frame } => h2_session::on_ctl(st, &frame)?,
+        ClientMsg::SettingsSeen { header_table_size } => h2_session::on_settings_seen(app, st, header_table_size)?,
         ClientMsg::Release { n, upto } => h2_session::on_release(st, n, upto)?,
-        ClientMsg::DiscloseHead { n, record, r, key_updates, epoch_start } => {
+        ClientMsg::DiscloseHead { n, record, r, key_updates, epoch_start, tail_lens, skip, trailing } if st.h2.is_some() => {
+            if !tail_lens.is_empty() || skip != 0 || trailing.is_some() {
+                bail!("framing 2: an error head names its server record (no tail_lens, skip or trailing)");
+            }
+            let record = record.ok_or_else(|| anyhow!("framing 2: disclose_head names the server record of the head"))?;
             h2_session::on_disclose_head(app, shared, to_client, st, log, n, record, &r, key_updates, epoch_start)?;
         }
         ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing, n, server_records } if st.h2.is_some() => {
@@ -2068,9 +2384,6 @@ async fn handle_control(
         }
         ClientMsg::Accept { n, server_records } if st.h2.is_some() => {
             h2_session::on_accept(app, st, to_client, log, n, server_records)?;
-        }
-        ClientMsg::BodySuffix { .. } if st.h2.is_some() => {
-            bail!("not a message of an http: 2 session");
         }
         ClientMsg::ReleaseHead {} => {
             if st.state != SessionState::AwaitHead || st.head_release.is_some() {
@@ -2082,47 +2395,12 @@ async fn handle_control(
             st.head_release = Some(st.ku_record.clone().ok_or_else(|| anyhow!("no KeyUpdate record"))?);
             write_head(st, log, to_client, tcp_tx).await?;
         }
-        ClientMsg::BodySuffix { suffix } => {
-            if st.state != SessionState::Body && st.state != SessionState::Attested {
-                bail!("body_suffix out of order");
+        ClientMsg::Accept { n, .. } => {
+            if n != Some(1) {
+                bail!("accept names no request in flight");
             }
-            if st.c2_requested {
-                bail!("duplicate body_suffix");
-            }
-            if st.body_bytes != st.body_len || st.body_records == 0 {
-                bail!("body incomplete ({} of {} bytes)", st.body_bytes, st.body_len);
-            }
-            let suffix = hex::decode(&suffix)?;
-            // The suffix is not the client's choice: it must be exactly the one
-            // that pins the setup's model and caps (and the escrow sizing).
-            if suffix != st.suffix.as_bytes() {
-                bail!("body suffix does not match the session's pinned suffix");
-            }
-            st.c2_requested = true;
-            let last = log.client_app_last.as_ref().ok_or_else(|| anyhow!("no body record"))?;
-            let inner_len = last.payload.len().saturating_sub(16); // drop the GCM tag
-            if inner_len == 0 || suffix.len() + 1 > inner_len {
-                bail!("suffix does not fit in the last body record");
-            }
-            // Epoch-1 sequence of the final body record (the body starts at 0).
-            let seq = (st.body_records - 1) as u64;
-            let (w, off, sel_start) = window(suffix.len(), inner_len);
-            let ct_window = last.payload[off..off + w].to_vec();
-            let ap = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?;
-            // The compared range runs through the inner content type byte, so
-            // the statement alone shows the record is application data ending
-            // in the suffix.
-            let mut expected = suffix;
-            expected.push(CT_APPLICATION_DATA);
-            let params = Params::PiC2S(zkbench::statements::PiC2S {
-                h1: ap.h1, seq, ct_window, off, w, sel_start, sel_len: expected.len(), expected,
-            });
-            shared.params.lock().unwrap().insert("pi_c2s".into(), params.clone());
-            send(serde_json::json!({"type":"zk_params","proof":"pi_c2s","params":params}));
-        }
-        ClientMsg::Accept { .. } => {
-            let Some(count) = st.images_count else { bail!("accept is for image sessions only") };
-            if st.state != SessionState::Attested || st.disclosed || st.accepted || !st.c2_ok {
+            let Some(count) = st.images_count else { bail!("accept is for image requests only") };
+            if st.state != SessionState::Attested || st.disclosed || st.accepted || !st.released {
                 bail!("accept out of order or repeated");
             }
             st.accepted = true;
@@ -2130,7 +2408,45 @@ async fn handle_control(
             side(st, format!("accepted: flat charge for {count} image(s)"));
             emit_settlement(app, st, to_client);
         }
-        ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing, .. } => {
+        ClientMsg::DiscloseHead { n, record, r, key_updates, epoch_start, tail_lens, skip, trailing } => {
+            if n != 1 || record.is_some() {
+                bail!("framing 1.1: disclose_head names request 1 and no record index");
+            }
+            disclose_11(app, shared, to_client, st, log, &r, &tail_lens, skip, key_updates, epoch_start, trailing, true)?;
+        }
+        ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing, n, server_records } => {
+            if n != Some(1) || server_records.is_some() {
+                bail!("framing 1.1: disclose names request 1 and no server_records");
+            }
+            disclose_11(app, shared, to_client, st, log, &r, &tail_lens, skip, key_updates, epoch_start, trailing, false)?;
+        }
+    }
+    Ok(())
+}
+
+/// Framing "1.1": the disclosure after the provider closed. `head` = an
+/// error head (`disclose_head`), else the usage tail (`disclose`).
+#[allow(clippy::too_many_arguments)]
+fn disclose_11(
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &RelayLog,
+    r: &str,
+    tail_lens: &[usize],
+    skip: usize,
+    key_updates: u32,
+    epoch_start: usize,
+    trailing: Option<usize>,
+    head: bool,
+) -> Result<()> {
+    let _ = app;
+    let send = |v: serde_json::Value| {
+        let _ = to_client.send(Message::Text(v.to_string().into()));
+    };
+    {
+        {
             // Only once, and only after the upstream closed: the anchor is the
             // end of the final transcript.
             if st.state != SessionState::Attested || st.disclosed || st.accepted {
@@ -2155,13 +2471,16 @@ async fn handle_control(
             if (key_updates == 0) != (epoch_start == 0) {
                 bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
             }
-            let r = hex::decode(&r)?;
+            let r = hex::decode(r)?;
             check_disclosure_size(r.len(), skip)?;
             // Either the terminal usage event of a successful stream (anchored
             // at the end of the transcript), or, for an upstream error, only the
             // response head: its status decides the charge, the body stays
             // private (it sits in the `skip` bytes after the head).
             let error_head = r.starts_with(b"HTTP/1.");
+            if error_head != head {
+                bail!("an error head is disclosed with disclose_head, a usage tail with disclose");
+            }
             if st.images_count.is_some() && !error_head {
                 bail!("an image session discloses only an error head (a success is accepted)");
             }
@@ -2172,7 +2491,7 @@ async fn handle_control(
                     bail!("a usage disclosure must end the transcript (skip = {skip})");
                 }
                 let usage = validate_r(&r)?;
-                // π_C2S already proved the model the request names. The
+                // π_WIN already proved the model the request names. The
                 // provider may report it under another spelling (an alias, a
                 // canonical id, a case change): that is logged and handed to
                 // the node, which settles at the pinned model.
@@ -2186,7 +2505,7 @@ async fn handle_control(
             };
             st.usage = Some(usage);
             let info = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?;
-            let chosen = log.covered_records(info.server_handshake_records, &tail_lens, trailing)?;
+            let chosen = log.covered_records(info.server_handshake_records, tail_lens, trailing)?;
             // Covered records are in the last epoch: sequence numbers restart
             // at its first record. (A wrong claim only makes the proof fail:
             // the records then decrypt to noise under the derived key.)
@@ -2237,8 +2556,12 @@ async fn handle_control(
             );
             let ap = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?;
             let params = Params::PiC3S(zkbench::statements::PiC3S { h2: ap.h2, records, expected: r, skip, key_updates });
-            shared.params.lock().unwrap().insert("pi_c3s".into(), params.clone());
-            send(serde_json::json!({"type":"zk_params","proof":"pi_c3s","params":params}));
+            shared.set_params("pi_c3s", params.clone());
+            let mut msg = serde_json::json!({"type":"zk_params","proof":"pi_c3s","n":1,"params":params});
+            if head {
+                msg["purpose"] = "error_head".into();
+            }
+            send(msg);
         }
     }
     Ok(())
@@ -2336,18 +2659,9 @@ fn same_params(proven: Option<&Params>, stored: Option<&Params>) -> bool {
     }
 }
 
-/// Choose a block-aligned window ending at the record end that contains the
-/// final `sel_len` content bytes (before the inner content-type byte).
-fn window(sel_len: usize, ct_len: usize) -> (usize, usize, usize) {
-    let w = (sel_len + 1 + 13).min(ct_len);
-    let off = ct_len - w;
-    let sel_start = w - 1 - sel_len;
-    (w, off, sel_start)
-}
-
 /// Relay complete body records from `buf` (leaving a partial one in it). The
 /// body plaintext must be exactly the declared length, and the record that
-/// completes it (the pinned suffix) is held until π_C2S verifies.
+/// completes it (the pinned suffix) is held until π_WIN verifies.
 async fn relay_body(
     st: &mut Session,
     log: &mut RelayLog,
@@ -2369,11 +2683,15 @@ async fn relay_body(
         st.body_bytes += content;
         st.body_records += 1;
         if st.body_bytes == st.body_len {
-            // The upstream cannot start inference without the full body, so a
-            // client that swaps the model or caps is stopped before it costs
-            // anything.
+            // The final record is the pinned suffix and nothing else, so one
+            // whole-record π_WIN window proves it. The upstream cannot start
+            // inference without the full body, so a client that swaps the
+            // model or caps is stopped before it costs anything.
+            if content != st.suffix.len() {
+                bail!("the final body record must be the pinned suffix alone ({} bytes), it carries {content}", st.suffix.len());
+            }
             st.held = Some(r.bytes());
-            info!("final body record held until π_C2S verifies");
+            info!("final body record held until π_WIN verifies");
         } else {
             write_upstream(tcp_tx, &r.bytes(), st.deadline).await?;
             st.sent.update(&r.bytes());
@@ -2447,7 +2765,7 @@ fn check_hello(st: &mut Session, pending: &[u8]) -> Result<bool> {
     }
     tls_v2::check_client_hello(msg, &joint, st.h2.is_some())?;
     st.ch_checked = true;
-    info!("v2 ClientHello checked: one P-256 share, the joint key");
+    info!("ClientHello checked: one P-256 share, the joint key");
     Ok(true)
 }
 
@@ -2482,7 +2800,7 @@ async fn v2_pump_client(
             // The client Finished (one encrypted record); then C waits for N.
             st.state = SessionState::AwaitHead;
         } else {
-            bail!("unexpected client record type {} during the v2 handshake", r.ctype);
+            bail!("unexpected client record type {} during the handshake", r.ctype);
         }
         log.client_handshake_record(&pending[..n])?;
         write_upstream(tcp_tx, &pending[..n], st.deadline).await?;
@@ -2533,12 +2851,15 @@ async fn v2_progress(
         if st.app_th_sf != Some(info.th_sf) {
             bail!("verified handshake transcript differs from the one fed to the 2PC");
         }
-        info!(th_sh = %hex::encode(info.th_sh), "v2 handshake verified: chain + hostname + CertificateVerify + both Finished");
+        info!(th_sh = %hex::encode(info.th_sh), "handshake verified: chain + hostname + CertificateVerify + both Finished");
         side(st, format!("handshake_verified th_sh={}", hex::encode(info.th_sh)));
-        // An `http: 2` session: the provider must have selected h2, or the
+        // A framing-"2" connection: the provider must have selected h2, or the
         // connection head N is about to write would not be HTTP/2.
         if st.h2.is_some() && info.alpn.as_deref() != Some(b"h2") {
-            bail!("the provider did not select h2 (ALPN) for an http: 2 session");
+            app.h2_guard.failed("the provider did not select h2");
+            st.fault = Some("upstream");
+            st.code = Some("h2_not_selected");
+            bail!("the provider did not select h2 (ALPN) for a framing-2 connection");
         }
         st.handshake = Some(info);
         let _ = to_client.send(Message::Text(serde_json::json!({"type":"hs_verified"}).to_string().into()));
@@ -2568,7 +2889,7 @@ async fn v2_progress(
             "type":"c_commit","params": params, "c_commit": hex::encode(c_commit),
             "h1": hex::encode(ap.h1), "h2": hex::encode(ap.h2), "hk": hex::encode(ap.hk),
         }).to_string().into()));
-        info!("v2 credential record assembled under K_0; π_NK params sent");
+        info!("head record assembled under K_0; π_NK params sent");
     }
     Ok(())
 }
@@ -2611,8 +2932,8 @@ where
 }
 
 /// The session's head with zeros at the key's positions, and those
-/// positions: the HTTP/1.1 request head of a v2 session, or the HTTP/2
-/// connection head of an `http: 2` one.
+/// positions: the HTTP/1.1 request head of a connection, or the HTTP/2
+/// connection head of an framing "2" one.
 fn head_template_now(app: &Arc<AppState>, st: &Session) -> Result<(Vec<u8>, Vec<usize>)> {
     match &st.h2 {
         Some(h) => h2_session::head_template(app, h),
@@ -2651,7 +2972,7 @@ async fn zk_ws(
 const ZK_MAX_MESSAGE: usize = 4 << 20;
 
 /// The proof names a `/zk` connection may carry.
-const ZK_PROOFS: [&str; 6] = ["twopc", "zkchan", "pi_nk", "pi_c2s", "pi_c3s", "pi_win"];
+const ZK_PROOFS: [&str; 5] = ["twopc", "zkchan", "pi_nk", "pi_c3s", "pi_win"];
 
 async fn zk_handler(socket: WebSocket, q: HashMap<String, String>, app: Arc<AppState>) {
     let proof = q.get("proof").cloned().unwrap_or_default();
@@ -2703,11 +3024,10 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
             bail!("proof channel already open for this session");
         }
         let (io, bridge) = ws_duplex(socket);
-        // The channel ends with its session, which lasts at most two
-        // `SESSION_TIMEOUT`s (up to the release, then after it).
-        // (An `http: 2` connection lives up to `H2_CONN_MAX`, plus its last request.)
-        let multi = shared.multi.load(std::sync::atomic::Ordering::SeqCst);
-        let limit = if multi { h2_session::H2_CONN_MAX + 2 * SESSION_TIMEOUT } else { 2 * SESSION_TIMEOUT };
+        // The channel ends with its connection: at most the longest
+        // `h2.max_lifetime_s` plus its last request (framing "1.1": two
+        // `SESSION_TIMEOUT`s).
+        let limit = h2::MAX_LIFETIME + 2 * SESSION_TIMEOUT;
         let result = tokio::time::timeout(limit, run_zkchan(io, &shared))
             .await
             .unwrap_or_else(|_| Err(anyhow!("proof channel reached the session time limit")));
@@ -2776,7 +3096,7 @@ fn wipe_witness(witness: &mut Option<Witness>) {
 }
 
 /// The session's long-lived proof channel (`zkbench::channel`). The
-/// correlations for π_NK (node proves) and π_C2S/π_C3S (client proves) are
+/// correlations for π_NK (node proves) and π_WIN/π_C3S (client proves) are
 /// generated while the session is armed; at claim time the client requests
 /// each proof by name and the node runs it against *its own* parameters for
 /// that name (exactly like the per-proof path), reporting `Ev::ZkDone`.
@@ -2796,7 +3116,6 @@ where
     let mut ch = tokio::time::timeout(TWOPC_TIMEOUT, ZkChannel::open(io, Party::Node, Prealloc::default()))
         .await
         .map_err(|_| anyhow!("proof channel preprocessing timed out"))??;
-    ch.set_multi(shared.multi.load(std::sync::atomic::Ordering::SeqCst));
     let steps: Vec<String> = ch.take_timings().iter().map(|t| format!("{}={:.0}ms/{}B", t.step, t.ms, t.bytes_sent + t.bytes_recv)).collect();
     info!(steps = %steps.join(" "), "zkchan ready");
     loop {
@@ -2815,7 +3134,7 @@ where
         // the channel without reporting to the session, which goes on (the
         // client may fall back to the per-proof path).
         let ready = async {
-            if !matches!(proof.as_str(), "pi_nk" | "pi_c2s" | "pi_c3s" | "pi_win") {
+            if !matches!(proof.as_str(), "pi_nk" | "pi_c3s" | "pi_win") {
                 bail!("{proof} is not served on the proof channel");
             }
             let params = shared.params.lock().unwrap().get(proof.as_str()).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
@@ -2994,9 +3313,10 @@ fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
 /// the node, or, without `--node-settles`, sign a stub receipt.
 fn emit_settlement(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) {
     let Some(usage) = st.usage.clone() else { return };
+    let error = usage.get("error_status").is_some();
     if app.node_settles {
         // The node holds the wallet and the Nostr key: it prices, refunds
-        // and signs. The model is always the pinned one (π_C2S proved the
+        // and signs. The model is always the pinned one (π_WIN proved the
         // request names it); a chat usage event that reports another
         // spelling is passed along as `reported_model`.
         let model = st.model.clone();
@@ -3018,6 +3338,8 @@ fn emit_settlement(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::Unbo
         let mut msg = serde_json::json!({
             "type":"usage",
             "sid": st.sid,
+            "http": "1.1",
+            "n": 1,
             "model": model,
             "usage": usage,
         });
@@ -3035,13 +3357,17 @@ fn emit_settlement(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::Unbo
         let sig = app.signer.sign(receipt_json.as_bytes());
         let _ = to_client.send(Message::Text(
             serde_json::json!({
-                "type":"receipt","receipt":receipt,
+                "type":"receipt","n":1,"receipt":receipt,
                 "receipt_json":receipt_json,
                 "sig":hex::encode(sig.to_bytes()),
             }).to_string().into(),
         ));
         write_receipt(&st.run_dir, &receipt);
         st.state = SessionState::Settled;
+    }
+    if st.state == SessionState::Settled {
+        // The connection carried its one request: it ends in order.
+        st.closing11 = Some(if error { "error_settled" } else { "done" });
     }
 }
 
@@ -3057,6 +3383,8 @@ fn settle(app: &Arc<AppState>, st: &Session) -> Option<serde_json::Value> {
     let model = st.model.clone();
     let receipt = serde_json::json!({
         "sid": sid,
+        "http": "1.1",
+        "n": 1,
         "usage": usage,
         "model": model,
         "cost_usd": cost_usd,
@@ -3189,15 +3517,65 @@ mod offer_tests {
     fn shipped_offer_parses() {
         let o: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
         assert!(o.model_allowlist.is_empty());
-        // The shipped offer stays HTTP/1.1 only; the h2 variant adds one block.
-        assert!(o.h2.is_none());
-        let h: Offer = serde_json::from_str(include_str!("../offer.venice.h2.json")).unwrap();
-        let block = h.h2.clone().expect("h2 block");
-        block.validate(&h.upstream_host, h.key_length).unwrap();
-        assert_eq!(crate::h2_session::chat_path(&h.head_template).unwrap(), "/api/v1/chat/completions");
-        let mut a = serde_json::to_value(&h).unwrap();
+        // The shipped offer serves both framings, "2" first; the example
+        // for a provider without HTTP/2 differs only in `http` and `h2`.
+        let mut o = o;
+        crate::check_http_list(&mut o).unwrap();
+        assert_eq!(o.http, ["2", "1.1"]);
+        let block = o.h2.clone().expect("h2 block");
+        block.validate(&o.upstream_host, o.key_length).unwrap();
+        assert_eq!(block.max_lifetime_s, 3600);
+        assert_eq!(crate::h2_session::chat_path(&o.head_template).unwrap(), "/api/v1/chat/completions");
+        let mut h: Offer = serde_json::from_str(include_str!("../offer.venice.http11.json")).unwrap();
+        crate::check_http_list(&mut h).unwrap();
+        assert_eq!(h.http, ["1.1"]);
+        assert!(h.h2.is_none());
+        let mut a = serde_json::to_value(&o).unwrap();
         a.as_object_mut().unwrap().remove("h2");
-        assert_eq!(a, serde_json::to_value(&o).unwrap());
+        a["http"] = serde_json::json!(["1.1"]);
+        assert_eq!(a, serde_json::to_value(&h).unwrap());
+    }
+
+    #[test]
+    fn the_http_list_is_checked() {
+        let base: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
+        // Absent: "1.1" only.
+        let mut o = Offer { http: vec![], h2: None, ..base.clone() };
+        crate::check_http_list(&mut o).unwrap();
+        assert_eq!(o.http, ["1.1"]);
+        // The operator's order is kept.
+        let mut o = Offer { http: vec!["1.1".into(), "2".into()], ..base.clone() };
+        crate::check_http_list(&mut o).unwrap();
+        assert_eq!(o.http, ["1.1", "2"]);
+        for bad in [vec!["2", "2"], vec!["3"], vec!["2", "h2"]] {
+            let mut o = Offer { http: bad.iter().map(|x| x.to_string()).collect(), ..base.clone() };
+            assert!(crate::check_http_list(&mut o).is_err(), "{bad:?}");
+        }
+        // "2" without its block.
+        let mut o = Offer { http: vec!["2".into()], h2: None, ..base.clone() };
+        assert!(crate::check_http_list(&mut o).is_err());
+    }
+
+    #[test]
+    fn framing_2_is_withdrawn_after_five_failed_opens_and_comes_back() {
+        let g = crate::H2Guard::new(std::time::Duration::from_millis(40), None);
+        for _ in 0..4 {
+            g.failed("test");
+        }
+        assert!(!g.withdrawn());
+        // A response resets the count.
+        g.opened();
+        for _ in 0..4 {
+            g.failed("test");
+        }
+        assert!(!g.withdrawn());
+        g.failed("test");
+        assert!(g.withdrawn());
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(!g.withdrawn());
+        // It starts counting afresh.
+        g.failed("test");
+        assert!(!g.withdrawn());
     }
 }
 
@@ -3551,7 +3929,11 @@ mod hardening_tests {
     fn app_state() -> Arc<AppState> {
         Arc::new(AppState {
             key: Arc::new(Zeroizing::new(b"k".repeat(32))),
-            offer: Arc::new(serde_json::from_str(r#"{"upstream_host": "api.example.com"}"#).unwrap()),
+            offer: Arc::new({
+                let mut o: Offer = serde_json::from_str(r#"{"upstream_host": "api.example.com", "http": ["1.1"]}"#).unwrap();
+                o.head_template = default_head_template_for("api.example.com", 32);
+                o
+            }),
             host: "api.example.com".into(),
             upstream: "127.0.0.1:9".into(),
             signer: Arc::new(SigningKey::from_bytes(&[7; 32])),
@@ -3562,6 +3944,7 @@ mod hardening_tests {
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
             max_body: 1 << 20,
             token_hash: None,
+            h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None),
         })
     }
 
@@ -3577,8 +3960,7 @@ mod hardening_tests {
             zkchan_taken: std::sync::atomic::AtomicBool::new(false),
             zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             proofs_run: StdMutex::new(Default::default()),
-            multi: std::sync::atomic::AtomicBool::new(false),
-            fresh: StdMutex::new(Default::default()),
+                fresh: StdMutex::new(Default::default()),
         });
         (s, rx)
     }
@@ -3609,6 +3991,7 @@ mod hardening_tests {
             slots: Arc::new(tokio::sync::Semaphore::new(1)),
             max_body: 1 << 20,
             token_hash: None,
+            h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None),
         })
     }
 
@@ -3708,11 +4091,8 @@ mod hardening_tests {
         assert!(ep.validate("api.venice.ai", 42).is_ok());
     }
 
-    fn setup(kind: Option<&str>, extra: serde_json::Value) -> serde_json::Value {
-        let mut v = serde_json::json!({"type": "setup", "nonce_c": "11".repeat(32), "model": "m", "len": 100});
-        if let Some(k) = kind {
-            v["kind"] = k.into();
-        }
+    fn setup(http: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut v = serde_json::json!({"type": "setup", "v": 3, "http": http, "nonce_c": "11".repeat(32)});
         for (k, x) in extra.as_object().unwrap() {
             v[k] = x.clone();
         }
@@ -3723,37 +4103,181 @@ mod hardening_tests {
         let (s, _rx) = shared(app);
         let (tx, mut out) = mpsc::unbounded_channel();
         let mut st = Session::default();
-        handle_setup(serde_json::from_value(v)?, app, &s, &tx, &mut st)?;
+        if let Err(e) = handle_setup(serde_json::from_value(v)?, app, &s, &tx, &mut st) {
+            return Err(e.context(format!("code={:?}", st.code)));
+        }
         let Some(Message::Text(t)) = out.try_recv().ok() else { bail!("no ready") };
         Ok((st, serde_json::from_str(&t)?))
     }
 
     #[test]
-    fn image_setups_take_the_node_suffix_and_chat_setups_stay_as_they_were() {
+    fn a_setup_names_the_framing_and_no_request() {
         let app = images_app();
-        let suffix = venice_images().render_suffix("m", 3, &[("format".into(), "webp".into())]);
-        let (st, ready) = run_setup(&app, setup(Some("images"), serde_json::json!({"suffix": suffix, "count": 3}))).unwrap();
-        assert_eq!(st.images_count, Some(3));
-        assert_eq!(ready["suffix"], suffix);
-        assert_eq!(ready["kind"], "images");
-        assert!(st.head_template.starts_with("POST /api/v1/image/generate "));
-        let (st, ready) = run_setup(&app, setup(None, serde_json::json!({"max_tokens": 7}))).unwrap();
-        assert_eq!(st.images_count, None);
-        assert_eq!(ready["suffix"], app.offer.chat.render("m", 7));
-        assert!(ready.get("kind").is_none());
+        let (st, ready) = run_setup(&app, setup("1.1", serde_json::json!({"armed": true}))).unwrap();
+        assert!(st.framing11 && !st.req1 && st.h2.is_none());
+        assert_eq!((ready["v"].as_u64(), ready["http"].as_str(), ready["armed"].as_bool()), (Some(3), Some("1.1"), Some(true)));
+        assert!(ready.get("head_len").is_none() && ready.get("suffix").is_none());
+        let (st, ready) = run_setup(&app, setup("2", serde_json::json!({}))).unwrap();
+        assert!(st.h2.is_some() && !st.framing11);
+        assert_eq!(ready["http"], "2");
+        assert!(ready["head_len"].as_u64().is_some() && ready["h2"].is_object());
+        // Request terms, another framing, a number for `http`.
         for bad in [
-            setup(Some("video"), serde_json::json!({"max_tokens": 7})),
-            setup(Some("images"), serde_json::json!({})),
-            setup(Some("images"), serde_json::json!({"suffix": suffix, "count": 2})),
-            setup(Some("images"), serde_json::json!({"suffix": suffix, "armed": true})),
-            setup(Some("images"), serde_json::json!({"suffix": suffix, "max_tokens": 7})),
-            setup(Some("chat"), serde_json::json!({"max_tokens": 7, "count": 1})),
-            setup(Some("chat"), serde_json::json!({"max_tokens": 7, "suffix": suffix})),
+            setup("1.1", serde_json::json!({"model": "m"})),
+            setup("1.1", serde_json::json!({"max_tokens": 7})),
+            setup("2", serde_json::json!({"len": 100})),
+            setup("2", serde_json::json!({"kind": "chat"})),
+            setup("1.1", serde_json::json!({"suffix": "x"})),
+            setup("1.1", serde_json::json!({"count": 1})),
+            setup("3", serde_json::json!({})),
+            setup("1.1", serde_json::json!({"http": 2})),
+            setup("1.1", serde_json::json!({"http": null})),
         ] {
             assert!(run_setup(&app, bad.clone()).is_err(), "accepted {bad}");
         }
-        // A sidecar without the images endpoint refuses image setups.
-        assert!(run_setup(&app_state(), setup(Some("images"), serde_json::json!({"suffix": suffix}))).is_err());
+        // A v2 setup, or none: the upgrade error.
+        for old in [serde_json::json!({"v": 2}), serde_json::json!({"v": null}), serde_json::json!({"v": "3"})] {
+            let e = run_setup(&app, setup("1.1", old)).err().unwrap();
+            assert!(format!("{e:#}").contains("upgrade_required"), "{e:#}");
+        }
+        let v2 = serde_json::json!({"type": "setup", "nonce_c": "11".repeat(32), "model": "m", "max_tokens": 7, "len": 100});
+        assert!(format!("{:#}", run_setup(&app, v2).err().unwrap()).contains("code=Some(\"upgrade_required\")"));
+        // A framing the offer does not list.
+        let mut offer = (*app.offer).clone();
+        offer.http = vec!["1.1".into()];
+        let only11 = Arc::new(AppState { offer: Arc::new(offer), key: app.key.clone(), host: app.host.clone(), upstream: app.upstream.clone(), signer: app.signer.clone(), runs_dir: app.runs_dir.clone(), runs_keep: app.runs_keep, node_settles: false, sessions: StdMutex::new(HashMap::new()), slots: app.slots.clone(), max_body: app.max_body, token_hash: None, h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None) });
+        assert!(run_setup(&only11, setup("2", serde_json::json!({}))).is_err());
+        // Withdrawn: refused as the provider's fault.
+        for _ in 0..H2_FAILS_TO_WITHDRAW {
+            app.h2_guard.failed("test");
+        }
+        let e = run_setup(&app, setup("2", serde_json::json!({}))).err().unwrap();
+        assert!(format!("{e:#}").contains("h2_withdrawn"), "{e:#}");
+        run_setup(&app, setup("1.1", serde_json::json!({}))).unwrap();
+    }
+
+    fn request_1(app: &Arc<AppState>, st: &mut Session, kind: Option<&str>, model: &str, max_tokens: u64, body_len: usize, suffix: Option<&str>, count: Option<u64>) -> Result<serde_json::Value> {
+        let (tx, mut out) = mpsc::unbounded_channel();
+        request_11(app, &tx, st, 1, kind, model.into(), max_tokens, body_len, suffix, count)?;
+        let Some(Message::Text(t)) = out.try_recv().ok() else { bail!("no request_ok") };
+        Ok(serde_json::from_str(&t)?)
+    }
+
+    #[test]
+    fn request_1_of_framing_11_fixes_the_head_and_the_suffix() {
+        let app = images_app();
+        let new = || run_setup(&app, setup("1.1", serde_json::json!({}))).unwrap().0;
+        let suffix = venice_images().render_suffix("m", 3, &[("format".into(), "webp".into())]);
+        let mut st = new();
+        let ok = request_1(&app, &mut st, Some("images"), "m", 0, 500, Some(&suffix), Some(3)).unwrap();
+        assert_eq!(st.images_count, Some(3));
+        assert_eq!((ok["type"].as_str(), ok["n"].as_u64(), ok["suffix"].as_str()), (Some("request_ok"), Some(1), Some(suffix.as_str())));
+        assert!(st.head_template.starts_with("POST /api/v1/image/generate "));
+        assert_eq!(ok["head_len"].as_u64(), Some(st.head_len as u64));
+        // One request per connection: a second is a protocol error, not a refusal.
+        let e = request_1(&app, &mut st, None, "m", 7, 500, None, None).unwrap_err();
+        assert!(!e.is::<Refused>());
+        let mut st = new();
+        let ok = request_1(&app, &mut st, None, "m", 7, 500, None, None).unwrap();
+        assert_eq!(ok["suffix"], app.offer.chat.render("m", 7));
+        assert!(st.req1 && st.body_len == 500 && st.images_count.is_none());
+        // Terms the sidecar does not serve are refusals: the connection
+        // stays armed and takes another request 1.
+        let mut st = new();
+        let cap = app.offer.max_tokens_cap;
+        let refused: Vec<Box<dyn Fn(&mut Session) -> Result<serde_json::Value>>> = vec![
+            Box::new(|st| request_1(&app, st, Some("video"), "m", 7, 500, None, None)),
+            Box::new(|st| request_1(&app, st, None, "m", cap + 1, 500, None, None)),
+            Box::new(|st| request_1(&app, st, None, "m", 0, 500, None, None)),
+            Box::new(|st| request_1(&app, st, None, "m", 7, 5, None, None)),
+            Box::new(|st| request_1(&app, st, None, "m", 7, app.max_body + 1, None, None)),
+            Box::new(|st| request_1(&app, st, None, "m", 7, 500, Some("x"), None)),
+            Box::new(|st| request_1(&app, st, None, "m", 7, 500, None, Some(1))),
+            Box::new(|st| request_1(&app, st, Some("images"), "m", 0, 500, None, None)),
+            Box::new(|st| request_1(&app, st, Some("images"), "m", 0, 500, Some(&suffix), Some(2))),
+            Box::new(|st| request_1(&app, st, Some("images"), "m", 7, 500, Some(&suffix), None)),
+        ];
+        for (i, f) in refused.iter().enumerate() {
+            let e = f(&mut st).unwrap_err();
+            assert!(e.is::<Refused>(), "case {i}: {e:#}");
+            assert!(!st.req1, "case {i}");
+        }
+        request_1(&app, &mut st, None, "m", 7, 500, None, None).unwrap();
+        // A wrong number is a protocol error.
+        let mut st = new();
+        let (tx, _out) = mpsc::unbounded_channel();
+        let e = request_11(&app, &tx, &mut st, 2, None, "m".into(), 7, 500, None, None).unwrap_err();
+        assert!(!e.is::<Refused>());
+        // A sidecar without the images endpoint refuses image requests.
+        let plain = app_state();
+        let mut st = run_setup(&plain, setup("1.1", serde_json::json!({}))).unwrap().0;
+        assert!(request_1(&plain, &mut st, Some("images"), "m", 0, 500, Some(&suffix), None).unwrap_err().is::<Refused>());
+    }
+
+    fn body_record(content: usize) -> Vec<u8> {
+        let n = content + 17;
+        let mut r = vec![0x17, 3, 3, (n >> 8) as u8, n as u8];
+        r.resize(5 + n, 0xaa);
+        r
+    }
+
+    #[tokio::test]
+    async fn the_final_record_of_framing_11_is_the_suffix_alone_and_waits_for_pi_win() {
+        let app = app_state();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = tokio::net::TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (mut up, _) = l.accept().await.unwrap();
+        let (_r, mut w) = c.into_split();
+        let new = || {
+            let mut st = run_setup(&app, setup("1.1", serde_json::json!({}))).unwrap().0;
+            request_1(&app, &mut st, None, "m", 7, 0, None, None).unwrap_err();
+            let suffix = app.offer.chat.render("m", 7);
+            request_1(&app, &mut st, None, "m", 7, 300 + suffix.len(), None, None).unwrap();
+            st.state = SessionState::Body;
+            st.ap = Some(Box::new(ApN { k0: Zeroizing::new([0; 16]), iv0: Zeroizing::new([0; 12]), h1: [0x11; 32], h2: [0x22; 32], hk: [0x33; 32] }));
+            (st, suffix)
+        };
+        // Honest: 300 private bytes, then the suffix alone.
+        let (mut st, suffix) = new();
+        let (s, _rx) = shared(&app);
+        let (tx, mut out) = mpsc::unbounded_channel();
+        let mut log = RelayLog::default();
+        let mut buf = body_record(300);
+        buf.extend(body_record(suffix.len()));
+        relay_body(&mut st, &mut log, &mut buf, &mut w).await.unwrap();
+        assert!(st.held.is_some() && !st.released);
+        final_record_params(&s, &tx, &mut st, &log).unwrap();
+        final_record_params(&s, &tx, &mut st, &log).unwrap();
+        let Some(Message::Text(t)) = out.try_recv().ok() else { panic!("no zk_params") };
+        assert!(out.try_recv().is_err(), "the parameters are sent once");
+        let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+        assert_eq!((v["proof"].as_str(), v["purpose"].as_str(), v["first_seq"].as_u64(), v["count"].as_u64()), (Some("pi_win"), Some("records"), Some(1), Some(1)));
+        let Params::PiWin(p) = serde_json::from_value(v["params"].clone()).unwrap() else { panic!() };
+        assert_eq!(p.anchor, [0x11; 32]);
+        assert_eq!(p.windows.len(), 1);
+        let mut want = suffix.as_bytes().to_vec();
+        want.push(0x17);
+        assert_eq!((p.windows[0].seq, p.windows[0].off, p.windows[0].sel_start), (1, 0, 0));
+        assert_eq!(p.windows[0].expected, want);
+        assert_eq!(p.windows[0].ct.len(), want.len());
+        // Only the first record reached the upstream.
+        let mut got = vec![0u8; 1 << 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), up.read(&mut got)).await.unwrap().unwrap();
+        assert_eq!(n, body_record(300).len());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(150), up.read(&mut got)).await.is_err());
+        // The suffix at the end of a larger record, a final record longer
+        // than the suffix, or bytes past the declared length: refused.
+        let (mut st, suffix) = new();
+        let mut buf = body_record(300 + suffix.len());
+        assert!(relay_body(&mut st, &mut RelayLog::default(), &mut buf, &mut w).await.is_err());
+        let (mut st, suffix) = new();
+        let mut buf = body_record(299);
+        buf.extend(body_record(suffix.len() + 1));
+        assert!(relay_body(&mut st, &mut RelayLog::default(), &mut buf, &mut w).await.is_err());
+        let (mut st, suffix) = new();
+        let mut buf = body_record(300);
+        buf.extend(body_record(suffix.len() + 5));
+        assert!(relay_body(&mut st, &mut RelayLog::default(), &mut buf, &mut w).await.is_err());
     }
 
     #[test]
@@ -3769,15 +4293,15 @@ mod hardening_tests {
             let (_r, mut w) = c.into_split();
             let mut log = RelayLog::default();
             let mut go = |st: &mut Session| {
-                let msg = ClientMsg::Accept { n: None, server_records: None };
+                let msg = ClientMsg::Accept { n: Some(1), server_records: None };
                 let fut = handle_control(msg, &app, &s, &tx, st, &mut log, &mut w);
                 futures_executor_block(fut)
             };
             st.state = SessionState::Body;
             assert!(go(&mut st).is_err(), "before the attestation");
             st.state = SessionState::Attested;
-            assert!(go(&mut st).is_err(), "before π_C2S");
-            st.c2_ok = true;
+            assert!(go(&mut st).is_err(), "before π_WIN");
+            st.released = true;
             go(&mut st).unwrap();
             let Some(Message::Text(t)) = out.try_recv().ok() else { panic!("no usage frame") };
             let v: serde_json::Value = serde_json::from_str(&t).unwrap();
@@ -3786,12 +4310,12 @@ mod hardening_tests {
             assert_eq!(st.state, SessionState::Settled);
             st.state = SessionState::Attested;
             assert!(go(&mut st).is_err(), "twice");
-            let mut chat = Session { state: SessionState::Attested, c2_ok: true, ..Session::default() };
+            let mut chat = Session { state: SessionState::Attested, released: true, ..Session::default() };
             assert!(go(&mut chat).is_err(), "on a chat session");
-            let mut disclosed = Session { images_count: Some(1), state: SessionState::Attested, c2_ok: true, disclosed: true, ..Session::default() };
+            let mut disclosed = Session { images_count: Some(1), state: SessionState::Attested, released: true, disclosed: true, ..Session::default() };
             assert!(go(&mut disclosed).is_err(), "after a disclosure");
             // An image session discloses only an error head, never a usage event.
-            let mut img = Session { images_count: Some(1), state: SessionState::Attested, c2_ok: true, ..Session::default() };
+            let mut img = Session { images_count: Some(1), state: SessionState::Attested, released: true, ..Session::default() };
             let usage = ClientMsg::Disclose {
                 r: hex::encode(b"data: {\"usage\":{}}\n\n"),
                 tail_lens: vec![40],
@@ -3799,7 +4323,7 @@ mod hardening_tests {
                 key_updates: 0,
                 epoch_start: 0,
                 trailing: None,
-                n: None,
+                n: Some(1),
                 server_records: None,
             };
             let err = futures_executor_block(handle_control(usage, &app, &s, &tx, &mut img, &mut log, &mut w)).unwrap_err();
@@ -3929,9 +4453,17 @@ mod hardening_tests {
     fn each_proof_runs_once_per_session() {
         let app = app_state();
         let (s, _rx) = shared(&app);
-        assert!(s.claim_proof("pi_c3s").is_ok());
-        assert!(s.claim_proof("pi_c2s").is_ok());
-        assert!(s.claim_proof("pi_c3s").is_err());
+        // π_NK once per connection; π_WIN and π_C3S once per parameter set.
+        assert!(s.claim_proof("pi_nk").is_ok());
+        assert!(s.claim_proof("pi_nk").is_err());
+        assert!(s.claim_proof("pi_c3s").is_err(), "no parameters yet");
+        let (p, _) = zkbench::fixtures::pi_c3s();
+        for _ in 0..2 {
+            s.set_params("pi_c3s", p.clone());
+            assert!(s.claim_proof("pi_c3s").is_ok());
+            assert!(s.claim_proof("pi_c3s").is_err());
+        }
+        assert!(s.claim_proof("pi_win").is_err());
     }
 
     #[test]
@@ -4051,7 +4583,7 @@ mod hardening_tests {
         }
         wipe_witness(&mut w);
         assert!(w.is_none());
-        assert!(matches!(node_side("pi_c2s", &s).unwrap(), (Role::Verifier, None)));
+        assert!(matches!(node_side("pi_win", &s).unwrap(), (Role::Verifier, None)));
     }
 
     #[tokio::test]
@@ -4157,8 +4689,8 @@ mod same_params_tests {
 
     #[test]
     fn only_equal_present_params_are_the_same() {
-        let (a, _) = fixtures::pi_c2s();
-        let (b, _) = fixtures::pi_c2s_after(1);
+        let (a, _) = fixtures::pi_win();
+        let (b, _) = fixtures::pi_win_body(300);
         assert!(same_params(Some(&a), Some(&a.clone())));
         assert!(!same_params(Some(&a), Some(&b)));
         assert!(!same_params(Some(&a), None));

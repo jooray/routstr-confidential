@@ -1,4 +1,4 @@
-//! HTTP/2 pieces of protocol v3, option A (`PROTOCOL-V3-DESIGN.md` A): the
+//! HTTP/2 pieces of protocol v3, framing "2" (`PROTOCOL-V3.md` §5, §12): the
 //! epoch-0 connection head N writes, the request header block, the frame
 //! headers N expects of every client record, the windows π_WIN proves, and
 //! the two disclosures N parses (the usage tail and the error head).
@@ -46,6 +46,10 @@ pub struct H2Block {
     /// Requests per connection.
     #[serde(default = "default_max_requests")]
     pub max_requests: u32,
+    /// A connection is closed at the first settlement after this long since
+    /// its head was written.
+    #[serde(default = "default_max_lifetime")]
+    pub max_lifetime_s: u64,
     /// The request kinds a connection serves: `chat`, and `images` when the
     /// offer has an images endpoint (A.13). Absent: chat only.
     #[serde(default = "default_kinds", skip_serializing_if = "chat_only")]
@@ -66,6 +70,19 @@ fn default_idle() -> u64 {
 
 fn default_max_requests() -> u32 {
     100
+}
+
+fn default_max_lifetime() -> u64 {
+    3600
+}
+
+/// The longest `max_lifetime_s` an offer may name.
+pub const MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(86400);
+
+/// The size of the credential's entry in the provider's HPACK table
+/// (RFC 7541 §4.1): name `authorization`, value `Bearer <key>`, 32 overhead.
+pub fn credential_entry_size(key_len: usize) -> u64 {
+    (32 + 13 + 7 + key_len) as u64
 }
 
 /// A path every party renders to the same header bytes and no provider
@@ -93,6 +110,9 @@ impl H2Block {
         }
         if !(10..=3600).contains(&self.idle_secs) {
             bail!("h2 idle_secs {} outside 10..=3600", self.idle_secs);
+        }
+        if !(60..=MAX_LIFETIME.as_secs()).contains(&self.max_lifetime_s) {
+            bail!("h2 max_lifetime_s {} outside 60..=86400", self.max_lifetime_s);
         }
         if !(1..=1000).contains(&self.max_requests) {
             bail!("h2 max_requests {} outside 1..=1000", self.max_requests);
@@ -503,7 +523,7 @@ mod tests {
 
     #[test]
     fn block_validation() {
-        let ok = H2Block { probe_path: "/api/v1/models".into(), idle_secs: 300, max_requests: 100, kinds: vec!["chat".into()] };
+        let ok = H2Block { probe_path: "/api/v1/models".into(), idle_secs: 300, max_requests: 100, max_lifetime_s: 3600, kinds: vec!["chat".into()] };
         ok.validate("api.venice.ai", 42).unwrap();
         for path in ["", "models", "/a?b", "/a/../b", "/a//b", "/a b", &format!("/{}", "a".repeat(130))] {
             let b = H2Block { probe_path: path.into(), ..ok.clone() };
