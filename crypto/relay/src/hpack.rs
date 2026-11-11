@@ -157,7 +157,7 @@ pub fn huffman_decode(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Huffman-encode (tests, and the reference for the client's decoder).
 #[cfg(test)]
-pub fn huffman_encode(data: &[u8]) -> Vec<u8> {
+pub(crate) fn huffman_encode(data: &[u8]) -> Vec<u8> {
     let (mut acc, mut bits, mut out) = (0u64, 0u32, Vec::new());
     for b in data {
         let (code, len) = HUFFMAN[*b as usize];

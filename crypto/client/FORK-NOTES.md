@@ -76,6 +76,19 @@ external: {
 Checks: `src/v2-fork-selfcheck.ts` (offline) and `src/v2-layout-test.ts` (live
 against the provider, 2PC simulated locally, N's epoch-0 records emulated).
 
+## Protocol v3 hook: `writeInner`
+
+Marked `// FORK PATCH (v3)` (`lib/make-tls-client.js`). `writeInner(inner)`
+seals and writes one TLS 1.3 record whose whole inner plaintext the caller
+supplies: content, the inner content-type byte, optional zero padding
+(1..16385 bytes). The `--http2` mode of the reference driver
+(`src/driver-h2.ts`, `PROTOCOL-V3-DESIGN.md` A) sends exactly one HTTP/2 frame
+per record with it (`write()` splits at 16 380 bytes, a frame may fill the
+whole 2^14), and its adversarial probe needs a padded record. Nothing else
+changes; without a call the client behaves as before. **This patch is only in
+the reference client's copy**: the SDK fork and the web library do not have it
+yet.
+
 ## Security patches (TLS-01 … TLS-10)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are

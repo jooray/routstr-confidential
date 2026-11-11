@@ -403,6 +403,62 @@ mod tests {
         assert!(head("h", "/p", 120).is_err());
     }
 
+    /// The cross-language vectors (`client/src/h2-vectors.json`): what this
+    /// module builds and decodes, for the reference client's self-check.
+    fn vectors() -> serde_json::Value {
+        let (template, offsets) = head("api.venice.ai", "/api/v1/models", 42).unwrap();
+        let block = request_block("api.venice.ai", "/api/v1/chat/completions");
+        let s = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
+        let mut blocks = Vec::new();
+        let huff = |text: &[u8]| {
+            let h = hpack::huffman_encode(text);
+            let mut v = vec![0x80 | h.len() as u8];
+            v.extend(h);
+            v
+        };
+        let mut b404 = vec![0x20, 0x8d, 0x0f, 0x10];
+        b404.extend(huff(b"application/json"));
+        b404.extend([0x00, 0x04, b'd', b'a', b't', b'e']);
+        b404.extend(huff(b"Wed, 11 Nov 2026 12:00:00 GMT"));
+        let mut b429 = vec![0x48];
+        b429.extend(huff(b"429"));
+        b429.extend([0x10]);
+        b429.extend(huff(b"x-ratelimit"));
+        b429.extend([0x02, b'n', b'o']);
+        for b in [b404, b429, vec![0x88, 0x5f, 0x01, b'x']] {
+            let fields: Vec<(String, String)> = hpack::decode_block(&b).unwrap().iter().map(|(n, v)| (s(n), s(v))).collect();
+            blocks.push(serde_json::json!({"block": hex::encode(&b), "fields": fields}));
+        }
+        let refused: Vec<String> = [&[0xbe][..], &[0x3f, 0xe1, 0x1f], &[0x8d, 0x20], &[0x08, 0x05, b'4'], &[0x08, 0x81, 0x00]]
+            .iter()
+            .map(hex::encode)
+            .collect();
+        let all: Vec<u8> = (0..=255u8).collect();
+        serde_json::json!({
+            "head": {"host": "api.venice.ai", "probe_path": "/api/v1/models", "key_len": 42, "template": hex::encode(&template), "first_offset": offsets[0]},
+            "request_block": {"host": "api.venice.ai", "path": "/api/v1/chat/completions", "block": hex::encode(&block)},
+            "blocks": blocks,
+            "refused_blocks": refused,
+            "huffman_all_bytes": hex::encode(hpack::huffman_encode(&all)),
+        })
+    }
+
+    #[test]
+    fn client_vectors_are_current() {
+        let on_disk: serde_json::Value = serde_json::from_str(include_str!("../../client/src/h2-vectors.json")).unwrap();
+        assert_eq!(on_disk, vectors(), "regenerate with: cargo test -p cu-sidecar write_client_vectors -- --ignored");
+        for b in on_disk["refused_blocks"].as_array().unwrap() {
+            assert!(hpack::decode_block(&hex::decode(b.as_str().unwrap()).unwrap()).is_err(), "{b}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn write_client_vectors() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../client/src/h2-vectors.json");
+        std::fs::write(path, serde_json::to_string_pretty(&vectors()).unwrap() + "\n").unwrap();
+    }
+
     #[test]
     fn request_block_layout() {
         let b = request_block("api.venice.ai", "/api/v1/chat/completions");

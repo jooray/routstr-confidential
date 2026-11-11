@@ -90,6 +90,9 @@ fi
 curl -fsS "$SIDECAR/offer" > "$OUT/offer.json" || { echo "no offer from $SIDECAR" >&2; exit 2; }
 grep -Eq '"http": *\[[^]]*"2"' "$OUT/offer.json" || { echo "the sidecar at $SIDECAR does not offer http 2" >&2; exit 2; }
 
+# Offline first: the client's HTTP/2 layer against the sidecar's vectors.
+(cd "$CRYPTO/client" && node --experimental-strip-types src/h2-selfcheck.ts) || { echo "h2-selfcheck failed" >&2; exit 1; }
+
 SUMMARY="$OUT/summary.tsv"
 printf 'case\texpected\tverdict\tevidence\n' > "$SUMMARY"
 failures=0
