@@ -451,23 +451,349 @@ ECtF semi-honest; no proof of the garbler-only construction).
 
 ## 12. Wire format
 
-Until the implementation is complete: `PROTOCOL-V3-DESIGN.md` A.11 (framing `"2"`, including "Through a
-node") with the changes of this file:
+The complete message reference. **S** marks what the sidecar speaks on its own sockets (`/offer`, `/session`,
+`/zk`); **N** what a client of a node sees (`/v1/confidential/offer`, `/v1/confidential/ws`,
+`/v1/confidential/zk`). A node relays every frame not listed under "node" unchanged, in both directions.
+Control messages are JSON text frames; TLS records are binary frames. Byte strings in JSON are lower-case
+hex, except inside `params`, where they are arrays of numbers. `http` is always the string `"2"` or `"1.1"`.
 
-| Change | Where |
+### 12.1 Offer
+
+**Sidecar offer file** (operator): the v2 fields (`upstream_host`, `head_template`, `key_alphabet`, `chat`,
+`max_tokens_cap`, `model_allowlist`, `endpoints.images`) plus
+
+```json
+"http": ["2", "1.1"],
+"h2": {"probe_path": "/api/v1/models", "max_requests": 100, "max_lifetime_s": 3600, "idle_secs": 300, "kinds": ["chat", "images"]}
+```
+
+| Field | Range, default | Meaning |
+|---|---|---|
+| `http` | non-empty, distinct, each `"2"` or `"1.1"`; default `["1.1"]` | framings served, in the operator's order of preference. `"2"` requires `h2` |
+| `h2.probe_path` | canonical path under 127 bytes | the GET of the connection head (§5.2) |
+| `h2.max_requests` | 1..1000, 100 | requests per connection |
+| `h2.max_lifetime_s` | 60..86400, 3600 | a connection is closed at the first settlement after this long since `head_written` |
+| `h2.idle_secs` | 10..3600, 300 | the sidecar's own idle limit; the ceiling of the node's `idle_timeout_s` |
+| `h2.kinds` | `["chat"]` (default, not serialized) or `["chat","images"]` (needs `endpoints.images`) | request kinds on a framing-`"2"` connection |
+
+Also required for `"2"`: host under 127 bytes, key at most 119 bytes. Framing `"1.1"` serves chat always and
+images when `endpoints.images` exists.
+
+**S** `GET /offer`: the file's content with `v: 3`, `twopc: "split-public-1"`, `notary_pubkey`,
+`node_settles`, and `http` as currently served: `"2"` is left out while it is withdrawn (§2.1; the `h2`
+block stays). An offer file that names `v` other than 3 is refused at startup.
+
+**N** `GET /v1/confidential/offer[?v=3]` (the query is ignored by the node; clients send it): the signed
+offer. Fields: `v: 3`; `http`, `h2` (the sidecar's; `kinds` lists `images` only when the offer has an
+`images` block; `h2` only when `http` lists `"2"`); `twopc`; `connection_deposit_msat` (integer ≥ 0);
+`idle_timeout_s` (integer, 10..`h2.idle_secs` when `"2"` is offered); and everything the v2 offer had
+(`upstream_host`, `head_template`, `chat`, `images`, `capabilities`, `price_list`, `session_fee_msat`,
+`abandon_fee_msat`, `max_tokens_cap`, `node_pubkey`, `sig`, …), unchanged in meaning.
+
+Client checks before a `setup` (§2.3): `v == 3`; `twopc == "split-public-1"`; `http` non-empty, known
+values, the chosen framing listed; for `"2"` the `h2` block in range and `probe_path` a trusted API base
+plus `/models`; `connection_deposit_msat` at most the client's maximum (reference driver: 100 000 msat);
+the v2 checks (signature, host, chat block, head template, images block). An offer with `v < 3`:
+`node_protocol_outdated`.
+
+**Connection-level fields** of an offer: `v`, `twopc`, `upstream_host`, `head_template`, `chat`, `h2`,
+`connection_deposit_msat`, `idle_timeout_s`, and the `images` block without its `price_list`. A `request`
+that names an offer in which one of these differs from the offer of the `setup`, or whose `http` no longer
+lists the connection's framing, is refused with `offer_changed` (12.4).
+
+### 12.2 Sockets
+
+| Socket | S | N |
+|---|---|---|
+| session | `/session` | `/v1/confidential/ws?session_id=<uuid>&v=3` |
+| 2PC | `/zk?proof=twopc&sid=<sid>` | `/v1/confidential/zk?proof=twopc&sid=<sid>&zk_token=<token>` |
+| proof channel | `/zk?proof=zkchan&sid=` | same path, `proof=zkchan` |
+| one proof | `/zk?proof=pi_nk`, `pi_win`, `pi_c3s` | same |
+
+**N** A session socket whose `v` is not `3` (absent, `2`, anything else), or whose first frame is a `setup`
+without `"v":3`: the node accepts the socket, sends
+`{"type":"error","status":426,"reason":"upgrade_required","min_v":3,"detail":"this node speaks routstr-confidential v3; update your client"}`
+and closes. **S** refuses a `setup` without `"v":3` with an `error` whose `code` is `upgrade_required`.
+
+The 2PC channel begins with the version tag of §4 in each direction. The client's `cu-2pc` exits with
+status 3 and code `twopc_version_mismatch` on another tag; the sidecar ends the connection with an `error`
+whose `code` is `twopc_version_mismatch`. `pi_win` and `pi_c3s` run once per `zk_params` on the channel
+(`cu-prover --channel`; the earlier `--multi` is the only mode) or on a socket of their own; `pi_nk` once
+per connection.
+
+### 12.3 `setup`, `ready`
+
+**N** `C → N  {"type":"setup","v":3,"http":"2"|"1.1","nonce_c":<64 hex>,"armed":<bool>,"auth":<sk- key or Cashu token>,"offer_sig":<sig of the verified offer>}`
+
+- Refused (400) when it names `kind`, `model`, `max_tokens`, `variant`, `count`, `len`, `body_len`,
+  `suffix`, `session_fee_msat` or `abandon_fee_msat`.
+- Node checks, in order, before it dials the sidecar: the shape; `http` is in its current offer (400);
+  `offer_sig` names an offer it signed and remembers (409 `offer_expired`); the credential is valid with an
+  available balance of at least `max(1 msat, the node's minimum request, that offer's session fee, its
+  abandon fee)` (401/402, the node's usual error body; a Cashu token is redeemed here); the deposit of that
+  offer is reserved (402 with `detail.error.type = "connection_deposit_unfunded"` and
+  `connection_deposit_msat`). A refusal is `{"type":"error","status","reason","detail"}` and the socket
+  closes.
+- **S** sees `{"type":"setup","v":3,"http","nonce_c","armed","escrow":"conn-<id>"}`: no credential, no
+  offer signature. `escrow` makes the sid unique. A direct client of a sidecar may send `escrow` or
+  `escrow_e` itself.
+
+**S** `N → C  {"type":"ready","v":3,"http","sid","nonce_n","pubkey","armed"}` plus, framing `"2"`,
+`"head_len"` (the connection head's length) and `"h2"` (the block). `sid = SHA256(nonce_c ‖ nonce_n ‖
+SHA256(escrow))` names the connection. **N** adds `zk_token`, `sig_scheme`, replaces `pubkey` by the
+node's, and adds `deposit_msat` (what the setup reserved; the client requires it to equal the offer's
+`connection_deposit_msat`).
+
+Then `/zk?proof=twopc` (preprocessing, key share) and `/zk?proof=zkchan`. `armed` changes nothing in what
+the sidecar does: in both framings it dials the provider only when the ClientHello arrives. An armed
+connection that sent no ClientHello within 600 s of its socket's accept is ended.
+
+### 12.4 `request`, `request_ok`, `request_refused`
+
+**N** `C → N  {"type":"request","n":k,"kind":"chat","model","max_tokens","body_len","auth","offer_sig","session_fee_msat","abandon_fee_msat"}`
+or `{"type":"request","n":k,"kind":"images","model","variant","count","body_len","auth","offer_sig","session_fee_msat","abandon_fee_msat"}`.
+
+- `n` is the number of the last **accepted** request (`request_ok`) plus 1; the first is 1. A refused
+  request does not use up its number. One request at a time.
+- `kind` absent = `chat`. `max_tokens` 1..`max_tokens_cap`. `count` 1..the offer's and the variant's
+  `max_count`. `body_len` = the JSON body's length, suffix included, more than the suffix, at most 8 MiB.
+- `auth`, `offer_sig` are per request (another credential, a newer offer). The fee fields echo that offer's
+  fees (409 `session_fee_not_accepted`).
+- **When.** Framing `"2"`: after `head_written` and a `settings_seen` (12.6). Framing `"1.1"`: after
+  `ready`, **before the ClientHello**; exactly one request is accepted on the connection.
+- The node validates, reserves (chat: a full-context prompt plus `max_tokens`; images:
+  `msat_per_image × count`; each plus `max(session fee still due, abandon fee)`), and forwards
+  **S** `{"type":"request","n","kind","model","max_tokens","body_len"}` or
+  `{"type":"request","n","kind":"images","model","count","body_len","suffix":<the node's rendering>}`.
+  A chat request may carry `suffix`; it must equal the canonical one.
+- **S** `N → C  {"type":"request_ok","sid","n","suffix":<the canonical suffix>}` plus `"stream": 2k+1`
+  (framing `"2"`) or `"head_len"` (framing `"1.1"`: the length of the request head N will write).
+- **C MUST NOT send a record of the request (framing `"1.1"`: the ClientHello) before `request_ok`.**
+
+`N → C  {"type":"request_refused","n","status","reason"[,"detail"]}`: the request is not accepted, nothing
+is held for it, and the connection stays as it was (READY, or ARMED in framing `"1.1"`). The next `request`
+carries the same `n`.
+
+| From | `status` | `reason` |
+|---|---|---|
+| node | 400 | a malformed `request`; a model the node does not serve confidentially; a kind the connection does not serve |
+| node | 401 / 402 | the credential, or its balance against the reservation (the node's usual error body in `detail`) |
+| node | 409 | `offer_expired`, `offer_changed`, `session_fee_not_accepted` |
+| node | 5xx | the node could not reserve (its own failure; counts for the deposit, 12.10) |
+| sidecar | 400 | terms the sidecar does not serve: `model_allowlist`, `max_tokens` above the cap, `body_len` out of range, an image suffix outside the offer |
+
+The node releases the reservation in full when the sidecar refuses. **Not** a refusal but a protocol error
+that ends the connection (`error`): a wrong `n`, a `request` while one is in flight, a `request` before
+`head_written` or without `settings_seen` (framing `"2"`), a second accepted request (framing `"1.1"`), a
+record sent before `request_ok`.
+
+### 12.5 Handshake and connection head (both framings)
+
+1. C sends the ClientHello (binary): one record, one message, one key share = the joint P-256 share, one
+   suite `TLS_AES_128_GCM_SHA256`, no PSK, ALPN exactly `h2` (framing `"2"`) or exactly `http/1.1` or none
+   (framing `"1.1"`). Framing `"1.1"`: only after `request_ok`. N dials the provider now.
+2. The joint key schedule runs on the 2PC channel; C relays ChangeCipherSpec and its Finished.
+3. `N → C  {"type":"hs_verified"}`: N verified chain, hostname, CertificateVerify and both Finished;
+   framing `"2"`: EncryptedExtensions selected `h2`, else `error` with `code: "h2_not_selected"`.
+4. `N → C  {"type":"c_commit","params":{"PiNK":…},"c_commit","h1","h2","hk"}`. `params.template` is the head
+   with zero bytes at the key positions: framing `"2"` the connection head of §5.2, bytes
+   `PREFACE ‖ 000012 04 00 00000000 ‖ 0001 00000000 ‖ 0002 00000000 ‖ 0004 7fffffff ‖ 000004 08 00 00000000 ‖
+   7fff0000 ‖ 0000LL 01 05 00000001 ‖ 82 87 01 <len> <host> 04 <len> <probe_path> 57 <7+keylen> "Bearer " <key>
+   ‖ 000004 03 00 00000001 ‖ 00000008`; framing `"1.1"` the offer's `head_template` of the request's kind
+   (`images.head_template` for images) with `{LEN}` = `body_len`. C rebuilds it and compares every byte,
+   `head_len` and `key_offsets`.
+5. π_NK (`pi_nk`); `C → N  {"type":"release_head"}`; N writes the head record (epoch 0, seq 0) and a
+   KeyUpdate (seq 1) in one write; `N → C  {"type":"head_written"}`.
+
+A binary frame between C's Finished and `head_written` is refused in framing `"2"`; in framing `"1.1"` body
+records sent early are held and relayed after the head (as v2).
+
+### 12.6 Framing `"2"`: records, control frames, π_WIN, release
+
+Every binary message after `head_written` is TLS records under `c_ap_1` (sequence numbers from 0), one
+HTTP/2 frame per record (§5.1), a DATA payload at most 16 375 bytes.
+
+- `C → N  {"type":"settings_seen","header_table_size":<integer or null>}`: the value of
+  `SETTINGS_HEADER_TABLE_SIZE` in the provider's SETTINGS frames so far (the last one; `null` when the
+  provider never sent the parameter, i.e. the default 4096). Required before the first `request`; sent again
+  whenever a later SETTINGS frame carries the parameter. A value below `32 + 13 + 7 + key_length` (the size
+  of the credential entry): `error` with `code: "h2_table_size"`.
+- `C → N  {"type":"ctl","frame":"settings_ack"|"ping_ack"|"window_update"|"rst_stream"}`: the next record is
+  that control frame (inner lengths 10, 18, 14, 14). `window_update` on stream 0; `rst_stream` on the
+  current request's stream, once its records are all received. At most 16 unproven control records.
+- Any other record belongs to the open request: first the HEADERS record (flags `04`, stream `2k+1`, block
+  `83 87 01 <len> <host> 04 <len> <path> 0f 10 10 "application/json" be`, `<path>` the route of
+  `head_template` or `images.head_template`), then DATA records (flags `00`, the last `01`) until the
+  payloads sum to `body_len`. Refused: an empty DATA frame, a last DATA frame shorter than the suffix, more
+  than `3 + body_len/4096` records, a record with no request open.
+- `N → C  {"type":"zk_params","proof":"pi_win","purpose":"records","first_seq":s,"count":c,"params":{"PiWin":…}}`:
+  all unproven queued records, sequence numbers `s … s+c-1`. Sent when the request is complete (control
+  records sent meanwhile join it) or, with no request open, per control record.
+- `C → N  {"type":"release","n":k,"upto":u}`: the first `u` records of request `k` may be written once
+  proven; `u` only grows. C follows the provider's flow control (stream credit = the provider's
+  `INITIAL_WINDOW_SIZE` + WINDOW_UPDATEs on the stream; connection credit = 65 535 + WINDOW_UPDATEs on
+  stream 0 − DATA bytes of earlier requests).
+- `N → C  {"type":"body_released","n":k}` when the last record of the request is written.
+
+`PiWin = {"anchor":[32],"key_updates":0,"windows":[{"seq","off","ct":[…],"sel_start","expected":[…]}]}` (`off`,
+`sel_start`, `key_updates` omitted when 0). Windows per record:
+
+| Record | Windows |
 |---|---|
-| `setup.v = 3`, `http` a string, `auth`/`offer_sig` as before; `ready.deposit_msat` | §3.1 |
-| deposit at the setup; `closed.deposit`; receipt `deposit_released_msat` | §8.1 |
-| `request_refused` keeps the connection; C waits for `request_ok` | §3.3 |
-| offer kept alive by its connections; `offer_changed` | §3.3 |
-| session fee once per connection | §8.3 |
-| framing `"1.1"` uses the same `setup` / `request` / `body_released` / `closed` messages; π_WIN replaces π_C2S | §3, §6 |
-| `settings_seen`, table-size guard | §5.6 |
-| 2PC tag and `split-public-1` | §4 |
-| upgrade errors | §11 |
+| control, HEADERS | the whole record when header ‖ `17` is all of it (SETTINGS ACK; HEADERS: frame ‖ `17`); else `[0,9)` = the frame header and the last byte = `17` |
+| DATA, not last | `[0,9)` = `len 00 00 stream`, `len = inner_len − 10`; last byte = `17` |
+| DATA, last | `[0,9)` with flags `01`; the last `|suffix|+1` bytes = suffix ‖ `17` |
+| framing `"1.1"`, the final record | the whole record = suffix ‖ `17` |
 
-The implementer replaces this section with the complete message reference (every message, field, limit and
-error reason for both framings, sidecar-facing and client-facing) and removes `PROTOCOL-V3-DESIGN.md`.
+C's check (`checkPiWinParams`): `anchor` is its `h1`; every window names one of the `count` records, `ct` is
+its own ciphertext at a block-aligned offset, the compared bytes equal its plaintext and lie in a range that
+is public for that record; every record of the batch is named.
+
+### 12.7 Framing `"1.1"`: records, π_WIN
+
+After `head_written` C sends the body as records under `c_ap_1`: content bytes summing to `body_len`, the
+canonical suffix alone in the final record. N writes each record but the final one to the provider as it
+arrives. When the final record is there (content = `|suffix|` bytes exactly; anything else is an `error`):
+
+`N → C  {"type":"zk_params","proof":"pi_win","purpose":"records","first_seq":<its sequence number>,"count":1,"params":{"PiWin":…}}`
+(one window, the whole record). C checks and proves with `c_ap_1`; N writes the record;
+`N → C  {"type":"body_released","n":1}`. There is no `body_suffix`, `ctl`, `release` or `settings_seen` in
+framing `"1.1"`.
+
+### 12.8 End of a request
+
+**Framing `"2"`.** `server_records` = the server records of outer type 23 the client has received since the
+connection began (handshake flight included).
+
+- Chat 2xx: `C → N  {"type":"disclose","n","r":<hex>,"tail_lens":[…],"skip":0,"server_records":m[,"key_updates","epoch_start"]}`.
+  `tail_lens`: inner lengths of the last records, last first; they must be N's last records, all with index
+  ≥ `S_k`. `r` starts with the 9-byte header of a DATA frame on the request's stream or with the line feed
+  before `data: `; text runs to the next `00`, which starts a frame header; accepted frames: DATA on the
+  stream, one trailers HEADERS (flags `05`), SETTINGS / PING / GOAWAY on stream 0, WINDOW_UPDATE on stream 0
+  or the stream; the stream must end inside `r`; the DATA payloads together are exactly
+  `data: <usage JSON>\n\ndata: [DONE]\n\n`. N holds more records than `m`:
+  `N → C  {"type":"disclose_retry","n","server_records"}` and C rebuilds. Then `attestation`, then
+  `{"type":"zk_params","proof":"pi_c3s","n","params":{"PiC3S":…}}`, C proves with `s_ap_0`.
+- Images 2xx: `C → N  {"type":"accept","n","server_records":m}` after END_STREAM
+  (`{"type":"accept_retry","n","server_records"}` when N holds more); `attestation`; settlement.
+- Status ≥ 400: `C → N  {"type":"disclose_head","n","record":i,"r":<hex>[,"key_updates","epoch_start"]}`: one
+  HEADERS frame of the stream with END_HEADERS at byte 0 of server record `i ≥ S_k`, at most 16 KiB and 8
+  records, decodable with an empty dynamic table, `:status` first, 400..599. Allowed once the request's first
+  record was written and no client record is unproven. `attestation`, then
+  `{"type":"zk_params","proof":"pi_win","purpose":"error_head","n","record","params"}` (`anchor = h2`; per
+  record the frame's bytes from offset 0 and the last byte = `17`).
+
+**Framing `"1.1"`.** The provider closes the connection after its response. N then sends the `attestation`
+on its own. After it:
+
+- Chat 2xx: `C → N  {"type":"disclose","n":1,"r","tail_lens","skip":0[,"trailing","key_updates","epoch_start"]}`
+  (v2's usage disclosure: `r` from the line feed before the usage event's `data: ` to the end of the chunked
+  response) → `{"type":"zk_params","proof":"pi_c3s","n":1,"params"}`.
+- Images 2xx: `C → N  {"type":"accept","n":1}`.
+- Status ≥ 400: `C → N  {"type":"disclose_head","n":1,"r","tail_lens","skip"[,"trailing","key_updates","epoch_start"]}`:
+  `r` is the response head (`HTTP/1.1 <status> …\r\n\r\n`) starting the first covered record, `skip` the
+  body bytes after it → `{"type":"zk_params","proof":"pi_c3s","purpose":"error_head","n":1,"params"}`.
+  A `disclose` whose `r` is a response head is refused.
+
+**Attestation** (S): `{"type":"attestation","n","a":{…},"sig":<ed25519 over the serialized a>}`.
+
+| Framing | `a` |
+|---|---|
+| `"2"` | `sid`, `http:"2"`, `n`, `stream`, `s_k`, `server_records`, `sha256_recv` (the type-23 server records of the request's interval, header ‖ payload), `client_records`, `sha256_sent` (the request's HEADERS and DATA records), `cert_chain_hash`, `th_sh`, `th_sf`, `c_commit`, `time` |
+| `"1.1"` | `sid`, `http:"1.1"`, `n:1`, `server_records` (all records), `sha256_recv` (every byte received), `client_records` (body records), `sha256_sent` (every byte written), `cert_chain_hash`, `th_sh`, `th_sf`, `c_commit`, `time` |
+
+**N** re-signs it: `a_json`, `sig` (the node's), `sig_scheme`, `sidecar_sig`.
+
+**Settlement.** S with `--node-settles`:
+`{"type":"usage","sid","http","n","model":<pinned>,"usage":<the usage event | {"error_status","choices":[]} | {"flat":true,"kind":"images","count"}>[,"reported_model"]}`;
+without it a stub `{"type":"receipt","n","receipt":{"sid","http","n",…},"receipt_json","sig"}`.
+**N** consumes `usage` and sends `{"type":"receipt","receipt":{…},"receipt_json","sig","sig_scheme"}`; the
+receipt has v2's fields plus `http`, `n`, and, on the connection's first settled request,
+`deposit_released_msat`. `session_fee_msat` in a receipt is the fee this request was charged (0 after the
+connection's first settlement).
+
+After a settled 2xx a framing-`"2"` connection is READY again. Otherwise the connection ends (12.9).
+
+### 12.9 `closed`, `error`, limits
+
+`N → C  {"type":"closed","reason"}`: an orderly end with no request in flight.
+
+| `reason` | When |
+|---|---|
+| `done` | framing `"1.1"`: its request was settled (2xx) |
+| `error_settled` | an error head was settled (both framings) |
+| `idle` | no request in flight for the idle limit (the node's `idle_timeout_s`; the sidecar's `h2.idle_secs` behind it) |
+| `max_requests`, `max_lifetime`, `max_bytes` | framing `"2"`: at the settlement that reached `h2.max_requests`, `h2.max_lifetime_s`, or 1 GiB received |
+| `upstream_closed` | the provider closed an open connection with no request in flight |
+| `ended` | node only: neither side had a last word |
+
+`N → C  {"type":"error","reason"[,"status"][,"code"][,"fault"]}` and the socket closes: every protocol
+violation and failed proof. `fault` is `"upstream"` (the provider could not be reached or did not behave as
+the framing needs) or `"node"` (the sidecar failed). `code`, when present: `upgrade_required`,
+`twopc_version_mismatch`, `upstream_unreachable`, `h2_not_selected`, `h2_withdrawn`, `h2_table_size`.
+`{"type":"upstream_closed_early","n","response_bytes"}` precedes the `error` when the provider closed before
+the request was fully written.
+
+**N** adds to the connection's last frame (`closed` or `error`) the signed deposit outcome when the deposit
+was not released by a settlement (12.10).
+
+| Limit | Value |
+|---|---|
+| setup frame after the socket opens | 15 s (S), 10 s (N) |
+| 2PC preprocessing and key share | 180 s |
+| socket accept to `head_written` (armed time included) | 600 s |
+| `request_ok` to `body_released`; `body_released` to settlement | 600 s each |
+| idle | `idle_timeout_s` (N), `h2.idle_secs` (S) |
+| body | 8 MiB (`--max-body`) |
+| response | chat 64 MiB; images `images.max_response_bytes`; a framing-`"2"` connection 1 GiB + two responses |
+| π_WIN | 2 200 windows, 64 KiB ciphertext |
+| π_C3S | `r` ≤ 16 KiB; the limits of `zkbench::statements` |
+| control message | 256 KiB |
+| sessions | 32 per process (S and N); unused connections per address: `CONFIDENTIAL_MAX_UNUSED_PER_IP` (12), counted until the first `body_released` |
+| `/zk` sockets per connection | 6 |
+
+### 12.10 Money (N)
+
+**Per request** (v2's rules, "session" read as "request"):
+
+| The request ends… | Its reservation |
+|---|---|
+| refused (`request_refused`) | never made, or released in full |
+| accepted, the connection ends before `body_released` (a failed π_WIN, the client leaves, the time limit) | released; the abandon fee is kept, except when the deposit is charged for it (below) |
+| before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes) | released; the session fee is kept if still due |
+| after `body_released` with no settlement | charged in full |
+| settled 2xx | usage at the frozen rates (chat) or `msat_per_image × count` (images), plus the session fee if still due |
+| settled error head | 429/503 and 401/402/403: the session fee if still due; any other 4xx: the abandon fee; other 5xx: the reservation |
+
+The session fee is "still due" until the connection's first settlement.
+
+**Connection deposit.** Reserved at the `setup` from its credential (`ready.deposit_msat`), released by the
+connection's first settlement (`deposit_released_msat` in that receipt). A connection that ends with no
+settled request, first matching row:
+
+| # | How the connection ended | Deposit | `reason` |
+|---|---|---|---|
+| 1 | the setup was refused before the sidecar was dialed | never reserved | (the `error`) |
+| 2 | no session slot, the sidecar unreachable, or it refused the setup | released | `not_started` |
+| 3 | the sidecar reported `fault: "upstream"` (the provider unreachable, `h2` not selected, framing `"2"` withdrawn) | released | `provider_unreachable` |
+| 4 | the sidecar reported `fault: "node"`, or its socket ended without `error` or `closed` | released | `sidecar_failure` |
+| 5 | the provider closed the open, idle connection before any request (`closed`, `upstream_closed`) | released | `provider_closed` |
+| 6 | the node refused a request of this connection with a 5xx, or a settlement's billing write failed | released | `node_failure` |
+| 7 | a request was written in full (`body_released`) and never settled | released (the reservation is charged) | `request_received` |
+| 8 | the provider answered a request and closed before its body was complete | released (the request keeps the session fee) | `provider_refused` |
+| 9 | a request was accepted and the connection ended before its `body_released` for any other reason | **charged**; the reservation is released in full | `request_abandoned` |
+| 10 | no request in flight for `idle_timeout_s` | **charged** | `idle` |
+| 11 | `head_written` not reached within 600 s | **charged** | `setup_timeout` |
+| 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake, only refused requests | **charged** | `unused` |
+
+A refused request (4xx) by itself costs nothing; the connection stays, and the deposit follows how the
+connection ends.
+
+```
+{"type":"closed"|"error", …,
+ "deposit":{"sid","msat","outcome":"released"|"charged","reason","cost_msats","balance_msats","time"},
+ "deposit_json":<the signed bytes>,"deposit_sig":<hex>,"sig_scheme":"schnorr-secp256k1"}
+```
 
 ## 13. Conformance: what "done" means
 
