@@ -27,7 +27,10 @@
 #   CU_MODEL         chat model (default mistral-small-3-2-24b-instruct)
 #   CU_CASES         optional space-separated subset of case ids (v2 always runs:
 #                    the other cases compare their reservation with it)
-#   CU_H2_PAUSE      seconds of idle time in the `idle` case (default 0 = skip)
+#   CU_H2_PAUSE      seconds of idle time in the `idle` case (default 0 = skip;
+#                    must stay below CU_H2_IDLE)
+#   CU_H2_DEPOSIT    the node's connection deposit in msat (default 7000)
+#   CU_H2_IDLE       the node's idle timeout in seconds (default 12, at least 10)
 #   CU_CASE_TIMEOUT  per-case limit in seconds (default 180, plus the pause)
 #   CU_H2_NODE_OUT   scratch and evidence directory (default crypto/runs/v3-h2-node-check;
 #                    removed and recreated)
@@ -49,6 +52,19 @@
 #                   (what v2 charges for a released request with no disclosure)
 #   no-funds        a setup with an unfunded key: refused (402) before the sidecar
 #                   is dialed, so it gets no garbled circuit
+#   low-balance     a setup with a key that holds less than the connection deposit:
+#                   refused (402, named as the deposit) before the sidecar is dialed
+#   open-drop       a connection is opened and dropped without a request: the
+#                   deposit is charged, exactly
+#   idle-drop       a connection is opened and left idle: the node closes it after
+#                   its idle timeout and charges the deposit (the client is told)
+#   idle-after      one request, then idle: the node closes the connection after
+#                   its idle timeout; the deposit went back with the request, and
+#                   nothing is held or charged for the idle time
+#
+# The node runs with a connection deposit (CU_H2_DEPOSIT) and a short idle
+# timeout (CU_H2_IDLE). In every case whose first request settles, that
+# request's receipt must return the deposit and the balance must show it.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -62,6 +78,8 @@ KEY_ENV="${CU_KEY_ENV:-VENICE_API_KEY}"
 SPORT="${CU_H2_PORT:-7470}"
 NPORT="${CU_NODE_PORT:-8010}"
 START_BALANCE=200000000
+DEPOSIT="${CU_H2_DEPOSIT:-7000}"
+IDLE="${CU_H2_IDLE:-12}"
 export CU_PROVER="${CU_PROVER:-$CRYPTO/zkbench/target/release/cu-prover}"
 read -r -a DRIVER <<< "${CU_DRIVER:-node --experimental-strip-types src/driver.ts}"
 PY="$(command -v python3)"
@@ -138,7 +156,8 @@ start_node() {
     export DATABASE_URL="sqlite+aiosqlite:///$DB" NSEC="$NSEC" \
       CONFIDENTIAL_SIDECAR_URL="$SIDECAR" CASHU_MINTS=http://127.0.0.1:3338 \
       UPSTREAM_BASE_URL="$UPSTREAM_BASE" UPSTREAM_API_KEY="$provider_key" \
-      HTTP_URL="$NODE" RELAYS='["ws://127.0.0.1:9"]' ENABLE_ANALYTICS_SHARING=false
+      HTTP_URL="$NODE" RELAYS='["ws://127.0.0.1:9"]' ENABLE_ANALYTICS_SHARING=false \
+      CONFIDENTIAL_H2_CONNECTION_DEPOSIT_MSAT="$DEPOSIT" CONFIDENTIAL_H2_IDLE_TIMEOUT_S="$IDLE"
     exec "$CORE/.venv/bin/uvicorn" --app-dir "$CORE" routstr.core.main:app --host 127.0.0.1 --port "$NPORT" \
       --ws-ping-timeout 300
   ) >> "$OUT/node.out" 2>&1 &
@@ -162,10 +181,11 @@ for _ in $(seq 1 150); do
     && "$PY" -I -c 'import json,sys; o=json.load(open(sys.argv[1])); sys.exit(0 if sys.argv[2] in o.get("price_list", {}) else 1)' "$OUT/offer.json" "$MODEL" && break
   sleep 0.4
 done
-"$PY" -I - "$OUT/offer.json" "$MODEL" <<'PYEOF' || { echo "the node's offer is not usable; see $OUT/offer.json and $OUT/node.out" >&2; exit 2; }
+"$PY" -I - "$OUT/offer.json" "$MODEL" "$DEPOSIT" "$IDLE" <<'PYEOF' || { echo "the node's offer is not usable; see $OUT/offer.json and $OUT/node.out" >&2; exit 2; }
 import json, sys
 o = json.load(open(sys.argv[1]))
 ok = sys.argv[2] in o.get("price_list", {}) and "2" in (o.get("http") or []) and isinstance(o.get("h2"), dict) and o.get("sig")
+ok = ok and o["h2"].get("connection_deposit_msat") == int(sys.argv[3]) and o["h2"].get("idle_timeout_s") == int(sys.argv[4])
 sys.exit(0 if ok else 1)
 PYEOF
 
@@ -232,6 +252,10 @@ run_case unknown-model  "node-refused:2:not served confidentially" "$START_BALAN
 run_case wrong-suffix   "released:2:pi_win failed" "$START_BALANCE" -- --http2 --requests 2 --adv-h2 suffix --adv-at 2
 run_case replay-usage   "charged:2:interval" "$START_BALANCE" -- --http2 --requests 2 --adv-h2 replay-usage
 run_case no-funds       "no-funds:402" 0 -- --http2
+run_case low-balance    "no-deposit:402" "$((DEPOSIT - 1))" -- --http2
+run_case open-drop      "unused:unused" "$START_BALANCE" -- --http2 --requests 0
+run_case idle-drop      "unused:idle" "$START_BALANCE" -- --http2 --requests 0 --linger-ms "$(((IDLE + 20) * 1000))"
+run_case idle-after     "settled:1:idle" "$START_BALANCE" -- --http2 --requests 1 --linger-ms "$(((IDLE + 20) * 1000))"
 
 cleanup
 still=""

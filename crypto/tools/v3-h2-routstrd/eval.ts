@@ -100,7 +100,23 @@ const okResult = (r: any) => r.status === 200 && r.verify === "confidential" && 
   if (m.reserved !== 0) p.push(`reserved_balance ${m.reserved}`);
   if (m.balance !== m.start - charges) p.push(`balance ${m.balance} != start ${m.start} - charges ${charges}`);
   if (charges <= 0) p.push("no charge in the node log");
-  verdict("money", p, `balance ${m.balance} msats = ${m.start} - ${charges} (${settled.length} settlements), reserved 0`);
+  // The connection deposit: reserved once per connection, released by that
+  // connection's first settlement, never charged.
+  const all = jsonl("node-all.log");
+  const taken = msg(all, "confidential ws: connection deposit reserved").length;
+  const back = msg(all, "confidential ws: connection deposit released");
+  const lost = msg(all, "confidential ws: connection deposit charged");
+  if (taken === 0) p.push("the node reserved no connection deposit");
+  if (back.length !== taken || back.some((l) => l.reason !== "request_settled")) {
+    p.push(`${taken} deposit(s) reserved, ${back.length} released (${back.map((l) => l.reason).join(",")})`);
+  }
+  if (lost.length) p.push(`${lost.length} deposit(s) charged (${lost.map((l) => l.reason).join(",")})`);
+  verdict(
+    "money",
+    p,
+    `balance ${m.balance} msats = ${m.start} - ${charges} (${settled.length} settlements), reserved 0; ` +
+      `${taken} connection deposit(s) of ${back[0]?.deposit_msat ?? "?"} msat reserved and released`,
+  );
 }
 
 // The table.

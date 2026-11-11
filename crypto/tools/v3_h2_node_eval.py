@@ -7,8 +7,14 @@ signed offer, the client's run directory, how many two-party handshakes the
 sidecar ran during the case, and what the v2 control session reserved.
 
 `expect` is one of:
-  settled:<n>              n requests on one connection, each reserved, settled at
-                           the usage the provider reported, with a verified receipt
+  settled:<n>[:idle]       n requests on one connection, each reserved, settled at
+                           the usage the provider reported, with a verified receipt;
+                           with `:idle` the client then stays idle and the node closes
+                           the connection (`closed`, reason `idle`), holding nothing
+  unused:<reason>          a connection is opened and ends without a request: the
+                           deposit is charged for that reason (`unused`: the client
+                           left; `idle`: the node closed it after its idle timeout
+                           and told the client so, signed)
   error:<n>:<status>       request n is refused by the provider with that status:
                            its error head is disclosed and its reservation released
   node-refused:<n>:<regex> the node refuses request n for that reason and reserves
@@ -20,9 +26,17 @@ sidecar ran during the case, and what the v2 control session reserved.
                            v2 charges for a released request with no disclosure)
   no-funds:<status>        a setup with an unfunded credential is refused with that
                            status before the sidecar is dialed
+  no-deposit:<status>      a setup whose credential has funds, but fewer than the
+                           connection deposit, is refused with that status and named
+                           as such, before the sidecar is dialed
   v2                       an unchanged protocol v2 session settles
 In every case the key's balance must equal its start minus exactly the charges
 named above, with nothing left reserved.
+
+The connection deposit (the signed offer's `h2.connection_deposit_msat`): in
+every http: 2 case whose first request settled it must be released by that
+request's receipt (`deposit_released_msat`), and the node's log must show
+exactly one outcome for the connection.
 """
 import json
 import math
@@ -93,7 +107,7 @@ def msg(evs, text):
 
 # The node decides an aborted request after the client is gone (it first hears
 # the sidecar's last frames): wait for the session's end and a settled row.
-ends = "http 2 connection ended" if kind not in ("v2", "no-funds") else None
+ends = "http 2 connection ended" if kind not in ("v2", "no-funds", "no-deposit") else None
 for _ in range(120):
     evs = node_events()
     row = key_row()
@@ -143,7 +157,30 @@ reserved = {e.get("n"): e.get("reserved_msats") for e in msg(evs, "request reser
 settled = {e.get("n"): e.get("cost_msats") for e in msg(evs, "confidential ws: settled")}
 aborted = [e.get("outcome") for e in msg(evs, "session aborted")]
 ended = msg(evs, "http 2 connection ended")
+DEPOSIT = int((offer.get("h2") or {}).get("connection_deposit_msat") or 0)
+# The deposit's outcome in the node's log: ("charged" | "released", reason, msat).
+deposits = [
+    (e["message"].rsplit(" ", 1)[1], e.get("reason"), e.get("deposit_msat"))
+    for e in evs
+    if e.get("message", "").startswith("confidential ws: connection deposit ")
+    and e["message"].rsplit(" ", 1)[1] in ("charged", "released")
+]
 charges = []  # what the key must have paid, in order
+
+
+def check_deposit_returned():
+    """The connection's first request settled: its receipt returns the deposit."""
+    if not DEPOSIT:
+        if deposits:
+            dev.append(f"the offer asks for no deposit, the node logged {deposits}")
+        return
+    if deposits != [("released", "request_settled", DEPOSIT)]:
+        dev.append(f"the deposit was not released by the first settlement (node: {deposits})")
+    rec = receipt(1) or {}
+    if rec.get("deposit_released_msat") != DEPOSIT:
+        dev.append(f"receipt 1 does not return the deposit ({rec.get('deposit_released_msat')})")
+    if any("deposit_released_msat" in (receipt(k) or {}) for k in range(2, len(reqs) + 1)):
+        dev.append("a later receipt returns the deposit again")
 evidence = f"rc={rc}"
 
 
@@ -195,7 +232,7 @@ elif kind == "v2":
         if settled.get(None) != e2e.get("cost_msats"):
             dev.append("the node log does not show the receipt's charge")
     evidence += f" cost={e2e and e2e.get('cost_msats')} reserved={e2e and e2e.get('reserved_msats')}"
-elif kind == "no-funds":
+elif kind in ("no-funds", "no-deposit"):
     refusal = re.search(r"sidecar rejected: .*?\(node status (\d+)\)", both)
     evidence += f" refusal={refusal.group(0)[:160] if refusal else None} sidecar_sessions={ctx.get('sidecar_sessions')}"
     if rc == 0 or e2e:
@@ -206,8 +243,38 @@ elif kind == "no-funds":
         dev.append("the sidecar was dialed for an unfunded credential")
     if reserved or settled:
         dev.append("something was reserved or settled")
+    if kind == "no-deposit":
+        if not DEPOSIT or not 0 < ctx["start_balance"] < DEPOSIT:
+            dev.append(f"the case needs a balance below the deposit ({ctx['start_balance']} vs {DEPOSIT})")
+        if not refusal or "connection deposit" not in refusal.group(0):
+            dev.append("the refusal does not name the connection deposit")
+elif kind == "unused":
+    dep = (e2e or {}).get("deposit") or {}
+    closed = (e2e or {}).get("closed") or {}
+    evidence += f" deposit={DEPOSIT} node={deposits} client={json.dumps(dep)} closed={json.dumps(closed)}"
+    if rc != 0 or not e2e or e2e.get("http") != 2 or reqs:
+        dev.append("expected an opened connection with no request")
+    if not DEPOSIT:
+        dev.append("the offer asks for no deposit")
+    if deposits != [("charged", rest, DEPOSIT)]:
+        dev.append(f"the deposit was not charged for /{rest}/ (node: {deposits})")
+    if reserved or settled or aborted:
+        dev.append("a request was reserved or settled")
+    if ctx.get("sidecar_sessions") != 1:
+        dev.append(f"the sidecar ran {ctx.get('sidecar_sessions')} sessions, not one")
+    if rest == "idle":
+        # The node closed the connection and said what became of the deposit.
+        if closed.get("reason") != "idle":
+            dev.append(f"the node did not close the idle connection (closed: {closed})")
+        if (dep.get("outcome"), dep.get("reason"), dep.get("msat"), dep.get("signed")) != ("charged", "idle", DEPOSIT, True):
+            dev.append("the client was not told, signed, that the deposit was charged")
+        limit = int((offer.get("h2") or {}).get("idle_timeout_s") or 0)
+        if not limit or not limit * 1000 - 3000 <= (closed.get("idle_ms") or 0) <= limit * 1000 + 8000:
+            dev.append(f"closed after {closed.get('idle_ms')} ms, the offer's idle_timeout_s is {limit}")
+    charges.append(DEPOSIT)
 elif kind == "settled":
-    n = int(rest)
+    n, _, then = rest.partition(":")
+    n = int(n)
     evidence += " " + trace()
     if rc != 0 or not e2e or e2e.get("http") != 2:
         dev.append("no http: 2 result")
@@ -223,6 +290,18 @@ elif kind == "settled":
             dev.append(f"the sidecar ran {ctx.get('sidecar_sessions')} sessions, not one")
         if aborted:
             dev.append(f"a reservation was finalized by an abort ({aborted})")
+        check_deposit_returned()
+        dep = e2e.get("deposit") or {}
+        if DEPOSIT and (dep.get("outcome"), dep.get("msat"), dep.get("signed")) != ("released", DEPOSIT, True):
+            dev.append(f"the client did not see the deposit released ({dep})")
+        if then == "idle":
+            closed = e2e.get("closed") or {}
+            limit = int((offer.get("h2") or {}).get("idle_timeout_s") or 0)
+            evidence += f" closed={json.dumps(closed)}"
+            if closed.get("reason") != "idle":
+                dev.append(f"the node did not close the idle connection (closed: {closed})")
+            elif not limit or not limit * 1000 - 3000 <= (closed.get("idle_ms") or 0) <= limit * 1000 + 8000:
+                dev.append(f"closed after {closed.get('idle_ms')} ms, the offer's idle_timeout_s is {limit}")
 elif kind == "error":
     n, status = (int(x) for x in rest.split(":"))
     evidence += " " + trace()
@@ -248,6 +327,7 @@ elif kind == "error":
         charges.append(last.get("cost_msats") or 0)
         if aborted:
             dev.append(f"a reservation was finalized by an abort ({aborted})")
+        check_deposit_returned()
 elif kind == "node-refused":
     n, _, reason = rest.partition(":")
     n = int(n)
@@ -270,6 +350,7 @@ elif kind == "node-refused":
     if aborted:
         dev.append(f"a reservation was finalized by an abort ({aborted})")
     evidence += f" reserved={sorted(reserved)} settled={settled}"
+    check_deposit_returned()
 else:  # released / charged: an attack on request n
     n, _, reason = rest.partition(":")
     n = int(n)
@@ -296,6 +377,7 @@ else:  # released / charged: an attack on request n
         if aborted != ["charged_reservation"]:
             dev.append(f"the withheld request's reservation was not charged (node: {aborted})")
         charges.append(reserved.get(n) or 0)
+    check_deposit_returned()
 
 # The money outcome: the key paid exactly the charges above.
 row = key_row()

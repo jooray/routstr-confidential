@@ -50,7 +50,10 @@
 #   v2-sequential  http2 disabled in the routstrd config (routstrd restarted):
 #                  5 sequential requests settle through the v2 flow
 #   money          the credential's balance in the node's database is the start
-#                  minus the charges the node logged; nothing stays reserved
+#                  minus the charges the node logged; nothing stays reserved.
+#                  The node takes a connection deposit (CU_H2_DEPOSIT, default
+#                  7000 msat): every connection routstrd opened got it back with
+#                  its first request, none was charged
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -181,7 +184,8 @@ start_node() {
     export DATABASE_URL="sqlite+aiosqlite:///$DB" NSEC="$NSEC" \
       CONFIDENTIAL_SIDECAR_URL="$SIDECAR" CASHU_MINTS="$MINT" \
       UPSTREAM_BASE_URL="${CU_UPSTREAM_BASE:-https://api.venice.ai/api/v1}" UPSTREAM_API_KEY="$key" \
-      HTTP_URL="$NODE" RELAYS='["ws://127.0.0.1:9"]' ENABLE_ANALYTICS_SHARING=false
+      HTTP_URL="$NODE" RELAYS='["ws://127.0.0.1:9"]' ENABLE_ANALYTICS_SHARING=false \
+      CONFIDENTIAL_H2_CONNECTION_DEPOSIT_MSAT="${CU_H2_DEPOSIT:-7000}"
     unset key
     exec "$CORE/.venv/bin/uvicorn" --app-dir "$CORE" routstr.core.main:app --host 127.0.0.1 --port "$NPORT" \
       --ws-ping-timeout 300
