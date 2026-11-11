@@ -203,6 +203,13 @@ fn zk_proof_of_a_compression() {
     let mut delta = Block::random(&mut rng);
     delta.set_lsb(true);
     let n = zk::compress_ands_secret_state() + 128;
+    eprintln!(
+        "COT-ANDs per compression: committed state, public block {}; public IV, 256 committed block bits {}; 224 bits {}; all inputs committed {}",
+        zk::compress_ands_secret_state(),
+        zk::compress_ands_secret_prefix(256),
+        zk::compress_ands_secret_prefix(224),
+        mpz_circuits::SHA256_COMPRESS.and_count()
+    );
     let r: Vec<bool> = (0..n).map(|_| rng.random()).collect();
     let keys: Vec<Block> = (0..n).map(|_| Block::random(&mut rng)).collect();
     let macs: Vec<Block> = keys.iter().zip(&r).map(|(k, r)| *k ^ sel(*r, delta)).collect();
@@ -622,6 +629,7 @@ async fn lying_about_hk_detected() {
         c.hs.as_ref().unwrap();
         n.hs.as_ref().unwrap();
         assert!(matches!(&c.ap, Err(Error::Abort(m)) if m.contains(what)), "{:?}", c.ap);
+        assert!(matches!(&n.ap, Err(Error::Abort(_))), "N must see the abort: {:?}", n.ap);
     }
 }
 

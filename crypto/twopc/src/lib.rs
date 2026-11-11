@@ -1699,6 +1699,14 @@ impl Party {
                 let (h1, h2) = self.n_rej(r).await?;
                 let msg = self.n_prove_hk()?;
                 self.n2c.send(&msg).await?;
+                // C's verdict on the hk proof. N has its outputs already; it
+                // waits so that the session ends with a message from C (the
+                // transport is closed by whoever finishes last) and so that
+                // N sees C's abort, as after every stage.
+                if self.c2n.recv_exact(1).await?[0] != 1 {
+                    kiv.zeroize();
+                    return Err(Error::Abort("peer aborted (C rejected the hk proof)".into()));
+                }
                 (h1, h2, hk_own)
             } else {
                 let get = |name: &str| -> Result<[u8; 32]> {
@@ -2032,7 +2040,9 @@ impl Party {
         let (h1, h2, hk) = match anchors {
             Some((h1, h2)) => {
                 let msg = self.c_recv(lay.hk_proof_len()).await?;
-                (h1, h2, self.c_verify_hk(&msg)?)
+                let r = self.c_verify_hk(&msg);
+                let _ = self.c2n.send(&[r.is_ok() as u8]).await;
+                (h1, h2, r?)
             }
             None => {
                 let st = self.cst()?;
