@@ -167,6 +167,9 @@ const ADV_OWN_SHARE = argv.includes('--adv-own-keyshare')
 // index, `--requests N` sequential chat requests on it.
 const HTTP2 = argv.includes('--http2')
 const H2_REQUESTS = Number(arg('--requests', '1'))
+// --private-extra-at N: with --http2, --private-extra applies to request N only
+// (for example a parameter the provider refuses, to get an error head on one request).
+const H2_PRIVATE_EXTRA_AT = Number(arg('--private-extra-at', '0'))
 // Idle time before every request after the first (ms).
 const H2_PAUSE_MS = Number(arg('--pause-ms', '0'))
 // Per-request models (comma-separated; request i uses entry i, then --model).
@@ -661,7 +664,10 @@ class Session {
         process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
         trace('<-', shown(m.type))
         if (typeof m.type === 'string' && this.tFirst[m.type] === undefined) this.tFirst[m.type] = Date.now()
-        if (m.type === 'error') this.errRej(new Error(`sidecar rejected: ${shown(m.reason, 300)}`))
+        // A node's own refusals carry an HTTP-style status; errors it relays from the sidecar do not.
+        if (m.type === 'error') {
+          this.errRej(new Error(`sidecar rejected: ${shown(m.reason, 300)}${typeof m.status === 'number' ? ` (node status ${m.status})` : ''}`))
+        }
         if (this.h2) {
           // An http: 2 session runs many proofs: their parameters are keyed
           // by proof and purpose.
@@ -1770,7 +1776,7 @@ async function mainHttp2(): Promise<void> {
       let content = H2_REQUESTS > 1 ? `${PROMPT} (request ${n})` : PROMPT
       if (H2_BODY_BYTES > content.length) content += ` Ignore this filler: ${'lorem ipsum '.repeat(Math.ceil((H2_BODY_BYTES - content.length) / 12))}`
       let p = `{"messages":[{"role":"user","content":${JSON.stringify(content)}}]`
-      if (PRIVATE_EXTRA) p += `,${PRIVATE_EXTRA}`
+      if (PRIVATE_EXTRA && (H2_PRIVATE_EXTRA_AT === 0 || H2_PRIVATE_EXTRA_AT === n)) p += `,${PRIVATE_EXTRA}`
       return { model, maxTokens: MAX_TOKENS, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix }
     },
     adv: ADV_H2 ? { mode: ADV_H2, at: ADV_H2_AT, path: ADV_H2_PATH } : undefined,
@@ -1784,6 +1790,29 @@ async function mainHttp2(): Promise<void> {
     ctx.requestExtras = { auth: s.token ?? '', ...(OFFER_SIG ? { offer_sig: OFFER_SIG } : {}) }
     if (SESSION_FEE > 0 && !NO_ACCEPT_FEE) ctx.requestExtras.session_fee_msat = SESSION_FEE
     if (ABANDON_FEE > 0 && !NO_ACCEPT_FEE) ctx.requestExtras.abandon_fee_msat = ABANDON_FEE
+    // The node's receipt, per request: the bounds a v2 receipt is held to.
+    ctx.checkReceipt = (receipt, q) => {
+      const cost = receipt.cost_msats
+      let bound: number
+      if (q.status >= 400) {
+        if ([401, 402, 403, 429, 503].includes(q.status)) bound = SESSION_FEE
+        else if (q.status < 500) bound = Math.max(SESSION_FEE, ABANDON_FEE)
+        else bound = Math.max(SESSION_FEE, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
+      } else {
+        // At most the usage at the signed rates (the node may charge less,
+        // for cached input) plus the session fee.
+        const rates = OFFER?.price_list?.[q.model]
+        if (!rates) throw new Error(`the signed offer does not price ${shown(q.model)}`)
+        bound = maxUsageCharge(rates, q.usage ?? {}) + SESSION_FEE
+      }
+      const costOk = Number.isSafeInteger(cost) && cost >= 0 && cost <= bound
+      console.log(
+        `[client ${s.label}] receipt ${q.n}: status=${q.status} cost_msats=${shown(cost)} reserved_msats=${shown(receipt.reserved_msats)} ` +
+          `balance_msats=${shown(receipt.balance_msats)} bound_msats=${bound} cost_ok=${costOk}`,
+      )
+      if (receipt.http !== 2) throw new Error('the receipt does not name http 2')
+      if (!costOk) throw new Error(`receipt ${q.n} charges ${shown(cost)} msats, more than the ${bound} its ${q.status >= 400 ? 'error status' : 'usage at the signed rates'} allows`)
+    }
   }
   const conn = new H2Conn(s, ctx)
   s.h2 = conn

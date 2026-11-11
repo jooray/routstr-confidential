@@ -25,6 +25,8 @@ export interface H2Ctx {
   nodeMode: boolean
   /** Node mode: fields every `request` carries (credential, offer signature, fees). */
   requestExtras: Record<string, unknown>
+  /** Node mode: check a request's signed receipt (the charge against our own usage or the error status); throws. */
+  checkReceipt?: (receipt: any, q: { n: number; model: string; status: number; usage: any }) => void
   requests: number
   pauseMs: number
   /** Largest DATA payload per record. */
@@ -435,6 +437,7 @@ export class H2Conn {
     } else {
       throw new Error(`request ${n}: status ${status} is neither a success nor a disclosable error`)
     }
+    ctx.checkReceipt?.(receipt, { n, model: b.model, status, usage: ownUsage?.usage })
     const tEnd = Date.now()
 
     // The request is settled: its records and its part of the stream go.
@@ -459,6 +462,9 @@ export class H2Conn {
       records: plan.length,
       usage: ownUsage?.usage && { prompt_tokens: ownUsage.usage.prompt_tokens, completion_tokens: ownUsage.usage.completion_tokens },
       receipt_sig_ok: receipt.unsigned ? false : true,
+      cost_msats: receipt.cost_msats,
+      reserved_msats: receipt.reserved_msats,
+      balance_msats: receipt.balance_msats,
       released_ms: cur.tReleased ? cur.tReleased - cur.tStart : undefined,
       ttft_ms: cur.tFirstData ? cur.tFirstData - cur.tStart : undefined,
       total_ms: tEnd - cur.tStart,

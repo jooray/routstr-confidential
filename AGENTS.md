@@ -257,9 +257,15 @@ Option A, `http: 2`: one two-party handshake per HTTP/2 connection, the credenti
 (it lands in the provider's HPACK table), then sequential requests that name it by index. Built so far: the
 statement `pi_win` (`zkbench`), the sidecar mode (`relay/src/{h2,h2_session,hpack}.rs`, offered only with an
 `h2` block: `relay/offer.venice.h2.json`), the reference driver (`--http2 --requests N`,
-`client/src/{h2,driver-h2}.ts`). Not built: the node, the SDK, routstrd, the web library. v2 is untouched and
-the default. Gate: `crypto/tools/v3-h2-check.sh` (starts its own sidecar; honest cases, five attacks, a v2
-control); offline: `node --experimental-strip-types src/h2-selfcheck.ts` in `crypto/client`.
+`client/src/{h2,driver-h2}.ts`), and the node (routstr-core branch `confidential-v3`, local only, from
+`confidential-2pc`: the setup checks the credential and reserves nothing, each `request` is reserved and
+settled as a v2 session; `routstr/confidential_ws.py` `_run_h2_session`, tests
+`tests/unit/test_confidential_http2.py`; A.11 "Through a node" is the client-facing wire format). Not built:
+the SDK, routstrd, the web library. v2 is untouched and the default. Gates: `crypto/tools/v3-h2-check.sh`
+(starts its own sidecar; honest cases, five attacks, a v2 control) and `crypto/tools/v3-h2-node-check.sh`
+(starts a sidecar and a node on scratch state, needs routstr-core on `confidential-v3`; checks every case's
+money outcome in the node's database); offline: `node --experimental-strip-types src/h2-selfcheck.ts` in
+`crypto/client`.
 
 ## Browser client (separate repos)
 

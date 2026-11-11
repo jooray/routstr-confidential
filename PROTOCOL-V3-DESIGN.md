@@ -208,8 +208,11 @@ design allows them; build chat first); connection deposits; the browser library.
 
 Prototype on branch `v3-h2`: sidecar (`crypto/relay/src/{h2,h2_session,hpack}.rs`), statement
 (`crypto/zkbench/src/statements.rs`, `PiWin`), reference client (`crypto/client/src/{h2,driver-h2}.ts`), gate
-`crypto/tools/v3-h2-check.sh`. This section is what the node and the SDK need; where it differs from A.1-A.8
-it says so ("differs"). All messages are JSON text frames on the session WebSocket (`/session` on the sidecar,
+`crypto/tools/v3-h2-check.sh`; the node on branch `confidential-v3` of routstr-core
+(`routstr/confidential_ws.py`, `_run_h2_session`), gate `crypto/tools/v3-h2-node-check.sh`. This section is
+what the SDK needs; where it differs from A.1-A.8 it says so ("differs"). The messages below are the
+sidecar's; **"Through a node"** at the end lists what a node adds, strips and changes, and is what a client
+of a node implements. All messages are JSON text frames on the session WebSocket (`/session` on the sidecar,
 `/v1/confidential/ws` on the node) unless marked binary. Byte strings in JSON are lower-case hex, except inside
 `params`, where they are arrays of numbers (as in v2). A v2 session (`setup` without `http`) is unchanged.
 
@@ -227,7 +230,8 @@ trusted API base plus `/models` (`checkH2Offer`); the usual v2 offer checks (hos
 #### Setup
 
 `C → N  {"type":"setup","http":2,"nonce_c":<64 hex>,"armed":<bool>}` plus, towards a node, `auth` and
-`offer_sig` (the sidecar ignores them; with a direct sidecar `escrow_e`/`escrow` as in v2). `http` may be the
+`offer_sig` (required there, and stripped by the node: "Through a node"; with a direct sidecar
+`escrow_e`/`escrow` as in v2). `http` may be the
 number 2 or the string `"2"`; absent, `1.1` or `"1.1"` is v2. A setup with `http: 2` that names `kind`, `model`,
 `max_tokens`, `len`, `suffix` or `count` is refused.
 
@@ -269,8 +273,8 @@ writes it to the provider only after a π_WIN that covers it verified (and, for 
 
 1. `C → N  {"type":"request","n":k,"kind":"chat","model","max_tokens","body_len"}` (`kind` optional; only chat;
    `suffix` optional and must equal the canonical one). Towards a node it also carries what a v2 setup carries
-   for billing: `auth`, `offer_sig`, `session_fee_msat`, `abandon_fee_msat`; **the node reserves here**, strips
-   `auth` and forwards the rest. `n` must be the previous `n` + 1 (first: 1), at most `max_requests`, and no
+   for billing: `auth`, `offer_sig`, `session_fee_msat`, `abandon_fee_msat`; **the node reserves here** and
+   forwards the request without those four ("Through a node"). `n` must be the previous `n` + 1 (first: 1), at most `max_requests`, and no
    request may be in flight. `body_len` is the sum of the DATA payloads (the JSON body), suffix included.
    `N → C  {"type":"request_ok","sid","n","stream":2k+1,"suffix":<the canonical suffix string>}`.
    The client may send its records without waiting for `request_ok`.
@@ -346,7 +350,7 @@ proves with `s_ap_0`.
 
 Settlement, when the proof verifies: with `--node-settles`
 `{"type":"usage","sid","http":2,"n":k,"model":<pinned>,"usage":<the usage event>[,"reported_model"]}` (v2's frame
-plus `http` and `n`; the node settles and signs the receipt, which should carry `n`); without it the sidecar's
+plus `http` and `n`; the node settles and signs the receipt, which carries `http` and `n`); without it the sidecar's
 stub `{"type":"receipt","n":k,"receipt":{"sid","http":2,"n",…,"attestation_hash"},"receipt_json","sig"}`.
 The connection is then idle and accepts `request` `k+1`.
 
@@ -385,11 +389,105 @@ error-head rules. Then `{"type":"closed","reason":"error_settled"}` and the sock
   channel preallocates as for v2 and extends online when it runs out (about 0.48 MB node → client per
   extension; in steady state about 1 MB per request).
 
+#### Through a node
+
+The client talks to the node's `/v1/confidential/ws?session_id=<uuid>&v=2` and `/v1/confidential/zk` exactly as
+for v2 (`zk_token` from `ready`; `/zk?proof=pi_win` is admitted). The node relays every frame not listed here
+unchanged, in both directions.
+
+**Offer.** The node's signed offer carries the sidecar's `http` and `h2` unchanged, and only when the sidecar
+offers `"2"` with an `h2` block. Without them the offer names neither (read an absent `http` as `["1.1"]`),
+so a node on an HTTP/1.1-only sidecar signs what it signed before.
+
+**Setup.** `C → node  {"type":"setup","http":2,"nonce_c","armed","auth","offer_sig"}`.
+
+- `auth` (the `sk-` key or Cashu token) and `offer_sig` are required, as for v2. No request terms and no
+  `session_fee_msat`/`abandon_fee_msat` (refused, 400): fees are accepted per request.
+- The node checks, before it dials the sidecar: its sidecar offers `http: 2` (else 400); `offer_sig` names an
+  offer it signed and still remembers (else 409 `offer_expired`); the credential is valid with an available
+  balance of at least `max(1 msat, MIN_REQUEST_MSAT, that offer's session fee, its abandon fee)` (else 401/402
+  with the node's usual error body). A Cashu token is redeemed here. **Nothing is reserved.** A client without
+  funds gets no garbled circuit.
+- The sidecar sees `{"type":"setup","http":2,"nonce_c","armed","escrow":"h2-<random>"}`: no credential, no
+  offer signature. `escrow` only makes the sid unique (v2 passes the reservation id there).
+- `ready` gains `zk_token`, `pubkey` (the node's) and `sig_scheme`, as for v2.
+
+**Request.** `C → node  {"type":"request","n":k,"kind":"chat","model","max_tokens","body_len","auth","offer_sig"
+[,"session_fee_msat","abandon_fee_msat"][,"suffix"]}`.
+
+- The node validates the shape (`n` = the last forwarded request + 1; `kind` absent or `chat`; `max_tokens` in
+  `[1, max_tokens_cap]`; `body_len` in `[1, 8 MiB]`), then does what it does for a v2 setup: the model must be
+  one the node serves confidentially (400 otherwise) and priced by the offer `offer_sig` names (409
+  `offer_expired`), the fees of that offer must be echoed (409 `session_fee_not_accepted`), the credential is
+  validated, and a full-context prompt plus `max_tokens` (plus the larger fee) is reserved at that offer's
+  rates (402 when the balance does not cover it).
+- `auth` and `offer_sig` are per request. A request may name another credential than the setup or the previous
+  request (a fresh Cashu token, another key), and a newer offer. The node remembers a signed offer for 10
+  minutes after it last served it, so a client that keeps a connection must refetch and verify
+  `/v1/confidential/offer` within that time and use the signature it gets; the connection-level fields of the
+  newer offer (`upstream_host`, `head_template`, `chat`, `h2`) must be the ones the connection was opened on,
+  or the client opens a new connection.
+- The sidecar sees `{"type":"request","n","kind","model","max_tokens","body_len"[,"suffix"]}` only.
+- **A request the node refuses ends the connection**: `{"type":"error","status","reason","detail"}` (the fields
+  of a refused v2 setup), nothing reserved, socket closed. Reason: the client may send the request's records
+  without waiting for `request_ok`, and the sidecar could not place them. Earlier requests stay settled.
+- One request at a time: a `request` while one is in flight is refused (409) and ends the connection; the
+  request in flight is then finalized by the abort rules.
+- Frames the client sends after `request` are forwarded only once the reservation is made, in order.
+
+**Settlement.** The sidecar's `usage` frame is consumed by the node (the client never sees it). The node
+re-signs `attestation` as for v2 (`a_json`, `sig`, `sig_scheme`, `sidecar_sig`), settles as v2 does (usage at
+the frozen rates plus the session fee; an error head by v2's status rules) and sends
+
+`{"type":"receipt","receipt":{…v2's fields…,"http":2,"n":k},"receipt_json","sig","sig_scheme"}`.
+
+`receipt.sid` is the connection's sid, `receipt.n` the request, `attestation_hash` the SHA-256 of that
+request's `a_json`. `reserved_msats`, `cost_msats`, `balance_msats`, `rates` and the fee fields are that
+request's. The client checks what it checks for v2 plus `http`, `n` and that the attestation's `n`, `stream`
+and `s_k` are its own. An `attestation` or `usage` that names another request than the one in flight is
+dropped by the node. If the node cannot sign a receipt (no attestation, a failed billing write) it sends an
+`error` and ends the connection.
+
+**Aborts** (per request, v2's rules with "session" read as "request"):
+
+| The connection ends… | The request's reservation |
+|---|---|
+| with no request in flight (idle, `closed`, the client leaves, never used) | nothing is held, nothing is charged |
+| before the sidecar's `request_ok` | released in full |
+| after `request_ok`, before `body_released` (a failed π_WIN, the client leaves) | released; the abandon fee is kept if the offer has one |
+| before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes) | released; the session fee is kept if the offer has one |
+| after `body_released` with no settlement | charged in full |
+
+**Limits.** An `http: 2` connection takes one of the node's session slots (32 per process) for its whole
+life. It counts against its address's unused-session limit (`CONFIDENTIAL_MAX_UNUSED_PER_IP`, default 12) from
+the setup until its **first `body_released`** (differs from v2, where `head_written` ends it: there a
+reservation is held by then, here none is). Time limits: 10 minutes from the websocket accept to
+`head_written` (an armed connection included); idle, the sidecar's `idle_secs` (it sends `closed`), with the
+node cutting the connection 15 s later if it did not; per request, 10 minutes from `request` to
+`body_released` and 10 minutes from there to the settlement, as for v2 (`error` with status 408). Each
+request's reservation has its own lease, taken at the `request`.
+
+**Open, by design of the prototype** (see also "Not implemented"):
+
+- An unused connection is free. The setup needs a funded credential but holds nothing, so a client can make
+  the node garble a key schedule (~22 MB, ~0.5 s of CPU) and drop the connection at no cost, and can hold up
+  to the per-address limit of session slots idle for `idle_secs` each, where v2 would hold a full-context
+  reservation per session. `CONFIDENTIAL_ABANDON_FEE_MSAT` does not cover it: with nothing reserved there is
+  nothing to keep the fee from. The fix is A.8's connection deposit (reserve the abandon fee at the setup,
+  release it with the first settlement).
+- The session fee is charged per request, as the v2 code does per session, although the 2PC it pays for now
+  happens once per connection. Whether it should move to the connection is undecided.
+- The setup's `offer_sig` is checked only for being known. The node does not record which offer a connection
+  was opened on, nor compare it with the offers its requests name.
+- A refusal that costs the connection (402 on request *k*) makes the client redo the handshake. An
+  alternative is a `request_refused` frame that leaves the connection idle, for clients that wait for
+  `request_ok` before sending records.
+
 #### Not implemented
 
 Images over `http: 2`; client KeyUpdates; parallel streams; a server KeyUpdate inside or after a disclosed tail
 (the disclosure then fails; one before the tail is handled by `key_updates`/`epoch_start` but is untested live);
-connection deposits and fees; the node, the SDK, routstrd and the web library.
+connection deposits and per-connection fees; the SDK, routstrd and the web library.
 
 ---
 
