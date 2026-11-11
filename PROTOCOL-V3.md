@@ -1,9 +1,7 @@
 # routstr-confidential protocol v3
 
-2026-11-11. Normative specification. It replaces protocol v2. `PROTOCOL-V3-DRAFT.md` has the reasoning,
-`PROTOCOL-V3-DESIGN.md` the prototype notes this was built from (its A.11 is the byte-level wire format of
-the HTTP/2 prototype and stays valid except where this file says otherwise; it is folded into §12 here when
-the implementation is complete and is then removed).
+2026-11-11. Normative specification. It replaces protocol v2. `PROTOCOL-V3-DRAFT.md` has the reasoning. §12
+is the complete wire format; the list at the end names what changed from the 2026-11-11 draft.
 
 Words: C = client, N = node (the routstr node and its sidecar; "node" and "sidecar" where the difference
 matters), U = the upstream provider. "Record" = TLS 1.3 record. "Frame" = HTTP/2 frame. MUST/SHOULD/MAY as in
@@ -22,7 +20,7 @@ RFC 2119.
 | Pre-warm object | a session bound to model, `max_tokens`, body length | a connection bound to the credential only |
 | Version | `v = 2` | `v = 3`; a v3 node refuses v2, a v3 client refuses a v2-only node, both with an explicit upgrade error (§11) |
 
-What does **not** change: the trust model and every guarantee of the paper's §3; the roles (C is the TLS
+What does **not** change: the trust model and every guarantee of the paper's §2; the roles (C is the TLS
 client of U, N relays records and writes the credential in epoch 0); ECtF and the joint P-256 share; the
 node-only authenticated garbling construction; π_NK and π_C3S; the chat suffix and its offer block
 (`docs/CHAT-SUFFIX.md`); image rules (`docs/CONFIDENTIAL-IMAGES.md`); the attestation and receipt signatures;
@@ -52,10 +50,15 @@ The operator states what their upstream supports. Nothing is probed or assumed.
 - `http`: the framings this sidecar serves for this upstream, **in the operator's order of preference**.
   At least one. `"2"` requires the `h2` block. Default when absent: `["1.1"]`.
 - `h2.probe_path`: a cheap authenticated GET path of the provider (§5.2). `max_requests` 1..1000 (default
-  100). `max_lifetime_s` 60..86400 (default 3600).
-- The sidecar SHOULD stop offering `"2"` after 5 consecutive HTTP/2 connections fail before their first
-  request's response began (ALPN not selected, the provider closing on the connection head, GOAWAY), log
-  it, and offer it again after 10 minutes. This protects clients from a provider that changed behaviour.
+  100). `max_lifetime_s` 60..86400 (default 3600). `idle_secs` 10..3600 (default 300): the sidecar's own
+  idle limit and the ceiling of the node's `idle_timeout_s`; an operator sets it no longer than the idle
+  time `provider-profile-check.py --h2` passed H5 with (the shipped Venice file: 300). `kinds`: §12.1.
+- The sidecar stops offering `"2"` after 5 consecutive HTTP/2 connections failed to open, logs it, and
+  offers it again after 10 minutes. A failed open is one of: the provider closed before it sent a
+  ServerHello; a verified handshake did not select `h2`; the provider closed within 10 s of the connection
+  head with no response to a request yet. (N cannot see a GOAWAY: it is encrypted. It sees the close that
+  follows.) A response to the connection's first request resets the count. While withdrawn, a `setup`
+  for `"2"` is refused with `code: "h2_withdrawn"` and `GET /offer` lists `"2"` no longer.
 - `crypto/tools/provider-profile-check.py --h2` checks what framing `"2"` needs from a provider (§5.6) and
   is what an operator runs before adding `"2"`.
 
@@ -145,13 +148,14 @@ hostname, CertificateVerify and both Finished messages), with:
 
 `C → N  {"type":"request","n":k,"kind":"chat"|"images","model", "max_tokens" | "variant","count", "body_len","auth","offer_sig","session_fee_msat","abandon_fee_msat"}`
 
-- `n` = previous `n` + 1, first 1. One request at a time.
+- `n` = the number of the last accepted request + 1, first 1 (a refused request does not use up its
+  number). One request at a time.
 - The node does what a v2 setup did: the model is served confidentially and priced by the named offer, the
   fees are echoed, the credential is validated (it may differ from the setup's), and the request is
   **reserved**: chat, a full-context prompt plus `max_tokens`; images, `msat_per_image × count`. The named
-  offer's connection-level fields MUST equal those of the offer the connection was opened on, else
-  `offer_changed` (C opens a new connection).
-- `N → C  {"type":"request_ok","sid","n","suffix", "stream"?}`.
+  offer's connection-level fields (§12.1) MUST equal those of the offer the connection was opened on, else
+  the request is refused with `offer_changed` (C opens a new connection, or names the old offer).
+- `N → C  {"type":"request_ok","sid","n","suffix", "stream"? (framing "2"), "head_len"? (framing "1.1")}`.
 - **A refused request leaves the connection READY** (`{"type":"request_refused","n","status","reason"}`)
   when C has sent no record for it. C MUST wait for `request_ok` before sending records. (The prototype
   ended the connection; a 402 then cost a handshake.) In framing `"1.1"` a refused request 1 may be
@@ -176,13 +180,13 @@ reservation is at stake.
 | status ≥ 400 | `disclose_head` | framing `"2"`: π_WIN under `s_ap_0`; `"1.1"`: π_C3S head mode, as v2 | v2's error rules by status |
 
 N answers with the attestation (per request), then the receipt (signed by the node, bound to `sid`, `n` and
-the attestation). Abort rules: v2's table with "session" read as "request" (`PROTOCOL-V3-DESIGN.md`, "Through
-a node", Aborts).
+the attestation). Framing `"1.1"`: the attestation is sent when the provider closes the connection, before
+C's disclosure (its anchor is the end of the connection). Abort rules: §12.10.
 
 ### 3.6 End of a connection
 
-`{"type":"closed","reason":"idle"|"max_requests"|"max_lifetime"|"upstream_closed"|"error_settled"|"done","deposit":{…}}`.
-`done` is the normal end of a `"1.1"` connection. The `deposit` object is §8's outcome. Any protocol
+`{"type":"closed","reason":"idle"|"max_requests"|"max_lifetime"|"max_bytes"|"upstream_closed"|"error_settled"|"done"|"ended","deposit":{…}}`
+(§12.9 says when each applies). `done` is the normal end of a `"1.1"` connection. The `deposit` object is §8's outcome. Any protocol
 violation or failed proof: `{"type":"error","status","reason"}` and the socket closes.
 
 ## 4. Two-party key schedule: `split-public-1`
@@ -226,8 +230,13 @@ Security statement (informal; no proof, external review outstanding, as for v2):
 - Assumptions beyond "HMAC-SHA256 is a PRF", for both parties, because both see `IS_k`: (1) `f` keyed by
   its chaining input is a PRF; (2) `OS_k` is pseudorandom given `IS_k`. These are the two assumptions of
   Bellare's HMAC proof (CRYPTO 2006), used directly.
-- Round trips: +2 per call compared with v2 (each stage's public output must reach N before it sends the
-  next stage's digest labels).
+- Round trips compared with v2, measured: +2 in the handshake call (A1, A2, A3: each stage's public output
+  must reach N before it sends the next stage's digest labels) and +0.5 in the application call (N sends
+  the B1 labels without waiting for C; B2 needs C's B1 report).
+- Where the stages run: A1, A2 and A3 run in one call that starts when the ServerHello arrives. After A2
+  both parties hold `c_hs` and `s_hs`; A3 follows at once, while C decrypts and verifies the server flight,
+  so A3 is done before C sends its Finished. B1 and B2 run after the server Finished (they need `th_SF`);
+  N has `K_0` only after it verified the handshake inputs it fed in.
 
 ## 5. Framing `"2"` (HTTP/2)
 
@@ -276,15 +285,24 @@ control with `release {n, upto}`; N never writes an unproven record nor beyond `
 
 ### 5.4 Usage disclosure, error head
 
-- `disclose`: `R` runs from the usage event to the last server byte N has received, within the request's
-  interval (server records with index ≥ `S_k`, the count when N wrote the request's first record). N
-  parses text and frames alternately; the DATA payloads on the request's stream must be exactly
-  `data: <usage JSON>\n\ndata: [DONE]\n\n` and the stream must end inside `R`. π_C3S, unchanged circuit.
+- `disclose`: `R` runs to the last server byte N has received, within the request's interval (server
+  records with index ≥ `S_k`, the count when N wrote the request's first record). `R` starts either with
+  the 9-byte header of a DATA frame on the request's stream, or with the line feed before `data: ` inside
+  such a frame. N parses text and frames alternately; the DATA payload bytes on the request's stream from
+  `R`'s start to END_STREAM must be exactly `data: <usage JSON>\n\ndata: [DONE]\n\n`, and the stream must
+  end inside `R`. π_C3S, unchanged circuit.
+- A tail that contains a frame on any stream other than 0 and the request's is refused. The only other
+  stream is the probe (stream 1, reset by N in the connection head); the provider may still answer it.
+  Those frames arrive right after the head, long before a usage tail, so in practice they are outside
+  every disclosed tail; C SHOULD wait for the probe's response (or 2 s) before its first request so that
+  they also lie before `S_1`. If one does land in a tail, C has no usage disclosure for that request and
+  it falls under the abort rule (charged in full after `body_released`).
 - `disclose_head`: one complete HEADERS frame of the request's stream at byte 0 of a server record in the
   interval, π_WIN under `s_ap_0`, decoded with an empty dynamic table, `:status` 400..599. The connection
   closes after an error head is settled.
-- Images: the response is one JSON body in DATA frames; C sends `accept` after END_STREAM. (Detail in
-  `PROTOCOL-V3-DESIGN.md`, images section.)
+- Images: the response is one JSON body in DATA frames; C sends `accept` after END_STREAM on the request's
+  stream (never by a length). N's connection head opens the windows to 2^31-1, so C sends no flow-control
+  frame for a response; the connection is retired after 1 GiB received (`closed`, `max_bytes`).
 
 ### 5.5 Why the credential cannot be read back
 
@@ -311,8 +329,11 @@ Checked by `provider-profile-check.py --h2`; an operator offers `"2"` only when 
 | H8 | the streamed usage event and `[DONE]` end the stream as §5.4 parses them |
 
 N MUST end the connection if U's SETTINGS set `HEADER_TABLE_SIZE` below the size of the credential entry
-(H3 at run time; C reports U's SETTINGS values in `settings_seen`, and a lying C only harms itself: its
-next request is unauthenticated).
+(H3 at run time; C reports the value in `settings_seen`, §12.6, and a lying C only harms itself: its
+next request is unauthenticated). Because the value is C's claim, this end does not count towards the
+withdrawal of §2.1 and the deposit is charged like any unused connection. H5 is checked for the idle time
+the node offers: `idle_timeout_s` MUST NOT exceed `h2.idle_secs`, and the operator sets `h2.idle_secs` no
+higher than the idle time the profile check ran with.
 
 ## 6. Framing `"1.1"` (HTTP/1.1)
 
@@ -360,13 +381,16 @@ correlations + 6.4 k per block).
 
 ### 8.1 Connection deposit
 
-- `connection_deposit_msat` (signed offer; node setting, default = the abandon fee, at least the session
-  fee) is reserved at the `setup` through the node's ordinary reservation path.
+- `connection_deposit_msat` (signed offer; node setting `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT`, default
+  max(abandon fee, session fee, 1000 msat); 0 = no deposit) is reserved at the `setup` through the node's
+  ordinary reservation path, for both framings.
 - It is **released when the first request of the connection reaches a settlement** (usage, `accept`, or an
   error head: any request the provider received).
 - A connection that ends with no settled request: the deposit is **charged**, except when the end was the
-  node's, the sidecar's or the provider's failure before C could have had a request settled (2PC failure
-  on N's side, the provider refusing the handshake or the connection head, sidecar loss): then released.
+  node's, the sidecar's or the provider's failure and not something C can cause: the provider unreachable,
+  `h2` not selected, framing `"2"` withdrawn, a sidecar or node failure, the provider closing an open idle
+  connection. Then it is released. A provider that closes **during the handshake** is charged: a client
+  can cause that (a bad Finished). §12.10 has every row.
 - The outcome is reported in `closed.deposit = {"msat", "outcome": "released"|"charged", "reason"}` and,
   when it is released by a settlement, in that request's receipt (`deposit_released_msat`).
 - An idle connection after its first settlement holds no reservation.
@@ -378,10 +402,15 @@ settlement (`closed`, reason `idle`). The client's pool uses a shorter idle time
 
 ### 8.3 Fees
 
-- `session_fee_msat` pays for the two-party handshake and is charged **once per connection**, with the
-  settlement of request 1. Requests 2… pay usage only.
-- `abandon_fee_msat` per request, v2's rule (kept when a reserved request is dropped before
-  `body_released`).
+- `session_fee_msat` pays for the two-party handshake and falls due **once per connection**, at the first
+  settlement of a request the provider received, by v2's rules for the outcome (added to a 2xx; the whole
+  charge for 429/503 and 401/402/403). Once a request was settled, no later request keeps or adds it:
+  where v2 says "less the session fee", read "less the session fee if it is still due on this connection".
+- A request's reservation = the usage bound (a full-context prompt plus `max_tokens`, or the image price)
+  + max(session fee if still due, abandon fee).
+- `abandon_fee_msat` per request (kept when an accepted request is dropped before `body_released`), except
+  on a connection with no settlement yet: there the deposit is charged instead and the abandon fee is not
+  kept on top. So it applies to dropped requests on a connection whose deposit was already released.
 - Everything else per request, as v2 per session.
 
 ### 8.4 Limits
@@ -486,7 +515,9 @@ block stays). An offer file that names `v` other than 3 is refused at startup.
 **N** `GET /v1/confidential/offer[?v=3]` (the query is ignored by the node; clients send it): the signed
 offer. Fields: `v: 3`; `http`, `h2` (the sidecar's; `kinds` lists `images` only when the offer has an
 `images` block; `h2` only when `http` lists `"2"`); `twopc`; `connection_deposit_msat` (integer ≥ 0);
-`idle_timeout_s` (integer, 10..`h2.idle_secs` when `"2"` is offered); and everything the v2 offer had
+`idle_timeout_s` (integer ≥ 10, at most `h2.idle_secs` when `"2"` is offered; node setting
+`CONFIDENTIAL_IDLE_TIMEOUT_S`, default 120; the deposit's default is max(abandon fee, session fee,
+1000 msat), 0 settable); and everything the v2 offer had
 (`upstream_host`, `head_template`, `chat`, `images`, `capabilities`, `price_list`, `session_fee_msat`,
 `abandon_fee_msat`, `max_tokens_cap`, `node_pubkey`, `sig`, …), unchanged in meaning.
 
@@ -809,3 +840,20 @@ connection ends.
 4. Documents: this file with §12 complete; the paper and its PDF; `docs/TWOPC-DESIGN.md`,
    `docs/TWOPC-NODE-GARBLING.md`, `docs/APPROACH.md`, `docs/ONE-PAGER.md` (+ PDF), `docs/ADVERSARIAL-QA.md`,
    `docs/SETUP.md`, `docs/CONFIDENTIAL-IMAGES.md`, `AGENTS.md`; the routstr-core, SDK and routstrd docs.
+
+## Changes from the 2026-11-11 draft
+
+| Change | Where |
+|---|---|
+| §12 is the wire reference; the prototype notes are removed | §12 |
+| `http` is the string `"2"` or `"1.1"` in every message (setup, ready, attestation, usage, receipt) | §12 |
+| a refused request does not use up its number `n`; `offer_changed` is a `request_refused`, not an error | §3.3, §12.4 |
+| framing `"1.1"`: `request_ok` carries `head_len` (`ready` has none); the attestation is sent when the provider closes, before the disclosure; the error head is `disclose_head` with π_C3S | §3.5, §12.7, §12.8 |
+| `h2.idle_secs` and `h2.kinds` are part of the block; `max_lifetime_s` replaces the fixed 3600 s | §2.1, §12.1 |
+| what counts as a failed HTTP/2 open (N cannot see GOAWAY); the `settings_seen` end does not count and charges the deposit | §2.1, §5.6 |
+| `closed` reasons `max_bytes`, `ended`; error `code`s | §3.6, §12.9 |
+| round trips: +2 in the handshake call, +0.5 in the application call; where A3 runs | §4 |
+| the disclosure start, frames of other streams in a tail, the probe stream | §5.4 |
+| default deposit max(abandon fee, session fee, 1000 msat); a provider closing during the handshake is charged | §8.1 |
+| session fee due once per connection at the first settlement; reservation formula; deposit instead of abandon fee before the first settlement | §8.3 |
+| the paper's §2, not §3 | §1 |
