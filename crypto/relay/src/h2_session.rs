@@ -628,11 +628,6 @@ pub(crate) fn on_disclose(
     }
     let r = hex::decode(r)?;
     check_disclosure_size(r.len(), 0)?;
-    let usage = h2::usage_event(&h2::parse_usage_tail(&r, q.stream)?)?;
-    let umodel = usage.get("model").and_then(|m| m.as_str()).unwrap_or("");
-    if umodel != q.model {
-        warn!(reported = umodel, pinned = %q.model, "usage event model differs from the pinned model");
-    }
     // The covered records: the last `tail_lens.len()` N holds, all inside
     // the request's interval.
     let k = tail_lens.len();
@@ -653,6 +648,12 @@ pub(crate) fn on_disclose(
     let total: usize = chosen.iter().map(|rec| rec.payload.len() - 17).sum();
     if total < r.len() {
         bail!("disclosed records ({total}) do not cover R ({})", r.len());
+    }
+    // R itself: one usage event and the end of the request's stream.
+    let usage = h2::usage_event(&h2::parse_usage_tail(&r, q.stream)?)?;
+    let umodel = usage.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    if umodel != q.model {
+        warn!(reported = umodel, pinned = %q.model, "usage event model differs from the pinned model");
     }
     let first_content = chosen[0].payload.len() - 17;
     let first_off = first_tail_offset(first_content, total - first_content, r.len());
@@ -1041,6 +1042,514 @@ mod tests {
         assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().upto, 2);
         assert!(on_release(&mut st, 2, 1).is_err());
         assert!(on_release(&mut st, 1, 1 << 20).is_err());
+    }
+
+    // --- disclosures, proofs and the write gate, against a loopback "upstream" ---
+
+    fn app_state(node_settles: bool) -> Arc<AppState> {
+        let offer: Offer = serde_json::from_str(include_str!("../offer.venice.h2.json")).unwrap();
+        Arc::new(AppState {
+            key: Arc::new(Zeroizing::new(b"k".repeat(42))),
+            offer: Arc::new(offer),
+            host: "api.venice.ai".into(),
+            upstream: "127.0.0.1:9".into(),
+            signer: Arc::new(SigningKey::from_bytes(&[7; 32])),
+            runs_dir: std::env::temp_dir(),
+            runs_keep: std::time::Duration::from_secs(3600),
+            node_settles,
+            sessions: StdMutex::new(HashMap::new()),
+            slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            max_body: 1 << 20,
+            token_hash: None,
+        })
+    }
+
+    fn shared(app: &AppState) -> (Arc<SessionShared>, mpsc::UnboundedReceiver<Ev>) {
+        let (evt, rx) = mpsc::unbounded_channel();
+        let s = Arc::new(SessionShared {
+            params: StdMutex::new(HashMap::new()),
+            twopc_rx: StdMutex::new(None),
+            k0_iv0: StdMutex::new(None),
+            key: app.key.clone(),
+            evt,
+            zk_lock: tokio::sync::Mutex::new(()),
+            zkchan_taken: std::sync::atomic::AtomicBool::new(false),
+            zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            proofs_run: StdMutex::new(Default::default()),
+            multi: std::sync::atomic::AtomicBool::new(true),
+            fresh: StdMutex::new(Default::default()),
+        });
+        (s, rx)
+    }
+
+    const SFX: &str = ",\"model\":\"m\"}";
+    const USAGE: &str = r#"{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3},"model":"m"}"#;
+
+    /// A session after the head: handshake verified (2 handshake records),
+    /// 2PC outputs present, one request open.
+    fn open_session(body_len: usize) -> Session {
+        let mut st = session_with_request(body_len, SFX);
+        st.sid = Some("ab".repeat(32));
+        st.handshake = Some(HandshakeInfo {
+            client_hs: [0; 32],
+            server_hs: [0; 32],
+            th_sh: [1; 32],
+            th_sf: [2; 32],
+            cert_chain_hash: [3; 32],
+            leaf_der: Vec::new(),
+            server_handshake_records: 2,
+            alpn: Some(b"h2".to_vec()),
+        });
+        st.ap = Some(Box::new(ApN { k0: Zeroizing::new([0; 16]), iv0: Zeroizing::new([0; 12]), h1: [0x11; 32], h2: [0x22; 32], hk: [0x33; 32] }));
+        st.c_commit = Some([4; 32]);
+        st
+    }
+
+    fn server_rec(content: &[u8]) -> Record {
+        let n = content.len() + 17;
+        let mut payload = content.to_vec();
+        payload.push(0x17);
+        payload.extend_from_slice(&[0xee; 16]);
+        Record { ctype: CT_APPLICATION_DATA, header: [0x17, 3, 3, (n >> 8) as u8, n as u8], payload }
+    }
+
+    fn feed(st: &mut Session, log: &mut RelayLog, content: &[u8]) {
+        let r = server_rec(content);
+        st.h2.as_mut().unwrap().server_record(&r);
+        log.server_record(r);
+    }
+
+    fn texts(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let Message::Text(t) = m {
+                out.push(serde_json::from_str(&t).unwrap());
+            }
+        }
+        out
+    }
+
+    /// The request's two records (HEADERS, one DATA) arrive; returns them.
+    fn send_request(st: &mut Session, body_len: usize) -> Vec<Vec<u8>> {
+        let block = h2::request_block("h", "/api/v1/chat/completions").len();
+        let recs = vec![record(9 + block + 1), record(10 + body_len)];
+        for r in &recs {
+            client_bytes(st, r).unwrap();
+        }
+        recs
+    }
+
+    async fn upstream() -> (tokio::net::tcp::OwnedWriteHalf, tokio::net::TcpStream) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (s, _) = l.accept().await.unwrap();
+        let (_r, w) = c.into_split();
+        (w, s)
+    }
+
+    async fn read_some(s: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        // Everything that arrives until the socket stays quiet.
+        while let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(150), s.read(&mut buf)).await {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    /// Mark the stored π_WIN batch proven, as the session loop does on `ZkDone`.
+    async fn prove(
+        app: &Arc<AppState>,
+        sh: &Arc<SessionShared>,
+        tx: &mpsc::UnboundedSender<Message>,
+        st: &mut Session,
+        log: &RelayLog,
+        w: &mut tokio::net::tcp::OwnedWriteHalf,
+        proof: &str,
+    ) -> Result<()> {
+        let params = sh.params.lock().unwrap().get(proof).cloned();
+        sh.claim_proof(proof)?;
+        proof_done(app, sh, tx, st, log, w, proof, params.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn nothing_reaches_the_upstream_unproven_or_unreleased() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, mut up) = upstream().await;
+        let mut log = RelayLog::default();
+        log.server_app_records = 5;
+        let mut st = open_session(300);
+        // A SETTINGS ACK declared before the request's records: one batch.
+        on_ctl(&mut st, "settings_ack").unwrap();
+        client_bytes(&mut st, &record(10)).unwrap();
+        // While the request is incomplete no proof is asked for.
+        let block = h2::request_block("h", "/api/v1/chat/completions").len();
+        client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        assert!(texts(&mut rx).is_empty());
+        client_bytes(&mut st, &record(10 + 300)).unwrap();
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        let msgs = texts(&mut rx);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!((msgs[0]["proof"].as_str(), msgs[0]["purpose"].as_str()), (Some("pi_win"), Some("records")));
+        assert_eq!((msgs[0]["first_seq"].as_u64(), msgs[0]["count"].as_u64()), (Some(0), Some(3)));
+        // The windows: the ACK and HEADERS records in full, the DATA record's
+        // header and its suffix tail; all anchored on h1.
+        let Params::PiWin(p) = serde_json::from_value(msgs[0]["params"].clone()).unwrap() else { panic!() };
+        assert_eq!(p.anchor, [0x11; 32]);
+        assert_eq!(p.windows.iter().map(|w| w.seq).collect::<Vec<_>>(), vec![0, 1, 2, 2]);
+        assert_eq!(p.windows[0].expected, [0, 0, 0, 4, 1, 0, 0, 0, 0, 0x17]);
+        assert_eq!(p.windows[1].expected.len(), 9 + block + 1);
+        assert_eq!(&p.windows[1].expected[..9], &h2::frame_header(block, h2::HEADERS, h2::END_HEADERS, 3));
+        assert_eq!(p.windows[2].expected, h2::frame_header(300, h2::DATA, h2::END_STREAM, 3));
+        let mut tail = SFX.as_bytes().to_vec();
+        tail.push(0x17);
+        assert_eq!(p.windows[3].expected, tail);
+        // Released but unproven: nothing was written, and a second pump asks
+        // for no second proof.
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        assert!(texts(&mut rx).is_empty());
+        assert!(read_some(&mut up).await.is_empty(), "unproven records reached the upstream");
+        // Proven: everything goes, in order; S_k is the record count at the write.
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let wrote = read_some(&mut up).await;
+        let mut want = record(10);
+        want.extend(record(9 + block + 1));
+        want.extend(record(10 + 300));
+        assert_eq!(wrote, want);
+        let q = st.h2.as_ref().unwrap().req.as_ref().unwrap();
+        assert!(q.released && q.interval_open);
+        assert_eq!(q.s_k, Some(5));
+        assert_eq!(texts(&mut rx).iter().filter(|m| m["type"] == "body_released").count(), 1);
+        // The same proof cannot be claimed twice.
+        assert!(sh.claim_proof("pi_win").is_err());
+    }
+
+    #[tokio::test]
+    async fn proven_records_wait_for_the_release_limit() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, mut up) = upstream().await;
+        let log = RelayLog::default();
+        let mut st = open_session(9000);
+        let block = h2::request_block("h", "/api/v1/chat/completions").len();
+        for inner in [9 + block + 1, 10 + 4000, 10 + 4000, 10 + 1000] {
+            client_bytes(&mut st, &record(inner)).unwrap();
+        }
+        // A control record behind the request keeps its place in the order.
+        on_ctl(&mut st, "ping_ack").unwrap();
+        client_bytes(&mut st, &record(18)).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        // Proven, no release yet: nothing.
+        assert!(read_some(&mut up).await.is_empty());
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        assert_eq!(read_some(&mut up).await.len(), record(9 + block + 1).len() + record(10 + 4000).len());
+        assert!(!st.h2.as_ref().unwrap().req.as_ref().unwrap().released);
+        assert!(texts(&mut rx).iter().all(|m| m["type"] != "body_released"));
+        // The rest, then the control record behind it.
+        on_release(&mut st, 1, 4).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        assert_eq!(read_some(&mut up).await.len(), record(10 + 4000).len() + record(10 + 1000).len() + record(18).len());
+        assert!(st.h2.as_ref().unwrap().req.as_ref().unwrap().released);
+        assert!(st.h2.as_ref().unwrap().queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_proof_on_other_parameters_releases_nothing() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (mut w, mut up) = upstream().await;
+        let log = RelayLog::default();
+        let mut st = open_session(300);
+        send_request(&mut st, 300);
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        let Some(Params::PiWin(mut other)) = sh.params.lock().unwrap().get("pi_win").cloned() else { panic!() };
+        other.windows.pop();
+        assert!(proof_done(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win", Some(&Params::PiWin(other))).await.is_err());
+        assert!(proof_done(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win", None).await.is_err());
+        // A π_C3S result with no disclosure waiting is an error too.
+        let win = sh.params.lock().unwrap().get("pi_win").cloned().unwrap();
+        sh.set_params("pi_c3s", win);
+        let p = sh.params.lock().unwrap().get("pi_c3s").cloned();
+        assert!(proof_done(&app, &sh, &tx, &mut st, &log, &mut w, "pi_c3s", p.as_ref()).await.is_err());
+        assert!(read_some(&mut up).await.is_empty());
+    }
+
+    /// A released request with its response in the log; returns the tail R
+    /// (the last three records) and their lengths, last first.
+    async fn released(
+        app: &Arc<AppState>,
+        sh: &Arc<SessionShared>,
+        tx: &mpsc::UnboundedSender<Message>,
+        st: &mut Session,
+        log: &mut RelayLog,
+        w: &mut tokio::net::tcp::OwnedWriteHalf,
+    ) -> (Vec<u8>, Vec<usize>) {
+        // Before the request: the handshake flight and the provider's SETTINGS.
+        for c in [&[1u8; 40][..], &[2; 900], &[3; 30]] {
+            feed(st, log, c);
+        }
+        send_request(st, 300);
+        on_release(st, 1, 2).unwrap();
+        pump(sh, tx, st, log, w).await.unwrap();
+        prove(app, sh, tx, st, log, w, "pi_win").await.unwrap();
+        // The response: head, content, then the tail as Venice sends it.
+        feed(st, log, &h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &[0x88]));
+        feed(st, log, &h2::frame(h2::DATA, 0, 3, b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"));
+        let tail = [
+            h2::frame(h2::DATA, 0, 3, format!("data: {USAGE}\n\n").as_bytes()),
+            h2::frame(h2::DATA, 0, 3, b"data: [DONE]\n\n"),
+            h2::frame(h2::DATA, h2::END_STREAM, 3, b""),
+        ];
+        let mut r = Vec::new();
+        let mut lens = Vec::new();
+        for f in &tail {
+            feed(st, log, f);
+            r.extend_from_slice(f);
+            lens.insert(0, f.len() + 1);
+        }
+        (r, lens)
+    }
+
+    #[tokio::test]
+    async fn usage_disclosure_is_bound_to_the_interval_and_the_end() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        let (r, lens) = released(&app, &sh, &tx, &mut st, &mut log, &mut w).await;
+        texts(&mut rx);
+        let n = log.server_app_records;
+        assert_eq!((n, st.h2.as_ref().unwrap().req.as_ref().unwrap().s_k), (8, Some(3)));
+        let go = |st: &mut Session, log: &RelayLog, nn: Option<u32>, r: &[u8], lens: &[usize], skip, trailing, count: Option<usize>| {
+            on_disclose(&app, &sh, &tx, st, log, nn, &hex::encode(r), lens, skip, 0, 0, trailing, count)
+        };
+        // Refused, leaving the request as it was: another request number, a
+        // skip, trailing records, no count, a count ahead of the node.
+        assert!(go(&mut st, &log, Some(2), &r, &lens, 0, None, Some(n)).is_err());
+        assert!(go(&mut st, &log, None, &r, &lens, 0, None, Some(n)).is_err());
+        assert!(go(&mut st, &log, Some(1), &r, &lens, 1, None, Some(n)).is_err());
+        assert!(go(&mut st, &log, Some(1), &r, &lens, 0, Some(0), Some(n)).is_err());
+        assert!(go(&mut st, &log, Some(1), &r, &lens, 0, None, None).is_err());
+        assert!(go(&mut st, &log, Some(1), &r, &lens, 0, None, Some(n + 1)).is_err());
+        // Lengths that are not the node's last records; records that do not cover R.
+        assert!(go(&mut st, &log, Some(1), &r, &[lens[0], lens[1], lens[2] + 1], 0, None, Some(n)).is_err());
+        assert!(go(&mut st, &log, Some(1), &r, &lens[..2], 0, None, Some(n)).is_err());
+        // An R that is not a usage tail of this stream (the content event,
+        // another stream's tail).
+        let mut other = r.clone();
+        other[8] = 5;
+        assert!(go(&mut st, &log, Some(1), &other, &lens, 0, None, Some(n)).is_err());
+        assert!(texts(&mut rx).is_empty());
+        // Behind the node: a retry, nothing else changes.
+        go(&mut st, &log, Some(1), &r, &lens, 0, None, Some(n - 1)).unwrap();
+        let m = texts(&mut rx);
+        assert_eq!((m.len(), m[0]["type"].as_str(), m[0]["server_records"].as_u64()), (1, Some("disclose_retry"), Some(n as u64)));
+        assert!(st.h2.as_ref().unwrap().req.as_ref().unwrap().usage.is_none());
+        // Honest: attestation, then the π_C3S parameters from N's own records.
+        go(&mut st, &log, Some(1), &r, &lens, 0, None, Some(n)).unwrap();
+        let m = texts(&mut rx);
+        assert_eq!(m.iter().map(|x| x["type"].as_str().unwrap()).collect::<Vec<_>>(), vec!["attestation", "zk_params"]);
+        let a = &m[0]["a"];
+        assert_eq!((a["n"].as_u64(), a["stream"].as_u64(), a["s_k"].as_u64(), a["server_records"].as_u64(), a["client_records"].as_u64()), (Some(1), Some(3), Some(3), Some(5), Some(2)));
+        assert_eq!(a["http"], 2);
+        let Params::PiC3S(p) = serde_json::from_value(m[1]["params"].clone()).unwrap() else { panic!() };
+        assert_eq!(p.h2, [0x22; 32]);
+        assert_eq!(p.expected, r);
+        // Sequence numbers count from the first record after the handshake flight (2 records).
+        assert_eq!(p.records.iter().map(|x| x.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+        assert_eq!(p.records[2].ct, log.server_tail[7].payload[..log.server_tail[7].payload.len() - 16]);
+        // Once only.
+        assert!(go(&mut st, &log, Some(1), &r, &lens, 0, None, Some(n)).is_err());
+        // The proof verifies: settled, the connection is idle again.
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_c3s").await.unwrap();
+        let m = texts(&mut rx);
+        assert_eq!((m[0]["type"].as_str(), m[0]["n"].as_u64()), (Some("receipt"), Some(1)));
+        assert_eq!(m[0]["receipt"]["usage"]["usage"]["prompt_tokens"], 7);
+        let h = st.h2.as_ref().unwrap();
+        assert!(h.req.is_none() && h.closing.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_earlier_requests_tail_is_outside_the_interval() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        let (r, lens) = released(&app, &sh, &tx, &mut st, &mut log, &mut w).await;
+        let n = log.server_app_records;
+        on_disclose(&app, &sh, &tx, &mut st, &log, Some(1), &hex::encode(&r), &lens, 0, 0, 0, None, Some(n)).unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_c3s").await.unwrap();
+        // With a node that settles: the usage frame, per request.
+        let m = texts(&mut rx);
+        let u = m.iter().find(|x| x["type"] == "usage").unwrap();
+        assert_eq!((u["n"].as_u64(), u["http"].as_u64(), u["model"].as_str()), (Some(1), Some(2), Some("m")));
+        // Request 2 on the same connection, released; no response yet.
+        on_request(&app, &tx, &mut st, 2, None, "m".into(), 20, 400, None).unwrap();
+        let block = st.h2.as_ref().unwrap().req.as_ref().unwrap().block.len();
+        client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+        client_bytes(&mut st, &record(10 + 400)).unwrap();
+        on_release(&mut st, 2, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().s_k, Some(n));
+        // (d) Request 1's tail presented for request 2: its records lie
+        // before S_2. The same bytes with stream 5 written into the frame
+        // headers do not help.
+        let err = on_disclose(&app, &sh, &tx, &mut st, &log, Some(2), &hex::encode(&r), &lens, 0, 0, 0, None, Some(n)).unwrap_err();
+        assert!(err.to_string().contains("interval"), "{err}");
+        let mut forged = r.clone();
+        let mut at = 0;
+        while at < forged.len() {
+            forged[at + 8] = 5;
+            at += 9 + forged[at + 2] as usize + ((forged[at + 1] as usize) << 8);
+        }
+        assert!(h2::parse_usage_tail(&forged, 5).is_ok());
+        let err = on_disclose(&app, &sh, &tx, &mut st, &log, Some(2), &hex::encode(&forged), &lens, 0, 0, 0, None, Some(n)).unwrap_err();
+        assert!(err.to_string().contains("interval"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn error_head_disclosure() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        for c in [&[1u8; 40][..], &[2; 900], &[3; 30]] {
+            feed(&mut st, &mut log, c);
+        }
+        send_request(&mut st, 300);
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        // The head may not be disclosed while our records are unproven.
+        let block = [0x20, 0x8d, 0x00, 0x04, b'd', b'a', b't', b'e', 0x03, b'x', b'y', b'z'];
+        let head = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &block);
+        assert!(on_disclose_head(&app, &sh, &tx, &mut st, &log, 1, 3, &hex::encode(&head), 0, 0).is_err());
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        // The 404 head split over two records (index 3 and 4), the second
+        // also holding the start of the error body.
+        feed(&mut st, &mut log, &head[..12]);
+        let mut second = head[12..].to_vec();
+        second.extend_from_slice(&h2::frame(h2::DATA, h2::END_STREAM, 3, b"{\"error\":\"no\"}"));
+        feed(&mut st, &mut log, &second);
+        texts(&mut rx);
+        let go = |st: &mut Session, n: u32, record: usize, r: &[u8]| on_disclose_head(&app, &sh, &tx, st, &log, n, record, &hex::encode(r), 0, 0);
+        // A record before the interval, one not received, another request,
+        // a success head, a frame on another stream, more than the frame.
+        assert!(go(&mut st, 1, 2, &head).is_err());
+        assert!(go(&mut st, 1, 5, &head).is_err());
+        assert!(go(&mut st, 2, 3, &head).is_err());
+        assert!(go(&mut st, 1, 3, &h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &[0x88])).is_err());
+        assert!(go(&mut st, 1, 3, &h2::frame(h2::HEADERS, h2::END_HEADERS, 5, &block)).is_err());
+        let mut long = head.clone();
+        long.push(0);
+        assert!(go(&mut st, 1, 3, &long).is_err());
+        // A head that would run past the records received.
+        let mut big = vec![0x8d, 0x00, 0x01, b'x', 80];
+        big.extend_from_slice(&[b'v'; 80]);
+        assert!(go(&mut st, 1, 4, &h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &big)).is_err());
+        assert!(texts(&mut rx).is_empty());
+        go(&mut st, 1, 3, &head).unwrap();
+        let m = texts(&mut rx);
+        assert_eq!(m.iter().map(|x| x["type"].as_str().unwrap()).collect::<Vec<_>>(), vec!["attestation", "zk_params"]);
+        assert_eq!((m[1]["proof"].as_str(), m[1]["purpose"].as_str()), (Some("pi_win"), Some("error_head")));
+        let Params::PiWin(p) = serde_json::from_value(m[1]["params"].clone()).unwrap() else { panic!() };
+        // Anchored on h2; record 3 in full (head bytes and its type byte),
+        // record 4 from offset 0 for the rest, and its last byte.
+        assert_eq!(p.anchor, [0x22; 32]);
+        assert_eq!(p.windows.iter().map(|w| w.seq).collect::<Vec<_>>(), vec![1, 2, 2]);
+        let mut first = head[..12].to_vec();
+        first.push(0x17);
+        assert_eq!(p.windows[0].expected, first);
+        assert_eq!(p.windows[1].expected, head[12..]);
+        assert_eq!(p.windows[2].expected, [0x17]);
+        // While that proof is out, the client's own records get no batch.
+        on_ctl(&mut st, "ping_ack").unwrap();
+        client_bytes(&mut st, &record(18)).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        assert!(texts(&mut rx).is_empty());
+        // Verified: an error receipt, and the connection closes.
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let m = texts(&mut rx);
+        assert_eq!(m[0]["receipt"]["usage"]["error_status"], 404);
+        assert_eq!(st.h2.as_ref().unwrap().closing, Some("error_settled"));
+    }
+
+    #[test]
+    fn requests_are_sequential_and_limited() {
+        let app = app_state(false);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut st = open_session(300);
+        // One in flight: no second.
+        assert!(on_request(&app, &tx, &mut st, 2, None, "m".into(), 20, 400, None).is_err());
+        st.h2.as_mut().unwrap().req = None;
+        let ok = |st: &mut Session, n: u32, kind: Option<&str>, model: &str, max_tokens: u64, len: usize, suffix: Option<&str>| {
+            let r = on_request(&app, &tx, st, n, kind, model.into(), max_tokens, len, suffix);
+            if r.is_ok() {
+                let h = st.h2.as_mut().unwrap();
+                h.req = None;
+                h.requests -= 1;
+            }
+            r
+        };
+        ok(&mut st, 2, Some("chat"), "m", 20, 400, None).unwrap();
+        assert!(ok(&mut st, 3, None, "m", 20, 400, None).is_err(), "out of order");
+        assert!(ok(&mut st, 2, Some("images"), "m", 20, 400, None).is_err());
+        assert!(ok(&mut st, 2, None, "", 20, 400, None).is_err());
+        assert!(ok(&mut st, 2, None, "m", 0, 400, None).is_err());
+        assert!(ok(&mut st, 2, None, "m", 1 << 20, 400, None).is_err());
+        assert!(ok(&mut st, 2, None, "m", 20, 10, None).is_err(), "shorter than the suffix");
+        assert!(ok(&mut st, 2, None, "m", 20, (1 << 20) + 1, None).is_err());
+        assert!(ok(&mut st, 2, None, "m", 20, 400, Some(",\"model\":\"other\"}")).is_err());
+        let canonical = app.offer.chat.render("m", 20);
+        ok(&mut st, 2, None, "m", 20, 400, Some(&canonical)).unwrap();
+        // The connection's request limit, and a closing connection.
+        st.h2.as_mut().unwrap().requests = 3;
+        assert!(ok(&mut st, 4, None, "m", 20, 400, None).is_err());
+        st.h2.as_mut().unwrap().requests = 1;
+        st.h2.as_mut().unwrap().tcp_closed = true;
+        assert!(ok(&mut st, 2, None, "m", 20, 400, None).is_err());
+        // Before the head is written.
+        let mut early = open_session(300);
+        early.h2.as_mut().unwrap().req = None;
+        early.state = SessionState::AwaitHead;
+        assert!(on_request(&app, &tx, &mut early, 2, None, "m".into(), 20, 400, None).is_err());
+    }
+
+    #[test]
+    fn upstream_close_by_request_state() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Idle: the session ends in order.
+        let mut st = open_session(300);
+        st.h2.as_mut().unwrap().req = None;
+        tcp_closed(&mut st, &tx).unwrap();
+        assert_eq!(st.h2.as_ref().unwrap().closing, Some("upstream_closed"));
+        // A request not fully released: nothing is at stake.
+        let mut st = open_session(300);
+        assert!(tcp_closed(&mut st, &tx).is_err());
+        assert_eq!(texts(&mut rx)[0]["type"], "upstream_closed_early");
+        // A released one may still be disclosed.
+        let mut st = open_session(300);
+        st.h2.as_mut().unwrap().req.as_mut().unwrap().released = true;
+        tcp_closed(&mut st, &tx).unwrap();
+        assert!(st.h2.as_ref().unwrap().closing.is_none());
     }
 
     #[test]
