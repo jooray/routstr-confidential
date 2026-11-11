@@ -167,6 +167,8 @@ pub struct HandshakeInfo {
     pub leaf_der: Vec<u8>,
     /// Number of server APPLICATION_DATA records consumed by the handshake.
     pub server_handshake_records: usize,
+    /// The protocol EncryptedExtensions selected (ALPN), if any.
+    pub alpn: Option<Vec<u8>>,
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -350,7 +352,43 @@ pub fn verify_handshake(
         cert_chain_hash,
         leaf_der,
         server_handshake_records: server_seq as usize,
+        alpn: selected_alpn(&ee)?,
     })
+}
+
+/// The protocol an EncryptedExtensions message (with its 4-byte header)
+/// selects with ALPN (RFC 7301: exactly one name), or `None` without the
+/// extension.
+pub fn selected_alpn(ee: &[u8]) -> Result<Option<Vec<u8>>> {
+    let bad = || anyhow!("malformed EncryptedExtensions");
+    let body = ee.get(4..).ok_or_else(bad)?;
+    let n = u16::from_be_bytes([*body.first().ok_or_else(bad)?, *body.get(1).ok_or_else(bad)?]) as usize;
+    let mut exts = body.get(2..2 + n).ok_or_else(bad)?;
+    if body.len() != 2 + n {
+        return Err(bad());
+    }
+    let mut found = None;
+    while !exts.is_empty() {
+        if exts.len() < 4 {
+            return Err(bad());
+        }
+        let ty = u16::from_be_bytes([exts[0], exts[1]]);
+        let len = u16::from_be_bytes([exts[2], exts[3]]) as usize;
+        let data = exts.get(4..4 + len).ok_or_else(bad)?;
+        exts = &exts[4 + len..];
+        if ty == 16 {
+            // ProtocolNameList with exactly one name.
+            let ok = data.len() >= 3
+                && u16::from_be_bytes([data[0], data[1]]) as usize == data.len() - 2
+                && data[2] as usize == data.len() - 3
+                && data.len() > 3;
+            if !ok || found.is_some() {
+                bail!("EncryptedExtensions: malformed or repeated ALPN");
+            }
+            found = Some(data[3..].to_vec());
+        }
+    }
+    Ok(found)
 }
 
 /// The content of a decrypted handshake-epoch record (RFC 8446 §5.4): strip

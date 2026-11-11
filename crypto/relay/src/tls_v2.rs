@@ -28,6 +28,9 @@ const EXT_ALPN: u16 = 16;
 /// The only ALPN a ClientHello may offer: the credential record is an
 /// HTTP/1.1 head, which a provider that negotiated h2 would refuse.
 const ALPN_HTTP11: &[u8] = b"\x00\x09\x08http/1.1";
+/// The only ALPN of an `http: 2` session (protocol v3): its credential record
+/// is an HTTP/2 connection head.
+const ALPN_H2: &[u8] = b"\x00\x03\x02h2";
 const TLS13: u16 = 0x0304;
 /// `legacy_version` of a TLS 1.3 ClientHello and ServerHello (RFC 8446 §4.1).
 const LEGACY_VERSION: u16 = 0x0303;
@@ -96,8 +99,9 @@ fn ext<'a>(exts: &[(u16, &'a [u8])], ty: u16) -> Option<&'a [u8]> {
 }
 
 /// Check a full ClientHello handshake message (with its 4-byte header)
-/// against the v2 profile and the joint key share.
-pub fn check_client_hello(msg: &[u8], joint: &[u8; 65]) -> Result<()> {
+/// against the v2 profile and the joint key share. `h2` is an `http: 2`
+/// session: its ClientHello must offer ALPN with exactly `h2`.
+pub fn check_client_hello(msg: &[u8], joint: &[u8; 65], h2: bool) -> Result<()> {
     if msg.len() < 4 || msg[0] != HS_CLIENT_HELLO {
         bail!("not a ClientHello");
     }
@@ -145,7 +149,11 @@ pub fn check_client_hello(msg: &[u8], joint: &[u8; 65]) -> Result<()> {
     if group != GROUP_SECP256R1 || share != joint.as_slice() {
         bail!("ClientHello key share is not the joint P-256 share");
     }
-    if ext(&exts, EXT_ALPN).is_some_and(|a| a != ALPN_HTTP11) {
+    if h2 {
+        if ext(&exts, EXT_ALPN) != Some(ALPN_H2) {
+            bail!("the ClientHello of an http: 2 session must offer exactly h2 (ALPN)");
+        }
+    } else if ext(&exts, EXT_ALPN).is_some_and(|a| a != ALPN_HTTP11) {
         bail!("ClientHello may offer only http/1.1 (ALPN)");
     }
     Ok(())
@@ -329,41 +337,55 @@ mod tests {
     #[test]
     fn accepts_the_v2_profile() {
         let ch = client_hello(&[0x1301], &[0x17], &[(0x17, joint().to_vec())], &[]);
-        check_client_hello(&ch, &joint()).unwrap();
+        check_client_hello(&ch, &joint(), false).unwrap();
     }
 
     #[test]
     fn rejects_an_extra_or_foreign_key_share() {
         let x25519 = (0x1d, vec![9u8; 32]);
         let ch = client_hello(&[0x1301], &[0x17], &[(0x17, joint().to_vec()), x25519.clone()], &[]);
-        assert!(check_client_hello(&ch, &joint()).is_err());
+        assert!(check_client_hello(&ch, &joint(), false).is_err());
         let ch = client_hello(&[0x1301], &[0x17, 0x1d], &[(0x17, joint().to_vec())], &[]);
-        assert!(check_client_hello(&ch, &joint()).is_err());
+        assert!(check_client_hello(&ch, &joint(), false).is_err());
         let mut other = joint();
         other[10] ^= 1;
         let ch = client_hello(&[0x1301], &[0x17], &[(0x17, other.to_vec())], &[]);
-        assert!(check_client_hello(&ch, &joint()).is_err());
+        assert!(check_client_hello(&ch, &joint(), false).is_err());
     }
 
     #[test]
     fn rejects_psk_early_data_and_other_suites() {
         let share = [(0x17, joint().to_vec())];
         let ch = client_hello(&[0x1301], &[0x17], &share, &[(EXT_PRE_SHARED_KEY, vec![0, 0])]);
-        assert!(check_client_hello(&ch, &joint()).is_err());
+        assert!(check_client_hello(&ch, &joint(), false).is_err());
         let ch = client_hello(&[0x1301], &[0x17], &share, &[(EXT_EARLY_DATA, vec![])]);
-        assert!(check_client_hello(&ch, &joint()).is_err());
+        assert!(check_client_hello(&ch, &joint(), false).is_err());
         let ch = client_hello(&[0x1301, 0x1302], &[0x17], &share, &[]);
-        assert!(check_client_hello(&ch, &joint()).is_err());
+        assert!(check_client_hello(&ch, &joint(), false).is_err());
     }
 
     #[test]
     fn alpn_is_absent_or_http11() {
         let share = [(0x17, joint().to_vec())];
         let ch = client_hello(&[0x1301], &[0x17], &share, &[(EXT_ALPN, ALPN_HTTP11.to_vec())]);
-        check_client_hello(&ch, &joint()).unwrap();
+        check_client_hello(&ch, &joint(), false).unwrap();
         for bad in [&b"\x00\x03\x02h2"[..], b"\x00\x0c\x02h2\x08http/1.1", b"\x00\x09\x08http/1.0", b""] {
             let ch = client_hello(&[0x1301], &[0x17], &share, &[(EXT_ALPN, bad.to_vec())]);
-            assert!(check_client_hello(&ch, &joint()).is_err(), "{bad:?}");
+            assert!(check_client_hello(&ch, &joint(), false).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_h2_session_offers_exactly_h2() {
+        let share = [(0x17, joint().to_vec())];
+        let ch = client_hello(&[0x1301], &[0x17], &share, &[(EXT_ALPN, ALPN_H2.to_vec())]);
+        check_client_hello(&ch, &joint(), true).unwrap();
+        // The v2 profile still refuses h2, and an h2 session anything else.
+        assert!(check_client_hello(&ch, &joint(), false).is_err());
+        for bad in [Some(ALPN_HTTP11), Some(&b"\x00\x0c\x02h2\x08http/1.1"[..]), Some(&b"\x00\x0c\x08http/1.1\x02h2"[..]), None] {
+            let extra: Vec<(u16, Vec<u8>)> = bad.iter().map(|b| (EXT_ALPN, b.to_vec())).collect();
+            let ch = client_hello(&[0x1301], &[0x17], &share, &extra);
+            assert!(check_client_hello(&ch, &joint(), true).is_err(), "{bad:?}");
         }
     }
 

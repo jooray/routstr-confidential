@@ -19,6 +19,9 @@
 //! The API key lives only in memory, is never logged (only its length), and
 //! appears only inside the single credential record written to the upstream.
 
+mod h2;
+mod h2_session;
+mod hpack;
 mod tls;
 mod tls_v2;
 mod wsio;
@@ -95,6 +98,15 @@ struct Offer {
     /// Further request kinds beside chat completions (absent: chat only).
     #[serde(default, skip_serializing_if = "Endpoints::is_empty")]
     endpoints: Endpoints,
+    /// The HTTP versions a session may ask for (`setup.http`): `"1.1"` always
+    /// (protocol v2 as it is), `"2"` when the offer file has an `h2` block
+    /// (protocol v3 option A, `PROTOCOL-V3-DESIGN.md`). Set at startup.
+    #[serde(default)]
+    http: Vec<String>,
+    /// HTTP/2 sessions: one handshake per connection, the credential by
+    /// HPACK index, sequential requests. Absent: not offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    h2: Option<h2::H2Block>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -834,11 +846,29 @@ struct SessionShared {
     /// Proofs that started running (on the channel or their own connection):
     /// each runs at most once per session.
     proofs_run: StdMutex<std::collections::HashSet<String>>,
+    /// An `http: 2` session: π_WIN and π_C3S run once per stored parameter
+    /// set (`fresh`) instead of once per session.
+    multi: std::sync::atomic::AtomicBool,
+    fresh: StdMutex<std::collections::HashSet<String>>,
 }
 
 impl SessionShared {
-    /// Claim `proof`'s one run, refusing a second one.
+    /// Store the parameters of the next run of `proof` (an `http: 2` session:
+    /// they may be proven once).
+    fn set_params(&self, proof: &str, params: Params) {
+        self.params.lock().unwrap().insert(proof.to_string(), params);
+        self.fresh.lock().unwrap().insert(proof.to_string());
+    }
+
+    /// Claim `proof`'s one run, refusing a second one. In an `http: 2`
+    /// session π_WIN and π_C3S run once per stored parameter set.
     fn claim_proof(&self, proof: &str) -> Result<()> {
+        if self.multi.load(std::sync::atomic::Ordering::SeqCst) && matches!(proof, "pi_win" | "pi_c3s") {
+            if !self.fresh.lock().unwrap().remove(proof) {
+                bail!("{proof}: no unproven parameters for this session");
+            }
+            return Ok(());
+        }
         if !self.proofs_run.lock().unwrap().insert(proof.to_string()) {
             bail!("{proof} already ran for this session");
         }
@@ -973,7 +1003,8 @@ Options:
   --host NAME             TLS server name to verify (default: the --upstream host)
   --key-env VAR           environment variable holding the provider API key
                           (default VENICE_API_KEY, the case-study provider's)
-  --offer FILE            sidecar offer file (head template, chat block, endpoints)
+  --offer FILE            sidecar offer file (head template, chat block, endpoints;
+                          an h2 block offers HTTP/2 sessions, protocol v3 option A)
   --node-settles          hand verified usage to the node to settle (production)
   --token-env VAR         node token variable (default CU_SIDECAR_TOKEN; required
                           off loopback)
@@ -1070,6 +1101,8 @@ async fn main() -> Result<()> {
             model_allowlist: Vec::new(),
             node_settles: false,
             endpoints: Endpoints::default(),
+            http: Vec::new(),
+            h2: None,
         }
     };
     offer.node_settles = node_settles;
@@ -1108,6 +1141,15 @@ async fn main() -> Result<()> {
         images.head_template = with_key_length(&images.head_template, key.len());
         let host = offer.upstream_host.clone();
         images.validate(&host, key.len())?;
+    }
+    // HTTP/2 sessions are offered only with an `h2` block; the list is the
+    // sidecar's, whatever the offer file says.
+    offer.http = vec!["1.1".to_string()];
+    if let Some(block) = &offer.h2 {
+        block.validate(&offer.upstream_host, key.len()).context("the offer's h2 block")?;
+        h2_session::chat_path(&offer.head_template).context("the offer's h2 block")?;
+        offer.http.push("2".to_string());
+        info!(probe_path = %block.probe_path, idle_secs = block.idle_secs, max_requests = block.max_requests, "http: 2 sessions offered");
     }
     // The π_NK membership circuit is a fixed-size check over one alphabet. An
     // offer demanding another alphabet must fail here rather than let the
@@ -1210,10 +1252,16 @@ async fn session_ws(ws: WebSocketUpgrade, State(app): State<Arc<AppState>>) -> i
 enum ClientMsg {
     Setup {
         nonce_c: String,
+        #[serde(default)]
         model: String,
         #[serde(default)]
         max_tokens: u64,
+        #[serde(default)]
         len: usize,
+        /// `2` selects an HTTP/2 session (protocol v3 option A): the setup
+        /// then names no request terms. Absent or `1.1`: protocol v2.
+        #[serde(default)]
+        http: Option<serde_json::Value>,
         /// `chat` (default) or `images`; any other kind is refused.
         #[serde(default)]
         kind: Option<String>,
@@ -1261,6 +1309,48 @@ enum ClientMsg {
         /// size. Absent: one trailing close_notify-sized record may be skipped.
         #[serde(default)]
         trailing: Option<usize>,
+        /// `http: 2` only: the request the disclosure is for, and the number
+        /// of server application-data records the client had received when
+        /// it built R (R runs to the end of the last of them).
+        #[serde(default)]
+        n: Option<u32>,
+        #[serde(default)]
+        server_records: Option<usize>,
+    },
+    /// `http: 2`: the terms of the next request on the connection (the
+    /// fields a v2 setup carries; the node reserves on it).
+    Request {
+        n: u32,
+        #[serde(default)]
+        kind: Option<String>,
+        model: String,
+        #[serde(default)]
+        max_tokens: u64,
+        body_len: usize,
+        #[serde(default)]
+        suffix: Option<String>,
+    },
+    /// `http: 2`: the client's next record is this control frame
+    /// (`settings_ack`, `ping_ack`, `window_update`, `rst_stream`).
+    Ctl {
+        frame: String,
+    },
+    /// `http: 2`: the first `upto` records of request `n` may be written to
+    /// the upstream once proven (flow control is the client's to follow).
+    Release {
+        n: u32,
+        upto: usize,
+    },
+    /// `http: 2`: the response head of a refused request: one HEADERS frame
+    /// at the start of server application-data record `record`.
+    DiscloseHead {
+        n: u32,
+        record: usize,
+        r: String,
+        #[serde(default)]
+        key_updates: u32,
+        #[serde(default)]
+        epoch_start: usize,
     },
     /// The client accepts π_NK (it verified it) and claims the session; N
     /// writes the credential record and the KeyUpdate under K_0.
@@ -1309,6 +1399,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         zkchan_taken: std::sync::atomic::AtomicBool::new(false),
         zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         proofs_run: StdMutex::new(Default::default()),
+        multi: std::sync::atomic::AtomicBool::new(false),
+        fresh: StdMutex::new(Default::default()),
     });
 
     // Upstream bytes in flight to the client (queued or being sent) hold
@@ -1431,8 +1523,29 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     v2_pump_client(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
 
         loop {
+            if let Some(h) = st.h2.as_mut() {
+                // An `http: 2` connection ends in order (idle, its request
+                // limit, a settled error), and its deadline moves with its
+                // requests.
+                if let Some(reason) = h.closing.take() {
+                    let _ = to_client.send(Message::Text(serde_json::json!({"type":"closed","reason":reason}).to_string().into()));
+                    side(&mut st, format!("connection closed: {reason}"));
+                    break;
+                }
+                if let Some(d) = st.deadline.filter(|d| *d != deadline.deadline()) {
+                    deadline.as_mut().reset(d);
+                }
+            }
             tokio::select! {
-                _ = &mut deadline => bail!("session time limit ({}s) reached", SESSION_TIMEOUT.as_secs()),
+                _ = &mut deadline => {
+                    if let Some(h) = st.h2.as_mut().filter(|h| h.idle()) {
+                        h.closing = Some("idle");
+                        st.deadline = None;
+                        deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_TIMEOUT);
+                        continue;
+                    }
+                    bail!("session time limit ({}s) reached", SESSION_TIMEOUT.as_secs())
+                },
                 msg = ws_rx.next() => {
                     let Some(Ok(msg)) = msg else { break };
                     match msg {
@@ -1450,6 +1563,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 // client fails fast instead of timing out.
                                 return Err(e);
                             }
+                            h2_session::pump(&shared, &to_client, &mut st, &log, &mut tcp_tx).await?;
                         }
                     Message::Binary(data) => {
                         if st.sid.is_none() {
@@ -1460,7 +1574,12 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 buffer_client(&mut client_pending, &data, st.body_len)?;
                                 v2_pump_client(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                             }
+                            SessionState::AwaitHead if st.h2.is_some() => bail!("http: 2: a client record before the connection head was written"),
                             SessionState::AwaitHead => buffer_client(&mut st.held_client, &data, st.body_len)?,
+                            SessionState::Body if st.h2.is_some() => {
+                                h2_session::client_bytes(&mut st, &data)?;
+                                h2_session::pump(&shared, &to_client, &mut st, &log, &mut tcp_tx).await?;
+                            }
                             SessionState::Body => {
                                 if !st.held_client.is_empty() {
                                     // The partial record left over from the head write.
@@ -1486,7 +1605,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         log.server_bytes(&bytes, st.handshake.is_some())?;
                         server_pending.extend_from_slice(&bytes);
                         let (recs, used) = parse_records(&server_pending);
-                        for r in recs { log.server_record(r); }
+                        for r in recs {
+                            if let Some(h) = st.h2.as_mut() { h.server_record(&r); }
+                            log.server_record(r);
+                        }
                         server_pending.drain(..used);
                         if to_client.send(Message::Binary(bytes.into())).is_err() { break; }
                         v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
@@ -1510,6 +1632,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         *shared.k0_iv0.lock().unwrap() = Some(kiv);
                         st.ap = Some(ap);
                         v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
+                    }
+                    Ev::TcpClosed if st.h2.is_some() => {
+                        info!("upstream closed the connection");
+                        h2_session::tcp_closed(&mut st, &to_client)?;
                     }
                     Ev::TcpClosed => {
                         info!("upstream closed the connection");
@@ -1573,6 +1699,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 continue;
                             }
                             bail!("proof {proof} failed: {err:?}");
+                        }
+                        if st.h2.is_some() && matches!(proof.as_str(), "pi_win" | "pi_c3s") {
+                            h2_session::proof_done(&app, &shared, &to_client, &mut st, &log, &mut tcp_tx, &proof, proven.as_ref()).await?;
+                            continue;
                         }
                         match proof.as_str() {
                             "pi_nk" => {
@@ -1752,6 +1882,8 @@ struct Session {
     usage: Option<serde_json::Value>,
     run_dir: Option<std::path::PathBuf>,
     side_log: Vec<String>,
+    /// `Some` for an `http: 2` session (protocol v3 option A).
+    h2: Option<Box<h2_session::H2>>,
 }
 
 fn side(st: &mut Session, ev: String) {
@@ -1775,11 +1907,17 @@ fn handle_setup(
     let send = |v: serde_json::Value| {
         let _ = to_client.send(Message::Text(v.to_string().into()));
     };
-    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed, kind, suffix, count } = msg else {
+    let ClientMsg::Setup { nonce_c, model, max_tokens, len, escrow_e, escrow, armed, kind, suffix, count, http } = msg else {
         bail!("expected a setup frame");
     };
     if st.sid.is_some() || st.state != SessionState::Handshake {
         bail!("duplicate setup");
+    }
+    if h2_session::wants_h2(http.as_ref())? {
+        if kind.is_some() || !model.is_empty() || max_tokens != 0 || len != 0 || suffix.is_some() || count.is_some() {
+            bail!("an http: 2 setup names no kind, model, max_tokens, length, suffix or count: they belong to its requests");
+        }
+        return h2_session::handle_setup(app, shared, to_client, st, &nonce_c, escrow.as_deref(), escrow_e, armed);
     }
     let images = match kind.as_deref() {
         None | Some("chat") => false,
@@ -1814,9 +1952,6 @@ fn handle_setup(
     if len == 0 || len > app.max_body {
         bail!("declared body length {len} outside 1..={}", app.max_body);
     }
-    if hex::decode(&nonce_c).map(|n| n.len()).unwrap_or(0) != 32 {
-        bail!("nonce_c must be 32 bytes of hex");
-    }
     if max_tokens > app.offer.max_tokens_cap {
         bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
     }
@@ -1824,22 +1959,7 @@ fn handle_setup(
     if !app.offer.model_allowlist.is_empty() && !app.offer.model_allowlist.contains(&model) {
         bail!("model {model:?} is not in the offer's model_allowlist");
     }
-    let nonce_n = os_random_32();
-    let mut h = Vec::new();
-    h.extend_from_slice(&hex::decode(&nonce_c)?);
-    h.extend_from_slice(&nonce_n);
-    // SPEC §5.1: sid = SHA256(nonce_C ‖ nonce_N ‖ SHA256(cashu_token)).
-    // Without a token (prototype / armed session before claim) the
-    // placeholder preserves the same shape.
-    match &escrow {
-        Some(token) => h.extend_from_slice(&cu_crypto::transcript::hash(token.as_bytes())),
-        None => {
-            let mut esc = b"stub-cashu".to_vec();
-            esc.extend_from_slice(&escrow_e.to_be_bytes());
-            h.extend_from_slice(&cu_crypto::transcript::hash(&esc));
-        }
-    }
-    let sid = hex::encode(cu_crypto::transcript::hash(&h));
+    let (sid, nonce_n) = session_id(&nonce_c, escrow.as_deref(), escrow_e)?;
     st.sid = Some(sid.clone());
     st.body_len = len;
     st.model = model.clone();
@@ -1868,6 +1988,26 @@ fn handle_setup(
     Ok(())
 }
 
+/// A fresh node nonce and the session id it gives with the client's:
+/// SPEC §5.1, sid = SHA256(nonce_C ‖ nonce_N ‖ SHA256(cashu_token)). Without
+/// a token (prototype / armed session before claim) the placeholder
+/// preserves the same shape.
+fn session_id(nonce_c: &str, escrow: Option<&str>, escrow_e: u64) -> Result<(String, [u8; 32])> {
+    let nonce_c = hex::decode(nonce_c).ok().filter(|n| n.len() == 32).ok_or_else(|| anyhow!("nonce_c must be 32 bytes of hex"))?;
+    let nonce_n = os_random_32();
+    let mut h = nonce_c;
+    h.extend_from_slice(&nonce_n);
+    match escrow {
+        Some(token) => h.extend_from_slice(&cu_crypto::transcript::hash(token.as_bytes())),
+        None => {
+            let mut esc = b"stub-cashu".to_vec();
+            esc.extend_from_slice(&escrow_e.to_be_bytes());
+            h.extend_from_slice(&cu_crypto::transcript::hash(&esc));
+        }
+    }
+    Ok((hex::encode(cu_crypto::transcript::hash(&h)), nonce_n))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_control(
     msg: ClientMsg,
@@ -1885,6 +2025,20 @@ async fn handle_control(
     match msg {
         // Handled once, before the upstream connection exists (handle_setup).
         ClientMsg::Setup { .. } => bail!("duplicate setup"),
+        ClientMsg::Request { n, kind, model, max_tokens, body_len, suffix } => {
+            h2_session::on_request(app, to_client, st, n, kind.as_deref(), model, max_tokens, body_len, suffix.as_deref())?;
+        }
+        ClientMsg::Ctl { frame } => h2_session::on_ctl(st, &frame)?,
+        ClientMsg::Release { n, upto } => h2_session::on_release(st, n, upto)?,
+        ClientMsg::DiscloseHead { n, record, r, key_updates, epoch_start } => {
+            h2_session::on_disclose_head(app, shared, to_client, st, log, n, record, &r, key_updates, epoch_start)?;
+        }
+        ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing, n, server_records } if st.h2.is_some() => {
+            h2_session::on_disclose(app, shared, to_client, st, log, n, &r, &tail_lens, skip, key_updates, epoch_start, trailing, server_records)?;
+        }
+        ClientMsg::BodySuffix { .. } | ClientMsg::Accept {} if st.h2.is_some() => {
+            bail!("not a message of an http: 2 session");
+        }
         ClientMsg::ReleaseHead {} => {
             if st.state != SessionState::AwaitHead || st.head_release.is_some() {
                 bail!("release_head out of order");
@@ -1943,7 +2097,7 @@ async fn handle_control(
             side(st, format!("accepted: flat charge for {count} image(s)"));
             emit_settlement(app, st, to_client);
         }
-        ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing } => {
+        ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing, .. } => {
             // Only once, and only after the upstream closed: the anchor is the
             // end of the final transcript.
             if st.state != SessionState::Attested || st.disclosed || st.accepted {
@@ -2227,6 +2381,11 @@ async fn write_head(
     info!(record_len = len, "credential record + KeyUpdate written to upstream");
     side(st, format!("credential_written len={len} c_commit={commit}"));
     let _ = to_client.send(Message::Text(serde_json::json!({"type":"head_written"}).to_string().into()));
+    if st.h2.is_some() {
+        // The connection is open; the client's records are held by π_WIN.
+        h2_session::head_written(st);
+        return Ok(());
+    }
     let mut held = std::mem::take(&mut st.held_client);
     relay_body(st, log, &mut held, tcp_tx).await?;
     // A record split across WebSocket frames: its start stays here and the
@@ -2253,7 +2412,7 @@ fn check_hello(st: &mut Session, pending: &[u8]) -> Result<bool> {
     if *ty != tls::HS_CLIENT_HELLO || msg.len() != r.payload.len() {
         bail!("first client record must be exactly the ClientHello");
     }
-    tls_v2::check_client_hello(msg, &joint)?;
+    tls_v2::check_client_hello(msg, &joint, st.h2.is_some())?;
     st.ch_checked = true;
     info!("v2 ClientHello checked: one P-256 share, the joint key");
     Ok(true)
@@ -2343,6 +2502,11 @@ async fn v2_progress(
         }
         info!(th_sh = %hex::encode(info.th_sh), "v2 handshake verified: chain + hostname + CertificateVerify + both Finished");
         side(st, format!("handshake_verified th_sh={}", hex::encode(info.th_sh)));
+        // An `http: 2` session: the provider must have selected h2, or the
+        // connection head N is about to write would not be HTTP/2.
+        if st.h2.is_some() && info.alpn.as_deref() != Some(b"h2") {
+            bail!("the provider did not select h2 (ALPN) for an http: 2 session");
+        }
         st.handshake = Some(info);
         let _ = to_client.send(Message::Text(serde_json::json!({"type":"hs_verified"}).to_string().into()));
     }
@@ -2353,7 +2517,7 @@ async fn v2_progress(
         let header: [u8; 5] = rec[..5].try_into()?;
         let c_commit = cu_crypto::transcript::hash(&rec[..rec.len() - 16]);
         st.ku_record = Some(tls_v2::seal_record(&ap.k0, &ap.iv0, 1, &tls_v2::KEY_UPDATE_NOT_REQUESTED, tls::CT_HANDSHAKE)?);
-        let (template, _) = placeholder_head(&st.head_template, app.key.len(), st.body_len)?;
+        let (template, _) = head_template_now(app, st)?;
         let params = Params::PiNK(zkbench::statements::PiNK {
             hk: ap.hk,
             head_len: st.head_len,
@@ -2413,9 +2577,19 @@ where
     Ok(())
 }
 
+/// The session's head with zeros at the key's positions, and those
+/// positions: the HTTP/1.1 request head of a v2 session, or the HTTP/2
+/// connection head of an `http: 2` one.
+fn head_template_now(app: &Arc<AppState>, st: &Session) -> Result<(Vec<u8>, Vec<usize>)> {
+    match &st.h2 {
+        Some(h) => h2_session::head_template(app, h),
+        None => placeholder_head(&st.head_template, app.key.len(), st.body_len),
+    }
+}
+
 /// The head with the API key spliced in; zeroized when dropped.
 fn fill_head_now(app: &Arc<AppState>, st: &Session) -> Result<(Zeroizing<Vec<u8>>, Vec<usize>)> {
-    let (head, offsets) = placeholder_head(&st.head_template, app.key.len(), st.body_len)?;
+    let (head, offsets) = head_template_now(app, st)?;
     let mut head = Zeroizing::new(head);
     for (i, off) in offsets.iter().enumerate() {
         head[*off] = app.key[i];
@@ -2444,7 +2618,7 @@ async fn zk_ws(
 const ZK_MAX_MESSAGE: usize = 4 << 20;
 
 /// The proof names a `/zk` connection may carry.
-const ZK_PROOFS: [&str; 5] = ["twopc", "zkchan", "pi_nk", "pi_c2s", "pi_c3s"];
+const ZK_PROOFS: [&str; 6] = ["twopc", "zkchan", "pi_nk", "pi_c2s", "pi_c3s", "pi_win"];
 
 async fn zk_handler(socket: WebSocket, q: HashMap<String, String>, app: Arc<AppState>) {
     let proof = q.get("proof").cloned().unwrap_or_default();
@@ -2498,7 +2672,10 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
         let (io, bridge) = ws_duplex(socket);
         // The channel ends with its session, which lasts at most two
         // `SESSION_TIMEOUT`s (up to the release, then after it).
-        let result = tokio::time::timeout(2 * SESSION_TIMEOUT, run_zkchan(io, &shared))
+        // (An `http: 2` connection lives up to `H2_CONN_MAX`, plus its last request.)
+        let multi = shared.multi.load(std::sync::atomic::Ordering::SeqCst);
+        let limit = if multi { h2_session::H2_CONN_MAX + 2 * SESSION_TIMEOUT } else { 2 * SESSION_TIMEOUT };
+        let result = tokio::time::timeout(limit, run_zkchan(io, &shared))
             .await
             .unwrap_or_else(|_| Err(anyhow!("proof channel reached the session time limit")));
         bridge.finish().await;
@@ -2586,6 +2763,7 @@ where
     let mut ch = tokio::time::timeout(TWOPC_TIMEOUT, ZkChannel::open(io, Party::Node, Prealloc::default()))
         .await
         .map_err(|_| anyhow!("proof channel preprocessing timed out"))??;
+    ch.set_multi(shared.multi.load(std::sync::atomic::Ordering::SeqCst));
     let steps: Vec<String> = ch.take_timings().iter().map(|t| format!("{}={:.0}ms/{}B", t.step, t.ms, t.bytes_sent + t.bytes_recv)).collect();
     info!(steps = %steps.join(" "), "zkchan ready");
     loop {
@@ -2604,7 +2782,7 @@ where
         // the channel without reporting to the session, which goes on (the
         // client may fall back to the per-proof path).
         let ready = async {
-            if !matches!(proof.as_str(), "pi_nk" | "pi_c2s" | "pi_c3s") {
+            if !matches!(proof.as_str(), "pi_nk" | "pi_c2s" | "pi_c3s" | "pi_win") {
                 bail!("{proof} is not served on the proof channel");
             }
             let params = shared.params.lock().unwrap().get(proof.as_str()).cloned().ok_or_else(|| anyhow!("no params for {proof}"))?;
@@ -2978,6 +3156,15 @@ mod offer_tests {
     fn shipped_offer_parses() {
         let o: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
         assert!(o.model_allowlist.is_empty());
+        // The shipped offer stays HTTP/1.1 only; the h2 variant adds one block.
+        assert!(o.h2.is_none());
+        let h: Offer = serde_json::from_str(include_str!("../offer.venice.h2.json")).unwrap();
+        let block = h.h2.clone().expect("h2 block");
+        block.validate(&h.upstream_host, h.key_length).unwrap();
+        assert_eq!(crate::h2_session::chat_path(&h.head_template).unwrap(), "/api/v1/chat/completions");
+        let mut a = serde_json::to_value(&h).unwrap();
+        a.as_object_mut().unwrap().remove("h2");
+        assert_eq!(a, serde_json::to_value(&o).unwrap());
     }
 }
 
@@ -3357,6 +3544,8 @@ mod hardening_tests {
             zkchan_taken: std::sync::atomic::AtomicBool::new(false),
             zk_conns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             proofs_run: StdMutex::new(Default::default()),
+            multi: std::sync::atomic::AtomicBool::new(false),
+            fresh: StdMutex::new(Default::default()),
         });
         (s, rx)
     }
@@ -3577,6 +3766,8 @@ mod hardening_tests {
                 key_updates: 0,
                 epoch_start: 0,
                 trailing: None,
+                n: None,
+                server_records: None,
             };
             let err = futures_executor_block(handle_control(usage, &app, &s, &tx, &mut img, &mut log, &mut w)).unwrap_err();
             assert!(err.to_string().contains("only an error head"), "{err}");

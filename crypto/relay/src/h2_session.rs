@@ -1,0 +1,1063 @@
+//! An `http: 2` session (protocol v3, option A; `PROTOCOL-V3-DESIGN.md` A):
+//! one two-party handshake, N writes the HTTP/2 connection head with the
+//! credential once in epoch 0, and C then sends sequential requests that
+//! refer to it by HPACK index.
+//!
+//! Security-critical rules, all enforced here:
+//!   * Every client record is one HTTP/2 frame, queued in arrival order (the
+//!     order of its TLS sequence number) and written to the upstream only
+//!     after a π_WIN that covers it verified, and, for a request's records,
+//!     only up to the client's `release`.
+//!   * N builds every π_WIN and π_C3S parameter from its own buffers: the
+//!     queued client records, the server records it received.
+//!   * A request's disclosure covers only server records received after N
+//!     wrote that request's first record (`S_k`), runs to the last server
+//!     record N holds, and must show the request's stream ending.
+//!   * After an error, an abort or a failed proof the connection is closed;
+//!     only a settled 2xx request leaves it open for the next one.
+
+use std::collections::VecDeque;
+
+use super::*;
+use crate::h2::{self, Ctl};
+
+/// Longest life of one `http: 2` connection, whatever its traffic.
+pub(crate) const H2_CONN_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Most control records queued unproven.
+const MAX_QUEUED_CTL: usize = 16;
+/// Most records an error head may span (a response head is about 1 kB).
+const MAX_HEAD_RECORDS: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+enum RecKind {
+    Ctl(Ctl),
+    Headers,
+    Data { last: bool },
+}
+
+/// A client record held by N.
+struct Rec {
+    /// Its TLS sequence number under `c_ap_1` (the first record C writes
+    /// after its Finished is 0).
+    seq: u64,
+    /// The record as received (header, ciphertext, tag).
+    bytes: Vec<u8>,
+    kind: RecKind,
+    /// A verified π_WIN covers it.
+    proven: bool,
+    /// 1-based position among its request's records; 0 for a control record.
+    req_idx: usize,
+}
+
+enum WinInflight {
+    /// The first `n` unproven queued records.
+    Records(usize),
+    /// The current request's error head (server records under `s_ap_0`).
+    ErrorHead,
+}
+
+/// One request on the connection.
+struct Req {
+    n: u32,
+    stream: u32,
+    model: String,
+    body_len: usize,
+    suffix: String,
+    /// The public header block of its HEADERS frame.
+    block: Vec<u8>,
+    /// Records received (HEADERS and DATA), DATA payload bytes among them,
+    /// and whether the body is complete.
+    records: usize,
+    data_bytes: usize,
+    complete: bool,
+    /// The client's release limit and the records written to the upstream.
+    upto: usize,
+    written: usize,
+    released: bool,
+    /// `S_k`: the index (among the server's application-data records since
+    /// the connection began) of the first server record of this request's
+    /// interval; set when N writes the request's first record.
+    s_k: Option<usize>,
+    /// The interval: server records since `S_k`, until the disclosure.
+    interval_open: bool,
+    recv: cu_crypto::transcript::Transcript,
+    recv_records: usize,
+    recv_bytes: usize,
+    /// The request's records as written to the upstream.
+    sent: cu_crypto::transcript::Transcript,
+    /// The disclosed usage (or error status), settled once its proof verifies.
+    usage: Option<serde_json::Value>,
+    /// The proof the settlement waits for.
+    settle_on: Option<&'static str>,
+    attestation: Option<serde_json::Value>,
+}
+
+/// Per-connection state of an `http: 2` session.
+pub(crate) struct H2 {
+    cfg: h2::H2Block,
+    /// The request path (the chat route of the offer's head template).
+    path: String,
+    /// Client bytes that do not yet form a record, the records held, and
+    /// their size.
+    pending: Vec<u8>,
+    queue: VecDeque<Rec>,
+    held: usize,
+    next_seq: u64,
+    /// The control frame the client declared for its next record.
+    next_ctl: Option<Ctl>,
+    win: Option<WinInflight>,
+    /// Requests started on this connection.
+    requests: u32,
+    req: Option<Req>,
+    tcp_closed: bool,
+    /// Set to end the session in order (the loop sends `closed`).
+    pub(crate) closing: Option<&'static str>,
+    conn_end: Option<tokio::time::Instant>,
+}
+
+impl H2 {
+    fn new(cfg: h2::H2Block, path: String) -> Self {
+        H2 {
+            cfg,
+            path,
+            pending: Vec::new(),
+            queue: VecDeque::new(),
+            held: 0,
+            next_seq: 0,
+            next_ctl: None,
+            win: None,
+            requests: 0,
+            req: None,
+            tcp_closed: false,
+            closing: None,
+            conn_end: None,
+        }
+    }
+
+    /// No request in flight: an expired deadline is the idle limit.
+    pub(crate) fn idle(&self) -> bool {
+        self.req.is_none()
+    }
+
+    /// Most client bytes held at once: the request being collected (its body,
+    /// framing, and the HEADERS record) and a few control records.
+    fn buffer_limit(&self) -> usize {
+        let ctl = (MAX_QUEUED_CTL + 1) * 64;
+        match &self.req {
+            Some(q) => q.body_len + max_records(q.body_len) * 40 + 1024 + ctl,
+            None => ctl,
+        }
+    }
+
+    /// A complete server record, in arrival order: part of the current
+    /// request's interval while it is open.
+    pub(crate) fn server_record(&mut self, r: &Record) {
+        if r.ctype != CT_APPLICATION_DATA {
+            return;
+        }
+        if let Some(q) = self.req.as_mut().filter(|q| q.interval_open) {
+            q.recv.update(&r.header);
+            q.recv.update(&r.payload);
+            q.recv_records += 1;
+            q.recv_bytes += 5 + r.payload.len();
+        }
+    }
+
+    fn idle_deadline(&self) -> tokio::time::Instant {
+        let idle = tokio::time::Instant::now() + std::time::Duration::from_secs(self.cfg.idle_secs);
+        self.conn_end.map_or(idle, |end| end.min(idle))
+    }
+}
+
+/// Most records one request may arrive in: its HEADERS, and DATA frames that
+/// average at least 4 KiB (a client sends full records and one for the suffix).
+fn max_records(body_len: usize) -> usize {
+    3 + body_len / 4096
+}
+
+/// The path of the offer's chat route (`POST <path> HTTP/1.1` of the head
+/// template, checked at startup).
+pub(crate) fn chat_path(head_template: &str) -> Result<String> {
+    head_template
+        .strip_prefix("POST ")
+        .and_then(|t| t.split_once(" HTTP/1.1\r\n"))
+        .map(|(p, _)| p.to_string())
+        .filter(|p| h2::path_ok(p))
+        .ok_or_else(|| anyhow!("the head template names no usable request path"))
+}
+
+/// Whether a setup's `http` selects option A. Missing or 1.1: protocol v2.
+pub(crate) fn wants_h2(http: Option<&serde_json::Value>) -> Result<bool> {
+    match http {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(v) if v.as_str() == Some("1.1") || v.as_f64() == Some(1.1) => Ok(false),
+        Some(v) if v.as_str() == Some("2") || v.as_u64() == Some(2) => Ok(true),
+        Some(other) => bail!("unsupported http version {other}"),
+    }
+}
+
+/// The setup of an `http: 2` session: no request terms, only the connection.
+pub(crate) fn handle_setup(
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    nonce_c: &str,
+    escrow: Option<&str>,
+    escrow_e: u64,
+    armed: bool,
+) -> Result<()> {
+    let cfg = app.offer.h2.clone().ok_or_else(|| anyhow!("this sidecar offers no http: 2 sessions"))?;
+    let (sid, nonce_n) = session_id(nonce_c, escrow, escrow_e)?;
+    let (head, _) = h2::head(&app.offer.upstream_host, &cfg.probe_path, app.key.len())?;
+    st.sid = Some(sid.clone());
+    st.body_len = 0;
+    st.head_len = head.len();
+    st.h2 = Some(Box::new(H2::new(cfg.clone(), chat_path(&app.offer.head_template)?)));
+    shared.multi.store(true, std::sync::atomic::Ordering::SeqCst);
+    st.run_dir = Some(init_run_dir(app, &sid)?);
+    app.sessions.lock().unwrap().insert(sid.clone(), shared.clone());
+    side(st, format!("setup sid={sid} http=2 armed={armed} node_settles={}", app.node_settles));
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({
+            "type":"ready","nonce_n":hex::encode(nonce_n),"sid":sid,
+            "pubkey":app.offer.notary_pubkey,"head_len":head.len(),
+            "armed": armed, "v": app.offer.v, "http": 2, "h2": cfg,
+        })
+        .to_string()
+        .into(),
+    ));
+    Ok(())
+}
+
+/// The head template (zeros at the key's positions) and the key's positions.
+pub(crate) fn head_template(app: &AppState, h: &H2) -> Result<(Vec<u8>, Vec<usize>)> {
+    h2::head(&app.offer.upstream_host, &h.cfg.probe_path, app.key.len())
+}
+
+/// The connection head and the KeyUpdate are written: the connection is
+/// open and idle.
+pub(crate) fn head_written(st: &mut Session) {
+    let Some(h) = st.h2.as_mut() else { return };
+    h.conn_end = Some(tokio::time::Instant::now() + H2_CONN_MAX);
+    st.deadline = Some(h.idle_deadline());
+}
+
+/// `request`: the terms of the next request (what a v2 setup carries).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn on_request(
+    app: &Arc<AppState>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    n: u32,
+    kind: Option<&str>,
+    model: String,
+    max_tokens: u64,
+    body_len: usize,
+    suffix: Option<&str>,
+) -> Result<()> {
+    if st.state != SessionState::Body {
+        bail!("request before the connection head was written");
+    }
+    let sid = st.sid.clone().unwrap_or_default();
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("request on a session that is not http: 2"))?;
+    if h.req.is_some() {
+        bail!("a request is already in flight (requests are sequential)");
+    }
+    if h.tcp_closed || h.closing.is_some() {
+        bail!("the connection is closing");
+    }
+    if n != h.requests + 1 {
+        bail!("request number {n}, expected {}", h.requests + 1);
+    }
+    if n > h.cfg.max_requests {
+        bail!("request {n} exceeds max_requests {}", h.cfg.max_requests);
+    }
+    if !matches!(kind, None | Some("chat")) {
+        bail!("an http: 2 session serves chat requests only (kind {kind:?})");
+    }
+    if model.is_empty() || max_tokens == 0 {
+        bail!("a request needs a model and max_tokens >= 1");
+    }
+    if max_tokens > app.offer.max_tokens_cap {
+        bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
+    }
+    if !app.offer.model_allowlist.is_empty() && !app.offer.model_allowlist.contains(&model) {
+        bail!("model {model:?} is not in the offer's model_allowlist");
+    }
+    let canonical = app.offer.chat.render(&model, max_tokens);
+    if suffix.is_some_and(|s| s != canonical) {
+        bail!("a chat request's suffix is the canonical one");
+    }
+    if body_len <= canonical.len() || body_len > app.max_body {
+        bail!("declared body length {body_len} outside {}..={}", canonical.len() + 1, app.max_body);
+    }
+    let stream = h2::request_stream(n);
+    let block = h2::request_block(&app.offer.upstream_host, &h.path);
+    h.requests = n;
+    h.req = Some(Req {
+        n,
+        stream,
+        model: model.clone(),
+        body_len,
+        suffix: canonical.clone(),
+        block,
+        records: 0,
+        data_bytes: 0,
+        complete: false,
+        upto: 0,
+        written: 0,
+        released: false,
+        s_k: None,
+        interval_open: false,
+        recv: Default::default(),
+        recv_records: 0,
+        recv_bytes: 0,
+        sent: Default::default(),
+        usage: None,
+        settle_on: None,
+        attestation: None,
+    });
+    // The per-request limit, as for a v2 session: up to the release, then
+    // again from it.
+    st.deadline = Some(tokio::time::Instant::now() + SESSION_TIMEOUT);
+    side(st, format!("request n={n} stream={stream} model={model} body_len={body_len} max_tokens={max_tokens}"));
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"request_ok","sid":sid,"n":n,"stream":stream,"suffix":canonical}).to_string().into(),
+    ));
+    Ok(())
+}
+
+/// `ctl`: the client's next record is this control frame.
+pub(crate) fn on_ctl(st: &mut Session, frame: &str) -> Result<()> {
+    if st.state != SessionState::Body {
+        bail!("ctl before the connection head was written");
+    }
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("ctl on a session that is not http: 2"))?;
+    let c = Ctl::from_name(frame).ok_or_else(|| anyhow!("unknown control frame {frame:?}"))?;
+    if h.next_ctl.is_some() || !h.pending.is_empty() {
+        bail!("ctl must come right before its record");
+    }
+    h.next_ctl = Some(c);
+    Ok(())
+}
+
+/// `release`: the first `upto` records of request `n` may go to the upstream
+/// once proven. The limit only grows.
+pub(crate) fn on_release(st: &mut Session, n: u32, upto: usize) -> Result<()> {
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("release on a session that is not http: 2"))?;
+    let q = h.req.as_mut().filter(|q| q.n == n).ok_or_else(|| anyhow!("release names no request in flight"))?;
+    if upto > max_records(q.body_len) {
+        bail!("release upto {upto} exceeds what the request can hold");
+    }
+    q.upto = q.upto.max(upto);
+    Ok(())
+}
+
+/// Client bytes after the head: complete records are classified and queued.
+/// Nothing is written to the upstream here.
+pub(crate) fn client_bytes(st: &mut Session, data: &[u8]) -> Result<()> {
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    if h.pending.len() + h.held + data.len() > h.buffer_limit() {
+        bail!("client sent more than the {} bytes this connection may hold unreleased", h.buffer_limit());
+    }
+    h.pending.extend_from_slice(data);
+    let (recs, used) = parse_records(&h.pending);
+    for r in recs {
+        if r.ctype != CT_APPLICATION_DATA || 5 + r.payload.len() > MAX_TLS_RECORD {
+            bail!("unexpected client record");
+        }
+        // One frame per record: a 9-byte frame header, the payload, the
+        // inner content type; at most 2^14 bytes of content.
+        let inner = r
+            .payload
+            .len()
+            .checked_sub(16)
+            .filter(|n| (10..=(1 << 14) + 1).contains(n))
+            .ok_or_else(|| anyhow!("a client record does not hold one HTTP/2 frame"))?;
+        let (kind, req_idx) = if let Some(c) = h.next_ctl.take() {
+            if inner != 10 + c.payload_len() {
+                bail!("the record is not the declared control frame ({c:?})");
+            }
+            if c == Ctl::RstStream && !h.req.as_ref().is_some_and(|q| q.complete) {
+                bail!("RST_STREAM without a complete request in flight");
+            }
+            if h.queue.iter().filter(|x| matches!(x.kind, RecKind::Ctl(_))).count() >= MAX_QUEUED_CTL {
+                bail!("too many unproven control records");
+            }
+            (RecKind::Ctl(c), 0)
+        } else {
+            let q = h
+                .req
+                .as_mut()
+                .filter(|q| !q.complete)
+                .ok_or_else(|| anyhow!("a client record outside a request (control frames are declared with ctl)"))?;
+            let kind = if q.records == 0 {
+                if inner != 9 + q.block.len() + 1 {
+                    bail!("the request's first record is not its HEADERS frame");
+                }
+                RecKind::Headers
+            } else {
+                let n = inner - 10;
+                if q.data_bytes + n > q.body_len {
+                    bail!("the request body exceeds its declared length {}", q.body_len);
+                }
+                q.data_bytes += n;
+                let last = q.data_bytes == q.body_len;
+                if n == 0 || (last && n < q.suffix.len()) {
+                    bail!("an empty DATA frame, or a last one shorter than the pinned suffix");
+                }
+                if q.records + 1 > max_records(q.body_len) {
+                    bail!("the request arrives in more than {} records", max_records(q.body_len));
+                }
+                q.complete = last;
+                RecKind::Data { last }
+            };
+            q.records += 1;
+            (kind, q.records)
+        };
+        let bytes = r.bytes();
+        h.held += bytes.len();
+        h.queue.push_back(Rec { seq: h.next_seq, bytes, kind, proven: false, req_idx });
+        h.next_seq += 1;
+    }
+    h.pending.drain(..used);
+    Ok(())
+}
+
+/// Write what may be written, then ask for the next proof if records wait.
+pub(crate) async fn pump(
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &RelayLog,
+    tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    if st.h2.is_none() || st.state != SessionState::Body {
+        return Ok(());
+    }
+    flush(to_client, st, log, tcp_tx).await?;
+    next_batch(shared, to_client, st)
+}
+
+/// Write queued records to the upstream, in order: each must be proven, and
+/// a request's record within the client's release limit.
+async fn flush(
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &RelayLog,
+    tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    loop {
+        let deadline = st.deadline;
+        let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+        let Some(front) = h.queue.front() else { break };
+        if !front.proven {
+            break;
+        }
+        if front.req_idx > 0 {
+            let q = h.req.as_mut().ok_or_else(|| anyhow!("a request record without its request"))?;
+            if front.req_idx > q.upto {
+                break;
+            }
+            if q.s_k.is_none() {
+                // The interval starts before the first byte of the request
+                // can reach the upstream.
+                q.s_k = Some(log.server_app_records);
+                q.interval_open = true;
+            }
+        }
+        let rec = h.queue.pop_front().expect("front exists");
+        h.held -= rec.bytes.len();
+        write_upstream(tcp_tx, &rec.bytes, deadline).await?;
+        st.sent.update(&rec.bytes);
+        if rec.req_idx == 0 {
+            continue;
+        }
+        let h = st.h2.as_mut().expect("checked above");
+        let q = h.req.as_mut().expect("checked above");
+        q.sent.update(&rec.bytes);
+        q.written += 1;
+        if q.written == 1 {
+            let note = format!("request n={} first record written; S_k={}", q.n, q.s_k.unwrap_or(0));
+            side(st, note);
+            continue;
+        }
+        if q.complete && q.written == q.records {
+            q.released = true;
+            let n = q.n;
+            // The upstream has the whole request: the reservation is at
+            // stake from here, and the request gets a fresh time limit.
+            let _ = to_client.send(Message::Text(serde_json::json!({"type":"body_released","n":n}).to_string().into()));
+            st.deadline = Some(tokio::time::Instant::now() + SESSION_TIMEOUT);
+            info!(n, "π_WIN verified; request released to the upstream");
+            side(st, format!("request n={n} released"));
+        }
+    }
+    Ok(())
+}
+
+/// If no π_WIN is in flight and unproven records wait (and no request is
+/// half received), fix the parameters of the next one and send them.
+fn next_batch(shared: &Arc<SessionShared>, to_client: &mpsc::UnboundedSender<Message>, st: &mut Session) -> Result<()> {
+    let h1 = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?.h1;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    if h.win.is_some() || h.req.as_ref().is_some_and(|q| !q.complete) {
+        return Ok(());
+    }
+    let Some(first) = h.queue.iter().position(|r| !r.proven) else { return Ok(()) };
+    let stream = h.req.as_ref().map_or(0, |q| q.stream);
+    let mut windows = Vec::new();
+    for rec in h.queue.iter().skip(first) {
+        let payload = &rec.bytes[5..];
+        let inner = payload.len() - 16;
+        let (head, tail): (Vec<u8>, &[u8]) = match rec.kind {
+            RecKind::Ctl(c) => (c.header(stream).to_vec(), &[]),
+            RecKind::Headers => {
+                let q = h.req.as_ref().ok_or_else(|| anyhow!("a HEADERS record without its request"))?;
+                (h2::frame(h2::HEADERS, h2::END_HEADERS, q.stream, &q.block), &[])
+            }
+            RecKind::Data { last } => {
+                let q = h.req.as_ref().ok_or_else(|| anyhow!("a DATA record without its request"))?;
+                let flags = if last { h2::END_STREAM } else { 0 };
+                let tail: &[u8] = if last { q.suffix.as_bytes() } else { &[] };
+                (h2::frame_header(inner - 10, h2::DATA, flags, q.stream).to_vec(), tail)
+            }
+        };
+        windows.extend(h2::windows_for(rec.seq, payload, &head, tail)?);
+    }
+    let count = h.queue.len() - first;
+    let first_seq = h.queue[first].seq;
+    let p = zkbench::statements::PiWin { anchor: h1, key_updates: 0, windows };
+    zkbench::statements::check_pi_win(&p).context("the queued records exceed one π_WIN")?;
+    let params = Params::PiWin(p);
+    shared.set_params("pi_win", params.clone());
+    h.win = Some(WinInflight::Records(count));
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"zk_params","proof":"pi_win","purpose":"records","first_seq":first_seq,"count":count,"params":params})
+            .to_string()
+            .into(),
+    ));
+    Ok(())
+}
+
+/// A π_WIN or π_C3S of this session verified against `proven`.
+pub(crate) async fn proof_done(
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &RelayLog,
+    tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
+    proof: &str,
+    proven: Option<&Params>,
+) -> Result<()> {
+    if !same_params(proven, shared.params.lock().unwrap().get(proof)) {
+        bail!("{proof} parameters changed after the proof started");
+    }
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    match (proof, h.win.take()) {
+        ("pi_win", Some(WinInflight::Records(count))) => {
+            let mut left = count;
+            for rec in h.queue.iter_mut().filter(|r| !r.proven) {
+                if left == 0 {
+                    break;
+                }
+                rec.proven = true;
+                left -= 1;
+            }
+            if left != 0 {
+                bail!("π_WIN covered records that are no longer queued");
+            }
+            side(st, format!("pi_win verified for {count} client record(s)"));
+            pump(shared, to_client, st, log, tcp_tx).await
+        }
+        ("pi_win", Some(WinInflight::ErrorHead)) => settle(app, st, to_client, "pi_win"),
+        ("pi_c3s", win) => {
+            h.win = win;
+            settle(app, st, to_client, "pi_c3s")
+        }
+        _ => bail!("{proof} verified with nothing waiting for it"),
+    }
+}
+
+/// `disclose`: the tail of a successful streamed completion (A.6).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn on_disclose(
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &RelayLog,
+    n: Option<u32>,
+    r: &str,
+    tail_lens: &[usize],
+    skip: usize,
+    key_updates: u32,
+    epoch_start: usize,
+    trailing: Option<usize>,
+    server_records: Option<usize>,
+) -> Result<()> {
+    let hs_records = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?.server_handshake_records;
+    let anchor = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?.h2;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let q = h.req.as_mut().filter(|q| Some(q.n) == n).ok_or_else(|| anyhow!("disclose names no request in flight"))?;
+    if !q.released || q.usage.is_some() {
+        bail!("disclose out of order or repeated");
+    }
+    if skip != 0 || trailing.is_some() {
+        bail!("an http: 2 usage disclosure ends at the last server record (no skip, no trailing records)");
+    }
+    // R must run to the last server record N holds. If more arrived since
+    // the client built it, the client rebuilds.
+    let upto = server_records.ok_or_else(|| anyhow!("an http: 2 disclosure names the server records it has seen (server_records)"))?;
+    if upto > log.server_app_records {
+        bail!("the disclosure counts {upto} server records, the node received {}", log.server_app_records);
+    }
+    if upto < log.server_app_records {
+        let _ = to_client.send(Message::Text(
+            serde_json::json!({"type":"disclose_retry","n":q.n,"server_records":log.server_app_records}).to_string().into(),
+        ));
+        return Ok(());
+    }
+    if r.len() > 2 * MAX_DISCLOSE_R {
+        bail!("disclosed R is too long");
+    }
+    if key_updates > zkbench::statements::MAX_SERVER_KEY_UPDATES || (key_updates == 0) != (epoch_start == 0) {
+        bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
+    }
+    let r = hex::decode(r)?;
+    check_disclosure_size(r.len(), 0)?;
+    let usage = h2::usage_event(&h2::parse_usage_tail(&r, q.stream)?)?;
+    let umodel = usage.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    if umodel != q.model {
+        warn!(reported = umodel, pinned = %q.model, "usage event model differs from the pinned model");
+    }
+    // The covered records: the last `tail_lens.len()` N holds, all inside
+    // the request's interval.
+    let k = tail_lens.len();
+    if k == 0 || k > MAX_DISCLOSE_RECORDS || k > log.server_tail.len() {
+        bail!("disclosure covers {k} records (limit {MAX_DISCLOSE_RECORDS}, and the node keeps the last {})", log.server_tail.len());
+    }
+    let first_abs = log.server_app_records - k;
+    let s_k = q.s_k.ok_or_else(|| anyhow!("the request has no interval"))?;
+    if first_abs < s_k || first_abs < hs_records + epoch_start {
+        bail!("the disclosed records start before the request's interval (or its key epoch)");
+    }
+    let chosen: Vec<&Record> = log.server_tail.iter().skip(log.server_tail.len() - k).collect();
+    for (rec, want) in chosen.iter().zip(tail_lens.iter().rev()) {
+        if rec.payload.len() < 16 + 2 || rec.payload.len() - 16 != *want {
+            bail!("tail record lengths do not match the end of the transcript");
+        }
+    }
+    let total: usize = chosen.iter().map(|rec| rec.payload.len() - 17).sum();
+    if total < r.len() {
+        bail!("disclosed records ({total}) do not cover R ({})", r.len());
+    }
+    let first_content = chosen[0].payload.len() - 17;
+    let first_off = first_tail_offset(first_content, total - first_content, r.len());
+    let records: Vec<zkbench::statements::TailRecord> = chosen
+        .iter()
+        .enumerate()
+        .map(|(i, rec)| {
+            let off = if i == 0 { first_off } else { 0 };
+            zkbench::statements::TailRecord {
+                seq: (first_abs + i - hs_records - epoch_start) as u64,
+                ct: rec.payload[off..rec.payload.len() - 16].to_vec(),
+                off,
+            }
+        })
+        .collect();
+    check_c3s_records(&records)?;
+    q.usage = Some(usage);
+    q.settle_on = Some("pi_c3s");
+    let params = Params::PiC3S(zkbench::statements::PiC3S { h2: anchor, records, expected: r, skip: 0, key_updates });
+    let n = q.n;
+    attest(app, st, to_client)?;
+    shared.set_params("pi_c3s", params.clone());
+    let _ = to_client.send(Message::Text(serde_json::json!({"type":"zk_params","proof":"pi_c3s","n":n,"params":params}).to_string().into()));
+    Ok(())
+}
+
+/// `disclose_head`: the response head of a request the provider refused
+/// (A.7): one complete HEADERS frame at the start of server record `record`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn on_disclose_head(
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &RelayLog,
+    n: u32,
+    record: usize,
+    r: &str,
+    key_updates: u32,
+    epoch_start: usize,
+) -> Result<()> {
+    let hs_records = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?.server_handshake_records;
+    let anchor = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?.h2;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    // One π_WIN at a time: the client's records are proven first.
+    if h.win.is_some() || h.queue.iter().any(|x| !x.proven) {
+        bail!("disclose_head while client records are unproven");
+    }
+    let q = h.req.as_mut().filter(|q| q.n == n).ok_or_else(|| anyhow!("disclose_head names no request in flight"))?;
+    let s_k = q.s_k.ok_or_else(|| anyhow!("disclose_head before any of the request reached the upstream"))?;
+    if q.usage.is_some() {
+        bail!("disclose_head out of order or repeated");
+    }
+    if r.len() > 2 * MAX_DISCLOSE_R {
+        bail!("disclosed R is too long");
+    }
+    if key_updates > zkbench::statements::MAX_SERVER_KEY_UPDATES || (key_updates == 0) != (epoch_start == 0) {
+        bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
+    }
+    let r = hex::decode(r)?;
+    let status = h2::parse_error_head(&r, q.stream)?;
+    // Record `record` is in the request's interval and still held.
+    let base = log.server_app_records - log.server_tail.len();
+    if record < s_k || record < base || record >= log.server_app_records || record < hs_records + epoch_start {
+        bail!("server record {record} is outside the request's interval or no longer held");
+    }
+    let mut windows = Vec::new();
+    let mut rest: &[u8] = &r;
+    for (i, rec) in log.server_tail.iter().skip(record - base).enumerate() {
+        if rest.is_empty() {
+            break;
+        }
+        if i >= MAX_HEAD_RECORDS {
+            bail!("the error head spans more than {MAX_HEAD_RECORDS} records");
+        }
+        let content = rec.payload.len().checked_sub(17).filter(|c| *c > 0).ok_or_else(|| anyhow!("a covered record has no content"))?;
+        let (chunk, tail) = rest.split_at(rest.len().min(content));
+        let seq = (record + i - hs_records - epoch_start) as u64;
+        // The frame's bytes from offset 0, and the record's last byte: it
+        // is application data, not a handshake record that could carry them.
+        windows.extend(h2::windows_for(seq, &rec.payload, chunk, &[])?);
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        bail!("the error head extends past the server records received");
+    }
+    let p = zkbench::statements::PiWin { anchor, key_updates, windows };
+    zkbench::statements::check_pi_win(&p)?;
+    q.usage = Some(serde_json::json!({ "error_status": status, "choices": [] }));
+    q.settle_on = Some("pi_win");
+    h.win = Some(WinInflight::ErrorHead);
+    let params = Params::PiWin(p);
+    attest(app, st, to_client)?;
+    shared.set_params("pi_win", params.clone());
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"zk_params","proof":"pi_win","purpose":"error_head","n":n,"record":record,"params":params}).to_string().into(),
+    ));
+    Ok(())
+}
+
+/// Close the current request's interval and sign its attestation.
+fn attest(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) -> Result<()> {
+    let hs = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?;
+    let (cert, th_sh, th_sf) = (hex::encode(hs.cert_chain_hash), hex::encode(hs.th_sh), hex::encode(hs.th_sf));
+    let c_commit = st.c_commit.map(hex::encode);
+    let sid = st.sid.clone();
+    let run_dir = st.run_dir.clone();
+    let q = st.h2.as_mut().and_then(|h| h.req.as_mut()).ok_or_else(|| anyhow!("no request in flight"))?;
+    q.interval_open = false;
+    let a = serde_json::json!({
+        "sid": sid,
+        "http": 2,
+        "n": q.n,
+        "stream": q.stream,
+        "s_k": q.s_k,
+        "server_records": q.recv_records,
+        "sha256_recv": hex::encode(q.recv.hash()),
+        "client_records": q.written,
+        "sha256_sent": hex::encode(q.sent.hash()),
+        "cert_chain_hash": cert,
+        "th_sh": th_sh,
+        "th_sf": th_sf,
+        "c_commit": c_commit,
+        "time": now_unix(),
+    });
+    let sig = app.signer.sign(a.to_string().as_bytes());
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"attestation","n":q.n,"a":a,"sig":hex::encode(sig.to_bytes())}).to_string().into(),
+    ));
+    q.attestation = Some(a.clone());
+    let n = q.n;
+    write_attestation(&run_dir, &a);
+    side(st, format!("attestation n={n} {a}"));
+    Ok(())
+}
+
+/// The disclosure's proof verified: hand the usage to the node (or sign the
+/// stub receipt), then either accept the next request or close.
+fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSender<Message>, proof: &str) -> Result<()> {
+    let sid = st.sid.clone();
+    let run_dir = st.run_dir.clone();
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    let q = h.req.take().filter(|q| q.settle_on == Some(proof)).ok_or_else(|| anyhow!("{proof} verified with no disclosure waiting for it"))?;
+    let usage = q.usage.clone().ok_or_else(|| anyhow!("no disclosed usage"))?;
+    let error = usage.get("error_status").is_some();
+    if app.node_settles {
+        let mut msg = serde_json::json!({"type":"usage","sid":sid,"http":2,"n":q.n,"model":q.model,"usage":usage});
+        if let Some(rm) = usage.get("model").and_then(|m| m.as_str()).filter(|m| *m != q.model) {
+            msg["reported_model"] = rm.into();
+        }
+        let _ = to_client.send(Message::Text(msg.to_string().into()));
+    } else {
+        let cost_usd = usage.pointer("/cost/usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
+        let receipt = serde_json::json!({
+            "sid": sid,
+            "http": 2,
+            "n": q.n,
+            "usage": usage,
+            "model": q.model,
+            "cost_usd": cost_usd,
+            "cost_diem": usage.pointer("/cost/diem").cloned().unwrap_or(serde_json::json!(0)),
+            "refund_diem": (1000.0 - cost_usd * 1e6).max(0.0),
+            "attestation_hash": q.attestation.as_ref().map(|a| hex::encode(cu_crypto::transcript::hash(a.to_string().as_bytes()))),
+            "notary_pubkey": app.offer.notary_pubkey,
+            "time": now_unix(),
+        });
+        let receipt_json = receipt.to_string();
+        let sig = app.signer.sign(receipt_json.as_bytes());
+        let _ = to_client.send(Message::Text(
+            serde_json::json!({"type":"receipt","n":q.n,"receipt":receipt,"receipt_json":receipt_json,"sig":hex::encode(sig.to_bytes())})
+                .to_string()
+                .into(),
+        ));
+        write_receipt(&run_dir, &receipt);
+    }
+    // Only a settled 2xx leaves the connection open.
+    if error {
+        h.closing = Some("error_settled");
+    } else if h.tcp_closed {
+        h.closing = Some("upstream_closed");
+    } else if h.requests >= h.cfg.max_requests {
+        h.closing = Some("max_requests");
+    } else if h.conn_end.is_some_and(|end| end <= tokio::time::Instant::now()) {
+        h.closing = Some("connection_lifetime");
+    }
+    let idle = h.idle_deadline();
+    st.deadline = Some(idle);
+    side(st, format!("request n={} settled ({proof}); error={error}", q.n));
+    Ok(())
+}
+
+/// The upstream closed the connection. With no request in flight the session
+/// ends in order; a request that never fully reached the upstream ends it
+/// with nothing at stake; a released request may still be disclosed.
+pub(crate) fn tcp_closed(st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) -> Result<()> {
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    h.tcp_closed = true;
+    match &h.req {
+        None => h.closing = Some("upstream_closed"),
+        Some(q) if !q.released => {
+            let (n, response_bytes) = (q.n, q.recv_bytes);
+            let _ = to_client.send(Message::Text(
+                serde_json::json!({"type":"upstream_closed_early","n":n,"response_bytes":response_bytes}).to_string().into(),
+            ));
+            side(st, format!("upstream closed early; request n={n}, {response_bytes} response bytes"));
+            bail!("upstream closed the connection before the request was complete (nothing billed)");
+        }
+        Some(_) => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_field_selects_the_mode() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert!(!wants_h2(None).unwrap());
+        assert!(!wants_h2(Some(&j("1.1"))).unwrap());
+        assert!(!wants_h2(Some(&j("\"1.1\""))).unwrap());
+        assert!(wants_h2(Some(&j("2"))).unwrap());
+        assert!(wants_h2(Some(&j("\"2\""))).unwrap());
+        for bad in ["3", "\"h2\"", "true", "[2]", "1"] {
+            assert!(wants_h2(Some(&j(bad))).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn chat_path_of_the_template() {
+        let t = "POST /api/v1/chat/completions HTTP/1.1\r\nHost: h\r\n\r\n";
+        assert_eq!(chat_path(t).unwrap(), "/api/v1/chat/completions");
+        assert!(chat_path("GET / HTTP/1.1\r\n").is_err());
+        assert!(chat_path("POST /a?b HTTP/1.1\r\n").is_err());
+    }
+
+    fn session_with_request(body_len: usize, suffix: &str) -> Session {
+        let mut st = Session { state: SessionState::Body, ..Session::default() };
+        let mut h = H2::new(h2::H2Block { probe_path: "/p".into(), idle_secs: 300, max_requests: 3 }, "/api/v1/chat/completions".into());
+        h.requests = 1;
+        h.req = Some(Req {
+            n: 1,
+            stream: 3,
+            model: "m".into(),
+            body_len,
+            suffix: suffix.into(),
+            block: h2::request_block("h", "/api/v1/chat/completions"),
+            records: 0,
+            data_bytes: 0,
+            complete: false,
+            upto: 0,
+            written: 0,
+            released: false,
+            s_k: None,
+            interval_open: false,
+            recv: Default::default(),
+            recv_records: 0,
+            recv_bytes: 0,
+            sent: Default::default(),
+            usage: None,
+            settle_on: None,
+            attestation: None,
+        });
+        st.h2 = Some(Box::new(h));
+        st
+    }
+
+    /// A record of `inner` plaintext bytes (content and type byte), as N sees it.
+    fn record(inner: usize) -> Vec<u8> {
+        let n = inner + 16;
+        let mut r = vec![0x17, 3, 3, (n >> 8) as u8, n as u8];
+        r.resize(5 + n, 0xaa);
+        r
+    }
+
+    fn kinds(st: &Session) -> Vec<String> {
+        st.h2.as_ref().unwrap().queue.iter().map(|r| format!("{:?}/{}", r.kind, r.req_idx)).collect()
+    }
+
+    #[test]
+    fn records_are_classified_by_position_and_length() {
+        let block = h2::request_block("h", "/api/v1/chat/completions").len();
+        let mut st = session_with_request(5000, ",\"model\":\"m\"}");
+        // HEADERS, a DATA frame of 4000 bytes, the last one of 1000; fed in odd pieces.
+        let mut bytes = record(9 + block + 1);
+        bytes.extend(record(10 + 4000));
+        bytes.extend(record(10 + 1000));
+        for chunk in bytes.chunks(777) {
+            client_bytes(&mut st, chunk).unwrap();
+        }
+        assert_eq!(kinds(&st), vec!["Headers/1", "Data { last: false }/2", "Data { last: true }/3"]);
+        let h = st.h2.as_ref().unwrap();
+        assert!(h.req.as_ref().unwrap().complete);
+        assert_eq!(h.queue.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(h.queue.iter().all(|r| !r.proven));
+        // Anything after the complete request, undeclared, is refused.
+        assert!(client_bytes(&mut st, &record(10 + 5)).is_err());
+    }
+
+    #[test]
+    fn malformed_request_records_are_refused() {
+        let block = h2::request_block("h", "/api/v1/chat/completions").len();
+        // A first record that is not the HEADERS frame's length.
+        let mut st = session_with_request(5000, "sfx");
+        assert!(client_bytes(&mut st, &record(9 + block + 2)).is_err());
+        // More body than declared.
+        let mut st = session_with_request(5000, "sfx");
+        client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+        assert!(client_bytes(&mut st, &record(10 + 5001)).is_err());
+        // An empty DATA frame.
+        let mut st = session_with_request(5000, "sfx");
+        client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+        assert!(client_bytes(&mut st, &record(10)).is_err());
+        // A last frame shorter than the suffix.
+        let mut st = session_with_request(5000, "a-suffix-of-18-bytes");
+        client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+        client_bytes(&mut st, &record(10 + 4990)).unwrap();
+        assert!(client_bytes(&mut st, &record(10 + 10)).is_err());
+        // Too many small frames.
+        let mut st = session_with_request(5000, "sfx");
+        client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+        let mut refused = false;
+        for _ in 0..10 {
+            if client_bytes(&mut st, &record(10 + 1)).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused);
+        // Not application data, shorter than a frame, longer than a record.
+        let mut st = session_with_request(5000, "sfx");
+        let mut hs = record(9 + block + 1);
+        hs[0] = 0x16;
+        assert!(client_bytes(&mut st, &hs).is_err());
+        let mut st = session_with_request(5000, "sfx");
+        assert!(client_bytes(&mut st, &record(9)).is_err());
+        // No request at all.
+        let mut st = session_with_request(5000, "sfx");
+        st.h2.as_mut().unwrap().req = None;
+        assert!(client_bytes(&mut st, &record(9 + block + 1)).is_err());
+    }
+
+    #[test]
+    fn control_records_are_declared_and_sized() {
+        let mut st = session_with_request(5000, "sfx");
+        st.h2.as_mut().unwrap().req = None;
+        on_ctl(&mut st, "settings_ack").unwrap();
+        // A second declaration before the record is refused.
+        assert!(on_ctl(&mut st, "ping_ack").is_err());
+        client_bytes(&mut st, &record(10)).unwrap();
+        on_ctl(&mut st, "ping_ack").unwrap();
+        client_bytes(&mut st, &record(18)).unwrap();
+        on_ctl(&mut st, "window_update").unwrap();
+        client_bytes(&mut st, &record(14)).unwrap();
+        assert_eq!(kinds(&st), vec!["Ctl(SettingsAck)/0", "Ctl(PingAck)/0", "Ctl(WindowUpdate)/0"]);
+        // The wrong size for the declared frame, an unknown name, a reset with no request.
+        on_ctl(&mut st, "settings_ack").unwrap();
+        assert!(client_bytes(&mut st, &record(11)).is_err());
+        let mut st = session_with_request(5000, "sfx");
+        assert!(on_ctl(&mut st, "headers").is_err());
+        on_ctl(&mut st, "rst_stream").unwrap();
+        assert!(client_bytes(&mut st, &record(14)).is_err());
+        // A declaration in the middle of a record is refused.
+        let mut st = session_with_request(5000, "sfx");
+        client_bytes(&mut st, &record(60)[..7]).unwrap();
+        assert!(on_ctl(&mut st, "ping_ack").is_err());
+    }
+
+    #[test]
+    fn the_buffer_is_bounded_by_the_request() {
+        let mut st = session_with_request(5000, "sfx");
+        let limit = st.h2.as_ref().unwrap().buffer_limit();
+        assert!(limit < 5000 + 4096);
+        assert!(client_bytes(&mut st, &vec![0x17; limit + 1]).is_err());
+        // Idle: only a few control records.
+        st.h2.as_mut().unwrap().req = None;
+        assert!(st.h2.as_ref().unwrap().buffer_limit() < 2048);
+    }
+
+    #[test]
+    fn release_only_grows() {
+        let mut st = session_with_request(5000, "sfx");
+        on_release(&mut st, 1, 2).unwrap();
+        on_release(&mut st, 1, 1).unwrap();
+        assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().upto, 2);
+        assert!(on_release(&mut st, 2, 1).is_err());
+        assert!(on_release(&mut st, 1, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn interval_counts_only_while_open() {
+        let mut st = session_with_request(5000, "sfx");
+        let rec = Record { ctype: CT_APPLICATION_DATA, header: [0x17, 3, 3, 0, 20], payload: vec![1; 20] };
+        let h = st.h2.as_mut().unwrap();
+        h.server_record(&rec);
+        assert_eq!(h.req.as_ref().unwrap().recv_records, 0);
+        h.req.as_mut().unwrap().interval_open = true;
+        h.server_record(&rec);
+        h.server_record(&Record { ctype: 21, header: [21, 3, 3, 0, 2], payload: vec![1, 0] });
+        let q = h.req.as_ref().unwrap();
+        assert_eq!((q.recv_records, q.recv_bytes), (1, 25));
+        let mut want = cu_crypto::transcript::Transcript::new();
+        want.update(&[0x17, 3, 3, 0, 20]);
+        want.update(&[1; 20]);
+        assert_eq!(q.recv.hash(), want.hash());
+    }
+}
