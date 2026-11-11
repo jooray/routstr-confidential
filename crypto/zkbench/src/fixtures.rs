@@ -9,7 +9,7 @@ use cu_crypto::hex;
 use cu_crypto::keyschedule::KeySchedule;
 
 use crate::statements::{
-    Params, PiC2S, PiC3S, PiNK, SUPPORTED_KEY_ALPHABET, TailRecord, Witness,
+    Params, PiC2S, PiC3S, PiNK, PiWin, SUPPORTED_KEY_ALPHABET, TailRecord, WinWindow, Witness,
 };
 
 /// The RFC 8448 handshake secret; the fixture's traffic secrets derive from it.
@@ -306,6 +306,83 @@ pub fn pi_nk() -> (Params, Witness) {
         Params::PiNK(pi_nk_params(&v, &parts, &c1)),
         Witness::NodeKey { k0: v.k0, iv0: v.iv0, key: parts.key.clone() },
     )
+}
+
+/// The inner ciphertext (tag excluded) of a record holding `content` and the
+/// inner content type `ctype`, then `pad` zero bytes, under `secret` at `seq`.
+pub fn win_record(secret: &[u8; 32], seq: u64, content: &[u8], ctype: u8, pad: usize) -> Vec<u8> {
+    let s = cu_crypto::keyschedule::Secret::new(*secret);
+    let mut inner = content.to_vec();
+    inner.push(ctype);
+    inner.resize(inner.len() + pad, 0);
+    let ks = aesgcm::ctr_keystream(&s.key(), &s.iv(), seq, inner.len());
+    xor(&inner, &ks)
+}
+
+/// The windows the sidecar proves for one client record of an `http: 2`
+/// request (`PROTOCOL-V3-DESIGN.md` A.4): the first `head` content bytes
+/// (the frame header, or the whole frame), and the record's last bytes
+/// (`tail` content bytes, then the inner content type 0x17). `content` is
+/// the honest plaintext the windows expect; `ct` the record as relayed.
+pub fn win_windows(seq: u64, ct: &[u8], content: &[u8], head: usize, tail: usize) -> Vec<WinWindow> {
+    let inner = ct.len();
+    let mut out = Vec::new();
+    if head + 1 + tail >= inner {
+        let mut expected = content.to_vec();
+        expected.push(0x17);
+        out.push(WinWindow { seq, off: 0, ct: ct.to_vec(), sel_start: 0, expected });
+        return out;
+    }
+    let n = head.div_ceil(16) * 16;
+    out.push(WinWindow { seq, off: 0, ct: ct[..n.min(inner)].to_vec(), sel_start: 0, expected: content[..head].to_vec() });
+    let start = inner - 1 - tail;
+    let off = start / 16 * 16;
+    let mut expected = content[content.len() - tail..].to_vec();
+    expected.push(0x17);
+    out.push(WinWindow { seq, off, ct: ct[off..].to_vec(), sel_start: start - off, expected });
+    out
+}
+
+/// An HTTP/2 frame: 9-byte header and payload.
+pub fn h2_frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let n = payload.len();
+    let mut f = vec![(n >> 16) as u8, (n >> 8) as u8, n as u8, ty, flags];
+    f.extend_from_slice(&stream.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// The plaintext frames of the π_WIN fixture request: HEADERS, a DATA frame
+/// of `body` private bytes, and a final DATA frame ending in [`SUFFIX`].
+pub fn pi_win_frames(body: usize) -> Vec<Vec<u8>> {
+    let block = b"\x83\x87\x01\x0dapi.venice.ai\x04\x18/api/v1/chat/completions\x0f\x10\x10application/json\xbe";
+    let private: Vec<u8> = (0..body).map(|i| b'a' + (i % 26) as u8).collect();
+    let mut last = b"\"}]".to_vec();
+    last.extend_from_slice(SUFFIX);
+    vec![h2_frame(1, 4, 3, block), h2_frame(0, 0, 3, &private), h2_frame(0, 1, 3, &last)]
+}
+
+/// π_WIN: one `http: 2` request under `c_ap_1` (epoch-1 records 0..2): the
+/// HEADERS record in full, each DATA record's frame header and last byte,
+/// and the pinned suffix at the end of the last one.
+pub fn pi_win() -> (Params, Witness) {
+    pi_win_body(4000)
+}
+
+pub fn pi_win_body(body: usize) -> (Params, Witness) {
+    let v = v2_secrets();
+    let frames = pi_win_frames(body);
+    let mut windows = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let ct = win_record(&v.c_ap_1, i as u64, f, 0x17, 0);
+        let (head, tail) = match i {
+            0 => (f.len(), 0),
+            2 => (9, SUFFIX.len()),
+            _ => (9, 0),
+        };
+        windows.extend(win_windows(i as u64, &ct, f, head, tail));
+    }
+    (Params::PiWin(PiWin { anchor: v.h1(), key_updates: 0, windows }), Witness::Secret(v.c_ap_1))
 }
 
 /// All three statements.

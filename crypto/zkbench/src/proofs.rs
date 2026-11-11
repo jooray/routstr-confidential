@@ -272,6 +272,10 @@ pub fn stats(params: &Params) -> Stats {
             // Each server KeyUpdate adds one "traffic upd" step (4).
             7 + 4 * p.key_updates as usize
         }
+        Params::PiWin(p) => {
+            aes_blocks += crate::statements::pi_win_blocks(p).len();
+            7 + 4 * p.key_updates as usize
+        }
         Params::PiNK(p) => {
             // hk (28 bytes, one block) + SHA256(header || C_1).
             aes_blocks += (p.head_len + 1).div_ceil(16);

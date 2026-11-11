@@ -1,4 +1,5 @@
-//! The three ZK statements of a session (`docs/TWOPC-DESIGN.md`).
+//! The ZK statements of a session (`docs/TWOPC-DESIGN.md`; π_WIN is protocol
+//! v3's, `PROTOCOL-V3-DESIGN.md` A.4).
 //!
 //! Nobody knows `HS`. The two-party key schedule hands the client `c_ap_1`
 //! and `s_ap_0`, the node `K_0`/`IV_0`, and both sides the public anchors
@@ -81,6 +82,9 @@ pub enum Proof {
     PiC2S,
     /// Usage disclosure under s_ap_0 (anchored by `h2`).
     PiC3S,
+    /// Several record windows under one traffic secret (protocol v3,
+    /// `http: 2`; anchored by `h1` for client records, `h2` for server ones).
+    PiWin,
 }
 
 impl Proof {
@@ -89,6 +93,7 @@ impl Proof {
             Proof::PiNK => "pi_nk",
             Proof::PiC2S => "pi_c2s",
             Proof::PiC3S => "pi_c3s",
+            Proof::PiWin => "pi_win",
         }
     }
     pub fn from_name(s: &str) -> Option<Self> {
@@ -96,6 +101,7 @@ impl Proof {
             "pi_nk" => Some(Proof::PiNK),
             "pi_c2s" => Some(Proof::PiC2S),
             "pi_c3s" => Some(Proof::PiC3S),
+            "pi_win" => Some(Proof::PiWin),
             _ => None,
         }
     }
@@ -198,6 +204,56 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// One window of π_WIN: a block-aligned ciphertext slice of one record and
+/// the bytes part of its plaintext must equal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WinWindow {
+    /// The record's sequence number within its key epoch.
+    pub seq: u64,
+    /// Block-aligned inner-plaintext offset of `ct` in the record. Omitted on
+    /// the wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub off: usize,
+    /// The record's ciphertext `[off, off + |ct|)` (never the tag).
+    pub ct: Vec<u8>,
+    /// Offset inside `ct` at which the plaintext must equal `expected`.
+    /// Omitted on the wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub sel_start: usize,
+    /// The bytes the plaintext must equal at `[sel_start, sel_start + |expected|)`.
+    pub expected: Vec<u8>,
+}
+
+/// π_WIN public parameters (protocol v3, `http: 2`): π_C2S with several
+/// windows. The witness is one traffic secret; every window is decrypted with
+/// AES-CTR under the key `key_updates` "traffic upd" steps after it, and all
+/// windows are compared in one equality, so the verifier decodes the anchor
+/// digest and one bit.
+///
+/// The statement says nothing about which records the windows belong to or
+/// what the rest of a record holds: the verifier takes every `ct` from its
+/// own relay buffer and chooses the windows (frame header, last byte, pinned
+/// block or suffix), and the prover checks every window against its own
+/// records before proving (the bit must not become an oracle on private
+/// bytes).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PiWin {
+    /// `SHA256(secret)`: `h1` for client records (under `c_ap_1`), `h2` for
+    /// server records (under `s_ap_0`), as output publicly by the 2PC.
+    pub anchor: [u8; 32],
+    /// KeyUpdates between the anchored secret and the windows' key epoch.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_updates: u32,
+    pub windows: Vec<WinWindow>,
+}
+
+/// Most windows a π_WIN may compare (two per DATA record: its frame header
+/// and its last byte).
+pub const MAX_WIN_WINDOWS: usize = 2200;
+
+/// Most ciphertext bytes, summed over the windows, a π_WIN may decrypt.
+pub const MAX_WIN_BYTES: usize = 64 << 10;
+
 /// π_NK public parameters: the head template, anchored by `hk` (the keystream
 /// is computed in-circuit from `K_0`/`IV_0`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -229,6 +285,7 @@ pub enum Params {
     PiNK(PiNK),
     PiC2S(PiC2S),
     PiC3S(PiC3S),
+    PiWin(PiWin),
 }
 
 impl Params {
@@ -237,6 +294,7 @@ impl Params {
             Params::PiNK(_) => Proof::PiNK,
             Params::PiC2S(_) => Proof::PiC2S,
             Params::PiC3S(_) => Proof::PiC3S,
+            Params::PiWin(_) => Proof::PiWin,
         }
     }
 }
@@ -296,6 +354,7 @@ pub fn build<VM: Vm<Binary>>(
         Params::PiNK(p) => build_pi_nk(vm, role, p, witness),
         Params::PiC2S(p) => build_pi_c2s(vm, role, p, witness),
         Params::PiC3S(p) => build_pi_c3s(vm, role, p, witness),
+        Params::PiWin(p) => build_pi_win(vm, role, p, witness),
     }
 }
 
@@ -416,6 +475,95 @@ pub fn build_pi_c3s<VM: Vm<Binary>>(
     let expected = public_bytes(vm, &want)?;
     let eq = eq_bytes(vm, &out, &expected)?;
     Ok(vec![anchor, Check::full("disclosure", eq, vec![1u8])])
+}
+
+/// The AES-CTR keystream blocks a π_WIN needs, each as `(seq, block index)`,
+/// in the order the circuit computes them (a block shared by two windows of
+/// one record is computed once).
+pub fn pi_win_blocks(p: &PiWin) -> Vec<(u64, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for w in &p.windows {
+        let first = w.off / 16;
+        for b in first..first + w.ct.len().div_ceil(16) {
+            if seen.insert((w.seq, b)) {
+                out.push((w.seq, b));
+            }
+        }
+    }
+    out
+}
+
+/// Shape checks of π_WIN parameters, shared by the builder and by whoever
+/// assembles parameters (so nothing unprovable is ever sent).
+pub fn check_pi_win(p: &PiWin) -> anyhow::Result<()> {
+    if p.windows.is_empty() {
+        anyhow::bail!("π_WIN: no windows");
+    }
+    if p.windows.len() > MAX_WIN_WINDOWS {
+        anyhow::bail!("π_WIN: {} windows (limit {MAX_WIN_WINDOWS})", p.windows.len());
+    }
+    if p.key_updates > MAX_SERVER_KEY_UPDATES {
+        anyhow::bail!("π_WIN: {} KeyUpdates (limit {MAX_SERVER_KEY_UPDATES})", p.key_updates);
+    }
+    let total = p.windows.iter().try_fold(0usize, |acc, w| acc.checked_add(w.ct.len()));
+    if total.is_none_or(|t| t > MAX_WIN_BYTES) {
+        anyhow::bail!("π_WIN: the windows exceed {MAX_WIN_BYTES} ciphertext bytes in all");
+    }
+    for (i, w) in p.windows.iter().enumerate() {
+        if w.off % 16 != 0 {
+            anyhow::bail!("π_WIN: window {i} offset {} is not block-aligned", w.off);
+        }
+        if w.ct.is_empty() || w.off.checked_add(w.ct.len()).is_none_or(|end| end > MAX_INNER_CIPHERTEXT_PAYLOAD) {
+            anyhow::bail!("π_WIN: window {i} is empty or exceeds a record");
+        }
+        if w.expected.is_empty() || w.sel_start.checked_add(w.expected.len()).is_none_or(|end| end > w.ct.len()) {
+            anyhow::bail!("π_WIN: window {i} compares nothing or bytes outside its ciphertext");
+        }
+    }
+    Ok(())
+}
+
+pub fn build_pi_win<VM: Vm<Binary>>(
+    vm: &mut VM,
+    role: Role,
+    p: &PiWin,
+    witness: Option<&Witness>,
+) -> anyhow::Result<Vec<Check>> {
+    check_pi_win(p)?;
+    let (anchor, k, iv) = anchored_keys_after_updates(vm, role, "anchor", &p.anchor, witness, p.key_updates)?;
+    // Keystream blocks by (seq, block): windows of one record may share one.
+    let mut keystream: std::collections::HashMap<(u64, usize), Vector<U8>> = std::collections::HashMap::new();
+    let mut outs = Vec::with_capacity(p.windows.len());
+    let mut want = Vec::new();
+    for w in &p.windows {
+        let first = w.off / 16;
+        let nblocks = w.ct.len().div_ceil(16);
+        let mut blocks: Vec<Vector<U8>> = Vec::with_capacity(nblocks);
+        for b in first..first + nblocks {
+            let ks = match keystream.get(&(w.seq, b)) {
+                Some(ks) => *ks,
+                None => {
+                    // J0 has counter 1; keystream block `b` has counter `b + 2`.
+                    let ctr = ctr_block(vm, &iv, w.seq, (b + 2) as u32)?;
+                    let ks: Vector<U8> = aes_block(vm, &k, &ctr)?.into();
+                    keystream.insert((w.seq, b), ks);
+                    ks
+                }
+            };
+            blocks.push(ks);
+        }
+        let ks_all = concat(vm, &blocks)?;
+        let ks_used = select(vm, &ks_all, 0, w.ct.len())?;
+        let ct = public_bytes(vm, &w.ct)?;
+        let pt = xor_bytes(vm, &ct, &ks_used)?;
+        outs.push(select(vm, &pt, w.sel_start, w.expected.len())?);
+        want.extend_from_slice(&w.expected);
+    }
+    let all = concat(vm, &outs)?;
+    let expected = public_bytes(vm, &want)?;
+    let eq = eq_bytes(vm, &all, &expected)?;
+    Ok(vec![anchor, Check::full("windows", eq, vec![1u8])])
 }
 
 pub fn build_pi_nk<VM: Vm<Binary>>(

@@ -205,3 +205,30 @@ fn largest_honest_disclosures_fit_the_caps() {
         build_ok("short head, many records", 200_000 + k, small, 600, MAX_C3S_NEED - 600);
     }
 }
+
+#[test]
+fn pi_win_malformed_params_are_errors() {
+    let (params, witness) = fixtures::pi_win();
+    for (side, r) in ["prover", "verifier"].iter().zip(build_both(&params, Some(&witness))) {
+        assert!(r.is_ok(), "pi_win ({side}): {r:?}");
+    }
+    let Params::PiWin(p) = params else { unreachable!() };
+    let cases: Vec<(&str, Box<dyn Fn(&mut zkbench::statements::PiWin)>)> = vec![
+        ("no windows", Box::new(|p| p.windows.clear())),
+        ("unaligned offset", Box::new(|p| p.windows[1].off = 3)),
+        ("empty window", Box::new(|p| p.windows[1].ct.clear())),
+        ("nothing compared", Box::new(|p| p.windows[1].expected.clear())),
+        ("compared range outside the window", Box::new(|p| p.windows[1].sel_start = usize::MAX - 2)),
+        ("window past a record", Box::new(|p| p.windows[1].off = 1 << 20)),
+        ("too many key updates", Box::new(|p| p.key_updates = 1000)),
+    ];
+    for (name, f) in cases {
+        let mut q = p.clone();
+        f(&mut q);
+        assert_rejected(name, &Params::PiWin(q), Some(&witness));
+    }
+    // The prover needs the secret witness; a node-key witness is an error.
+    let (_, nk) = fixtures::pi_nk();
+    let [prover, _] = build_both(&Params::PiWin(p), Some(&nk));
+    assert!(matches!(prover, Err(e) if e.starts_with("error:")));
+}

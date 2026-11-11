@@ -429,7 +429,7 @@ fn chain_of(proof: &str) -> Result<bool> {
     // true = chain nk (node proves), false = chain cp (client proves).
     match proof {
         "pi_nk" => Ok(true),
-        "pi_c2s" | "pi_c3s" => Ok(false),
+        "pi_c2s" | "pi_c3s" | "pi_win" => Ok(false),
         other => bail!("proof {other} is not served on the proof channel"),
     }
 }
@@ -439,6 +439,7 @@ fn params_name(params: &Params) -> &'static str {
         Params::PiNK(_) => "pi_nk",
         Params::PiC2S(_) => "pi_c2s",
         Params::PiC3S(_) => "pi_c3s",
+        Params::PiWin(_) => "pi_win",
     }
 }
 
@@ -457,8 +458,12 @@ pub struct ZkChannel {
     cp: Chain,
     mux: Option<Mux>,
     counters: Arc<Counters>,
-    /// Proofs already run (each at most once per channel).
+    /// Proofs already run (each at most once per channel, unless `multi`).
     done: Vec<String>,
+    /// An `http: 2` session (protocol v3): π_WIN and π_C3S run once per
+    /// request or control record, so they may repeat. Each still consumes
+    /// fresh correlations, and a failure still poisons the channel.
+    multi: bool,
     /// Set by any failure: the channel never runs another proof.
     poisoned: bool,
     timings: Vec<Timing>,
@@ -524,6 +529,7 @@ impl ZkChannel {
             mux: Some(mux),
             counters,
             done: Vec::new(),
+            multi: false,
             poisoned: false,
             timings: vec![Timing { step: "hello".into(), ms: hello_ms.as_secs_f64() * 1e3, bytes_sent: 0, bytes_recv: 0 }],
             last: (0, 0),
@@ -553,6 +559,12 @@ impl ZkChannel {
         (self.nk.available(), self.cp.available())
     }
 
+    /// Let π_WIN and π_C3S run more than once (an `http: 2` session). Both
+    /// ends must agree, or the second request is refused by the strict one.
+    pub fn set_multi(&mut self, multi: bool) {
+        self.multi = multi;
+    }
+
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -562,10 +574,14 @@ impl ZkChannel {
             bail!("proof channel is closed after a failure");
         }
         let nk = chain_of(proof)?;
+        let repeatable = self.multi && matches!(proof, "pi_win" | "pi_c3s");
         if self.done.iter().any(|p| p == proof) {
-            bail!("{proof} already ran on this channel");
+            if !repeatable {
+                bail!("{proof} already ran on this channel");
+            }
+        } else {
+            self.done.push(proof.to_string());
         }
-        self.done.push(proof.to_string());
         Ok(nk)
     }
 
