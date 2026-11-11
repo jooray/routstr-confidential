@@ -269,6 +269,14 @@ export class H2Conn {
     return p
   }
 
+  /**
+   * A text frame in order with the records: a `ctl` must be directly
+   * followed by its record, so nothing may be sent while one is sealed.
+   */
+  private sendOrdered(obj: unknown): void {
+    this.tx = this.tx.then(() => this.s.sendText(obj)).then(() => {}, (e) => this.failRej(e))
+  }
+
   private sendCtl(name: string, payload: Uint8Array): Promise<number> {
     const f =
       name === 'settings_ack' ? frame(FRAME.SETTINGS, FLAG.ACK, 0)
@@ -293,7 +301,7 @@ export class H2Conn {
     }
     if (upto > cur.upto) {
       cur.upto = upto
-      this.s.sendText({ type: 'release', n: cur.n, upto })
+      this.sendOrdered({ type: 'release', n: cur.n, upto })
     }
   }
 
@@ -352,8 +360,9 @@ export class H2Conn {
     }
   }
 
-  private wait(type: string, ms: number): Promise<any> {
-    return Promise.race([this.s.waitT(type, ms), this.failP])
+  /** The next control frame of `type` (or of any of several: the frame's `type` tells which). */
+  private wait(type: string | string[], ms: number): Promise<any> {
+    return this.s.waitT(type, ms, this.failP)
   }
 
   /** Every received byte decrypted and parsed. */
@@ -442,9 +451,9 @@ export class H2Conn {
       // An image request: a node takes the variant and renders the suffix
       // itself; a sidecar without a node is handed the suffix.
       const terms = ctx.nodeMode ? { variant: b.image.variant, count: b.image.count } : { count: b.image.count, suffix: b.canonicalSuffix }
-      s.sendText({ type: 'request', n, kind: 'images', model: b.model, ...terms, body_len: bodyLen, ...ctx.requestExtras })
+      this.sendOrdered({ type: 'request', n, kind: 'images', model: b.model, ...terms, body_len: bodyLen, ...ctx.requestExtras })
     } else {
-      s.sendText({ type: 'request', n, kind: 'chat', model: b.model, max_tokens: b.maxTokens, body_len: bodyLen, ...ctx.requestExtras })
+      this.sendOrdered({ type: 'request', n, kind: 'chat', model: b.model, max_tokens: b.maxTokens, body_len: bodyLen, ...ctx.requestExtras })
     }
     while (this.unackedSettings > 0) {
       this.unackedSettings--
@@ -598,11 +607,11 @@ export class H2Conn {
         msg.epoch_start = epoch.epochStart
       }
       this.lastDisclosure = msg
-      s.sendText(msg)
-      const next = await Promise.race([
-        this.wait('disclose_retry', 60000).then((m: any) => ({ retry: m })),
-        this.wait('attestation', 60000).then((m: any) => ({ att: m })),
-      ])
+      this.sendOrdered(msg)
+      // One wait for either frame: a separate wait that lost would stay on
+      // the bus and take the next request's frame.
+      const m = await this.wait(['disclose_retry', 'attestation'], 60000)
+      const next = m.type === 'disclose_retry' ? { retry: m } : { att: m }
       if ('retry' in next) {
         // More server records reached the node than we had parsed: catch up.
         if (attempt >= 20) throw new Error('the node keeps asking for a newer disclosure')
@@ -642,15 +651,12 @@ export class H2Conn {
    * settles at the flat price. Nothing is disclosed and nothing proven.
    */
   private async settleAccept(cur: Cur): Promise<any> {
-    const { s } = this
     for (let attempt = 0; ; attempt++) {
       await this.drained()
       const serverRecords = this.recvCount()
-      s.sendText({ type: 'accept', n: cur.n, server_records: serverRecords })
-      const next = await Promise.race([
-        this.wait('accept_retry', 60000).then((m: any) => ({ retry: m })),
-        this.wait('attestation', 60000).then((m: any) => ({ att: m })),
-      ])
+      this.sendOrdered({ type: 'accept', n: cur.n, server_records: serverRecords })
+      const m: any = await this.wait(['accept_retry', 'attestation'], 60000)
+      const next = m.type === 'accept_retry' ? { retry: m } : { att: m }
       if ('retry' in next) {
         // More server records reached the node than we had parsed: catch up.
         if (attempt >= 20) throw new Error('the node keeps asking for a newer accept')
@@ -712,7 +718,7 @@ export class H2Conn {
       msg.key_updates = keyUpdates
       msg.epoch_start = epochStart
     }
-    s.sendText(msg)
+    this.sendOrdered(msg)
     const attJson = await this.checkAttestation(await this.wait('attestation', 60000), cur, undefined)
     const m = await this.wait('zk_params:pi_win:error_head', 30000)
     // The windows may touch only the head's bytes and each record's final type byte.
@@ -791,10 +797,8 @@ export class H2Conn {
   /** The request's signed receipt (or, with a node that settles, the unsigned usage frame). */
   private async receipt(cur: Cur, attJson: string): Promise<any> {
     const { s, ctx } = this
-    const terminal = await Promise.race([
-      this.wait('receipt', 60000).then((m: any) => ({ kind: 'receipt' as const, m })),
-      this.wait('usage', 60000).then((m: any) => ({ kind: 'usage' as const, m })),
-    ])
+    const m = await this.wait(['receipt', 'usage'], 60000)
+    const terminal = { kind: m.type as 'receipt' | 'usage', m }
     if (terminal.kind === 'usage') {
       if (terminal.m.n !== cur.n) throw new Error('usage frame is for another request')
       return { sid: s.sid, n: cur.n, model: terminal.m.model, usage: terminal.m.usage, unsigned: true }
@@ -817,15 +821,13 @@ export class H2Conn {
     if (!this.lastDisclosure) throw new Error('replay-usage needs an earlier settled request on the connection')
     await this.until(() => cur.released, 'body_released', 120000)
     const stale = { ...this.lastDisclosure, n: cur.n }
-    s.sendText(stale)
+    this.sendOrdered(stale)
     for (;;) {
-      const next = await Promise.race([
-        this.wait('disclose_retry', 30000).then((m: any) => ({ retry: m })),
-        this.wait('attestation', 30000).then((m: any) => ({ att: m })),
-      ])
+      const m = await this.wait(['disclose_retry', 'attestation'], 30000)
+      const next = m.type === 'disclose_retry' ? { retry: m } : { att: m }
       if ('att' in next) return { adv: 'replay-usage', accepted: true }
       // The node saw newer records: claim them, with the old bytes.
-      s.sendText({ ...stale, server_records: next.retry.server_records })
+      this.sendOrdered({ ...stale, server_records: next.retry.server_records })
     }
   }
 }
