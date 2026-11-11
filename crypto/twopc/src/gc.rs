@@ -360,12 +360,27 @@ pub fn garble<R: rand::Rng + ?Sized>(
 
 /// Evaluates; returns the active label of every feed.
 pub fn evaluate(circ: &Circuit, in_labels: &[Block], tables: &[Gate3], phase: usize) -> Vec<Block> {
-    let cipher = &*FIXED_KEY_AES;
     let mut l = vec![Block::ZERO; circ.feed_count()];
     l[..in_labels.len()].copy_from_slice(in_labels);
+    evaluate_range(circ, &mut l, tables, 0..circ.gates().len(), 0, phase);
+    l
+}
+
+/// Evaluates the gates `gates` (a stage) in place: `l` holds the active label
+/// of every feed computed so far, `and_start` is the index of the stage's
+/// first AND gate in `tables`.
+pub fn evaluate_range(
+    circ: &Circuit,
+    l: &mut [Block],
+    tables: &[Gate3],
+    gates: std::ops::Range<usize>,
+    and_start: usize,
+    phase: usize,
+) {
+    let cipher = &*FIXED_KEY_AES;
     let base = gid_base(phase);
-    let mut a = 0usize;
-    for g in circ.gates() {
+    let mut a = and_start;
+    for g in &circ.gates()[gates] {
         match g {
             Gate::Xor { x, y, z } => l[z.id()] = l[x.id()] ^ l[y.id()],
             Gate::And { x, y, z } => {
@@ -378,7 +393,87 @@ pub fn evaluate(circ: &Circuit, in_labels: &[Block], tables: &[Gate3], phase: us
             Gate::Inv { x, z } | Gate::Id { x, z } => l[z.id()] = l[x.id()],
         }
     }
-    l
+}
+
+/// One evaluation stage of a circuit: its gates, its AND gates (indices in
+/// AND-gate order) and the wires its consistency check has a row for.
+#[derive(Debug, Clone)]
+pub struct StageShape {
+    pub gates: std::ops::Range<usize>,
+    pub ands: std::ops::Range<usize>,
+    /// The stage's *row wires* (feed ids): first the wires that enter the
+    /// stage (circuit inputs and outputs of earlier stages' gates that an AND
+    /// input of this stage depends on linearly), then every AND output of the
+    /// stage in gate order.
+    pub rows: Vec<usize>,
+    /// How many of `rows` are entering wires.
+    pub entering: usize,
+}
+
+/// Splits a circuit into stages ending at `gate_end` (exclusive gate indices,
+/// increasing; the last one is the gate count).
+///
+/// The consistency check of a stage covers exactly the AND gates of that
+/// stage. Its relation is linear in the pointer bits of the gates' inputs,
+/// and within the stage those are linear in the pointer bits of the row
+/// wires. A wire that crosses a stage boundary (`OS_k`) is a row wire of the
+/// later stage in its own right, like a circuit input: its mask is committed
+/// (a linear combination of base masks, so N holds its MAC and C its key),
+/// C holds its active label, and its row is padded by hashes of its two
+/// labels. Without this cut the stage would need a row for every base wire of
+/// the earlier stages that the crossing wire depends on (most of them).
+pub fn stage_shapes(circ: &Circuit, gate_end: &[usize]) -> Vec<StageShape> {
+    let gates = circ.gates();
+    let mut out = Vec::with_capacity(gate_end.len());
+    let (mut g0, mut a0) = (0usize, 0usize);
+    // Wires that exist before the current stage starts.
+    let mut before = vec![false; circ.feed_count()];
+    for w in circ.inputs() {
+        before[w] = true;
+    }
+    for &g1 in gate_end {
+        let mut mark = vec![false; circ.feed_count()];
+        let mut and_out = Vec::new();
+        for g in &gates[g0..g1] {
+            if let Gate::And { x, y, z } = g {
+                mark[x.id()] = true;
+                mark[y.id()] = true;
+                and_out.push(z.id());
+            }
+        }
+        for g in gates[g0..g1].iter().rev() {
+            match g {
+                Gate::Xor { x, y, z } => {
+                    if mark[z.id()] {
+                        mark[x.id()] = true;
+                        mark[y.id()] = true;
+                    }
+                }
+                Gate::Inv { x, z } | Gate::Id { x, z } => {
+                    if mark[z.id()] {
+                        mark[x.id()] = true;
+                    }
+                }
+                Gate::And { .. } => {}
+            }
+        }
+        let mut rows: Vec<usize> = (0..circ.feed_count()).filter(|&w| mark[w] && before[w]).collect();
+        let entering = rows.len();
+        let na = and_out.len();
+        rows.extend(and_out);
+        out.push(StageShape {
+            gates: g0..g1,
+            ands: a0..a0 + na,
+            rows,
+            entering,
+        });
+        for g in &gates[g0..g1] {
+            before[g.z().id()] = true;
+        }
+        g0 = g1;
+        a0 += na;
+    }
+    out
 }
 
 /// N: propagates committed masks and their MACs from the base wires to every
@@ -478,7 +573,10 @@ pub fn dvzk_verifier_acc(
     }
 }
 
-/// N's consistency-check material for one phase.
+/// N's consistency-check material for one stage: `ands`, `t_mac` and `pw` are
+/// the stage's AND gates, `base` its row wires ([`StageShape::rows`]), `gates`
+/// the stage's gates, and `phase` the stage index (it separates the row-hash
+/// tweaks of the stages).
 ///
 /// For AND gate k = (i, j → o) the relation to check is
 /// `e_k = λ_o ⊕ t_k ⊕ Λ_i·λ_j ⊕ Λ_j·λ_i ⊕ (Λ_o ⊕ Λ_i·Λ_j) = 0`. Under the MACs,
@@ -507,6 +605,7 @@ pub struct CheckMaterial {
 #[allow(clippy::too_many_arguments)]
 pub fn check_material(
     circ: &Circuit,
+    gates: std::ops::Range<usize>,
     salt: u128,
     phase: usize,
     ands: &[(usize, usize, usize)],
@@ -526,7 +625,7 @@ pub fn check_material(
         x[i] ^= c.gfmul(mac[j]);
         x[j] ^= c.gfmul(mac[i]);
     }
-    for g in circ.gates().iter().rev() {
+    for g in circ.gates()[gates].iter().rev() {
         match g {
             Gate::Xor { x: a, y: b, z } => {
                 let v = x[z.id()];

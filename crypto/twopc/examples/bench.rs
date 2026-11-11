@@ -1,8 +1,8 @@
-//! Benchmark of the two-party key schedule (node-only authenticated garbling)
-//! on emulated links (`zkbench::transport::emulated_link`: per-direction rate,
-//! pipelined one-way delay).
+//! Benchmark of the two-party key schedule (node-only authenticated garbling,
+//! split key schedule) on emulated links (`zkbench::transport::emulated_link`:
+//! per-direction rate, pipelined one-way delay).
 //!
-//! `cargo run --release -p twopc --example bench [-- --runs N] [--only <scenario prefix>]`
+//! `cargo run --release -p twopc --example bench [-- --runs N] [--only <scenario prefix>] [--variant proven|public]`
 //!
 //! Wall time is a full cold session (Party::new → preprocess → key_share →
 //! handshake → application) until *both* parties are done. Bytes are what
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use p256::ProjectivePoint;
 use p256::elliptic_curve::PrimeField;
-use twopc::{Party, Role, circuit_stats};
+use twopc::{Party, Role, Variant, circuit_stats};
 use zkbench::transport::emulated_link;
 
 fn server_share() -> [u8; 65] {
@@ -34,7 +34,7 @@ struct Res {
     c_steps: Steps,
 }
 
-async fn session(delay: Duration, up: f64, down: f64) -> Res {
+async fn session(v: Variant, delay: Duration, up: f64, down: f64) -> Res {
     // a = C: a→b is C's uplink.
     let (io_c, io_n, counters) = emulated_link(delay, up, down);
     let share = server_share();
@@ -43,6 +43,7 @@ async fn session(delay: Duration, up: f64, down: f64) -> Res {
     let t0 = Instant::now();
     let run = move |role, io| async move {
         let mut p = Party::new(role, io).await.unwrap();
+        p.set_variant(v);
         p.preprocess().await.unwrap();
         p.key_share().await.unwrap();
         p.handshake(&share, th_sh).await.unwrap();
@@ -72,24 +73,40 @@ fn mb(b: u64) -> String {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let runs: usize = args
-        .iter()
-        .skip_while(|a| *a != "--runs")
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let only: Option<String> = args.iter().skip_while(|a| *a != "--only").nth(1).cloned();
+    let arg = |name: &str| args.iter().skip_while(|a| *a != name).nth(1).cloned();
+    let runs: usize = arg("--runs").and_then(|s| s.parse().ok()).unwrap_or(3);
+    let only = arg("--only");
+    let variants: Vec<Variant> = match arg("--variant").as_deref() {
+        Some("proven") => vec![Variant::Proven],
+        Some("public") => vec![Variant::PublicIs],
+        _ => vec![Variant::Proven, Variant::PublicIs],
+    };
 
+    println!("| design | garbled AND | garbled SHA-256 compressions |");
+    println!("|---|---|---|");
+    for (name, and, comp) in twopc::circuits::design_stats() {
+        println!("| {name} | {and} | {comp} |");
+    }
+    let (pc, pn) = twopc::proof_and_gates();
+    println!("\nB.2 proven: AND gates in proofs: C {pc} (11 compressions), N {pn} (hk)\n");
     println!("| circuit | AND | XOR | SHA-256 compressions | C in | N in | out |");
     println!("|---|---|---|---|---|---|---|");
-    for s in circuit_stats() {
+    for v in &variants {
+        for s in circuit_stats(*v).into_iter().skip(if *v == variants[0] { 0 } else { 2 }) {
+            println!(
+                "| {} | {} | {} | {} | {} | {} | {} |",
+                s.name, s.and_gates, s.xor_gates, s.compressions, s.c_input_bits, s.n_input_bits, s.output_bits
+            );
+        }
+    }
+    for v in &variants {
+        let (c2n, n2c) = twopc::message_sizes(*v);
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} |",
-            s.name, s.and_gates, s.xor_gates, s.compressions, s.c_input_bits, s.n_input_bits, s.output_bits
+            "\n{v:?}: AND gates at the end of each stage {:?}; protocol messages (computed, excl. OT): C→N {c2n} B, N→C {n2c} B",
+            twopc::stage_and_ends(*v)
         );
     }
-    let (c2n, n2c) = twopc::message_sizes();
-    println!("\nProtocol messages (computed, excl. OT extension): C→N {c2n} B, N→C {n2c} B\n");
+    println!();
 
     let mbit = |x: f64| x * 1e6 / 8.0;
     let scenarios: Vec<(&str, Duration, f64, f64)> = vec![
@@ -100,36 +117,37 @@ async fn main() {
         ("slow down: 40 ms one-way, 2 Mbit/s up, 10 Mbit/s down", Duration::from_millis(40), mbit(2.0), mbit(10.0)),
     ];
 
-    // Warm-up (circuit construction, page faults).
-    let _ = session(Duration::ZERO, f64::INFINITY, f64::INFINITY).await;
-
-    for (name, delay, up, down) in scenarios {
-        if let Some(o) = &only {
-            if !name.starts_with(o.as_str()) {
-                continue;
+    for v in variants {
+        // Warm-up (circuit construction, page faults).
+        let _ = session(v, Duration::ZERO, f64::INFINITY, f64::INFINITY).await;
+        for (name, delay, up, down) in &scenarios {
+            if let Some(o) = &only {
+                if !name.starts_with(o.as_str()) {
+                    continue;
+                }
             }
+            let mut walls = Vec::new();
+            let mut last = None;
+            for _ in 0..runs {
+                let r = session(v, *delay, *up, *down).await;
+                walls.push(r.wall_ms);
+                last = Some(r);
+            }
+            walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let r = last.unwrap();
+            println!("## {v:?}: {name}\n");
+            println!(
+                "cold session {:.2} s (median of {runs}), C→N {} MB, N→C {} MB\n",
+                walls[walls.len() / 2] / 1e3,
+                mb(r.c2n),
+                mb(r.n2c)
+            );
+            println!("| step (C) | ms | C sent | C recv |");
+            println!("|---|---|---|---|");
+            for (s, ms, snt, rcv) in &r.c_steps {
+                println!("| {s} | {ms:.1} | {snt} | {rcv} |");
+            }
+            println!();
         }
-        let mut walls = Vec::new();
-        let mut last = None;
-        for _ in 0..runs {
-            let r = session(delay, up, down).await;
-            walls.push(r.wall_ms);
-            last = Some(r);
-        }
-        walls.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let r = last.unwrap();
-        println!("## {name}\n");
-        println!(
-            "cold session {:.2} s (median of {runs}), C→N {} MB, N→C {} MB\n",
-            walls[walls.len() / 2] / 1e3,
-            mb(r.c2n),
-            mb(r.n2c)
-        );
-        println!("| step (C) | ms | C sent | C recv |");
-        println!("|---|---|---|---|");
-        for (s, ms, snt, rcv) in &r.c_steps {
-            println!("| {s} | {ms:.1} | {snt} | {rcv} |");
-        }
-        println!();
     }
 }
