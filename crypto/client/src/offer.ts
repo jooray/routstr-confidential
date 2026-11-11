@@ -85,6 +85,18 @@ export function chatBlockProblem(offer: any): string | null {
   return null
 }
 
+/**
+ * The request key an image endpoint reads the image count from, by the route
+ * its head template names: `n` for the OpenAI-style `/images/generations`,
+ * `variants` for `/image/generate`. Undefined for any other route.
+ */
+export function imageCountKeyForRoute(headTemplate: unknown): string | undefined {
+  const path = typeof headTemplate === 'string' ? (/^POST (\S+) HTTP\/1\.1\r\n/.exec(headTemplate)?.[1]?.split('?')[0] ?? '') : ''
+  if (path.endsWith('/images/generations')) return 'n'
+  if (path.endsWith('/image/generate')) return 'variants'
+  return undefined
+}
+
 /** The variant pin keys a client lets the node pin (the price axes). */
 const VARIANT_PIN_KEYS = new Set(['resolution', 'quality', 'format'])
 
@@ -101,6 +113,12 @@ export function checkImagesBlock(im: any): void {
   }
   const countKey = im.count_key ?? 'variants'
   if (typeof countKey !== 'string' || !countKey) bad('count_key')
+  // The count is pinned under this key and the charge is the price × count:
+  // under a key the endpoint does not read, the provider would make its
+  // default number of images while the client paid for `count`.
+  const routeKey = imageCountKeyForRoute(im.head_template)
+  if (routeKey === undefined) bad('head_template does not name an image endpoint with a known count key')
+  if (countKey !== routeKey) bad(`count_key ${JSON.stringify(countKey)} is not the one the endpoint reads (${JSON.stringify(routeKey)})`)
   if (!(Number.isSafeInteger(im.max_count) && im.max_count >= 1 && im.max_count <= 4)) bad('max_count must be 1..4')
   if (im.response_idle_s !== undefined && !(Number.isSafeInteger(im.response_idle_s) && im.response_idle_s >= 30 && im.response_idle_s <= 600)) {
     bad('response_idle_s must be 30..600')
@@ -157,10 +175,14 @@ export function tokenCount(v: unknown): number {
 
 /**
  * The most the node may charge for a usage at the signed rates (msats, no
- * fee): prompt tokens at `in`, less cached reads at `cached_in` (never above
- * `in`) and prompt-cache writes at `cache_write` (`in` when the offer has
- * none), both counted inside `prompt_tokens`; the larger of that, the formula
- * without writes and the uncached one (as the SDK's maxChargeMsats).
+ * fee). The node computes its charge from the same disclosed usage: prompt
+ * tokens at `in`, less cached reads at `cached_in` (never above `in`) and
+ * prompt-cache writes at `cache_write` (`in` when the offer has none), both
+ * counted inside `prompt_tokens`. The bound is that formula, or the same with
+ * the writes billed at `in` when that is larger (a node that read no write
+ * count bills them so). It is never the uncached price for a usage that
+ * reports cached reads: a charge that ignores the cache discount is an
+ * overcharge (as the SDK's maxChargeMsats).
  */
 export function maxUsageCharge(rates: any, usage: any): number {
   const inRate = Number(rates.in)
@@ -179,5 +201,6 @@ export function maxUsageCharge(rates: any, usage: any): number {
   const writeRate = Number(rates.cache_write ?? inRate)
   const cost = (c: number, w: number) =>
     Math.ceil((inRate * (prompt - c - w) + cachedRate * c + writeRate * w + outRate * completion) / 1000)
-  return Math.max(cost(0, 0), cost(cached, 0), cost(cached, written))
+  // `cost(cached, 0)` is the uncached price when no cached reads are reported.
+  return Math.max(cost(cached, 0), cost(cached, written))
 }

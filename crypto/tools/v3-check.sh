@@ -142,9 +142,14 @@ offer_http() { curl -fsS "$SIDECAR/offer" | "$PY" -I -c 'import json,sys; print(
 [ "$(offer_http)" = "2,1.1" ] || { echo "the sidecar at $SIDECAR does not offer http [\"2\", \"1.1\"] (got $(offer_http))" >&2; exit 2; }
 
 # Offline first: the client's HTTP/2 layer against the sidecar's vectors, the
-# parameter checks, the message handling and the TLS fork's hooks.
+# parameter checks, the message handling, the TLS fork's hooks and its record
+# rules (no application data before the handshake is done, no plaintext
+# handshake or alert record under record protection) and the offer rules
+# (the receipt bound, the image count key).
 (cd "$CRYPTO/client" && node --experimental-strip-types src/h2-selfcheck.ts && node --experimental-strip-types src/h2-conn-test.ts \
-  && node --experimental-strip-types src/fork-selfcheck.ts > /dev/null) || { echo "offline self-checks failed" >&2; exit 1; }
+  && node --experimental-strip-types src/fork-selfcheck.ts > /dev/null \
+  && node --experimental-strip-types test/tls-fork-records-check.ts > /dev/null \
+  && node --experimental-strip-types test/offer-check.ts > /dev/null) || { echo "offline self-checks failed" >&2; exit 1; }
 
 SUMMARY="$OUT/summary.tsv"
 printf 'case\texpected\tverdict\tevidence\n' > "$SUMMARY"

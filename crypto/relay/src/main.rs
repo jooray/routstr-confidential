@@ -374,6 +374,14 @@ impl ImagesEndpoint {
         if !(30..=SESSION_TIMEOUT.as_secs()).contains(&self.response_idle_s) {
             bail!("images response_idle_s {} outside 30..={}", self.response_idle_s, SESSION_TIMEOUT.as_secs());
         }
+        // The count is pinned under this key and charged per image: under a
+        // key the endpoint does not read, the provider would make its default
+        // number of images. Clients refuse such an offer; fail here first.
+        match image_count_key_for_route(&self.head_template) {
+            Some(k) if k == self.count_key => {}
+            Some(k) => bail!("images count_key {:?} is not the one the endpoint reads ({k:?})", self.count_key),
+            None => bail!("images head_template does not name an image endpoint with a known count key"),
+        }
         let mut keys = std::collections::HashSet::new();
         for k in std::iter::once(&"model".to_string())
             .chain(std::iter::once(&self.count_key))
@@ -532,6 +540,20 @@ fn default_head_template_for(host: &str, key_len: usize) -> String {
 
 /// The routes a head template may post to, by kind (as the clients hold them).
 const CHAT_ROUTES: &[&str] = &["/chat/completions"];
+
+/// The request key an image endpoint reads the image count from, by the route
+/// its head template names: `n` for the OpenAI-style `/images/generations`,
+/// `variants` for `/image/generate`.
+fn image_count_key_for_route(head_template: &str) -> Option<&'static str> {
+    let path = head_template.strip_prefix("POST ")?.split(' ').next()?.split('?').next()?;
+    if path.ends_with("/images/generations") {
+        Some("n")
+    } else if path.ends_with("/image/generate") {
+        Some("variants")
+    } else {
+        None
+    }
+}
 const IMAGES_ROUTES: &[&str] = &["/image/generate", "/images/generations"];
 /// The headers a head template sets, each exactly once.
 const TEMPLATE_HEADERS: [&str; 6] = ["host", "authorization", "content-type", "accept-encoding", "connection", "content-length"];
@@ -4099,6 +4121,14 @@ mod hardening_tests {
         let mut ep = venice_images();
         ep.count_key = "model".into();
         assert!(ep.validate("api.venice.ai", 42).is_err());
+        // The count key is the one the route reads.
+        let mut ep = venice_images();
+        ep.count_key = "n".into();
+        let e = ep.validate("api.venice.ai", 42).unwrap_err();
+        assert!(format!("{e:#}").contains("count_key"), "{e:#}");
+        assert_eq!(image_count_key_for_route("POST /v1/images/generations HTTP/1.1\r\n"), Some("n"));
+        assert_eq!(image_count_key_for_route("POST /api/v1/image/generate?x=1 HTTP/1.1\r\n"), Some("variants"));
+        assert_eq!(image_count_key_for_route("POST /v1/chat/completions HTTP/1.1\r\n"), None);
         let mut ep = venice_images();
         ep.head_template = ep.head_template.replace("Connection: close", "Connection: keep-alive");
         assert!(ep.validate("api.venice.ai", 42).is_err());

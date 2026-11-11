@@ -10,6 +10,7 @@
     "layout": "node --experimental-strip-types src/layout-test.ts",
     "fork-selfcheck": "node --experimental-strip-types src/fork-selfcheck.ts",
     "tls-records-check": "node --experimental-strip-types test/tls-fork-records-check.ts",
+    "offer-check": "node --experimental-strip-types test/offer-check.ts",
     "h2-selfcheck": "node --experimental-strip-types src/h2-selfcheck.ts",
     "h2-conn-test": "node --experimental-strip-types src/h2-conn-test.ts"
   },
