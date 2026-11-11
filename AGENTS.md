@@ -266,10 +266,11 @@ State (2026-11-11):
 | Part | State |
 |---|---|
 | `crypto/zkbench` | done: π_C2S removed, the proof channel repeats `pi_win`/`pi_c3s` (69 tests) |
-| `crypto/relay` (sidecar) | done, unit-tested (94 tests), **not yet run live**: `main.rs` (setup, framing "1.1": `request_11`, `final_record_params`, `disclose_11`; `H2Guard`: withdrawal of "2" after 5 failed opens, test hooks `CU_TEST_H2_FAIL_FILE`, `CU_TEST_H2_RETRY_SECS` on loopback), `h2_session.rs` (framing "2", `settings_seen`, refusals). Offer files: `relay/offer.venice.json` (`"http": ["2","1.1"]`), `relay/offer.venice.http11.json` |
+| `crypto/relay` (sidecar) | done, unit-tested (94 tests), run live by `v3-check.sh`: `main.rs` (setup, framing "1.1": `request_11`, `final_record_params`, `disclose_11`; `H2Guard`: withdrawal of "2" after 5 failed opens, test hooks `CU_TEST_H2_FAIL_FILE`, `CU_TEST_H2_RETRY_SECS` on loopback), `h2_session.rs` (framing "2", `settings_seen`, refusals). Offer files: `relay/offer.venice.json` (`"http": ["2","1.1"]`), `relay/offer.venice.http11.json` |
 | `routstr-core` (node) | code ported (`routstr/confidential_ws.py`: one path, `_run_h2_session` serves both framings; `routstr/confidential.py`: offer v3, `pin_offer`, `check_request_offer`, deposit default, session fee once), settings `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT`, `CONFIDENTIAL_IDLE_TIMEOUT_S`. **Unit tests (`tests/unit/test_confidential*.py`) are not ported yet and fail**; not run live |
-| `crypto/client` (reference driver) | being ported (one driver, `--http 2|1.1|auto`) |
-| gates | to be renamed `crypto/tools/v3-check.sh`, `v3-node-check.sh`; the `v3-h2-*` scripts are the prototype's and do not match the v3 wire format |
+| `crypto/client` (reference driver) | done: `src/driver.ts` (`--http 2\|1.1\|auto`, `--requests`, `--image`, `--arm`, `--refuse-first`, `--adv MODE`, `--legacy-v2-socket`), `driver-h2.ts`, `driver-h11.ts`, `ctx.ts`; run live against the sidecar, **not against a node** |
+| gates | `crypto/tools/v3-check.sh` (sidecar + driver, real Venice: every case has passed, not yet in one clean run); `crypto/tools/v3-node-check.sh` has the driver flags ported but its node-side expectations are still the prototype's and it was not run; `v3-h2-routstrd-check.sh` is the prototype's |
+| `provider-profile-check.py --h2` (H1-H8) | not written |
 | routstr-sdk, routstrd, web library | not ported: they speak v2 / the prototype and do not work against a v3 node |
 
 ## Browser client (separate repos)
