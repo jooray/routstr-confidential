@@ -462,6 +462,7 @@ export class H2Conn {
       released_ms: cur.tReleased ? cur.tReleased - cur.tStart : undefined,
       ttft_ms: cur.tFirstData ? cur.tFirstData - cur.tStart : undefined,
       total_ms: tEnd - cur.tStart,
+      at: { start: cur.tStart, released: cur.tReleased, first_data: cur.tFirstData },
       proofs: this.proofs.slice(proofs0),
       bytes: delta,
     }
@@ -775,7 +776,15 @@ export async function runHttp2(s: any, conn: H2Conn, tClaim: number): Promise<an
     twopc: s.twopc?.timings,
   }
   ctx.writePrivate(`${s.runDir}/client.jsonl`, s.logLines.join('\n') + '\n')
+  // The cold path: from the claim (the connection's start) to request 1.
+  const first = results[0]?.at
+  const cold = first && {
+    released_ms: first.released ? first.released - tClaim : undefined,
+    ttft_ms: first.first_data ? first.first_data - tClaim : undefined,
+  }
+  for (const r of results) delete r.at
   return {
+    cold,
     sid: s.sid,
     protocol: 2,
     http: 2,

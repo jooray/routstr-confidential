@@ -660,6 +660,7 @@ class Session {
         const m = JSON.parse(d)
         process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
         trace('<-', shown(m.type))
+        if (typeof m.type === 'string' && this.tFirst[m.type] === undefined) this.tFirst[m.type] = Date.now()
         if (m.type === 'error') this.errRej(new Error(`sidecar rejected: ${shown(m.reason, 300)}`))
         if (this.h2) {
           // An http: 2 session runs many proofs: their parameters are keyed
@@ -740,6 +741,8 @@ class Session {
     if (this.h2) this.h2.bytes.control_sent += text.length
     this.ws.send(text)
   }
+  /** When each kind of control frame first arrived (measurements). */
+  tFirst: Record<string, number> = {}
   /** The HTTP/2 connection of an `--http2` session. */
   h2: H2Conn | undefined
   waitT(type: string, ms: number): Promise<any> {
@@ -1220,6 +1223,8 @@ class Session {
       zkchan_ready_ms: this.zkchan?.tReady ? this.zkchan.tReady - this.zkchan.tStart : undefined,
       zkchan_setup: this.zkchan?.readyInfo?.timings,
       claim_to_body_ms: tBodyWrite - tClaim,
+      // The node released the final body record (π_C2S verified).
+      claim_to_released_ms: this.tFirst.body_released ? this.tFirst.body_released - tClaim : undefined,
       upstream_ttft_ms: ttftAbs - tBodyWrite,
     }
     return {

@@ -250,6 +250,17 @@ is env-only (the routes are mounted at startup), and the node must run as a
 single worker (offers, sessions and `/zk` admission are per process); it
 refuses to start in confidential mode when it detects more than one.
 
+## Protocol v3 prototype (branch `v3-h2`, not merged, not deployed)
+
+`PROTOCOL-V3-DESIGN.md` (spec; A.11 is the wire format as built) and `PROTOCOL-V3-DRAFT.md` (reasoning).
+Option A, `http: 2`: one two-party handshake per HTTP/2 connection, the credential written once in epoch 0
+(it lands in the provider's HPACK table), then sequential requests that name it by index. Built so far: the
+statement `pi_win` (`zkbench`), the sidecar mode (`relay/src/{h2,h2_session,hpack}.rs`, offered only with an
+`h2` block: `relay/offer.venice.h2.json`), the reference driver (`--http2 --requests N`,
+`client/src/{h2,driver-h2}.ts`). Not built: the node, the SDK, routstrd, the web library. v2 is untouched and
+the default. Gate: `crypto/tools/v3-h2-check.sh` (starts its own sidecar; honest cases, five attacks, a v2
+control); offline: `node --experimental-strip-types src/h2-selfcheck.ts` in `crypto/client`.
+
 ## Browser client (separate repos)
 
 `~/projects/routstr-confidential-web` (github jooray/routstr-confidential-web): the browser library

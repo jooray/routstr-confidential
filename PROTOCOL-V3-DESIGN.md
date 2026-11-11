@@ -204,6 +204,193 @@ disclosure is verified.
 Parallel streams on one connection; client KeyUpdates after epoch 0; image requests over `http: 2` (the
 design allows them; build chat first); connection deposits; the browser library.
 
+### A.11 Wire format (as implemented)
+
+Prototype on branch `v3-h2`: sidecar (`crypto/relay/src/{h2,h2_session,hpack}.rs`), statement
+(`crypto/zkbench/src/statements.rs`, `PiWin`), reference client (`crypto/client/src/{h2,driver-h2}.ts`), gate
+`crypto/tools/v3-h2-check.sh`. This section is what the node and the SDK need; where it differs from A.1-A.8
+it says so ("differs"). All messages are JSON text frames on the session WebSocket (`/session` on the sidecar,
+`/v1/confidential/ws` on the node) unless marked binary. Byte strings in JSON are lower-case hex, except inside
+`params`, where they are arrays of numbers (as in v2). A v2 session (`setup` without `http`) is unchanged.
+
+#### Offer
+
+Sidecar offer file: optional block `"h2": {"probe_path": "/api/v1/models", "idle_secs": 300, "max_requests": 100}`
+(`idle_secs` 10..3600, default 300; `max_requests` 1..1000, default 100; `probe_path` canonical, under 127
+bytes; host under 127 bytes; key at most 119 bytes). The sidecar's `/offer` then carries the block unchanged
+and `"http": ["1.1", "2"]`; without the block `"http": ["1.1"]`. The node copies both into its signed offer.
+The request path is not a new field: it is the path of the offer's `head_template` (`POST <path> HTTP/1.1`).
+
+Client checks before a `setup` with `http: 2`: `http` lists `"2"`; the `h2` block is in range; `probe_path` is a
+trusted API base plus `/models` (`checkH2Offer`); the usual v2 offer checks (host, chat block, head template).
+
+#### Setup
+
+`C → N  {"type":"setup","http":2,"nonce_c":<64 hex>,"armed":<bool>}` plus, towards a node, `auth` and
+`offer_sig` (the sidecar ignores them; with a direct sidecar `escrow_e`/`escrow` as in v2). `http` may be the
+number 2 or the string `"2"`; absent, `1.1` or `"1.1"` is v2. A setup with `http: 2` that names `kind`, `model`,
+`max_tokens`, `len`, `suffix` or `count` is refused.
+
+`N → C  {"type":"ready","sid","nonce_n","pubkey","head_len":170,"armed","v":2,"http":2,"h2":{…block…}}`.
+No `suffix`. `sid` is computed as in v2 and names the **connection**; a request is `(sid, n)`.
+
+Then exactly as v2: `/zk?proof=twopc`, `/zk?proof=zkchan` (the client's `cu-prover --channel --multi`), the
+ClientHello (ALPN must be exactly `h2`), `hs_verified` (N also requires EncryptedExtensions to select `h2`),
+`c_commit` with the π_NK parameters, π_NK, `release_head`, `head_written`.
+
+π_NK parameters are the v2 `PiNK` object; `template` is the connection head of A.3 with zero bytes at the key
+positions, `key_offsets` the 42 (key length) consecutive positions, `head_len` its length (170 for Venice).
+Head bytes, in order: the 24-byte preface; `00 00 12 04 00 00000000` + `0001 00000000`, `0002 00000000`,
+`0004 7fffffff`; `00 00 04 08 00 00000000` + `7fff0000`; `00 00 LL 01 05 00000001` + block
+`82 87 01 <len> <host> 04 <len> <probe_path> 57 <7+keylen> "Bearer " <key>`; `00 00 04 03 00 00000001` +
+`00000008`. The client rebuilds this from the offer (`h2Head`) and compares every byte.
+
+A client record (binary) between its Finished and `head_written` is refused in an `http: 2` session.
+
+#### After `head_written`: client records
+
+Every binary message after `head_written` is TLS records under `c_ap_1` (sequence numbers from 0). **One HTTP/2
+frame per record**: inner plaintext = 9-byte frame header ‖ payload ‖ `0x17`, no padding; at most 2^14 content
+bytes, so a DATA payload is at most 16 375 bytes. N classifies each record when it arrives, queues it, and
+writes it to the provider only after a π_WIN that covers it verified (and, for a request's record, within
+`release`). Records are written in arrival order, which is their sequence order.
+
+- A record is a **control record** iff the text frame right before it was
+  `C → N  {"type":"ctl","frame":"settings_ack"|"ping_ack"|"window_update"|"rst_stream"}` (differs: the spec did
+  not say how N learns the kind). Inner lengths must be 10, 18, 14, 14. `window_update` is on stream 0;
+  `rst_stream` is on the current request's stream and only accepted once that request's records are all
+  received. At most 16 unproven control records.
+- Any other record belongs to the open request (below): the first must be the HEADERS record (inner length
+  9 + block + 1), the rest are DATA records until their payloads sum to `body_len`. Not allowed: an empty DATA
+  frame, a last DATA frame shorter than the suffix, more than `3 + body_len/4096` records, any record when no
+  request is open or after the request is complete.
+
+#### A request
+
+1. `C → N  {"type":"request","n":k,"kind":"chat","model","max_tokens","body_len"}` (`kind` optional; only chat;
+   `suffix` optional and must equal the canonical one). Towards a node it also carries what a v2 setup carries
+   for billing: `auth`, `offer_sig`, `session_fee_msat`, `abandon_fee_msat`; **the node reserves here**, strips
+   `auth` and forwards the rest. `n` must be the previous `n` + 1 (first: 1), at most `max_requests`, and no
+   request may be in flight. `body_len` is the sum of the DATA payloads (the JSON body), suffix included.
+   `N → C  {"type":"request_ok","sid","n","stream":2k+1,"suffix":<the canonical suffix string>}`.
+   The client may send its records without waiting for `request_ok`.
+2. Records: `HEADERS` (flags END_HEADERS = 0x04, stream 2k+1) with the block
+   `83 87 01 <len> <host> 04 <len> <path> 0f 10 10 "application/json" be`, then DATA frames (flags 0, the last
+   one END_STREAM = 0x01 and ending in the suffix).
+3. When the request is complete and no π_WIN is in flight, N sends
+   `{"type":"zk_params","proof":"pi_win","purpose":"records","first_seq":s,"count":c,"params":{"PiWin":…}}`
+   covering **all** unproven queued records (control records included), sequence numbers `s … s+c-1`. While a
+   request is open but incomplete N sends none (so a `settings_ack` sent after `request` joins that request's
+   proof). With no request open, a control record gets its own `zk_params` at once. The client checks the
+   parameters (below) and proves `pi_win` on the proof channel (witness `c_ap_1`).
+4. `C → N  {"type":"release","n":k,"upto":u}`: the first `u` records of request `k` (HEADERS is 1) may be written
+   once proven. `u` only grows; it may be sent before the proof. The client follows the provider's flow control:
+   stream credit = the provider's `INITIAL_WINDOW_SIZE` + WINDOW_UPDATEs on the stream, connection credit = 65 535
+   + WINDOW_UPDATEs on stream 0 − DATA bytes of earlier requests.
+5. When the last record of the request is written: `N → C  {"type":"body_released","n":k}`. The node treats the
+   reservation as at stake from here, as for v2's `body_released`.
+
+π_WIN parameters (`PiWin`): `{"anchor":[32 bytes],"key_updates":0,"windows":[{"seq","off","ct":[…],"sel_start","expected":[…]}]}`
+(`off`, `sel_start`, `key_updates` omitted when 0). Plaintext of record `seq` at `[off+sel_start, …)` must equal
+`expected`; `ct` is the record's ciphertext `[off, off+|ct|)`, `off` a multiple of 16. For client records
+`anchor = h1`. N's windows per record:
+
+| Record | Windows |
+|---|---|
+| control, HEADERS | whole record if header ‖ `17` is all of it (SETTINGS ACK, HEADERS: the full frame ‖ `17`); else `[0,9)` = the expected frame header, and the last byte = `17` |
+| DATA, not last | `[0,9)` = `len 00 00 stream` with `len = inner_len − 10`; last byte = `17` |
+| DATA, last | `[0,9)` = the same with flags `01`; the last `|suffix|+1` bytes = suffix ‖ `17` |
+
+Limits: 2 200 windows, 64 KiB of ciphertext, per proof. Client-side check (`checkPiWinParams`): `anchor` is our
+`h1`; every window names one of the `count` records, its `ct` is our ciphertext at a block-aligned offset, and
+the compared bytes equal our plaintext and lie inside a range that is public for that record (frame header
+`[0,9)`; the last byte; the whole HEADERS / SETTINGS-ACK record; the suffix tail). Every record of the batch is
+named by at least one window.
+
+Cost: 7 SHA-256 compressions plus one AES block per distinct 16-byte block touched. 308 k correlations for a
+300-byte body (23 blocks), 457 k for a 200 kB body in 13 DATA records (46 blocks): about 160 k + 6.4 k per block.
+
+#### Success: disclosure, attestation, settlement
+
+`C → N  {"type":"disclose","n":k,"r":<hex>,"tail_lens":[…],"skip":0,"server_records":m[,"key_updates","epoch_start"]}`
+
+- `server_records` (differs: new, replaces v2's `trailing`): the number of server records of outer type 23 the
+  client had received since the connection began (handshake flight included) when it built `R`. If N holds more:
+  `N → C  {"type":"disclose_retry","n":k,"server_records":<N's count>}`, nothing else changes, the client
+  rebuilds. If N holds fewer: error.
+- `tail_lens`: inner lengths (content + 1) of the last records, last first; they must be exactly N's last
+  `|tail_lens|` records, all with index ≥ `S_k` (the count of such records when N wrote the request's first
+  record). `skip` must be 0 and `trailing` absent. `key_updates`/`epoch_start` as in v2.
+- `R` (differs from A.6 in where it starts): a suffix of the server plaintext that starts **either** with the
+  9-byte header of a DATA frame on the request's stream (when the usage event begins a frame), **or** with the
+  line feed that precedes `data: ` (when the event begins inside a frame; this is v2's rule, and anchors the
+  event at a line start). From there text runs to the next `0x00`, which starts a frame header; accepted frames:
+  DATA on the stream (flags 0 or END_STREAM), one HEADERS on the stream with flags exactly `05` (trailers),
+  SETTINGS / PING / GOAWAY on stream 0, WINDOW_UPDATE on stream 0 or the request's stream. A frame may split the
+  text anywhere (differs: A.6 mentions only event boundaries). The stream must end inside `R` (END_STREAM), and
+  the DATA payloads together must be exactly `data: <usage JSON>\n\ndata: [DONE]\n\n`, the JSON on one line with
+  empty `choices` and integer `usage.prompt_tokens`, `usage.completion_tokens`.
+
+N answers, in this order:
+
+`{"type":"attestation","n":k,"a":{…},"sig":<ed25519 over the serialized a>}` with
+`a = {"sid","http":2,"n","stream","s_k","server_records","sha256_recv","client_records","sha256_sent","cert_chain_hash","th_sh","th_sf","c_commit","time"}`:
+`server_records` and `sha256_recv` cover the outer-type-23 server records with index in `[s_k, s_k+server_records)`
+(each as header ‖ payload); for a usage disclosure that interval ends at the disclosure's `server_records`.
+`client_records`/`sha256_sent` cover the request's own records (HEADERS, DATA) written to the provider, not
+control records. The node re-signs it as for v2 (`a_json`, `sig_scheme`).
+
+`{"type":"zk_params","proof":"pi_c3s","n":k,"params":{"PiC3S":…}}`: as v2, `skip` 0, record `seq` = index −
+handshake records − `epoch_start`. The client checks it as in v2 (`checkPiC3SParams` with `trailing: 0`) and
+proves with `s_ap_0`.
+
+Settlement, when the proof verifies: with `--node-settles`
+`{"type":"usage","sid","http":2,"n":k,"model":<pinned>,"usage":<the usage event>[,"reported_model"]}` (v2's frame
+plus `http` and `n`; the node settles and signs the receipt, which should carry `n`); without it the sidecar's
+stub `{"type":"receipt","n":k,"receipt":{"sid","http":2,"n",…,"attestation_hash"},"receipt_json","sig"}`.
+The connection is then idle and accepts `request` `k+1`.
+
+#### Error: the response head
+
+`C → N  {"type":"disclose_head","n":k,"record":i,"r":<hex>[,"key_updates","epoch_start"]}`: `r` is exactly one
+HEADERS frame on the request's stream with END_HEADERS (END_STREAM allowed; no padding or priority), at most
+16 KiB, starting at byte 0 of server record `i` (index as in `server_records`), `i ≥ S_k`, spanning at most 8
+records. Its block must decode with an empty dynamic table: static indices 1..61, literals of any kind, a size
+update to 0 before the first field; `:status` first, no other pseudo-header, three digits, 400..599.
+Allowed as soon as the request's first record was written (differs: not only after `body_released`, because a
+refused request may never get the window to release its body), and only when none of the client's records is
+unproven.
+
+N answers `attestation` (as above; the interval ends at N's current record count), then
+`{"type":"zk_params","proof":"pi_win","purpose":"error_head","n":k,"record":i,"params":{"PiWin":…}}` with
+`anchor = h2`, `key_updates`, and per covered record: the frame's bytes from offset 0, and the record's last
+byte = `17` (differs: added, so the head cannot be read out of a non-application record). The client checks
+that the windows touch only the frame's bytes and those last bytes of its own received records, and proves with
+`s_ap_0`. Settlement as above with `usage = {"error_status":<status>,"choices":[]}`; the node applies v2's
+error-head rules. Then `{"type":"closed","reason":"error_settled"}` and the socket closes.
+
+#### Lifecycle and failures
+
+- `{"type":"closed","reason":"idle"|"max_requests"|"error_settled"|"upstream_closed"|"connection_lifetime"}`: an
+  orderly end with no request in flight. Idle: `h2.idle_secs` after `head_written` or the last settlement.
+  Differs: a connection also ends 3 600 s after `head_written` (at its next settlement).
+- Time limits per request: 600 s from `request` to `body_released`, 600 s from there to settlement.
+- The provider closes: no request in flight → `closed`; a request not fully released →
+  `{"type":"upstream_closed_early","n","response_bytes"}` then an error; a released request may still be
+  disclosed until its time limit.
+- `{"type":"error","reason"}` and a closed socket for everything else, including any failed proof. A request
+  in flight then falls under v2's abort rules (before `body_released`: release the reservation; after it, with
+  no settlement: charge it).
+- Proofs: `pi_win` and `pi_c3s` run once per `zk_params` (on the channel, or `/zk?proof=pi_win|pi_c3s`). The
+  channel preallocates as for v2 and extends online when it runs out (about 0.48 MB node → client per
+  extension; in steady state about 1 MB per request).
+
+#### Not implemented
+
+Images over `http: 2`; client KeyUpdates; parallel streams; a server KeyUpdate inside or after a disclosed tail
+(the disclosure then fails; one before the tail is handled by `key_updates`/`epoch_start` but is untested live);
+connection deposits and fees; the node, the SDK, routstrd and the web library.
+
 ---
 
 ## B. Split key schedule
