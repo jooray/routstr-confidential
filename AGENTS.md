@@ -250,58 +250,27 @@ is env-only (the routes are mounted at startup), and the node must run as a
 single worker (offers, sessions and `/zk` admission are per process); it
 refuses to start in confidential mode when it detects more than one.
 
-## Protocol v3 prototype (branch `v3-h2`, not merged, not deployed)
+## Protocol v3 (branch `v3-h2`; routstr-core `confidential-v3`): the unification in progress
 
-`PROTOCOL-V3-DESIGN.md` (spec; A.11 is the wire format as built) and `PROTOCOL-V3-DRAFT.md` (reasoning).
-Option A, `http: 2`: one two-party handshake per HTTP/2 connection, the credential written once in epoch 0
-(it lands in the provider's HPACK table), then sequential requests that name it by index. Built so far: the
-statement `pi_win` (`zkbench`), the sidecar mode (`relay/src/{h2,h2_session,hpack}.rs`, offered only with an
-`h2` block: `relay/offer.venice.h2.json`), the reference driver (`--http2 --requests N`,
-`client/src/{h2,driver-h2}.ts`), and the node (routstr-core branch `confidential-v3`, local only, from
-`confidential-2pc`: the setup checks the credential and reserves the connection deposit, each `request` is
-reserved and settled as a v2 session; `routstr/confidential_ws.py` `_run_h2_session`, tests
-`tests/unit/test_confidential_http2.py`; A.11 "Through a node" is the client-facing wire format). Not built:
-the web library. v2 is untouched and the default. Gates: `crypto/tools/v3-h2-check.sh`
-(starts its own sidecar; honest cases, five attacks, a v2 control) and `crypto/tools/v3-h2-node-check.sh`
-(starts a sidecar and a node on scratch state, needs routstr-core on `confidential-v3`; checks every case's
-money outcome in the node's database, the deposit cases included); offline:
-`node --experimental-strip-types src/h2-selfcheck.ts` in `crypto/client`.
+`PROTOCOL-V3.md` is the normative specification; **§12 is the complete wire format** (sidecar-facing "S" and
+client-facing "N"). v3 is a breaking change: one connection lifecycle (`setup {v:3, http}` without request
+terms, a connection deposit, `request` / `request_ok` / `request_refused`, π_WIN, attestation and receipt per
+request, `closed` with the deposit outcome) and two framings of the inner connection, `"2"` (HTTP/2, many
+sequential requests) and `"1.1"` (one request, sent before the ClientHello). π_C2S, `body_suffix` and the v2
+setup are gone; v2 lives on the branches `twopc-v2` (here) and `confidential-2pc` (routstr-core, routstr-sdk).
+**Until the unification is finished, read the "One session (protocol v2…)" text above as history**: the
+steps and proofs are the same, the messages are those of §12.
 
-Connection deposit and idle timeout (A.12, which has the rule for every way a connection can end): the
-node's signed `h2` block adds `connection_deposit_msat` (`CONFIDENTIAL_H2_CONNECTION_DEPOSIT_MSAT`, default
--1 = the abandon fee, so 0 unless the operator sets a fee) and `idle_timeout_s`
-(`CONFIDENTIAL_H2_IDLE_TIMEOUT_S`, default 120, at most the sidecar's `h2.idle_secs`). The setup reserves the
-deposit through the ordinary reservation path (`reserve_deposit` in `routstr/confidential.py`); the first
-settled request releases it (`deposit_released_msat` in its receipt); a connection that ends without one
-loses it unless the node, the sidecar or the provider failed (`_h2_deposit_verdict`; the sidecar marks its
-own failures with `fault` in its `error` frame), and the connection's last frame carries the signed outcome.
-The node closes a connection with no request in flight for `idle_timeout_s` (`closed`, reason `idle`). The
-driver: `--requests 0`, `--linger-ms`, `--max-deposit`.
+State (2026-11-11):
 
-Images over `http: 2` (A.13): the sidecar offer's `h2.kinds` (`["chat", "images"]` in
-`relay/offer.venice.h2.json`; absent = chat only) lets an image request run as one more request on a
-connection. The path is the route of the images endpoint's head template, the node renders the suffix
-(`reserve_image`) and the sidecar checks it (`check_suffix` in `on_request`), π_WIN proves it like a chat
-suffix, a 2xx is settled by `accept {n, server_records}` (`on_accept`; flat usage, `settle_flat`), an error
-by its head. The response is one JSON body over DATA frames, ended by END_STREAM; the connection head's
-2^31-1 windows cover it without WINDOW_UPDATEs, and a connection is retired after 1 GiB received
-(`closed`, reason `max_bytes`). Driver: `--http2 --image`, or `--h2-kinds chat,images --image-model <id>`.
-The gates' image cases generate real images (z-image-turbo, about $0.01 each: one in `v3-h2-check.sh`, two
-in `v3-h2-node-check.sh`, one in `v3-h2-routstrd-check.sh` and one in the SDK script's `image` case).
-
-The clients (local branches `confidential-v3` in routstr-sdk, from `confidential-2pc`, and in routstrd, from
-`confidential-upstream`): the SDK runs chat on pooled `http: 2` connections when the verified offer lists
-`"2"` (`client/confidential/{h2,h2conn,h2pool}.ts`, `confidential.http2`, on by default; one-off Cashu
-bearers and other nodes keep the v2 flow, and so do images unless the offer's `h2.kinds` lists them; a node whose deposit exceeds `http2.maxConnectionDepositMsat`,
-default 100 000 msat, also gets the v2 flow; the pool's idle time stays below the node's `idle_timeout_s`),
-routstrd passes `confidentialUpstream.http2` through. Live checks:
-`bun scripts/confidential-h2-e2e.ts <node> <sk-key> <model>` in routstr-sdk (SDK level, against a node you
-started), and `crypto/tools/v3-h2-routstrd-check.sh`, which starts a sidecar, a node, a stub mint
-(`crypto/tools/v3-h2-routstrd/`) and a scratch routstrd (scratch HOME/ROUTSTRD_DIR/COCOD_DIR, dead proxy for
-non-loopback HTTP), sends curl requests with `x-routstr-verify: confidential` (5 sequential, a burst of 3,
-one image request, 5 with http2 disabled), checks the routstrd log, the node log and the node's balance, and prints the time to
-first token and the bytes per request. It needs both client checkouts built (SDK `npm run build`, then
-routstrd `bun run build`).
+| Part | State |
+|---|---|
+| `crypto/zkbench` | done: π_C2S removed, the proof channel repeats `pi_win`/`pi_c3s` (69 tests) |
+| `crypto/relay` (sidecar) | done, unit-tested (94 tests), **not yet run live**: `main.rs` (setup, framing "1.1": `request_11`, `final_record_params`, `disclose_11`; `H2Guard`: withdrawal of "2" after 5 failed opens, test hooks `CU_TEST_H2_FAIL_FILE`, `CU_TEST_H2_RETRY_SECS` on loopback), `h2_session.rs` (framing "2", `settings_seen`, refusals). Offer files: `relay/offer.venice.json` (`"http": ["2","1.1"]`), `relay/offer.venice.http11.json` |
+| `routstr-core` (node) | code ported (`routstr/confidential_ws.py`: one path, `_run_h2_session` serves both framings; `routstr/confidential.py`: offer v3, `pin_offer`, `check_request_offer`, deposit default, session fee once), settings `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT`, `CONFIDENTIAL_IDLE_TIMEOUT_S`. **Unit tests (`tests/unit/test_confidential*.py`) are not ported yet and fail**; not run live |
+| `crypto/client` (reference driver) | being ported (one driver, `--http 2|1.1|auto`) |
+| gates | to be renamed `crypto/tools/v3-check.sh`, `v3-node-check.sh`; the `v3-h2-*` scripts are the prototype's and do not match the v3 wire format |
+| routstr-sdk, routstrd, web library | not ported: they speak v2 / the prototype and do not work against a v3 node |
 
 ## Browser client (separate repos)
 
