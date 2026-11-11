@@ -81,6 +81,7 @@ import { runZk } from './zkbridge.ts'
 import { checkHeadTemplate, checkPiC2SParams, checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from './params.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
 import { ZkChan } from './zkchan.ts'
+import { Bus, waitMsg } from './bus.ts'
 import { H2Conn, runHttp2, type H2Ctx } from './driver-h2.ts'
 import { MAX_DATA_IN_RECORD, checkH2Offer, checkPiNKParamsH2 } from './h2.ts'
 
@@ -273,33 +274,6 @@ let OFFER_SIG: string | undefined
 let SESSION_FEE = 0
 /** The signed offer's fee for a session that ends unused (msats, ≥ SESSION_FEE). */
 let ABANDON_FEE = 0
-
-// ---------------------------------------------------------------------------
-// Minimal message bus
-// ---------------------------------------------------------------------------
-
-class Bus {
-  private pending = new Map<string, unknown[]>()
-  private waiters = new Map<string, ((m: unknown) => void)[]>()
-  emit(msg: any) {
-    const w = this.waiters.get(msg.type)
-    if (w && w.length) w.shift()!(msg)
-    else {
-      const p = this.pending.get(msg.type) ?? []
-      p.push(msg)
-      this.pending.set(msg.type, p)
-    }
-  }
-  wait(type: string): Promise<any> {
-    const p = this.pending.get(type)
-    if (p && p.length) return Promise.resolve(p.shift())
-    return new Promise((res) => {
-      const w = this.waiters.get(type) ?? []
-      w.push(res)
-      this.waiters.set(type, w)
-    })
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Body construction (SPEC §5.5)
@@ -751,8 +725,9 @@ class Session {
   tFirst: Record<string, number> = {}
   /** The HTTP/2 connection of an `--http2` session. */
   h2: H2Conn | undefined
-  waitT(type: string, ms: number): Promise<any> {
-    return Promise.race([this.bus.wait(type), this.errP, timeout(ms, type)])
+  /** The next control frame of `type` (or of any of several types); also ends on `stops`. */
+  waitT(type: string | string[], ms: number, ...stops: Promise<unknown>[]): Promise<any> {
+    return waitMsg(this.bus, type, ms, this.errP, ...stops)
   }
   sendBytes(b: Uint8Array) {
     if (this.h2) this.h2.bytes.relay_sent += b.length
