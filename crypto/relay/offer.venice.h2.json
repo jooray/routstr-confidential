@@ -82,6 +82,7 @@
   "h2": {
     "probe_path": "/api/v1/models",
     "idle_secs": 300,
-    "max_requests": 100
+    "max_requests": 100,
+    "kinds": ["chat", "images"]
   }
 }

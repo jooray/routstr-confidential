@@ -46,6 +46,18 @@ pub struct H2Block {
     /// Requests per connection.
     #[serde(default = "default_max_requests")]
     pub max_requests: u32,
+    /// The request kinds a connection serves: `chat`, and `images` when the
+    /// offer has an images endpoint (A.13). Absent: chat only.
+    #[serde(default = "default_kinds", skip_serializing_if = "chat_only")]
+    pub kinds: Vec<String>,
+}
+
+fn default_kinds() -> Vec<String> {
+    vec!["chat".into()]
+}
+
+fn chat_only(kinds: &Vec<String>) -> bool {
+    kinds.len() == 1 && kinds[0] == "chat"
 }
 
 fn default_idle() -> u64 {
@@ -85,7 +97,15 @@ impl H2Block {
         if !(1..=1000).contains(&self.max_requests) {
             bail!("h2 max_requests {} outside 1..=1000", self.max_requests);
         }
+        if self.kinds != ["chat"] && self.kinds != ["chat", "images"] {
+            bail!("h2 kinds {:?} must be [\"chat\"] or [\"chat\", \"images\"]", self.kinds);
+        }
         Ok(())
+    }
+
+    /// Whether a connection serves requests of `kind`.
+    pub fn serves(&self, kind: &str) -> bool {
+        self.kinds.iter().any(|k| k == kind)
     }
 }
 
@@ -483,7 +503,7 @@ mod tests {
 
     #[test]
     fn block_validation() {
-        let ok = H2Block { probe_path: "/api/v1/models".into(), idle_secs: 300, max_requests: 100 };
+        let ok = H2Block { probe_path: "/api/v1/models".into(), idle_secs: 300, max_requests: 100, kinds: vec!["chat".into()] };
         ok.validate("api.venice.ai", 42).unwrap();
         for path in ["", "models", "/a?b", "/a/../b", "/a//b", "/a b", &format!("/{}", "a".repeat(130))] {
             let b = H2Block { probe_path: path.into(), ..ok.clone() };
@@ -493,6 +513,16 @@ mod tests {
         assert!(ok.validate("bad host", 42).is_err());
         assert!(H2Block { idle_secs: 5, ..ok.clone() }.validate("h", 42).is_err());
         assert!(H2Block { max_requests: 0, ..ok.clone() }.validate("h", 42).is_err());
+        // The kinds: chat, or chat and images, nothing else.
+        let kinds = |k: &[&str]| H2Block { kinds: k.iter().map(|s| s.to_string()).collect(), ..ok.clone() };
+        assert!(kinds(&["chat", "images"]).validate("h", 42).is_ok());
+        for bad in [&[][..], &["images"], &["images", "chat"], &["chat", "chat"], &["chat", "video"], &["chat", "images", "images"]] {
+            assert!(kinds(bad).validate("h", 42).is_err(), "{bad:?}");
+        }
+        assert!(kinds(&["chat", "images"]).serves("images") && !ok.serves("images"));
+        // A chat-only block serializes as it did before the field existed.
+        assert!(!serde_json::to_string(&ok).unwrap().contains("kinds"));
+        assert!(serde_json::to_string(&kinds(&["chat", "images"])).unwrap().contains(r#""kinds":["chat","images"]"#));
     }
 
     #[test]

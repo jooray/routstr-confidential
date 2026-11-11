@@ -23,6 +23,13 @@ use crate::h2::{self, Ctl};
 
 /// Longest life of one `http: 2` connection, whatever its traffic.
 pub(crate) const H2_CONN_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Upstream bytes after which a connection is closed at its next settlement:
+/// its receive window (2^31-1, set by the connection head) is never
+/// replenished, so it is retired long before the window can run out.
+pub(crate) const H2_CONN_SOFT_BYTES: usize = 1 << 30;
+/// The most a connection may receive at all: the soft limit, the request in
+/// flight when it was reached (at most one response cap) and one more.
+pub(crate) const H2_CONN_MAX_BYTES: usize = H2_CONN_SOFT_BYTES + 2 * MAX_SERVER_BYTES;
 /// Most control records queued unproven.
 const MAX_QUEUED_CTL: usize = 16;
 /// Most records an error head may span (a response head is about 1 kB).
@@ -61,6 +68,10 @@ struct Req {
     n: u32,
     stream: u32,
     model: String,
+    /// `Some(count)` for an image request (settled flat on `accept`).
+    images: Option<u64>,
+    /// Most upstream bytes its interval may hold (the response cap).
+    cap: usize,
     body_len: usize,
     suffix: String,
     /// The public header block of its HEADERS frame.
@@ -95,8 +106,10 @@ struct Req {
 /// Per-connection state of an `http: 2` session.
 pub(crate) struct H2 {
     cfg: h2::H2Block,
-    /// The request path (the chat route of the offer's head template).
+    /// The request path (the chat route of the offer's head template), and
+    /// the images route when the connection serves image requests.
     path: String,
+    images_path: Option<String>,
     /// Client bytes that do not yet form a record, the records held, and
     /// their size.
     pending: Vec<u8>,
@@ -116,10 +129,11 @@ pub(crate) struct H2 {
 }
 
 impl H2 {
-    fn new(cfg: h2::H2Block, path: String) -> Self {
+    fn new(cfg: h2::H2Block, path: String, images_path: Option<String>) -> Self {
         H2 {
             cfg,
             path,
+            images_path,
             pending: Vec::new(),
             queue: VecDeque::new(),
             held: 0,
@@ -150,17 +164,22 @@ impl H2 {
     }
 
     /// A complete server record, in arrival order: part of the current
-    /// request's interval while it is open.
-    pub(crate) fn server_record(&mut self, r: &Record) {
+    /// request's interval while it is open. A response past the request's
+    /// cap ends the connection.
+    pub(crate) fn server_record(&mut self, r: &Record) -> Result<()> {
         if r.ctype != CT_APPLICATION_DATA {
-            return;
+            return Ok(());
         }
         if let Some(q) = self.req.as_mut().filter(|q| q.interval_open) {
             q.recv.update(&r.header);
             q.recv.update(&r.payload);
             q.recv_records += 1;
             q.recv_bytes += 5 + r.payload.len();
+            if q.recv_bytes > q.cap {
+                bail!("the response to request {} exceeds {} bytes", q.n, q.cap);
+            }
         }
+        Ok(())
     }
 
     fn idle_deadline(&self) -> tokio::time::Instant {
@@ -175,8 +194,18 @@ fn max_records(body_len: usize) -> usize {
     3 + body_len / 4096
 }
 
-/// The path of the offer's chat route (`POST <path> HTTP/1.1` of the head
-/// template, checked at startup).
+/// The images route of an offer whose `h2` block serves image requests
+/// (`None` when it does not): the path of the images endpoint's template.
+pub(crate) fn images_path(offer: &Offer) -> Result<Option<String>> {
+    if !offer.h2.as_ref().is_some_and(|b| b.serves("images")) {
+        return Ok(None);
+    }
+    let ep = offer.endpoints.images.as_ref().ok_or_else(|| anyhow!("h2 kinds lists images, but the offer has no images endpoint"))?;
+    Ok(Some(chat_path(&ep.head_template).context("the images endpoint's head template")?))
+}
+
+/// The path of a request route (`POST <path> HTTP/1.1` of a head template,
+/// checked at startup): the offer's chat template, or its images endpoint's.
 pub(crate) fn chat_path(head_template: &str) -> Result<String> {
     head_template
         .strip_prefix("POST ")
@@ -213,7 +242,7 @@ pub(crate) fn handle_setup(
     st.sid = Some(sid.clone());
     st.body_len = 0;
     st.head_len = head.len();
-    st.h2 = Some(Box::new(H2::new(cfg.clone(), chat_path(&app.offer.head_template)?)));
+    st.h2 = Some(Box::new(H2::new(cfg.clone(), chat_path(&app.offer.head_template)?, images_path(&app.offer)?)));
     shared.multi.store(true, std::sync::atomic::Ordering::SeqCst);
     st.run_dir = Some(init_run_dir(app, &sid)?);
     app.sessions.lock().unwrap().insert(sid.clone(), shared.clone());
@@ -255,6 +284,7 @@ pub(crate) fn on_request(
     max_tokens: u64,
     body_len: usize,
     suffix: Option<&str>,
+    count: Option<u64>,
 ) -> Result<()> {
     if st.state != SessionState::Body {
         bail!("request before the connection head was written");
@@ -273,32 +303,56 @@ pub(crate) fn on_request(
     if n > h.cfg.max_requests {
         bail!("request {n} exceeds max_requests {}", h.cfg.max_requests);
     }
-    if !matches!(kind, None | Some("chat")) {
-        bail!("an http: 2 session serves chat requests only (kind {kind:?})");
-    }
-    if model.is_empty() || max_tokens == 0 {
-        bail!("a request needs a model and max_tokens >= 1");
-    }
-    if max_tokens > app.offer.max_tokens_cap {
-        bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
-    }
+    let images = match kind {
+        None | Some("chat") => false,
+        Some("images") => true,
+        Some(other) => bail!("unknown request kind {other:?}"),
+    };
     if !app.offer.model_allowlist.is_empty() && !app.offer.model_allowlist.contains(&model) {
         bail!("model {model:?} is not in the offer's model_allowlist");
     }
-    let canonical = app.offer.chat.render(&model, max_tokens);
-    if suffix.is_some_and(|s| s != canonical) {
-        bail!("a chat request's suffix is the canonical one");
-    }
+    // The suffix the request's last record must end with, its path, the
+    // image count (an image request) and the response cap.
+    let (canonical, path, image_count, cap) = if images {
+        // An image request (A.13): the node rendered the suffix from its
+        // signed offer; it is checked here as for a v2 image setup.
+        let (Some(path), Some(ep)) = (h.images_path.as_ref(), app.offer.endpoints.images.as_ref()) else {
+            bail!("this connection serves no image requests");
+        };
+        if model.is_empty() || max_tokens != 0 {
+            bail!("an image request needs a model and no max_tokens");
+        }
+        let suffix = suffix.ok_or_else(|| anyhow!("an image request needs the node's suffix"))?;
+        let c = ep.check_suffix(&model, suffix)?;
+        if count.is_some_and(|x| x != c) {
+            bail!("request count {count:?} differs from the suffix's count {c}");
+        }
+        (suffix.to_string(), path.clone(), Some(c), ep.max_response_bytes)
+    } else {
+        if model.is_empty() || max_tokens == 0 {
+            bail!("a request needs a model and max_tokens >= 1");
+        }
+        if max_tokens > app.offer.max_tokens_cap {
+            bail!("max_tokens {max_tokens} exceeds cap {}", app.offer.max_tokens_cap);
+        }
+        let canonical = app.offer.chat.render(&model, max_tokens);
+        if suffix.is_some_and(|s| s != canonical) || count.is_some() {
+            bail!("a chat request's suffix is the canonical one and it has no count");
+        }
+        (canonical, h.path.clone(), None, MAX_SERVER_BYTES)
+    };
     if body_len <= canonical.len() || body_len > app.max_body {
         bail!("declared body length {body_len} outside {}..={}", canonical.len() + 1, app.max_body);
     }
     let stream = h2::request_stream(n);
-    let block = h2::request_block(&app.offer.upstream_host, &h.path);
+    let block = h2::request_block(&app.offer.upstream_host, &path);
     h.requests = n;
     h.req = Some(Req {
         n,
         stream,
         model: model.clone(),
+        images: image_count,
+        cap,
         body_len,
         suffix: canonical.clone(),
         block,
@@ -321,7 +375,7 @@ pub(crate) fn on_request(
     // The per-request limit, as for a v2 session: up to the release, then
     // again from it.
     st.deadline = Some(tokio::time::Instant::now() + SESSION_TIMEOUT);
-    side(st, format!("request n={n} stream={stream} model={model} body_len={body_len} max_tokens={max_tokens}"));
+    side(st, format!("request n={n} stream={stream} model={model} body_len={body_len} max_tokens={max_tokens} images={image_count:?}"));
     let _ = to_client.send(Message::Text(
         serde_json::json!({"type":"request_ok","sid":sid,"n":n,"stream":stream,"suffix":canonical}).to_string().into(),
     ));
@@ -572,10 +626,10 @@ pub(crate) async fn proof_done(
             side(st, format!("pi_win verified for {count} client record(s)"));
             pump(shared, to_client, st, log, tcp_tx).await
         }
-        ("pi_win", Some(WinInflight::ErrorHead)) => settle(app, st, to_client, "pi_win"),
+        ("pi_win", Some(WinInflight::ErrorHead)) => settle(app, st, to_client, "pi_win", log.recv_len),
         ("pi_c3s", win) => {
             h.win = win;
-            settle(app, st, to_client, "pi_c3s")
+            settle(app, st, to_client, "pi_c3s", log.recv_len)
         }
         _ => bail!("{proof} verified with nothing waiting for it"),
     }
@@ -604,6 +658,9 @@ pub(crate) fn on_disclose(
     let q = h.req.as_mut().filter(|q| Some(q.n) == n).ok_or_else(|| anyhow!("disclose names no request in flight"))?;
     if !q.released || q.usage.is_some() {
         bail!("disclose out of order or repeated");
+    }
+    if q.images.is_some() {
+        bail!("an image request settles on accept or on an error head, never on a usage disclosure");
     }
     if skip != 0 || trailing.is_some() {
         bail!("an http: 2 usage disclosure ends at the last server record (no skip, no trailing records)");
@@ -754,6 +811,46 @@ pub(crate) fn on_disclose_head(
     Ok(())
 }
 
+/// `accept`: a successful image response (A.13). The price was fixed by the
+/// request, so nothing is disclosed and nothing proven: the interval closes
+/// at the records the client has seen, and the request is settled flat.
+pub(crate) fn on_accept(
+    app: &Arc<AppState>,
+    st: &mut Session,
+    to_client: &mpsc::UnboundedSender<Message>,
+    log: &RelayLog,
+    n: Option<u32>,
+    server_records: Option<usize>,
+) -> Result<()> {
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
+    if h.win.is_some() || h.queue.iter().any(|x| !x.proven) {
+        bail!("accept while client records are unproven");
+    }
+    let q = h.req.as_mut().filter(|q| Some(q.n) == n).ok_or_else(|| anyhow!("accept names no request in flight"))?;
+    let Some(count) = q.images else { bail!("accept is for image requests only") };
+    if !q.released || q.usage.is_some() {
+        bail!("accept out of order or repeated");
+    }
+    // The interval ends at the last server record the client has: if more
+    // arrived since, the client catches up first (as for a disclosure).
+    let upto = server_records.ok_or_else(|| anyhow!("an http: 2 accept names the server records it has seen (server_records)"))?;
+    if upto > log.server_app_records {
+        bail!("the accept counts {upto} server records, the node received {}", log.server_app_records);
+    }
+    if upto < log.server_app_records {
+        let _ = to_client.send(Message::Text(
+            serde_json::json!({"type":"accept_retry","n":q.n,"server_records":log.server_app_records}).to_string().into(),
+        ));
+        return Ok(());
+    }
+    q.usage = Some(serde_json::json!({"flat": true, "kind": "images", "count": count}));
+    q.settle_on = Some("accept");
+    let n = q.n;
+    attest(app, st, to_client)?;
+    side(st, format!("request n={n} accepted: flat charge for {count} image(s)"));
+    settle(app, st, to_client, "accept", log.recv_len)
+}
+
 /// Close the current request's interval and sign its attestation.
 fn attest(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) -> Result<()> {
     let hs = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?;
@@ -792,7 +889,7 @@ fn attest(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
 
 /// The disclosure's proof verified: hand the usage to the node (or sign the
 /// stub receipt), then either accept the next request or close.
-fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSender<Message>, proof: &str) -> Result<()> {
+fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSender<Message>, proof: &str, recv_len: usize) -> Result<()> {
     let sid = st.sid.clone();
     let run_dir = st.run_dir.clone();
     let h = st.h2.as_mut().ok_or_else(|| anyhow!("not an http: 2 session"))?;
@@ -836,6 +933,8 @@ fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
         h.closing = Some("upstream_closed");
     } else if h.requests >= h.cfg.max_requests {
         h.closing = Some("max_requests");
+    } else if recv_len >= H2_CONN_SOFT_BYTES {
+        h.closing = Some("max_bytes");
     } else if h.conn_end.is_some_and(|end| end <= tokio::time::Instant::now()) {
         h.closing = Some("connection_lifetime");
     }
@@ -893,12 +992,14 @@ mod tests {
 
     fn session_with_request(body_len: usize, suffix: &str) -> Session {
         let mut st = Session { state: SessionState::Body, ..Session::default() };
-        let mut h = H2::new(h2::H2Block { probe_path: "/p".into(), idle_secs: 300, max_requests: 3 }, "/api/v1/chat/completions".into());
+        let mut h = H2::new(h2::H2Block { probe_path: "/p".into(), idle_secs: 300, max_requests: 3, kinds: vec!["chat".into()] }, "/api/v1/chat/completions".into(), None);
         h.requests = 1;
         h.req = Some(Req {
             n: 1,
             stream: 3,
             model: "m".into(),
+            images: None,
+            cap: MAX_SERVER_BYTES,
             body_len,
             suffix: suffix.into(),
             block: h2::request_block("h", "/api/v1/chat/completions"),
@@ -1115,7 +1216,7 @@ mod tests {
 
     fn feed(st: &mut Session, log: &mut RelayLog, content: &[u8]) {
         let r = server_rec(content);
-        st.h2.as_mut().unwrap().server_record(&r);
+        st.h2.as_mut().unwrap().server_record(&r).unwrap();
         log.server_record(r);
     }
 
@@ -1383,6 +1484,233 @@ mod tests {
         assert!(h.req.is_none() && h.closing.is_none());
     }
 
+    /// The image suffix the node would render for the shipped offer (model
+    /// `img`, one image, WebP).
+    fn image_suffix(app: &AppState, model: &str, count: u64) -> String {
+        let ep = app.offer.endpoints.images.as_ref().unwrap();
+        ep.render_suffix(model, count, &[("format".to_string(), serde_json::json!("webp"))])
+    }
+
+    /// An idle open connection (no request yet) on the shipped h2 offer.
+    fn idle_session(app: &AppState) -> Session {
+        let mut st = open_session(300);
+        let h = st.h2.as_mut().unwrap();
+        *h = Box::new(H2::new(app.offer.h2.clone().unwrap(), chat_path(&app.offer.head_template).unwrap(), images_path(&app.offer).unwrap()));
+        st
+    }
+
+    #[test]
+    fn the_images_route_comes_from_the_offers_endpoint() {
+        let app = app_state(true);
+        assert_eq!(images_path(&app.offer).unwrap().as_deref(), Some("/api/v1/image/generate"));
+        // A chat-only h2 block: no image requests, whatever endpoints exist.
+        let mut o = (*app.offer).clone();
+        o.h2.as_mut().unwrap().kinds = vec!["chat".into()];
+        assert_eq!(images_path(&o).unwrap(), None);
+        // `images` without an images endpoint is refused at startup.
+        let mut o = (*app.offer).clone();
+        o.endpoints.images = None;
+        assert!(images_path(&o).is_err());
+    }
+
+    #[test]
+    fn an_image_request_takes_the_nodes_suffix_and_the_images_path() {
+        let app = app_state(true);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sfx = image_suffix(&app, "img", 2);
+        let req = |st: &mut Session, kind: Option<&str>, max_tokens: u64, suffix: Option<&str>, count: Option<u64>| {
+            on_request(&app, &tx, st, 1, kind, "img".into(), max_tokens, sfx.len() + 40, suffix, count)
+        };
+        // Refused: no suffix, max_tokens, a count that is not the suffix's, a
+        // suffix for another model, a tampered pin, an unknown kind; a chat
+        // request with a count.
+        for (kind, max_tokens, suffix, count) in [
+            (Some("images"), 0, None, Some(2)),
+            (Some("images"), 20, Some(sfx.as_str()), Some(2)),
+            (Some("images"), 0, Some(sfx.as_str()), Some(1)),
+            (Some("images"), 0, Some(image_suffix(&app, "other", 2).as_str()), Some(2)),
+            (Some("images"), 0, Some(sfx.replace("\"return_binary\":false", "\"return_binary\":true").as_str()), Some(2)),
+            (Some("video"), 0, Some(sfx.as_str()), Some(2)),
+            (None, 20, None, Some(1)),
+        ] {
+            let mut st = idle_session(&app);
+            assert!(req(&mut st, kind, max_tokens, suffix, count).is_err(), "{kind:?} {max_tokens} {suffix:?} {count:?}");
+            assert!(st.h2.as_ref().unwrap().req.is_none());
+        }
+        assert!(texts(&mut rx).is_empty());
+        // Honest: the suffix is echoed, the HEADERS block names the images path.
+        let mut st = idle_session(&app);
+        req(&mut st, Some("images"), 0, Some(&sfx), Some(2)).unwrap();
+        let m = texts(&mut rx);
+        assert_eq!((m[0]["type"].as_str(), m[0]["suffix"].as_str(), m[0]["stream"].as_u64()), (Some("request_ok"), Some(sfx.as_str()), Some(3)));
+        let q = st.h2.as_ref().unwrap().req.as_ref().unwrap();
+        assert_eq!(q.images, Some(2));
+        assert_eq!(q.block, h2::request_block("api.venice.ai", "/api/v1/image/generate"));
+        assert_ne!(q.block, h2::request_block("api.venice.ai", "/api/v1/chat/completions"));
+        assert_eq!(q.cap, app.offer.endpoints.images.as_ref().unwrap().max_response_bytes);
+        // A connection whose offer serves chat only refuses an image request.
+        let mut st = open_session(300);
+        st.h2.as_mut().unwrap().req = None;
+        st.h2.as_mut().unwrap().requests = 0;
+        assert!(req(&mut st, Some("images"), 0, Some(&sfx), Some(2)).is_err());
+    }
+
+    /// An image request written to the upstream in full, its response in the log.
+    async fn image_released(
+        app: &Arc<AppState>,
+        sh: &Arc<SessionShared>,
+        tx: &mpsc::UnboundedSender<Message>,
+        st: &mut Session,
+        log: &mut RelayLog,
+        w: &mut tokio::net::tcp::OwnedWriteHalf,
+        n: u32,
+    ) {
+        let sfx = image_suffix(app, "img", 1);
+        let body_len = sfx.len() + 60;
+        on_request(app, tx, st, n, Some("images"), "img".into(), 0, body_len, Some(&sfx), Some(1)).unwrap();
+        let block = h2::request_block("api.venice.ai", "/api/v1/image/generate").len();
+        for r in [record(9 + block + 1), record(10 + body_len)] {
+            client_bytes(st, &r).unwrap();
+        }
+        on_release(st, n, 2).unwrap();
+        pump(sh, tx, st, log, w).await.unwrap();
+        prove(app, sh, tx, st, log, w, "pi_win").await.unwrap();
+        let stream = h2::request_stream(n);
+        feed(st, log, &h2::frame(h2::HEADERS, h2::END_HEADERS, stream, &[0x88]));
+        feed(st, log, &h2::frame(h2::DATA, 0, stream, &[b'A'; 9000]));
+        feed(st, log, &h2::frame(h2::DATA, h2::END_STREAM, stream, b"\"]}"));
+    }
+
+    #[tokio::test]
+    async fn an_image_request_is_proven_like_chat_and_settles_flat_on_accept() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = idle_session(&app);
+        for c in [&[1u8; 40][..], &[2; 900], &[3; 30]] {
+            feed(&mut st, &mut log, c);
+        }
+        // Before the proof: nothing can be accepted.
+        let sfx = image_suffix(&app, "img", 1);
+        on_request(&app, &tx, &mut st, 1, Some("images"), "img".into(), 0, sfx.len() + 60, Some(&sfx), Some(1)).unwrap();
+        assert!(on_accept(&app, &mut st, &tx, &log, Some(1), Some(log.server_app_records)).is_err());
+        st.h2.as_mut().unwrap().req = None;
+        st.h2.as_mut().unwrap().requests = 0;
+        texts(&mut rx);
+
+        image_released(&app, &sh, &tx, &mut st, &mut log, &mut w, 1).await;
+        let m = texts(&mut rx);
+        // π_WIN pins the whole HEADERS record and the last record's tail = suffix ‖ 0x17.
+        let zk = m.iter().find(|x| x["type"] == "zk_params").unwrap();
+        let Params::PiWin(p) = serde_json::from_value(zk["params"].clone()).unwrap() else { panic!() };
+        let mut tail = sfx.clone().into_bytes();
+        tail.push(0x17);
+        assert!(p.windows.iter().any(|x| x.seq == 1 && x.expected.ends_with(&tail)));
+        let headers = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &h2::request_block("api.venice.ai", "/api/v1/image/generate"));
+        assert!(p.windows.iter().any(|x| x.seq == 0 && x.expected.starts_with(&headers[..16])));
+        assert!(m.iter().any(|x| x["type"] == "body_released"));
+
+        let n = log.server_app_records;
+        // A usage disclosure is refused for an image request.
+        assert!(on_disclose(&app, &sh, &tx, &mut st, &log, Some(1), "00", &[5], 0, 0, 0, None, Some(n)).is_err());
+        // Refused: another request, no record count, a count ahead of the node.
+        assert!(on_accept(&app, &mut st, &tx, &log, Some(2), Some(n)).is_err());
+        assert!(on_accept(&app, &mut st, &tx, &log, None, Some(n)).is_err());
+        assert!(on_accept(&app, &mut st, &tx, &log, Some(1), None).is_err());
+        assert!(on_accept(&app, &mut st, &tx, &log, Some(1), Some(n + 1)).is_err());
+        assert!(texts(&mut rx).is_empty());
+        // Behind the node: a retry, nothing else changes.
+        on_accept(&app, &mut st, &tx, &log, Some(1), Some(n - 1)).unwrap();
+        let m = texts(&mut rx);
+        assert_eq!((m.len(), m[0]["type"].as_str(), m[0]["server_records"].as_u64()), (1, Some("accept_retry"), Some(n as u64)));
+        // Honest: the attestation of the request's interval, then the flat usage for the node.
+        on_accept(&app, &mut st, &tx, &log, Some(1), Some(n)).unwrap();
+        let m = texts(&mut rx);
+        assert_eq!(m.iter().map(|x| x["type"].as_str().unwrap()).collect::<Vec<_>>(), vec!["attestation", "usage"]);
+        let a = &m[0]["a"];
+        assert_eq!((a["n"].as_u64(), a["stream"].as_u64(), a["s_k"].as_u64(), a["server_records"].as_u64(), a["client_records"].as_u64()), (Some(1), Some(3), Some(3), Some(3), Some(2)));
+        assert_eq!(m[1]["usage"], serde_json::json!({"flat": true, "kind": "images", "count": 1}));
+        assert_eq!((m[1]["n"].as_u64(), m[1]["model"].as_str(), m[1]["http"].as_u64()), (Some(1), Some("img"), Some(2)));
+        // Settled: the connection is idle, and a second accept has no request.
+        let h = st.h2.as_ref().unwrap();
+        assert!(h.req.is_none() && h.closing.is_none());
+        assert!(on_accept(&app, &mut st, &tx, &log, Some(1), Some(n)).is_err());
+
+        // A chat request on the same connection is not settled by accept.
+        on_request(&app, &tx, &mut st, 2, None, "m".into(), 20, 400, None, None).unwrap();
+        assert!(on_accept(&app, &mut st, &tx, &log, Some(2), Some(log.server_app_records)).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_image_requests_error_head_is_disclosed_like_chats() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = idle_session(&app);
+        // Before the request: the handshake flight and the provider's SETTINGS.
+        for c in [&[1u8; 40][..], &[2; 900], &[3; 30]] {
+            feed(&mut st, &mut log, c);
+        }
+        let sfx = image_suffix(&app, "img", 1);
+        let body_len = sfx.len() + 60;
+        on_request(&app, &tx, &mut st, 1, Some("images"), "img".into(), 0, body_len, Some(&sfx), Some(1)).unwrap();
+        let block = h2::request_block("api.venice.ai", "/api/v1/image/generate").len();
+        for r in [record(9 + block + 1), record(10 + body_len)] {
+            client_bytes(&mut st, &r).unwrap();
+        }
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        // 400: `:status` literal, END_STREAM on the body.
+        let head = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &[0x8c]);
+        feed(&mut st, &mut log, &head);
+        feed(&mut st, &mut log, &h2::frame(h2::DATA, h2::END_STREAM, 3, b"{\"error\":\"bad\"}"));
+        texts(&mut rx);
+        on_disclose_head(&app, &sh, &tx, &mut st, &log, 1, 3, &hex::encode(&head), 0, 0).unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let m = texts(&mut rx);
+        let usage = m.iter().find(|x| x["type"] == "usage").unwrap();
+        assert_eq!(usage["usage"]["error_status"], 400);
+        assert_eq!(st.h2.as_ref().unwrap().closing, Some("error_settled"));
+    }
+
+    #[test]
+    fn a_response_past_its_requests_cap_ends_the_connection() {
+        let mut st = session_with_request(300, SFX);
+        let h = st.h2.as_mut().unwrap();
+        let q = h.req.as_mut().unwrap();
+        q.interval_open = true;
+        q.cap = 100;
+        assert!(h.server_record(&server_rec(&[0; 60])).is_ok());
+        assert!(h.server_record(&server_rec(&[0; 60])).is_err());
+        // Outside a request's interval nothing is counted against a request.
+        let mut st = session_with_request(300, SFX);
+        let h = st.h2.as_mut().unwrap();
+        h.req.as_mut().unwrap().cap = 10;
+        assert!(h.server_record(&server_rec(&[0; 60])).is_ok());
+        // The connection's own cap is above the point where it is retired.
+        assert!(H2_CONN_MAX_BYTES > H2_CONN_SOFT_BYTES && H2_CONN_MAX_BYTES < (1usize << 31) - 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_is_retired_after_its_byte_limit() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = idle_session(&app);
+        image_released(&app, &sh, &tx, &mut st, &mut log, &mut w, 1).await;
+        texts(&mut rx);
+        log.recv_len = H2_CONN_SOFT_BYTES;
+        on_accept(&app, &mut st, &tx, &log, Some(1), Some(log.server_app_records)).unwrap();
+        assert_eq!(st.h2.as_ref().unwrap().closing, Some("max_bytes"));
+    }
+
     #[tokio::test]
     async fn an_earlier_requests_tail_is_outside_the_interval() {
         let app = app_state(true);
@@ -1400,7 +1728,7 @@ mod tests {
         let u = m.iter().find(|x| x["type"] == "usage").unwrap();
         assert_eq!((u["n"].as_u64(), u["http"].as_u64(), u["model"].as_str()), (Some(1), Some(2), Some("m")));
         // Request 2 on the same connection, released; no response yet.
-        on_request(&app, &tx, &mut st, 2, None, "m".into(), 20, 400, None).unwrap();
+        on_request(&app, &tx, &mut st, 2, None, "m".into(), 20, 400, None, None).unwrap();
         let block = st.h2.as_ref().unwrap().req.as_ref().unwrap().block.len();
         client_bytes(&mut st, &record(9 + block + 1)).unwrap();
         client_bytes(&mut st, &record(10 + 400)).unwrap();
@@ -1498,10 +1826,10 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut st = open_session(300);
         // One in flight: no second.
-        assert!(on_request(&app, &tx, &mut st, 2, None, "m".into(), 20, 400, None).is_err());
+        assert!(on_request(&app, &tx, &mut st, 2, None, "m".into(), 20, 400, None, None).is_err());
         st.h2.as_mut().unwrap().req = None;
         let ok = |st: &mut Session, n: u32, kind: Option<&str>, model: &str, max_tokens: u64, len: usize, suffix: Option<&str>| {
-            let r = on_request(&app, &tx, st, n, kind, model.into(), max_tokens, len, suffix);
+            let r = on_request(&app, &tx, st, n, kind, model.into(), max_tokens, len, suffix, None);
             if r.is_ok() {
                 let h = st.h2.as_mut().unwrap();
                 h.req = None;
@@ -1530,7 +1858,7 @@ mod tests {
         let mut early = open_session(300);
         early.h2.as_mut().unwrap().req = None;
         early.state = SessionState::AwaitHead;
-        assert!(on_request(&app, &tx, &mut early, 2, None, "m".into(), 20, 400, None).is_err());
+        assert!(on_request(&app, &tx, &mut early, 2, None, "m".into(), 20, 400, None, None).is_err());
     }
 
     #[test]

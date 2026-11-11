@@ -1148,8 +1148,9 @@ async fn main() -> Result<()> {
     if let Some(block) = &offer.h2 {
         block.validate(&offer.upstream_host, key.len()).context("the offer's h2 block")?;
         h2_session::chat_path(&offer.head_template).context("the offer's h2 block")?;
+        h2_session::images_path(&offer).context("the offer's h2 block")?;
         offer.http.push("2".to_string());
-        info!(probe_path = %block.probe_path, idle_secs = block.idle_secs, max_requests = block.max_requests, "http: 2 sessions offered");
+        info!(probe_path = %block.probe_path, idle_secs = block.idle_secs, max_requests = block.max_requests, kinds = ?block.kinds, "http: 2 sessions offered");
     }
     // The π_NK membership circuit is a fixed-size check over one alphabet. An
     // offer demanding another alphabet must fail here rather than let the
@@ -1329,6 +1330,9 @@ enum ClientMsg {
         body_len: usize,
         #[serde(default)]
         suffix: Option<String>,
+        /// An image request: the image count (it must be the suffix's).
+        #[serde(default)]
+        count: Option<u64>,
     },
     /// `http: 2`: the client's next record is this control frame
     /// (`settings_ack`, `ping_ack`, `window_update`, `rst_stream`).
@@ -1356,8 +1360,15 @@ enum ClientMsg {
     /// writes the credential record and the KeyUpdate under K_0.
     ReleaseHead {},
     /// Image sessions: the client accepts a successful response. The charge
-    /// is the flat price fixed at setup, so nothing is disclosed.
-    Accept {},
+    /// is the flat price fixed at setup, so nothing is disclosed. On an
+    /// `http: 2` connection it names the request and the server records the
+    /// client has seen (the end of the request's interval).
+    Accept {
+        #[serde(default)]
+        n: Option<u32>,
+        #[serde(default)]
+        server_records: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1443,6 +1454,11 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     handle_setup(setup, &app, &shared, &to_client, &mut st)?;
     if st.images_count.is_some() {
         log.max_server_bytes = app.offer.endpoints.images.as_ref().map(|e| e.max_response_bytes);
+    }
+    if st.h2.is_some() {
+        // A connection carries many responses: each request has its own cap
+        // (`h2_session`), the connection a larger one.
+        log.max_server_bytes = Some(h2_session::H2_CONN_MAX_BYTES);
     }
 
     // The 2PC preprocessing (tens of MB over the client's link) runs before
@@ -1610,7 +1626,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         server_pending.extend_from_slice(&bytes);
                         let (recs, used) = parse_records(&server_pending);
                         for r in recs {
-                            if let Some(h) = st.h2.as_mut() { h.server_record(&r); }
+                            if let Some(h) = st.h2.as_mut() { h.server_record(&r)?; }
                             log.server_record(r);
                         }
                         server_pending.drain(..used);
@@ -2039,8 +2055,8 @@ async fn handle_control(
     match msg {
         // Handled once, before the upstream connection exists (handle_setup).
         ClientMsg::Setup { .. } => bail!("duplicate setup"),
-        ClientMsg::Request { n, kind, model, max_tokens, body_len, suffix } => {
-            h2_session::on_request(app, to_client, st, n, kind.as_deref(), model, max_tokens, body_len, suffix.as_deref())?;
+        ClientMsg::Request { n, kind, model, max_tokens, body_len, suffix, count } => {
+            h2_session::on_request(app, to_client, st, n, kind.as_deref(), model, max_tokens, body_len, suffix.as_deref(), count)?;
         }
         ClientMsg::Ctl { frame } => h2_session::on_ctl(st, &frame)?,
         ClientMsg::Release { n, upto } => h2_session::on_release(st, n, upto)?,
@@ -2050,7 +2066,10 @@ async fn handle_control(
         ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing, n, server_records } if st.h2.is_some() => {
             h2_session::on_disclose(app, shared, to_client, st, log, n, &r, &tail_lens, skip, key_updates, epoch_start, trailing, server_records)?;
         }
-        ClientMsg::BodySuffix { .. } | ClientMsg::Accept {} if st.h2.is_some() => {
+        ClientMsg::Accept { n, server_records } if st.h2.is_some() => {
+            h2_session::on_accept(app, st, to_client, log, n, server_records)?;
+        }
+        ClientMsg::BodySuffix { .. } if st.h2.is_some() => {
             bail!("not a message of an http: 2 session");
         }
         ClientMsg::ReleaseHead {} => {
@@ -2101,7 +2120,7 @@ async fn handle_control(
             shared.params.lock().unwrap().insert("pi_c2s".into(), params.clone());
             send(serde_json::json!({"type":"zk_params","proof":"pi_c2s","params":params}));
         }
-        ClientMsg::Accept {} => {
+        ClientMsg::Accept { .. } => {
             let Some(count) = st.images_count else { bail!("accept is for image sessions only") };
             if st.state != SessionState::Attested || st.disclosed || st.accepted || !st.c2_ok {
                 bail!("accept out of order or repeated");
@@ -3750,7 +3769,7 @@ mod hardening_tests {
             let (_r, mut w) = c.into_split();
             let mut log = RelayLog::default();
             let mut go = |st: &mut Session| {
-                let msg = ClientMsg::Accept {};
+                let msg = ClientMsg::Accept { n: None, server_records: None };
                 let fut = handle_control(msg, &app, &s, &tx, st, &mut log, &mut w);
                 futures_executor_block(fut)
             };
