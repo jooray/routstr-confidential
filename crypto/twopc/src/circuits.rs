@@ -1,4 +1,6 @@
-//! The two key-schedule circuits (phase A and phase B).
+//! The key-schedule circuits: the split circuit the protocol runs (`Split`,
+//! five stages) and v2's two phase circuits, kept for comparison (statistics
+//! and the plaintext test).
 //!
 //! Wire conventions: a byte string is a `Vec<W>` with 8 wires per byte, least
 //! significant bit first (the convention of `mpz-circuits`). A SHA-256 state
@@ -480,13 +482,6 @@ fn build_phase_b() -> Spec {
 
 pub static PHASE_A: LazyLock<Spec> = LazyLock::new(build_phase_a);
 pub static PHASE_B: LazyLock<Spec> = LazyLock::new(build_phase_b);
-
-pub(crate) fn spec(phase: usize) -> &'static Spec {
-    match phase {
-        0 => &PHASE_A,
-        _ => &PHASE_B,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Split key schedule (protocol v3, option B).
