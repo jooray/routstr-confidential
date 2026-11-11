@@ -81,6 +81,8 @@ import { runZk } from './zkbridge.ts'
 import { checkHeadTemplate, checkPiC2SParams, checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from './params.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
 import { ZkChan } from './zkchan.ts'
+import { H2Conn, runHttp2, type H2Ctx } from './driver-h2.ts'
+import { MAX_DATA_IN_RECORD, checkH2Offer, checkPiNKParamsH2 } from './h2.ts'
 
 setCryptoImplementation(webcryptoCrypto)
 
@@ -160,6 +162,29 @@ const ADV_CLAIM_CANONICAL = argv.includes('--adv-claim-canonical')
 // of the joint one (we would then hold the whole ECDHE secret). The node must
 // refuse to relay it.
 const ADV_OWN_SHARE = argv.includes('--adv-own-keyshare')
+// --- protocol v3, option A (PROTOCOL-V3-DESIGN.md): --http2 -----------------
+// One two-party handshake per HTTP/2 connection, the credential by HPACK
+// index, `--requests N` sequential chat requests on it.
+const HTTP2 = argv.includes('--http2')
+const H2_REQUESTS = Number(arg('--requests', '1'))
+// Idle time before every request after the first (ms).
+const H2_PAUSE_MS = Number(arg('--pause-ms', '0'))
+// Per-request models (comma-separated; request i uses entry i, then --model).
+const H2_MODELS = (arg('--h2-models') ?? '').split(',').filter(Boolean)
+// Pad the prompt so the request body has about this many bytes (flow control).
+const H2_BODY_BYTES = Number(arg('--body-bytes', '0'))
+// Largest DATA payload per record.
+const H2_CHUNK = Number(arg('--h2-chunk', String(MAX_DATA_IN_RECORD)))
+// Adversarial probes (crypto/tools/v3-h2-check.sh), applied to request --adv-at:
+//   hidden-headers  a HEADERS frame for another stream inside a "DATA" record
+//   padding         TLS record padding that shifts the frame boundary
+//   path            a HEADERS block with --adv-h2-path as :path
+//   replay-usage    the previous request's usage tail as this one's disclosure
+//   suffix          another model's suffix (--adv-suffix-model)
+const ADV_H2 = arg('--adv-h2')
+const ADV_H2_AT = Number(arg('--adv-at', ADV_H2 === 'replay-usage' ? '2' : '1'))
+const ADV_H2_PATH = arg('--adv-h2-path', '/api/v1/api_keys/abcdefg')
+let H2_BLOCK: { probe_path: string; idle_secs: number; max_requests: number } | undefined
 // The only protocol version: 2 = two-party handshake (docs/TWOPC-DESIGN.md).
 // Protocol v1 is retired (branch v1-poc); an offer naming it is refused.
 const PROTO = 2
@@ -636,10 +661,18 @@ class Session {
         process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
         trace('<-', shown(m.type))
         if (m.type === 'error') this.errRej(new Error(`sidecar rejected: ${shown(m.reason, 300)}`))
+        if (this.h2) {
+          // An http: 2 session runs many proofs: their parameters are keyed
+          // by proof and purpose.
+          this.h2.bytes.control_recv += d.length
+          this.h2.onControl(m)
+          if (m.type === 'zk_params') m.type = `zk_params:${m.proof}:${m.purpose ?? ''}`
+        }
         this.bus.emit(m)
         return
       }
       const bytes = new Uint8Array(d as ArrayBuffer)
+      if (this.h2) this.h2.bytes.relay_recv += bytes.length
       this.trackServerRecords(bytes)
       this.flushChain = this.flushChain
         .then(() => this.tls.handleReceivedBytes(bytes))
@@ -664,13 +697,15 @@ class Session {
         cipherSuites: ['TLS_AES_128_GCM_SHA256'],
         supportedProtocolVersions: ['TLS1_3'],
         namedCurves: ['SECP256R1'],
-        applicationLayerProtocols: ['http/1.1'],
+        applicationLayerProtocols: [HTTP2 ? 'h2' : 'http/1.1'],
         write: (packet: { header: Uint8Array; content: Uint8Array }) => {
           const record = concat(packet.header, packet.content)
           if (this.inBody) this.bodyRecords.push(record)
+          this.h2?.onWrite(record)
           this.sendBytes(record)
         },
         onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
+          this.h2?.onRead(ctx)
           if (!this.postHandshake || ctx?.type !== 'ciphertext') return
           this.serverPost.push({
             data: ctx.contentType === 'APPLICATION_DATA',
@@ -678,6 +713,7 @@ class Session {
           })
         },
         onApplicationData: (rec: Uint8Array) => {
+          if (this.h2) return this.h2.onData(rec)
           if (!this.ttft) this.ttft = Date.now()
           this.responseChunks.push(rec)
           this.responseBytes = concat(this.responseBytes, rec)
@@ -700,12 +736,17 @@ class Session {
 
   private handshakeDone!: () => void
   sendText(obj: unknown) {
-    this.ws.send(JSON.stringify(obj))
+    const text = JSON.stringify(obj)
+    if (this.h2) this.h2.bytes.control_sent += text.length
+    this.ws.send(text)
   }
+  /** The HTTP/2 connection of an `--http2` session. */
+  h2: H2Conn | undefined
   waitT(type: string, ms: number): Promise<any> {
     return Promise.race([this.bus.wait(type), this.errP, timeout(ms, type)])
   }
   sendBytes(b: Uint8Array) {
+    if (this.h2) this.h2.bytes.relay_sent += b.length
     if (this.wsOpen) this.ws.send(b)
     else this.outbox.push(b)
   }
@@ -722,7 +763,15 @@ class Session {
   async arm(): Promise<void> {
     await this.wsReady
     const nonceC = hex(cryptoRandom(32))
-    if (NODE_MODE) {
+    if (HTTP2) {
+      // The setup names the connection only; the terms come with each request.
+      const setup: any = { type: 'setup', http: 2, nonce_c: nonceC, armed: ARM }
+      if (NODE_MODE) {
+        setup.auth = this.token ?? ''
+        if (OFFER_SIG) setup.offer_sig = OFFER_SIG
+      } else setup.escrow_e = 1000
+      this.sendText(setup)
+    } else if (NODE_MODE) {
       const setup: any = IMAGE
         ? { type: 'setup', kind: 'images', nonce_c: nonceC, model: MODEL, variant: IMAGE_VARIANT_ID, count: IMAGE_COUNT, len: body.length }
         : {
@@ -764,12 +813,13 @@ class Session {
     console.log(`[client ${this.label}] sid=${this.sid} head_len=${shown(this.ready.head_len)}`)
 
     if (this.ready.v !== 2) throw new Error('node did not start a v2 session')
+    if (HTTP2 && this.ready.http !== 2) throw new Error('node did not start an http: 2 session')
     this.twopc = new TwoPc()
     this.twopc.start(this.zkUrl('twopc', this.sid))
     if (ZKCHAN) {
       // The proof channel's OT/VOLE setup runs alongside the 2PC preprocessing.
       this.zkchan = new ZkChan()
-      this.zkchan.start(this.zkUrl('zkchan', this.sid))
+      this.zkchan.start(this.zkUrl('zkchan', this.sid), HTTP2)
     }
     const t2pc = Date.now()
     let keyShare = await this.twopc.keyShare()
@@ -858,7 +908,15 @@ class Session {
     // an alphabet key, and K_0 is the one the 2PC anchored (hk).
     this.tNkStart = Date.now()
     const commit = await this.waitT('c_commit', 60000)
-    checkPiNKParams(commit.params, IMAGE ? { ...OFFER, head_template: imagesOffer().head_template } : OFFER, this.ap!, body.length)
+    if (HTTP2) {
+      checkPiNKParamsH2(commit.params, {
+        host: OFFER.upstream_host,
+        probePath: H2_BLOCK!.probe_path,
+        keyLength: OFFER.key_length,
+        keyAlphabet: OFFER.key_alphabet,
+        hk: this.ap!.hk,
+      })
+    } else checkPiNKParams(commit.params, IMAGE ? { ...OFFER, head_template: imagesOffer().head_template } : OFFER, this.ap!, body.length)
     // The attestation must later name the commitment π_NK proves; the frame
     // has to carry exactly it.
     this.cCommitHex = hex(Uint8Array.from(commit.params.PiNK.c_commit))
@@ -1630,6 +1688,8 @@ async function main() {
     setupChatBody()
   }
 
+  if (HTTP2) return await mainHttp2()
+
   if (ABANDON) {
     const s = new Session('abandon', ESCROW_TOKENS[0])
     await s.connect()
@@ -1676,6 +1736,72 @@ async function main() {
   console.log('E2E_JSON ' + JSON.stringify(out))
   s.close()
   process.exit(out.receipt_sig_ok ? 0 : 3)
+}
+
+/** `--http2`: one connection, `--requests N` sequential chat requests. */
+async function mainHttp2(): Promise<void> {
+  if (IMAGE || POOL > 0 || ABANDON) throw new Error('--http2 serves chat requests on one connection (no --image, --pool, --abandon)')
+  if (!ZKCHAN) throw new Error('--http2 needs the proof channel (no --no-zkchan)')
+  const bases = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
+  // Refuse before any setup if the verified offer does not list http 2.
+  H2_BLOCK = checkH2Offer(OFFER, bases)
+  if (!(Number.isSafeInteger(H2_REQUESTS) && H2_REQUESTS >= 1 && H2_REQUESTS <= H2_BLOCK.max_requests)) {
+    throw new Error(`--requests must be 1..${H2_BLOCK.max_requests}`)
+  }
+  const enc = new TextEncoder()
+  const ctx: H2Ctx = {
+    offer: OFFER,
+    h2: H2_BLOCK,
+    nodeMode: NODE_MODE,
+    requestExtras: {},
+    requests: H2_REQUESTS,
+    pauseMs: H2_PAUSE_MS,
+    chunk: H2_CHUNK,
+    buildBody: (n: number) => {
+      const model = H2_MODELS[n - 1] ?? MODEL
+      const wrong = ADV_H2 === 'suffix' && ADV_H2_AT === n
+      const canonicalSuffix = renderChatSuffix(OFFER.chat, model, MAX_TOKENS)
+      const sfx = wrong ? renderChatSuffix(OFFER.chat, ADV_SUFFIX_MODEL ?? `${model}-x`, MAX_TOKENS) : canonicalSuffix
+      let content = H2_REQUESTS > 1 ? `${PROMPT} (request ${n})` : PROMPT
+      if (H2_BODY_BYTES > content.length) content += ` Ignore this filler: ${'lorem ipsum '.repeat(Math.ceil((H2_BODY_BYTES - content.length) / 12))}`
+      let p = `{"messages":[{"role":"user","content":${JSON.stringify(content)}}]`
+      if (PRIVATE_EXTRA) p += `,${PRIVATE_EXTRA}`
+      return { model, maxTokens: MAX_TOKENS, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix }
+    },
+    adv: ADV_H2 ? { mode: ADV_H2, at: ADV_H2_AT, path: ADV_H2_PATH } : undefined,
+    verifySig,
+    shown,
+    writePrivate,
+    log: () => {},
+  }
+  const s = new Session('h2', ESCROW_TOKENS[0])
+  if (NODE_MODE) {
+    ctx.requestExtras = { auth: s.token ?? '', ...(OFFER_SIG ? { offer_sig: OFFER_SIG } : {}) }
+    if (SESSION_FEE > 0 && !NO_ACCEPT_FEE) ctx.requestExtras.session_fee_msat = SESSION_FEE
+    if (ABANDON_FEE > 0 && !NO_ACCEPT_FEE) ctx.requestExtras.abandon_fee_msat = ABANDON_FEE
+  }
+  const conn = new H2Conn(s, ctx)
+  s.h2 = conn
+  await s.connect()
+  const tClaim = Date.now()
+  await s.arm()
+  await s.prepareProofs()
+  ctx.log = s.log
+  if (ARM) {
+    console.log(`ARMED sid=${s.sid} (http: 2 connection, no request yet)`)
+    console.log('READY (send "go" on stdin to open the connection)')
+    await waitForGo()
+  }
+  const out = await runHttp2(s, conn, ARM ? Date.now() : tClaim)
+  if (out.adv) console.log('ADV_H2 ' + JSON.stringify(out.adv))
+  console.log('E2E_JSON ' + JSON.stringify(out))
+  s.twopc?.close()
+  s.close()
+  const honestOk = out.requests.length === (ADV_H2 ? ADV_H2_AT - 1 : H2_REQUESTS) || out.requests.some((r: any) => r.status >= 400)
+  // Exit codes: 0 = every request settled (or the attack was refused), 3 = a
+  // receipt was not verified, 5 = an attack was not refused.
+  if (ADV_H2) process.exit(out.adv?.refused ? 0 : 5)
+  process.exit(honestOk && out.receipt_sig_ok ? 0 : 3)
 }
 
 // Run only as the entry point, so the offer checks above can be imported offline.

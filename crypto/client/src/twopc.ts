@@ -56,6 +56,9 @@ export class TwoPc {
   // writableLength is not reliable on every runtime).
   private unflushed = 0
   readonly timings: any[] = []
+  /** Bytes on the 2PC WebSocket, each way (measurements). */
+  bytesSent = 0
+  bytesRecv = 0
 
   start(url: string): void {
     this.ws = new WebSocket(url)
@@ -67,7 +70,9 @@ export class TwoPc {
     }
     this.ws.onmessage = (ev) => {
       try {
-        this.toChild(frame(0, wsBytes(ev.data)))
+        const b = wsBytes(ev.data)
+        this.bytesRecv += b.length
+        this.toChild(frame(0, b))
       } catch (e) {
         this.fail(e as Error)
       }
@@ -97,6 +102,7 @@ export class TwoPc {
       this.buf = this.buf.subarray(5 + len)
       if (ch === 0) {
         const out = Buffer.from(payload)
+        this.bytesSent += out.length
         if (this.wsOpen) this.ws.send(out)
         else this.outbox.push(out)
       } else if (ch === 1) {

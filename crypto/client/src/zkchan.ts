@@ -53,6 +53,9 @@ export class ZkChan {
   readyInfo: any
   readonly tStart = Date.now()
   tReady = 0
+  /** Bytes on the proof-channel WebSocket, each way (measurements). */
+  bytesSent = 0
+  bytesRecv = 0
 
   constructor() {
     this.readyP = new Promise((res, rej) => {
@@ -63,7 +66,8 @@ export class ZkChan {
     this.readyP.catch(() => {})
   }
 
-  start(url: string): void {
+  /** `multi`: an `http: 2` session, where π_WIN and π_C3S run once per request. */
+  start(url: string, multi = false): void {
     this.ws = new WebSocket(url)
     this.ws.binaryType = 'arraybuffer'
     this.ws.onopen = () => {
@@ -73,7 +77,9 @@ export class ZkChan {
     }
     this.ws.onmessage = (ev) => {
       try {
-        this.toChild(frame(0, wsBytes(ev.data)))
+        const b = wsBytes(ev.data)
+        this.bytesRecv += b.length
+        this.toChild(frame(0, b))
       } catch (e) {
         this.fail(e as Error)
       }
@@ -81,6 +87,7 @@ export class ZkChan {
     this.ws.onerror = () => this.fail(new Error('proof channel websocket error'))
     this.ws.onclose = () => this.fail(new Error('proof channel websocket closed'))
     const args = ['--channel']
+    if (multi) args.push('--multi')
     if (process.env.CU_PREALLOC_NK) args.push('--prealloc-nk', process.env.CU_PREALLOC_NK)
     if (process.env.CU_PREALLOC_CP) args.push('--prealloc-cp', process.env.CU_PREALLOC_CP)
     this.child = spawn(CU_PROVER, args, { stdio: ['pipe', 'pipe', 'inherit'], env: process.env })
@@ -101,6 +108,7 @@ export class ZkChan {
       this.buf = this.buf.subarray(5 + len)
       if (ch === 0) {
         const out = Buffer.from(payload)
+        this.bytesSent += out.length
         if (this.wsOpen) this.ws.send(out)
         else this.outbox.push(out)
       } else if (ch === 1) {
