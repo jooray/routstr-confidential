@@ -238,7 +238,9 @@ async fn cu_2pc_refuses_a_flood_past_the_channel_cap() {
         }
         evs
     });
-    // 17 mux frames of 1 MiB on channel 3, as network bytes on stdin channel 0.
+    // The version tag, then 17 mux frames of 1 MiB on channel 3, as network
+    // bytes on stdin channel 0.
+    write_frame(&mut stdin, 0, twopc::VERSION_TAG).await;
     let mut mux_frame = vec![3u8];
     mux_frame.extend_from_slice(&(1u32 << 20).to_be_bytes());
     mux_frame.resize(5 + (1 << 20), 0x55);
@@ -258,4 +260,70 @@ async fn cu_2pc_refuses_a_flood_past_the_channel_cap() {
     let evs = reader.await.unwrap();
     assert!(!status.success());
     assert!(evs.iter().any(|v| v["ev"] == "error"), "{evs:?}");
+}
+
+/// What `cu-2pc` reports for a peer whose first bytes are `first`: the
+/// control events, the network bytes it wrote, and its exit status.
+async fn against_first_bytes(first: &[u8]) -> (Vec<Value>, Vec<u8>, std::process::ExitStatus) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cu-2pc"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = tokio::spawn(async move {
+        let (mut evs, mut net) = (Vec::new(), Vec::new());
+        loop {
+            let mut hdr = [0u8; 5];
+            if stdout.read_exact(&mut hdr).await.is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes(hdr[1..].try_into().unwrap()) as usize;
+            let mut d = vec![0u8; len];
+            stdout.read_exact(&mut d).await.unwrap();
+            if hdr[0] == 1 {
+                evs.push(serde_json::from_slice::<Value>(&d).unwrap());
+            } else {
+                net.extend_from_slice(&d);
+            }
+        }
+        (evs, net)
+    });
+    write_frame(&mut stdin, 0, first).await;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        .await
+        .expect("cu-2pc must exit")
+        .unwrap();
+    drop(stdin);
+    let (evs, net) = reader.await.unwrap();
+    (evs, net, status)
+}
+
+/// The first bytes on the 2PC channel are the version tag, in each
+/// direction. A peer that sends anything else (another variant's tag, or a
+/// v2 peer, whose first bytes are a multiplexer frame header) is refused
+/// with the code `twopc_version_mismatch`: in the control event, and as exit
+/// status 3.
+#[tokio::test(flavor = "multi_thread")]
+async fn cu_2pc_reports_a_version_mismatch() {
+    assert_eq!(twopc::VERSION_TAG, b"routstr-2pc/split-public-1\n");
+    let v2_first_frame = [1u8, 0, 0, 0, 16, 0xaa, 0xbb, 0xcc];
+    for first in [&b"routstr-2pc/split-proven-1\n"[..], &v2_first_frame[..], &b"routstr-2pc/split-public-2\n"[..]] {
+        let (evs, net, status) = against_first_bytes(first).await;
+        assert!(net.starts_with(twopc::VERSION_TAG), "cu-2pc writes the tag first: {:?}", &net[..net.len().min(32)]);
+        assert_eq!(status.code(), Some(3), "{evs:?}");
+        let err = evs.iter().find(|v| v["ev"] == "error").unwrap_or_else(|| panic!("an error event: {evs:?}"));
+        assert_eq!(err["code"], "twopc_version_mismatch");
+        assert!(err["msg"].as_str().unwrap().starts_with("twopc_version_mismatch: "), "{err}");
+        assert!(!evs.iter().any(|v| v["ev"] == "key_share"));
+    }
+    // The right tag is not a mismatch: the process goes on and fails later,
+    // on the garbage that follows, with the generic status.
+    let mut ok_then_garbage = twopc::VERSION_TAG.to_vec();
+    ok_then_garbage.extend_from_slice(&[0xff; 8]);
+    let (evs, _net, status) = against_first_bytes(&ok_then_garbage).await;
+    assert_eq!(status.code(), Some(1), "{evs:?}");
+    assert!(evs.iter().all(|v| v["code"].is_null()), "{evs:?}");
 }

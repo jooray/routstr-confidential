@@ -1,8 +1,9 @@
-//! Two-party TLS 1.3 key schedule (`docs/TWOPC-DESIGN.md`), with **only N
-//! garbling** (authenticated garbling with garbler-held masks and an IT-MAC
-//! consistency check) and, as a prototype of protocol v3 option B, a **split
-//! key schedule**: the garbled circuit computes only the HMAC key-pad states
-//! and the outer compressions (`docs/TWOPC-SPLIT.md`).
+//! Two-party TLS 1.3 key schedule, version `split-public-1` (protocol v3,
+//! `PROTOCOL-V3.md` §4; `docs/TWOPC-DESIGN.md`, `docs/TWOPC-NODE-GARBLING.md`).
+//! Only N garbles (authenticated garbling with garbler-held masks and an
+//! IT-MAC consistency check), and the garbled circuit holds only the part of
+//! the key schedule that needs a secret: the HMAC key-pad states and the outer
+//! compressions.
 //!
 //! C (the client) and N (the node) jointly run the client side of a TLS 1.3
 //! ECDHE(P-256) + SHA-256 key schedule so that neither learns the ECDHE secret
@@ -14,21 +15,24 @@
 //! | s_ap_0, c_ap_1 | yes | never |
 //! | K_0, IV_0 (of c_ap_0) | never | yes |
 //! | h1 = SHA256(c_ap_1), h2 = SHA256(s_ap_0), hk = SHA256(K_0‖IV_0) | yes | yes |
+//! | IS_HS, IS_dHS, IS_MS, IS_c0 (inner key-pad states) | yes | yes |
 //!
 //! # API
 //!
 //! ```ignore
-//! let mut p = Party::new(Role::C, io).await?;   // io: futures AsyncRead + AsyncWrite
+//! let mut p = Party::new(Role::C, io).await?;   // io: futures AsyncRead + AsyncWrite; exchanges VERSION_TAG
 //! p.preprocess().await?;                         // input independent (pre-warm)
 //! let joint: [u8; 65] = p.key_share().await?;    // commit-then-open joint P-256 share
 //! let hs: HsSecrets = p.handshake(&server_share, th_sh).await?;  // ECtF + stages A1–A3
-//! let ap: ApOut = p.application(th_sf).await?;   // stages B1, B2, anchors
+//! let ap: ApOut = p.application(th_sf).await?;   // stages B1, B2 (with the anchors)
 //! p.close().await;
 //! ```
 //!
 //! `Party::new` needs a running tokio runtime (it spawns the channel
-//! multiplexer); `close` flushes the transport; `take_timings` returns per-step
-//! wall time and transport bytes.
+//! multiplexer). It writes [`VERSION_TAG`] as the first bytes on the
+//! transport and reads the peer's; anything else is
+//! [`Error::VersionMismatch`] (`twopc_version_mismatch`). `close` flushes the
+//! transport; `take_timings` returns per-step wall time and transport bytes.
 //!
 //! The library sets no deadlines: a receive waits until the peer's data or
 //! EOF arrives, so a half-open transport stalls a step. Callers bound each
@@ -40,28 +44,16 @@
 //! `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))` with `f` the SHA-256 compression
 //! function. Every HKDF message of the key schedule is public, so the garbled
 //! circuit ([`circuits::Split`], one circuit evaluated in five stages)
-//! computes only `IS_k`, `OS_k` and the outer compressions. `OS_k` never
-//! leaves the circuit. The inner digests `d = f(IS_k, m)` are computed outside
-//! and enter the next stage as inputs; how they are bound is the
-//! [`Variant`]:
-//!
-//! * [`Variant::Proven`] (spec B.2, 19 garbled compressions). `IS_k` is
-//!   opened to C only. C commits to it towards N with a random COT under Δ_A
-//!   (N sender) and a *label check* that ties the commitment to its active
-//!   output label, proves each inner digest in zero knowledge ([`zk`]), and
-//!   N turns the proven digest's MACs into the next stage's input labels
-//!   (`k_w ⊕ K_d` per bit), only after it has verified the proof. The anchors
-//!   h1, h2 are proven the same way by C; hk by N under Δ_B, where N's
-//!   authenticated mask plus the pointer bit C reported is the commitment.
-//! * [`Variant::PublicIs`] (22 garbled compressions). `IS_k` is a public
-//!   output. Both parties compute the inner digests; N sends their input
-//!   labels and C pins them with pointer checks against opened masks, as v2
-//!   pins the transcript hash. No proofs, the anchors stay garbled.
+//! computes only `IS_k`, `OS_k`, the outer compressions and the anchors.
+//! `IS_k` is a **public output** of its stage. Both parties compute the inner
+//! digests `d = f(IS_k, m)` in the clear; N sends the labels of the digest's
+//! input wires and C pins them with pointer checks against opened,
+//! authenticated masks. `OS_k` never leaves the circuit.
 //!
 //! Garbling, the IT-MACs on N's masks, the product check and the AND-gate
-//! consistency check are those of v2 ([`gc`]); the check runs **per stage**,
-//! over exactly that stage's AND gates, before any output of the stage is
-//! decoded, reported or used.
+//! consistency check are in [`gc`]; the check runs **per stage**, over exactly
+//! that stage's AND gates, before any output of the stage is decoded, reported
+//! or used.
 //!
 //! * **Preprocess.** N garbles the circuit and streams the tables. Random
 //!   COTs with C as sender (Δ_B; Ferret over KOS) authenticate N's masks and
@@ -70,32 +62,34 @@
 //!   opened masks (C's input wires, the digest input wires, every output that
 //!   C may decode) with one hash of their MACs, per stage the check rows and
 //!   `Y_N`, and the *label-check pairs*: for every output wire that C reports
-//!   or converts, two salted 128-bit hashes of the two values C can hold. COTs
-//!   with N as sender (Δ_A): KOS for C's 256 input bits, and in `Proven`
-//!   Ferret over that KOS for the conversions and the proofs.
+//!   to N, two salted 128-bit hashes of its two labels. KOS COTs with N as
+//!   sender (Δ_A) cover C's 256 input bits.
 //! * **Online, per stage.** C gets its input labels (stage A1: `d = x ⊕ b`,
 //!   then N's corrections; later stages: the digest labels), checks their
 //!   pointer bits, evaluates, runs the stage's consistency check, checks the
-//!   label-check pair of every output wire it is about to report or convert,
-//!   and only then sends one message: the report (pointer bits of the outputs
-//!   N may know, conversion bits, one hash over the labels) and, in `Proven`,
-//!   the proof for the next stage's digests. N checks the hash (C cannot
-//!   report a wrong bit without an inactive label), verifies the proof, and
-//!   answers with the next stage's digest labels. One round trip per stage.
+//!   label-check pair of every output wire it is about to report, and only
+//!   then sends one message: the pointer bits of the outputs N may know and
+//!   one hash over their labels. N checks the hash (C cannot report a wrong
+//!   bit without an inactive label), decodes `IS_k`, computes the next
+//!   stage's inner digests and answers with their labels. One round trip per
+//!   stage.
 //!
-//! # Security (sketch; `docs/TWOPC-SPLIT.md` has the argument and its limits)
+//! # Security (sketch; `docs/TWOPC-DESIGN.md` has the argument and its limits)
 //!
-//! * **Malicious N** is held to the v2 argument, stage by stage: an AND gate
-//!   evaluated inconsistently with the committed masks is caught by that
-//!   stage's check (≤ 2^-63 per stage). N's remaining power is selective
-//!   failure: one observable abort per stage. The label-check pairs make N
-//!   commit to the labels it expects *before* it sees anything derived from
-//!   them, so the report hash carries no information beyond that abort.
-//! * **Malicious C** cannot report a wrong output or conversion bit (it needs
-//!   an inactive label, i.e. Δ_A), cannot prove a digest of another message
-//!   or state (product check, Δ_A), and has exactly one label per digest
-//!   input wire, the one N derived from the proven digest.
-//! * **Inputs are never revealed.** ECtF is unchanged (semi-honest A2M/M2A).
+//! * **Malicious N** is held stage by stage: an AND gate evaluated
+//!   inconsistently with the committed masks is caught by that stage's check
+//!   (≤ 2^-63 per stage). N's remaining power is selective failure: one
+//!   observable abort per stage. The label-check pairs make N commit to the
+//!   labels it expects *before* it sees anything derived from them, so the
+//!   report hash carries no information beyond that abort. A digest label for
+//!   another bit fails the pointer check, whatever C's secrets are.
+//! * **Malicious C** cannot report a wrong output bit (it needs an inactive
+//!   label, i.e. Δ_A) and has exactly one label per digest input wire, the one
+//!   N computed from the `IS_k` C reported under its labels.
+//! * **Both parties see `IS_k`.** Beyond "HMAC-SHA256 is a PRF" this needs the
+//!   two assumptions of Bellare's HMAC proof, used directly: `f` keyed by its
+//!   chaining input is a PRF, and `OS_k` is pseudorandom given `IS_k`.
+//! * **Inputs are never revealed.** ECtF is semi-honest A2M/M2A.
 
 pub mod circuits;
 
@@ -106,7 +100,6 @@ mod mux;
 pub mod testutil;
 #[cfg(test)]
 mod tests;
-pub mod zk;
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -128,13 +121,11 @@ use sha2::{Digest, Sha256};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use zeroize::{Zeroize, Zeroizing};
 
-pub use circuits::Variant;
 use circuits::{HS_STAGES, N_STAGES, OutKind, Split, from_bits, to_bits};
 use ectf::SecretFp;
 use gc::SecretBlocks;
 pub use mux::Counters;
 use mux::{FrameChan, Mux};
-use zk::{PW, VW};
 
 /// Errors. `Abort` means a check failed (possible cheating); the session must
 /// be discarded.
@@ -150,7 +141,16 @@ pub enum Error {
     Input(String),
     #[error("wrong call order: {0}")]
     State(&'static str),
+    /// The peer's first bytes were not [`VERSION_TAG`]: it speaks another
+    /// version of the two-party key schedule (or another protocol). The
+    /// field is what was read up to the first differing byte, in hex. The
+    /// message starts with the error code `twopc_version_mismatch`.
+    #[error("twopc_version_mismatch: this side speaks routstr-2pc/split-public-1, the peer's first bytes were 0x{0}")]
+    VersionMismatch(String),
 }
+
+/// The error code of [`Error::VersionMismatch`], as callers report it.
+pub const VERSION_MISMATCH: &str = "twopc_version_mismatch";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -230,49 +230,29 @@ pub struct CircuitStats {
     pub compressions: usize,
     pub c_input_bits: usize,
     pub n_input_bits: usize,
+    /// Public inner-digest input bits (labels chosen by N, pinned by C).
+    pub digest_input_bits: usize,
     pub output_bits: usize,
 }
 
-/// The garbled circuit of `variant` and, for comparison, v2's two phases.
-pub fn circuit_stats(variant: Variant) -> Vec<CircuitStats> {
-    let f = |name, s: &circuits::Spec| CircuitStats {
-        name,
-        and_gates: s.circ.and_count(),
-        xor_gates: s.circ.xor_count(),
-        compressions: s.compressions,
-        c_input_bits: s.c_bits,
-        n_input_bits: s.n_bits,
-        output_bits: s.out_bits,
-    };
-    let sp = circuits::split(variant);
-    vec![
-        f("v2 phase A", &circuits::PHASE_A),
-        f("v2 phase B", &circuits::PHASE_B),
-        CircuitStats {
-            name: match variant {
-                Variant::Proven => "split, proven digests (B.2)",
-                Variant::PublicIs => "split, public IS",
-            },
-            and_gates: sp.circ.and_count(),
-            xor_gates: sp.circ.xor_count(),
-            compressions: sp.compressions,
-            c_input_bits: 256,
-            n_input_bits: 256,
-            output_bits: sp.circ.outputs().len(),
-        },
-    ]
+/// The garbled circuit.
+pub fn circuit_stats() -> CircuitStats {
+    let sp = &*circuits::SPLIT;
+    CircuitStats {
+        name: "split-public-1",
+        and_gates: sp.circ.and_count(),
+        xor_gates: sp.circ.xor_count(),
+        compressions: sp.compressions,
+        c_input_bits: sp.xc.len(),
+        n_input_bits: sp.xn.len(),
+        digest_input_bits: sp.dig.iter().map(|d| d.len()).sum(),
+        output_bits: sp.circ.outputs().len(),
+    }
 }
 
-/// AND gates at the end of each stage of `variant`'s circuit.
-pub fn stage_and_ends(variant: Variant) -> [usize; N_STAGES] {
-    circuits::split(variant).and_end
-}
-
-/// AND gates C proves per session (inner digests and h1, h2) and N proves
-/// (hk) in `Variant::Proven`.
-pub fn proof_and_gates() -> (usize, usize) {
-    let l = lay(Variant::Proven);
-    (l.batch.iter().map(|b| b.1 - 128).sum(), l.hk_len - 128)
+/// AND gates at the end of each stage of the circuit.
+pub fn stage_and_ends() -> [usize; N_STAGES] {
+    circuits::SPLIT.and_end
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,12 +282,17 @@ pub(crate) enum Cheat {
     BadT,
     /// N: lie about one opened output mask of a stage (flips C's output).
     LieOpen(usize),
-    /// N: send a garbage label for its first own input (stage 0), or a wrong
-    /// label / label correction for the first digest input of a later stage.
+    /// N: lie about the opened mask of an input wire, by its position among
+    /// the opened inputs (0..256: C's x share; then the digest inputs).
+    LieOpenIn(usize),
+    /// N: send a garbage label (right pointer bit) for its first own input
+    /// (stage 0) or for the first digest input of a later stage.
     BadInputLabel(usize),
-    /// N: as `BadInputLabel` for a digest input, but the label is shifted by
-    /// Δ_A (the label of the flipped bit).
+    /// N: the label of the flipped bit (shifted by Δ_A) for one digest input.
     FlipDigestLabel(usize),
+    /// N: valid labels, but of another inner digest (the next block's of the
+    /// stage, or the digest of a modified block if the stage has one).
+    OtherDigest(usize),
     /// N: run the COTs under Δ_A with a different Δ than garbling.
     KosDelta,
     /// N: add random offsets to every check row of a stage.
@@ -316,25 +301,20 @@ pub(crate) enum Cheat {
     WrongSalt(usize),
     /// N: flip Y_N of a stage.
     BadYn(usize),
-    /// N: a wrong label-check pair for one reported/converted wire of a stage.
+    /// N: the two halves of the label-check pair of one reported wire of a
+    /// stage swapped.
     BadPair(usize),
-    /// N: open hk with one bit flipped.
-    LieHk,
-    /// N: prove hk for a K_0 with one bit flipped (and open that hash).
-    WrongHkWitness,
-    /// C: report one flipped output / conversion bit of a stage to N.
-    FlipOutput(usize),
+    /// N: the label-check pairs of a stage's first reported group are right
+    /// for the bit 0 and wrong for the bit 1 (an abort that depends on the
+    /// group's value).
+    BadPairHalf(usize),
+    /// C: report one flipped bit of the named output group to N.
+    FlipReported(&'static str),
     /// C: opens its key-share commitment to a different point.
     BadOpen,
-    /// C: proves the "s ap traffic" digest over the "c ap traffic" block.
-    WrongLabel,
-    /// C: flips one correction bit of the proof for a stage's digests.
-    BadProofBit(usize),
     /// C: uses another label than the one it got for a digest input of a
     /// stage, ignores its own checks and reports what it computed.
     FeedOther(usize),
-    /// C: opens h1 with one bit flipped.
-    LieAnchor,
 }
 
 type KosS = kos::Sender<chou_orlandi::Receiver>;
@@ -347,19 +327,12 @@ struct NState {
     /// Zero-labels of the circuit inputs and outputs (with Δ_A, both labels).
     k_in: SecretBlocks,
     k_out: SecretBlocks,
-    /// Masks of the outputs and their MACs under Δ_B.
+    /// Masks of the outputs.
     lam_out: Zeroizing<Vec<bool>>,
-    mac_out: SecretBlocks,
-    /// COT keys under Δ_A: C's inputs, conversions, proofs.
+    /// COT keys under Δ_A for C's inputs.
     cota: SecretBlocks,
-    /// COTs under Δ_B for the hk proof.
-    hk_r: Zeroizing<Vec<bool>>,
-    hk_m: SecretBlocks,
-    seed: [u8; 32],
     /// Decoded values of the reported output groups.
     vals: Vec<Option<Zeroizing<Vec<bool>>>>,
-    /// C's conversion bits of the converted output groups.
-    conv_d: Vec<Option<Vec<bool>>>,
     next: usize,
 }
 
@@ -378,18 +351,13 @@ struct CState {
     lam_out: Vec<bool>,
     /// Label-check pairs, by `Lay::e_idx`.
     pairs: Vec<[[u8; 16]; 2]>,
-    /// MAC keys of the output masks (for N's hk proof).
-    key_out: SecretBlocks,
-    /// COTs under Δ_A (`msg = key ⊕ choice·Δ_A`).
+    /// COTs under Δ_A for C's inputs (`msg = key ⊕ choice·Δ_A`).
     cot_choices: Zeroizing<Vec<bool>>,
     cot_msgs: SecretBlocks,
-    /// COT keys under Δ_B for N's hk proof.
-    hk_k: SecretBlocks,
-    seed: [u8; 32],
     /// Decoded values of the output groups (pointer bits for `ToN` groups).
     vals: Vec<Option<Zeroizing<Vec<bool>>>>,
-    /// Inner digests waiting for N's labels: bits and, in `Proven`, MACs.
-    dig: Vec<Option<(Zeroizing<Vec<bool>>, SecretBlocks)>>,
+    /// Inner digests C computed, waiting for N's labels.
+    dig: Vec<Option<Zeroizing<Vec<bool>>>>,
     next: usize,
 }
 
@@ -398,7 +366,7 @@ enum Pre {
     C(Box<CState>),
 }
 
-const CH_COTA: usize = 0; // COTs under Δ_A (N sender): C's inputs, conversions, proofs
+const CH_COTA: usize = 0; // COTs under Δ_A (N sender): C's inputs
 const CH_COTB: usize = 1; // MAC COTs (C sender, Δ_B)
 const CH_SC: usize = 2; // share conversion
 const CH_N2C: usize = 3; // all N→C protocol messages
@@ -406,12 +374,17 @@ const CH_C2N: usize = 4; // all C→N protocol messages
 const CH_TAB: usize = 5; // N→C garbled tables (bulk: lowest priority on the link)
 const N_CH: usize = 6;
 
+/// The version tag: the first bytes each party writes on the transport,
+/// before any multiplexer frame. A peer that reads anything else fails with
+/// [`Error::VersionMismatch`].
+pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-1\n";
+
 /// N streams the first part of the tables (stages A1–A3) once this many
 /// MAC-COT bytes from C arrived (C has N's OT bootstrap messages and is
 /// uploading the first part of the Ferret extension), and the rest once C is
-/// past the first part (484 184 bytes with mpz2 rev 8f89783; measured with
-/// `TWOPC_TRACE=1`), i.e. past the last small N→C Ferret message. Either gate
-/// also opens when N's MAC COTs are complete, or after `TABLES_MAX_WAIT`.
+/// past the first part (measured with `TWOPC_TRACE=1`, see `BENCH.md`), i.e.
+/// past the last small N→C Ferret message. Either gate also opens when N's
+/// MAC COTs are complete, or after `TABLES_MAX_WAIT`.
 const TABLES_GATE: [u64; 2] = [64 * 1024, 500_000];
 const TABLES_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -420,12 +393,12 @@ const TAG_OPEN: &[u8] = b"routstr-twopc-ag open";
 const TAG_OUT: &[u8] = b"routstr-twopc-split output labels";
 const TAG_CHI: &[u8] = b"routstr-twopc-ag chi";
 const TAG_PAIR: &[u8] = b"routstr-twopc-split label check";
-const TAG_FS: &[u8] = b"routstr-twopc-split proof";
-const TAG_ZOPEN: &[u8] = b"routstr-twopc-split proof open";
 
-/// Everything derived from a variant's circuit, computed once.
+/// COTs under Δ_A: one per bit of C's x-coordinate share.
+const N_COTA: usize = 256;
+
+/// Everything derived from the circuit, computed once.
 struct Lay {
-    v: Variant,
     sp: &'static Split,
     shapes: Vec<gc::StageShape>,
     ands: Vec<(usize, usize, usize)>,
@@ -437,25 +410,18 @@ struct Lay {
     out0: usize,
     /// Input wires whose mask is opened to C: its x share, the digest inputs.
     open_in: Vec<usize>,
-    /// Per output group: offset of its conversion COTs in the Δ_A pool.
-    conv_off: Vec<Option<usize>>,
-    /// Per output: index of its label-check pair.
+    /// Per output: index of its label-check pair (the outputs C reports).
     e_idx: Vec<Option<usize>>,
     n_pairs: usize,
-    /// Δ_A pool: proof batches as (offset, COTs incl. the 128 mask COTs):
-    /// the digests of stages 1–4, then the anchors h1, h2.
-    batch: Vec<(usize, usize)>,
-    n_cota: usize,
-    /// Δ_B pool: base masks and products (fixed), 128 product-check mask
-    /// COTs, then the hk proof (`hk_len` COTs, 0 without it).
+    /// Δ_B pool: base masks and products (fixed), then 128 product-check
+    /// mask COTs.
     mac_fixed: usize,
-    hk_len: usize,
     n_mac: usize,
 }
 
 impl Lay {
-    fn new(v: Variant) -> Lay {
-        let sp = circuits::split(v);
+    fn new() -> Lay {
+        let sp: &'static Split = &circuits::SPLIT;
         let circ = &sp.circ;
         let shapes = gc::stage_shapes(circ, &sp.gate_end);
         for (s, sh) in shapes.iter().enumerate() {
@@ -464,43 +430,23 @@ impl Lay {
         let n_in = circ.inputs().len();
         let n_and = circ.and_count();
         let n_out = circ.outputs().len();
+        assert_eq!(sp.xc.len(), N_COTA);
         let mut open_in: Vec<usize> = sp.xc.clone().collect();
         for d in &sp.dig {
             open_in.extend(d.clone());
         }
-        let mut off = 256;
-        let mut conv_off = Vec::new();
         let mut e_idx = vec![None; n_out];
         let mut n_pairs = 0;
         for g in &sp.outs {
-            conv_off.push(g.conv.then_some(off));
-            if g.conv {
-                off += g.len;
-            }
-            if g.conv || g.kind != OutKind::ToC {
+            if g.kind != OutKind::ToC {
                 for i in 0..g.len {
                     e_idx[g.off + i] = Some(n_pairs);
                     n_pairs += 1;
                 }
             }
         }
-        let mut batch = Vec::new();
-        let mut hk_len = 0;
-        if v == Variant::Proven {
-            let n_cs = zk::compress_ands_secret_state();
-            for s in 1..N_STAGES {
-                let len = sp.digs_of(s).len() * n_cs + 128;
-                batch.push((off, len));
-                off += len;
-            }
-            let len = 2 * zk::compress_ands_secret_prefix(256) + 128;
-            batch.push((off, len));
-            off += len;
-            hk_len = zk::compress_ands_secret_prefix(224) + 128;
-        }
         let mac_fixed = n_in + 2 * n_and;
         Lay {
-            v,
             sp,
             ands: gc::and_gates(circ),
             base: gc::base_wires(circ),
@@ -510,19 +456,11 @@ impl Lay {
             n_out,
             out0: circ.outputs().start,
             open_in,
-            conv_off,
             e_idx,
             n_pairs,
-            batch,
-            n_cota: off,
             mac_fixed,
-            hk_len,
-            n_mac: mac_fixed + 128 + hk_len,
+            n_mac: mac_fixed + 128,
         }
-    }
-
-    fn proven(&self) -> bool {
-        self.v == Variant::Proven
     }
 
     /// Output groups C opens (decodes).
@@ -530,52 +468,21 @@ impl Lay {
         self.sp.outs[gi].kind != OutKind::ToN
     }
 
-    /// Output groups of `stage` that C reports to N (pointer or conversion bits).
+    /// Output groups of `stage` that C reports to N (pointer bits).
     fn reported(&self, stage: usize) -> Vec<usize> {
         (0..self.sp.outs.len())
             .filter(|&gi| {
                 let g = &self.sp.outs[gi];
-                g.stage == stage && (g.conv || g.kind != OutKind::ToC)
+                g.stage == stage && g.kind != OutKind::ToC
             })
             .collect()
     }
-
-    /// Bytes of the proof C attaches for the digests of `stage` (0 if none).
-    fn proof_len(&self, stage: usize) -> usize {
-        if self.proven() && (1..N_STAGES).contains(&stage) {
-            (self.batch[stage - 1].1 - 128).div_ceil(8) + 32
-        } else {
-            0
-        }
-    }
-
-    /// Bytes of C's anchor proof (h1, h2) and of N's hk proof.
-    fn anchors_len(&self) -> usize {
-        if self.proven() { (self.batch[4].1 - 128).div_ceil(8) + 32 + 64 + 32 } else { 0 }
-    }
-    fn hk_proof_len(&self) -> usize {
-        (self.hk_len - 128).div_ceil(8) + 32 + 32 + 32
-    }
 }
 
-static LAY_PROVEN: LazyLock<Lay> = LazyLock::new(|| Lay::new(Variant::Proven));
-static LAY_PUBLIC: LazyLock<Lay> = LazyLock::new(|| Lay::new(Variant::PublicIs));
+static LAY: LazyLock<Lay> = LazyLock::new(Lay::new);
 
-fn lay(v: Variant) -> &'static Lay {
-    match v {
-        Variant::Proven => &LAY_PROVEN,
-        Variant::PublicIs => &LAY_PUBLIC,
-    }
-}
-
-/// The variant a new `Party` uses: `TWOPC_VARIANT=public` selects
-/// [`Variant::PublicIs`], anything else [`Variant::Proven`]. Both parties
-/// must agree (a mismatch fails in preprocessing on message lengths).
-fn default_variant() -> Variant {
-    match std::env::var("TWOPC_VARIANT").as_deref() {
-        Ok("public") => Variant::PublicIs,
-        _ => Variant::Proven,
-    }
+fn lay() -> &'static Lay {
+    &LAY
 }
 
 /// The inner state whose digests feed `stage` (1..=4).
@@ -585,7 +492,6 @@ fn is_group(sp: &Split, stage: usize) -> usize {
 
 pub struct Party {
     role: Role,
-    variant: Variant,
     mux: Option<Mux>,
     counters: Arc<Counters>,
     ctx_a: Context,
@@ -684,24 +590,6 @@ fn first_nonzero(mut draw: impl FnMut(u32) -> Block) -> Block {
         .expect("a non-zero draw")
 }
 
-/// Fiat–Shamir challenge of a proof: the session seed, the statement (which
-/// proof, its public message blocks, the bits that fix the committed inputs)
-/// and every correction bit of the prover.
-fn fs_chi(seed: &[u8; 32], id: u8, blocks: &[[u8; 64]], commit: &[u8], d_bytes: &[u8]) -> Block {
-    let mut h = Sha256::new();
-    h.update(TAG_FS);
-    h.update(seed);
-    h.update([id, blocks.len() as u8]);
-    for b in blocks {
-        h.update(b);
-    }
-    h.update((commit.len() as u32).to_be_bytes());
-    h.update(commit);
-    h.update(d_bytes);
-    let ctx: [u8; 32] = h.finalize().into();
-    chi(&ctx, b"fs")
-}
-
 /// One half of a label-check pair: a salted hash of the value C holds for
 /// output `o` when its reported bit is `p`.
 fn pair_hash(salt: &[u8; 16], o: usize, p: bool, x: Block) -> [u8; 16] {
@@ -714,13 +602,6 @@ fn pair_hash(salt: &[u8; 16], o: usize, p: bool, x: Block) -> [u8; 16] {
         .finalize()
         .into();
     h[..16].try_into().unwrap()
-}
-
-fn iv_bits() -> Vec<bool> {
-    circuits::SHA256_IV
-        .iter()
-        .flat_map(|w| (0..32).map(move |k| (w >> k) & 1 == 1))
-        .collect()
 }
 
 fn parse_point(b: &[u8]) -> Result<ProjectivePoint> {
@@ -763,6 +644,36 @@ fn fp_from_be(be: &[u8]) -> Result<Fp> {
     r
 }
 
+/// Writes [`VERSION_TAG`] and reads the peer's, byte by byte, so that a peer
+/// speaking anything else (a v2 peer starts with a multiplexer frame header)
+/// is refused at its first differing byte and nothing past the tag is read.
+async fn exchange_version<IO>(io: IO) -> Result<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    use futures::{AsyncReadExt, AsyncWriteExt};
+    let (mut rd, mut wr) = io.split();
+    let send = async {
+        wr.write_all(VERSION_TAG).await?;
+        wr.flush().await?;
+        Ok::<_, Error>(())
+    };
+    let recv = async {
+        let mut got = Vec::with_capacity(VERSION_TAG.len());
+        let mut b = [0u8; 1];
+        while got.len() < VERSION_TAG.len() {
+            rd.read_exact(&mut b).await?;
+            got.push(b[0]);
+            if b[0] != VERSION_TAG[got.len() - 1] {
+                return Err(Error::VersionMismatch(hex::encode(&got)));
+            }
+        }
+        Ok(())
+    };
+    futures::try_join!(send, recv)?;
+    rd.reunite(wr).map_err(|_| Error::Protocol("transport halves".into()))
+}
+
 fn perr<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> Error {
     move |e| Error::Protocol(format!("{what}: {e}"))
 }
@@ -801,21 +712,26 @@ impl Party {
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        // The version tag, both ways, before anything else.
+        let io = exchange_version(io).await?;
         // What the peer may send per channel. N (the node) is the exposed
-        // party: C's honest upload is about 1.5 MB in all (Ferret on CH_COTB,
-        // the KOS bootstrap of the Δ_A Ferret on CH_COTA), a few KB of ECtF
-        // traffic and well under 64 KB of protocol messages; N→C-only
-        // channels accept nothing from C. C bounds N too, so a malicious node
-        // cannot grow the client's memory: an honest N sends about 0.5 MB on
-        // each COT channel, 21 KB on CH_SC, under 4 MB on CH_N2C and about
-        // 10 MB of tables (the circuit is fixed).
+        // party: C's honest upload is about 1.1 MB in all (Ferret on CH_COTB;
+        // 12 KB of KOS on CH_COTA), a few KB of ECtF traffic and under 1 KB
+        // of protocol messages; N→C-only channels accept nothing from C. C
+        // bounds N too, so a malicious node cannot grow the client's memory:
+        // an honest N sends about 0.5 MB on CH_COTB, a few KB on CH_COTA,
+        // 21 KB on CH_SC, about 4.1 MB on CH_N2C and 11.8 MB of tables (the
+        // circuit is fixed).
         const MIB: u64 = 1 << 20;
         let caps: [u64; N_CH] = match role {
-            Role::N => [8 * MIB, 16 * MIB, 4 * MIB, 0, MIB, 0],
-            Role::C => [4 * MIB, 4 * MIB, MIB, 16 * MIB, 0, 32 * MIB],
+            Role::N => [MIB, 16 * MIB, 4 * MIB, 0, MIB, 0],
+            Role::C => [MIB, 4 * MIB, MIB, 16 * MIB, 0, 32 * MIB],
         };
         let (mux, mut chans) = Mux::start(io, N_CH, &[CH_TAB], &caps);
         let counters = mux.counters.clone();
+        let tag = VERSION_TAG.len() as u64;
+        counters.sent.fetch_add(tag, std::sync::atomic::Ordering::Relaxed);
+        counters.recv.fetch_add(tag, std::sync::atomic::Ordering::Relaxed);
         let mut take = |i: usize| std::mem::replace(&mut chans[i], tokio::io::duplex(1).0);
         let ctx_a = Context::new_single_threaded(take(CH_COTA).compat());
         let ctx_b = Context::new_single_threaded(take(CH_COTB).compat());
@@ -864,7 +780,6 @@ impl Party {
         }
         Ok(Party {
             role,
-            variant: default_variant(),
             mux: Some(mux),
             counters,
             ctx_a,
@@ -891,13 +806,6 @@ impl Party {
 
     pub fn role(&self) -> Role {
         self.role
-    }
-
-    /// Selects the split variant (prototype switch; before `preprocess`, and
-    /// the same on both sides).
-    #[doc(hidden)]
-    pub fn set_variant(&mut self, v: Variant) {
-        self.variant = v;
     }
 
     pub fn counters(&self) -> Arc<Counters> {
@@ -1005,7 +913,7 @@ impl Party {
     async fn preprocess_n(&mut self) -> Result<()> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
         let delta = self.delta;
         let mut grng = StdRng::from_seed(self.rng.random());
@@ -1031,8 +939,7 @@ impl Party {
                 chou_orlandi::Receiver::new_with_seed(self.rng.random()),
             ));
         }
-        let kos_a = self.kos_a_s.take().ok_or(Error::State("preprocess already ran"))?;
-        let fa_seed: Block = self.rng.random();
+        let mut kos_a = self.kos_a_s.take().ok_or(Error::State("preprocess already ran"))?;
 
         let Party {
             ctx_a,
@@ -1095,13 +1002,7 @@ impl Party {
             Ok::<_, Error>(k)
         };
         let cot_a_fut = async {
-            let keys = if lay.proven() {
-                let mut f = ferret::Sender::new(fcfg(), fa_seed, kos_a);
-                rcot_send!(&mut f, ctx_a, lay.n_cota)
-            } else {
-                let mut kos_a = kos_a;
-                rcot_send!(&mut kos_a, ctx_a, lay.n_cota)
-            };
+            let keys = rcot_send!(&mut kos_a, ctx_a, N_COTA);
             Ok::<_, Error>(SecretBlocks(keys))
         };
         let cot_b_fut = async {
@@ -1115,7 +1016,7 @@ impl Party {
         let cota = cota?;
         let (r_bits, r_macs) = macs?;
         scr?;
-        if cota.len() != lay.n_cota || r_bits.len() != lay.n_mac {
+        if cota.len() != N_COTA || r_bits.len() != lay.n_mac {
             return Err(Error::Protocol("cot count".into()));
         }
 
@@ -1149,8 +1050,6 @@ impl Party {
         let off = lay.mac_fixed;
         let mask_bits = Zeroizing::new(r_bits[off..off + 128].to_vec());
         let mask_macs = SecretBlocks(r_macs[off..off + 128].to_vec());
-        let hk_r = Zeroizing::new(r_bits[off + 128..].to_vec());
-        let hk_m = SecretBlocks(r_macs[off + 128..].to_vec());
         drop((r_bits, r_macs));
         n2c.send(&from_bits(&d_bits)).await?;
 
@@ -1225,8 +1124,13 @@ impl Party {
                 let mut bits = Vec::new();
                 let mut h = Sha256::new();
                 h.update(TAG_OPEN);
-                for &w in &lay.open_in {
-                    bits.push(lam[w]);
+                #[allow(unused_variables)]
+                for (j, &w) in lay.open_in.iter().enumerate() {
+                    #[cfg(test)]
+                    let lie = cheat == Cheat::LieOpenIn(j);
+                    #[cfg(not(test))]
+                    let lie = false;
+                    bits.push(lam[w] ^ lie);
                     h.update(mac[w].as_bytes());
                 }
                 for (gi, g) in sp.outs.iter().enumerate() {
@@ -1255,26 +1159,28 @@ impl Party {
                 msgs.push(y);
             }
 
-            // Label-check pairs: for each output wire C reports (pointer bit
-            // Λ: the two labels) or converts (bit d = z ⊕ r: label ⊕ COT
-            // message, i.e. k ⊕ K ⊕ d·Δ_A), the salted hash of both values.
+            // Label-check pairs: for each output wire C reports, the salted
+            // hashes of its two labels, by pointer bit.
             let mut pairs = Vec::with_capacity(32 * lay.n_pairs);
+            #[allow(unused_variables)]
             for (gi, g) in sp.outs.iter().enumerate() {
                 for i in 0..g.len {
                     let o = g.off + i;
                     if lay.e_idx[o].is_none() {
                         continue;
                     }
-                    let kw = k[lay.out0 + o];
-                    let x0 = match lay.conv_off[gi] {
-                        Some(c) => kw ^ cota[c + i],
-                        None => kw ^ sel(lam[lay.out0 + o], delta),
-                    };
+                    // The label with pointer bit 0: k ⊕ λ·Δ_A.
+                    let x0 = k[lay.out0 + o] ^ sel(lam[lay.out0 + o], delta);
                     #[allow(unused_mut)]
                     let mut pair = [pair_hash(&salt_b, o, false, x0), pair_hash(&salt_b, o, true, x0 ^ delta)];
                     #[cfg(test)]
-                    if cheat == Cheat::BadPair(g.stage) && lay.reported(g.stage)[0] == gi && i == 3 {
-                        pair.swap(0, 1);
+                    if lay.reported(g.stage)[0] == gi {
+                        if cheat == Cheat::BadPair(g.stage) && i == 3 {
+                            pair.swap(0, 1);
+                        }
+                        if cheat == Cheat::BadPairHalf(g.stage) {
+                            pair[1][0] ^= 1;
+                        }
                     }
                     pairs.extend_from_slice(&pair[0]);
                     pairs.extend_from_slice(&pair[1]);
@@ -1286,14 +1192,9 @@ impl Party {
             let st = NState {
                 k_in: SecretBlocks(k[..lay.n_in].to_vec()),
                 k_out: SecretBlocks(k[outs.clone()].to_vec()),
-                lam_out: Zeroizing::new(lam[outs.clone()].to_vec()),
-                mac_out: SecretBlocks(mac[outs].to_vec()),
+                lam_out: Zeroizing::new(lam[outs].to_vec()),
                 cota,
-                hk_r,
-                hk_m,
-                seed,
                 vals: (0..sp.outs.len()).map(|_| None).collect(),
-                conv_d: (0..sp.outs.len()).map(|_| None).collect(),
                 next: 0,
             };
             (st, msgs)
@@ -1309,12 +1210,11 @@ impl Party {
     }
 
     async fn preprocess_c(&mut self) -> Result<()> {
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
         let delta_b = self.delta;
         let seed: [u8; 32] = self.rng.random();
-        let kos_a = self.kos_a_r.take().ok_or(Error::State("preprocess already ran"))?;
-        let fa_seed: Block = self.rng.random();
+        let mut kos_a = self.kos_a_r.take().ok_or(Error::State("preprocess already ran"))?;
         let Party {
             ctx_a,
             ctx_b,
@@ -1341,13 +1241,7 @@ impl Party {
             Ok::<_, Error>((t, unpack(&d, lay.mac_fixed)))
         };
         let cot_a_fut = async {
-            let (c, m) = if lay.proven() {
-                let mut f = ferret::Receiver::new(fcfg(), fa_seed, kos_a);
-                rcot_recv!(&mut f, ctx_a, lay.n_cota)
-            } else {
-                let mut kos_a = kos_a;
-                rcot_recv!(&mut kos_a, ctx_a, lay.n_cota)
-            };
+            let (c, m) = rcot_recv!(&mut kos_a, ctx_a, N_COTA);
             tr(t0, "C", "cot (delta_A) done");
             Ok::<_, Error>((c, m))
         };
@@ -1367,11 +1261,11 @@ impl Party {
         let kb = SecretBlocks(kb?);
         scr?;
         let (cot_choices, cot_msgs) = (Zeroizing::new(cot_choices), SecretBlocks(cot_msgs));
-        if kb.len() != lay.n_mac || cot_choices.len() != lay.n_cota {
+        if kb.len() != lay.n_mac || cot_choices.len() != N_COTA {
             return Err(Error::Protocol("cot count".into()));
         }
-        // Keys of the committed values: K[x] = K[r] ⊕ d·Δ_B. The COTs after
-        // them stay random: the product-check mask and N's hk proof.
+        // Keys of the committed values: K[x] = K[r] ⊕ d·Δ_B. The 128 COTs
+        // after them stay random: the product-check mask.
         let kfix = SecretBlocks(
             kb.iter()
                 .enumerate()
@@ -1421,13 +1315,12 @@ impl Party {
             for i in 0..128 {
                 k_star ^= Block::MONOMIAL[i].gfmul(kfix[off + i]);
             }
-            let hk_k = SecretBlocks(kfix[off + 128..].to_vec());
-            (key, cks, acc ^ k_star, hk_k)
+            (key, cks, acc ^ k_star)
         });
         let (r2, comp) = futures::join!(recv2, compute);
         tr(t0, "C", "rows recv + keys computed");
         let (dv, open, rows, pairs) = r2?;
-        let (key, cks, w, hk_k) = comp.map_err(perr("preprocess task"))?;
+        let (key, cks, w) = comp.map_err(perr("preprocess task"))?;
 
         // Product check: Σχ B ⊕ K* = U ⊕ V·Δ_B.
         let uv = bytes_to_blocks(&dv);
@@ -1475,11 +1368,8 @@ impl Party {
             lam_in,
             lam_out,
             pairs,
-            key_out: SecretBlocks(key[sp.circ.outputs()].to_vec()),
             cot_choices,
             cot_msgs,
-            hk_k,
-            seed,
             vals: (0..sp.outs.len()).map(|_| None).collect(),
             dig: (0..sp.dig.len()).map(|_| None).collect(),
             next: 0,
@@ -1623,7 +1513,7 @@ impl Party {
     async fn handshake_n(&mut self, x_bits: &[bool], th: [u8; 32]) -> Result<HsSecrets> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
         let delta = self.delta;
         // Own input labels, sent at once.
@@ -1640,20 +1530,20 @@ impl Party {
             labels[0] = labels[0] ^ Block::new([0x5a; 16]);
         }
         self.n2c.send(&blocks_to_bytes(&labels)).await?;
+        gc::wipe_blocks(&mut labels);
         let d = unpack(&self.c2n.recv_exact(32).await?, 256);
-        let adj: Vec<Block> = {
+        let mut adj: Vec<Block> = {
             let st = self.nst()?;
             sp.xc.clone().enumerate().map(|(j, w)| st.k_in[w] ^ st.cota[j] ^ sel(d[j], delta)).collect()
         };
         self.n2c.send(&blocks_to_bytes(&adj)).await?;
+        gc::wipe_blocks(&mut adj);
 
         for s in 0..HS_STAGES {
-            let more = s + 1 < HS_STAGES;
-            let r = self.n_report(s, if more { lay.proof_len(s + 1) } else { 0 }).await;
-            let extra = self.n_rej(r).await?;
-            if more {
-                let r = self.n_digest_labels(s + 1, &th, &extra);
-                let lab = self.n_rej(r).await?;
+            let r = self.n_report(s).await;
+            self.n_rej(r).await?;
+            if s + 1 < HS_STAGES {
+                let lab = self.n_digest_labels(s + 1, &th)?;
                 self.n2c.send(&lab).await?;
             }
         }
@@ -1669,77 +1559,51 @@ impl Party {
     }
 
     async fn application_n(&mut self, th: [u8; 32]) -> Result<ApOut> {
-        #[allow(unused_variables)]
-        let cheat = self.cheat();
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
-        // Stage B1's digests need th_SF: in `Proven` C proves them first.
-        let proof = if lay.proven() { self.c2n.recv().await? } else { Vec::new() };
-        let r = self.n_digest_labels(HS_STAGES, &th, &proof);
-        let lab = self.n_rej(r).await?;
+        // Stage B1's digests need th_SF; `IS_MS` came with the A3 report.
+        let lab = self.n_digest_labels(HS_STAGES, &th)?;
         self.n2c.send(&lab).await?;
         for s in HS_STAGES..N_STAGES {
-            let more = s + 1 < N_STAGES;
-            let r = self.n_report(s, if more { lay.proof_len(s + 1) } else { lay.anchors_len() }).await;
-            let extra = self.n_rej(r).await?;
-            if more {
-                let r = self.n_digest_labels(s + 1, &th, &extra);
-                let lab = self.n_rej(r).await?;
+            let r = self.n_report(s).await;
+            self.n_rej(r).await?;
+            if s + 1 < N_STAGES {
+                let lab = self.n_digest_labels(s + 1, &th)?;
                 self.n2c.send(&lab).await?;
-                continue;
             }
-            // After B2: the anchors.
-            let st = self.nst()?;
-            let mut kiv: [u8; 28] = from_bits(st.vals[sp.group("kiv")].as_ref().ok_or(Error::State("output missing"))?)
-                .try_into()
-                .expect("28 bytes");
-            let hk_own: [u8; 32] = Sha256::digest(kiv).into();
-            let (h1, h2, hk) = if lay.proven() {
-                let r = self.n_verify_anchors(&extra);
-                let (h1, h2) = self.n_rej(r).await?;
-                let msg = self.n_prove_hk()?;
-                self.n2c.send(&msg).await?;
-                // C's verdict on the hk proof. N has its outputs already; it
-                // waits so that the session ends with a message from C (the
-                // transport is closed by whoever finishes last) and so that
-                // N sees C's abort, as after every stage.
-                if self.c2n.recv_exact(1).await?[0] != 1 {
-                    kiv.zeroize();
-                    return Err(Error::Abort("peer aborted (C rejected the hk proof)".into()));
-                }
-                (h1, h2, hk_own)
-            } else {
-                let get = |name: &str| -> Result<[u8; 32]> {
-                    let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
-                    Ok(from_bits(v).try_into().expect("32 bytes"))
-                };
-                let (h1, h2, hk) = (get("h1")?, get("h2")?, get("hk")?);
-                if hk != hk_own {
-                    kiv.zeroize();
-                    return Err(Error::Abort("anchor mismatch".into()));
-                }
-                (h1, h2, hk)
-            };
-            let o = ApOut::N {
-                k0: kiv[..16].try_into().unwrap(),
-                iv0: kiv[16..].try_into().unwrap(),
-                h1,
-                h2,
-                hk,
-            };
-            kiv.zeroize();
-            return Ok(o);
         }
-        unreachable!("the last stage returns")
+        let st = self.nst()?;
+        let get = |name: &str| -> Result<[u8; 32]> {
+            let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
+            Ok(from_bits(v).try_into().expect("32 bytes"))
+        };
+        let (h1, h2, hk) = (get("h1")?, get("h2")?, get("hk")?);
+        let mut kiv: [u8; 28] = from_bits(st.vals[sp.group("kiv")].as_ref().ok_or(Error::State("output missing"))?)
+            .try_into()
+            .expect("28 bytes");
+        // The circuit computed hk over the same wires; a difference means C's
+        // report went through although the labels were not N's (not reachable
+        // without Δ_A), so this is a self-check.
+        if Sha256::digest(kiv)[..] != hk {
+            kiv.zeroize();
+            return Err(Error::Abort("anchor mismatch".into()));
+        }
+        let o = ApOut::N {
+            k0: kiv[..16].try_into().unwrap(),
+            iv0: kiv[16..].try_into().unwrap(),
+            h1,
+            h2,
+            hk,
+        };
+        kiv.zeroize();
+        Ok(o)
     }
 
     /// Receives C's report of stage `s` and checks it against N's labels: for
-    /// every reported bit N recomputes the value C must hold (the output
-    /// label, or label ⊕ COT message for a conversion) and compares one hash,
-    /// so C cannot report a bit it has no label for. Returns the `extra`
-    /// trailing bytes (the proof attached to the report).
-    async fn n_report(&mut self, s: usize, extra: usize) -> Result<Vec<u8>> {
-        let lay = lay(self.variant);
+    /// every reported pointer bit N recomputes the label C must hold and
+    /// compares one hash, so C cannot report a bit it has no label for.
+    async fn n_report(&mut self, s: usize) -> Result<()> {
+        let lay = lay();
         let sp = lay.sp;
         let delta = self.delta;
         let msg = self.c2n.recv().await?;
@@ -1748,7 +1612,7 @@ impl Party {
         }
         let groups = lay.reported(s);
         let body: usize = groups.iter().map(|&gi| sp.outs[gi].len / 8).sum();
-        if msg.len() != 1 + body + 32 + extra {
+        if msg.len() != 1 + body + 32 {
             return Err(Error::Protocol("report length".into()));
         }
         let st = self.nst()?;
@@ -1766,77 +1630,56 @@ impl Party {
             off += g.len / 8;
             for (i, p) in bits.iter().enumerate() {
                 let o = g.off + i;
-                let x = match lay.conv_off[gi] {
-                    Some(c) => st.k_out[o] ^ st.cota[c + i] ^ sel(*p, delta),
-                    None => st.k_out[o] ^ sel(*p ^ st.lam_out[o], delta),
-                };
+                // The label with pointer bit p: k ⊕ (p ⊕ λ)·Δ_A.
+                let x = st.k_out[o] ^ sel(*p ^ st.lam_out[o], delta);
                 h.update(x.as_bytes());
             }
             parsed.push((gi, bits));
         }
         let hd: [u8; 32] = h.finalize().into();
-        if hd[..] != msg[off..off + 32] {
+        if hd[..] != msg[off..] {
             return Err(Error::Abort("output labels do not authenticate".into()));
         }
         for (gi, bits) in parsed {
             let g = &sp.outs[gi];
-            if g.conv {
-                st.conv_d[gi] = Some(bits);
-            } else {
-                let v: Vec<bool> = bits.iter().enumerate().map(|(i, p)| p ^ st.lam_out[g.off + i]).collect();
-                st.vals[gi] = Some(Zeroizing::new(v));
-            }
+            let v: Vec<bool> = bits.iter().enumerate().map(|(i, p)| p ^ st.lam_out[g.off + i]).collect();
+            st.vals[gi] = Some(Zeroizing::new(v));
         }
         st.next = s + 1;
-        Ok(msg[off + 32..].to_vec())
+        Ok(())
     }
 
-    /// The labels of stage `s`'s digest inputs. `Proven`: N verifies C's
-    /// proof of the digests over its own message blocks and its key of the
-    /// committed `IS`, and sends the corrections `k_w ⊕ K_d` (C's MAC on the
-    /// proven bit then becomes exactly that bit's label). `PublicIs`: N
-    /// computes the digests from the public `IS` and sends their labels.
-    fn n_digest_labels(&mut self, s: usize, th: &[u8; 32], proof: &[u8]) -> Result<Vec<u8>> {
+    /// The labels of stage `s`'s digest inputs: N computes the inner digests
+    /// from the public `IS` (which C reported under its labels in the stage
+    /// before) and its own transcript hash, and sends the label of every
+    /// digest bit. C gets one label per wire and nothing to choose from.
+    fn n_digest_labels(&mut self, s: usize, th: &[u8; 32]) -> Result<Vec<u8>> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
         let delta = self.delta;
         let st = self.nst()?;
-        let blocks = circuits::digest_blocks(s, th);
+        if st.next != s {
+            return Err(Error::State("stage order"));
+        }
+        #[allow(unused_mut)]
+        let mut blocks = circuits::digest_blocks(s, th);
+        #[cfg(test)]
+        if cheat == Cheat::OtherDigest(s) {
+            if blocks.len() > 1 {
+                blocks.rotate_left(1);
+            } else {
+                blocks[0][0] ^= 1;
+            }
+        }
         let digs = sp.digs_of(s);
-        let gi = is_group(sp, s);
+        let is = st.vals[is_group(sp, s)].as_ref().ok_or(Error::State("no inner state"))?;
         let mut labels: Vec<Block> = Vec::with_capacity(256 * digs.len());
-        if lay.proven() {
-            let (boff, blen) = lay.batch[s - 1];
-            let d_len = (blen - 128).div_ceil(8);
-            if proof.len() != d_len + 32 {
-                return Err(Error::Protocol("proof length".into()));
-            }
-            let reject = || Error::Abort("inner-digest proof rejected".into());
-            let mut ver = zk::Verifier::new(&st.cota[boff..boff + blen], delta, &proof[..d_len]).ok_or_else(reject)?;
-            let conv = lay.conv_off[gi].expect("converted group");
-            let cd = st.conv_d[gi].as_ref().ok_or(Error::State("no commitment"))?;
-            let state: Vec<VW> = (0..256).map(|i| VW::secret(st.cota[conv + i] ^ sel(cd[i], delta))).collect();
-            for (n, blk) in blocks.iter().enumerate() {
-                let out = ver.compress(&state, &zk::pub_block_v(blk, delta)).ok_or_else(reject)?;
-                let dk = circuits::digest_perm(&out);
-                for (i, w) in sp.dig[digs[n]].clone().enumerate() {
-                    labels.push(st.k_in[w] ^ dk[i].k);
-                }
-            }
-            let chi = fs_chi(&st.seed, s as u8, &blocks, &from_bits(cd), &proof[..d_len]);
-            let uv = bytes_to_blocks(&proof[d_len..]);
-            if !ver.finish(chi, uv[0], uv[1]) {
-                return Err(reject());
-            }
-        } else {
-            let is = st.vals[gi].as_ref().ok_or(Error::State("no inner state"))?;
-            for (n, blk) in blocks.iter().enumerate() {
-                let d = Zeroizing::new(circuits::inner_digest(is, blk));
-                for (i, w) in sp.dig[digs[n]].clone().enumerate() {
-                    labels.push(st.k_in[w] ^ sel(d[i], delta));
-                }
+        for (n, blk) in blocks.iter().enumerate() {
+            let d = Zeroizing::new(circuits::inner_digest(is, blk));
+            for (i, w) in sp.dig[digs[n]].clone().enumerate() {
+                labels.push(st.k_in[w] ^ sel(d[i], delta));
             }
         }
         #[cfg(test)]
@@ -1852,102 +1695,6 @@ impl Party {
         Ok(out)
     }
 
-    /// `Proven`: verifies C's proof of h1 = SHA256(c_ap_1), h2 = SHA256(s_ap_0)
-    /// over its commitments to those outputs, and the opening of both hashes.
-    fn n_verify_anchors(&mut self, proof: &[u8]) -> Result<([u8; 32], [u8; 32])> {
-        let lay = lay(self.variant);
-        let sp = lay.sp;
-        let delta = self.delta;
-        let st = self.nst()?;
-        let (boff, blen) = lay.batch[4];
-        let d_len = (blen - 128).div_ceil(8);
-        if proof.len() != d_len + 32 + 64 + 32 {
-            return Err(Error::Protocol("proof length".into()));
-        }
-        let reject = || Error::Abort("anchor proof rejected".into());
-        let mut ver = zk::Verifier::new(&st.cota[boff..boff + blen], delta, &proof[..d_len]).ok_or_else(reject)?;
-        let pad = circuits::msg_block(0, &[0u8; 32]);
-        let iv: Vec<VW> = iv_bits().into_iter().map(|b| VW::public(b, delta)).collect();
-        let mut commit = Vec::new();
-        let mut outs = Vec::new();
-        for name in ["c_ap_1", "s_ap_0"] {
-            let gi = sp.group(name);
-            let conv = lay.conv_off[gi].expect("converted group");
-            let cd = st.conv_d[gi].as_ref().ok_or(Error::State("no commitment"))?;
-            commit.extend_from_slice(&from_bits(cd));
-            let mut blk = zk::pub_block_v(&pad, delta);
-            for i in 0..256 {
-                blk[i] = VW::secret(st.cota[conv + i] ^ sel(cd[i], delta));
-            }
-            let out = ver.compress(&iv, &blk).ok_or_else(reject)?;
-            outs.extend(circuits::digest_perm(&out));
-        }
-        let chi = fs_chi(&st.seed, 5, &[pad], &commit, &proof[..d_len]);
-        let uv = bytes_to_blocks(&proof[d_len..d_len + 32]);
-        if !ver.finish(chi, uv[0], uv[1]) {
-            return Err(reject());
-        }
-        let hb = &proof[d_len + 32..d_len + 96];
-        let mut h = Sha256::new();
-        h.update(TAG_ZOPEN);
-        for (w, b) in outs.iter().zip(to_bits(hb)) {
-            h.update((w.k ^ sel(b, delta)).as_bytes());
-        }
-        let hd: [u8; 32] = h.finalize().into();
-        if hd[..] != proof[d_len + 96..] {
-            return Err(Error::Abort("anchor opening rejected".into()));
-        }
-        Ok((hb[..32].try_into().unwrap(), hb[32..].try_into().unwrap()))
-    }
-
-    /// `Proven`: N proves hk = SHA256(K_0 ‖ IV_0) to C under Δ_B. N's
-    /// commitment to an output bit z is its authenticated mask: `M[λ]` is a
-    /// MAC on z = Λ ⊕ λ under the key `K[λ] ⊕ Λ·Δ_B`, Λ being the pointer bit
-    /// C reported.
-    fn n_prove_hk(&mut self) -> Result<Vec<u8>> {
-        #[allow(unused_variables)]
-        let cheat = self.cheat();
-        let lay = lay(self.variant);
-        let sp = lay.sp;
-        let st = self.nst()?;
-        let gi = sp.group("kiv");
-        let g = &sp.outs[gi];
-        let z = st.vals[gi].as_ref().ok_or(Error::State("output missing"))?;
-        let pad = circuits::msg_block(0, &[0u8; 28]);
-        let mut blk = zk::pub_block_p(&pad);
-        for i in 0..g.len {
-            blk[i] = PW::secret(z[i], st.mac_out[g.off + i]);
-        }
-        #[cfg(test)]
-        if cheat == Cheat::WrongHkWitness {
-            blk[9].v = !blk[9].v;
-        }
-        let iv: Vec<PW> = iv_bits().into_iter().map(PW::public).collect();
-        let mut prover = zk::Prover::new(&st.hk_r, &st.hk_m);
-        let out = circuits::digest_perm(&prover.compress(&iv, &blk));
-        let d_bytes = prover.d_bytes();
-        let pbits: Vec<bool> = z.iter().enumerate().map(|(i, v)| v ^ st.lam_out[g.off + i]).collect();
-        let chi = fs_chi(&st.seed, 6, &[pad], &from_bits(&pbits), &d_bytes);
-        let (u, v) = prover.finish(chi);
-        #[allow(unused_mut)]
-        let mut bits: Vec<bool> = out.iter().map(|w| w.v).collect();
-        let mut h = Sha256::new();
-        h.update(TAG_ZOPEN);
-        for w in &out {
-            h.update(w.m.as_bytes());
-        }
-        let hd: [u8; 32] = h.finalize().into();
-        #[cfg(test)]
-        if cheat == Cheat::LieHk {
-            bits[77] = !bits[77];
-        }
-        let mut msg = d_bytes;
-        msg.extend_from_slice(&blocks_to_bytes(&[u, v]));
-        msg.extend_from_slice(&from_bits(&bits));
-        msg.extend_from_slice(&hd);
-        Ok(msg)
-    }
-
     // ----------------------------------------------------------------- C --
 
     /// A message from N of exactly `n` bytes; a single zero byte instead
@@ -1955,7 +1702,7 @@ impl Party {
     async fn c_recv(&mut self, n: usize) -> Result<Vec<u8>> {
         let m = self.n2c.recv().await?;
         if m.len() == 1 && m[0] == 0 && n != 1 {
-            return Err(Error::Abort("peer aborted (N rejected a report or a proof)".into()));
+            return Err(Error::Abort("peer aborted (N rejected a report)".into()));
         }
         if m.len() != n {
             return Err(Error::Protocol(format!("unexpected message length {} (expected {n})", m.len())));
@@ -1964,7 +1711,7 @@ impl Party {
     }
 
     async fn handshake_c(&mut self, x_bits: &[bool], th: [u8; 32]) -> Result<HsSecrets> {
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
         let d: Vec<bool> = {
             let st = self.cst()?;
@@ -1974,8 +1721,8 @@ impl Party {
             x_bits.iter().zip(st.cot_choices.iter()).map(|(x, r)| x ^ r).collect()
         };
         self.c2n.send(&from_bits(&d)).await?;
-        let gl = bytes_to_blocks(&self.c_recv(16 * 256).await?);
-        let el = bytes_to_blocks(&self.c_recv(16 * 256).await?);
+        let gl = SecretBlocks(bytes_to_blocks(&self.c_recv(16 * 256).await?));
+        let el = SecretBlocks(bytes_to_blocks(&self.c_recv(16 * 256).await?));
         // Active labels: with N's zero-labels and Δ_A they give C's inputs.
         let mut ok_in = true;
         {
@@ -1989,15 +1736,10 @@ impl Party {
             }
         }
         for s in 0..HS_STAGES {
-            let mut msg = self.c_stage(s, ok_in).await?;
-            let more = s + 1 < HS_STAGES;
-            if more {
-                msg.extend(self.c_prove_digests(s + 1, &th)?);
-            }
+            let msg = self.c_stage(s, ok_in).await?;
             self.c2n.send(&msg).await?;
-            if more {
-                let lab = self.c_recv(16 * 256 * sp.digs_of(s + 1).len()).await?;
-                ok_in = self.c_set_digest_labels(s + 1, &lab)?;
+            if s + 1 < HS_STAGES {
+                ok_in = self.c_next_digests(s + 1, &th).await?;
             }
         }
         let st = self.cst()?;
@@ -2012,68 +1754,44 @@ impl Party {
     }
 
     async fn application_c(&mut self, th: [u8; 32]) -> Result<ApOut> {
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
-        let proof = self.c_prove_digests(HS_STAGES, &th)?;
-        if lay.proven() {
-            self.c2n.send(&proof).await?;
-        }
-        let lab = self.c_recv(16 * 256 * sp.digs_of(HS_STAGES).len()).await?;
-        let mut ok_in = self.c_set_digest_labels(HS_STAGES, &lab)?;
-        let mut anchors = None;
+        let mut ok_in = self.c_next_digests(HS_STAGES, &th).await?;
         for s in HS_STAGES..N_STAGES {
-            let mut msg = self.c_stage(s, ok_in).await?;
-            let more = s + 1 < N_STAGES;
-            if more {
-                msg.extend(self.c_prove_digests(s + 1, &th)?);
-            } else if lay.proven() {
-                let (proof, h1, h2) = self.c_prove_anchors()?;
-                msg.extend(proof);
-                anchors = Some((h1, h2));
+            let msg = self.c_stage(s, ok_in).await?;
+            if s + 1 < N_STAGES {
+                self.c2n.send(&msg).await?;
+                ok_in = self.c_next_digests(s + 1, &th).await?;
+                continue;
             }
-            self.c2n.send(&msg).await?;
-            if more {
-                let lab = self.c_recv(16 * 256 * sp.digs_of(s + 1).len()).await?;
-                ok_in = self.c_set_digest_labels(s + 1, &lab)?;
+            // Last stage: C compares the anchors with its own outputs before
+            // it reports anything of the stage (N gets K_0 with that report).
+            let st = self.cst()?;
+            let get = |name: &str| -> Result<[u8; 32]> {
+                let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
+                Ok(from_bits(v).try_into().expect("32 bytes"))
+            };
+            let (h1, h2, hk) = (get("h1")?, get("h2")?, get("hk")?);
+            let (mut s_ap_0, mut c_ap_1) = (get("s_ap_0")?, get("c_ap_1")?);
+            if Sha256::digest(c_ap_1)[..] != h1 || Sha256::digest(s_ap_0)[..] != h2 {
+                s_ap_0.zeroize();
+                c_ap_1.zeroize();
+                let _ = self.c2n.send(&[0u8]).await;
+                return Err(Error::Abort("anchor mismatch".into()));
             }
-        }
-        let (h1, h2, hk) = match anchors {
-            Some((h1, h2)) => {
-                let msg = self.c_recv(lay.hk_proof_len()).await?;
-                let r = self.c_verify_hk(&msg);
-                let _ = self.c2n.send(&[r.is_ok() as u8]).await;
-                (h1, h2, r?)
-            }
-            None => {
-                let st = self.cst()?;
-                let get = |name: &str| -> Result<[u8; 32]> {
-                    let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
-                    Ok(from_bits(v).try_into().expect("32 bytes"))
-                };
-                (get("h1")?, get("h2")?, get("hk")?)
-            }
-        };
-        let st = self.cst()?;
-        let get = |name: &str| -> Result<[u8; 32]> {
-            let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
-            Ok(from_bits(v).try_into().expect("32 bytes"))
-        };
-        let (mut s_ap_0, mut c_ap_1) = (get("s_ap_0")?, get("c_ap_1")?);
-        if Sha256::digest(c_ap_1)[..] != h1 || Sha256::digest(s_ap_0)[..] != h2 {
+            let o = ApOut::C {
+                s_ap_0,
+                c_ap_1,
+                h1,
+                h2,
+                hk,
+            };
             s_ap_0.zeroize();
             c_ap_1.zeroize();
-            return Err(Error::Abort("anchor mismatch".into()));
+            self.c2n.send(&msg).await?;
+            return Ok(o);
         }
-        let o = ApOut::C {
-            s_ap_0,
-            c_ap_1,
-            h1,
-            h2,
-            hk,
-        };
-        s_ap_0.zeroize();
-        c_ap_1.zeroize();
-        Ok(o)
+        unreachable!("the last stage returns")
     }
 
     /// Evaluates stage `s` and runs its checks; only if all pass does it
@@ -2083,14 +1801,15 @@ impl Party {
     /// The checks, in this order: the pointer bits of the stage's input
     /// labels (`ok_in`, done by the caller against opened masks), the
     /// consistency check of every AND gate of the stage, and the label check
-    /// of every output wire that is reported or converted: the value C holds
-    /// must hash to the half of N's pair that belongs to the bit C is about
-    /// to send. N fixed the pairs in preprocessing, so the hash C then sends
-    /// tells N nothing it did not commit to.
+    /// of every output wire that is reported: the label C holds must hash to
+    /// the half of N's pair that belongs to the pointer bit C is about to
+    /// send. N fixed the pairs in preprocessing, so the hash C then sends
+    /// tells N nothing it did not commit to. Whatever fails, C evaluates the
+    /// whole stage first and sends the same single byte.
     async fn c_stage(&mut self, s: usize, ok_in: bool) -> Result<Vec<u8>> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
         let delta_b = self.delta;
         let st = self.cst()?;
@@ -2124,30 +1843,29 @@ impl Party {
         h.update(TAG_OUT);
         h.update([s as u8]);
         let mut decoded = Vec::new();
+        #[allow(unused_mut, unused_variables)]
+        let mut flip_at: Option<usize> = None;
         for (gi, g) in sp.outs.iter().enumerate().filter(|(_, g)| g.stage == s) {
             let mut vals = Vec::with_capacity(g.len);
             let mut bits = Vec::with_capacity(g.len);
             for i in 0..g.len {
                 let o = g.off + i;
                 let lab = st.l[lay.out0 + o];
-                let z = lab.lsb() ^ st.lam_out[o];
-                let (p, x, v) = match lay.conv_off[gi] {
-                    // Conversion: C's COT (r, M_r = K_r ⊕ r·Δ_A) commits it to
-                    // z = r ⊕ d; label ⊕ M_r = k ⊕ K_r ⊕ d·Δ_A binds that to
-                    // the label.
-                    Some(c) => (z ^ st.cot_choices[c + i], lab ^ st.cot_msgs[c + i], z),
-                    // N's own outputs: C sees only the pointer bit.
-                    None if g.kind == OutKind::ToN => (lab.lsb(), lab, lab.lsb()),
-                    None => (lab.lsb(), lab, z),
-                };
+                // N's own outputs: their masks are not opened (`lam_out` is
+                // false there), so C keeps only the pointer bit.
+                vals.push(lab.lsb() ^ st.lam_out[o]);
                 if let Some(e) = lay.e_idx[o] {
-                    ok_pair &= pair_hash(&salt_b, o, p, x) == st.pairs[e][p as usize];
-                    h.update(x.as_bytes());
+                    let p = lab.lsb();
+                    ok_pair &= pair_hash(&salt_b, o, p, lab) == st.pairs[e][p as usize];
+                    h.update(lab.as_bytes());
                     bits.push(p);
                 }
-                vals.push(v);
             }
             if !bits.is_empty() {
+                #[cfg(test)]
+                if cheat == Cheat::FlipReported(g.name) {
+                    flip_at = Some(body.len() + 1);
+                }
                 body.extend_from_slice(&from_bits(&bits));
             }
             decoded.push((gi, Zeroizing::new(vals)));
@@ -2175,8 +1893,8 @@ impl Party {
             ));
         }
         #[cfg(test)]
-        if cheat == Cheat::FlipOutput(s) {
-            body[1 + 12] ^= 0x10;
+        if let Some(at) = flip_at {
+            body[at] ^= 0x10;
         }
         // Only now are the outputs used.
         for (gi, v) in decoded {
@@ -2186,75 +1904,33 @@ impl Party {
         Ok(body)
     }
 
-    /// The inner digests of stage `s`'s inputs (C knows `IS`); in `Proven`
-    /// also their proof: the correction bits and (U, V).
-    fn c_prove_digests(&mut self, s: usize, th: &[u8; 32]) -> Result<Vec<u8>> {
+    /// Computes the inner digests of stage `s`'s inputs from the public `IS`
+    /// and C's own transcript hash, receives N's labels for them and checks
+    /// every label's pointer bit against the opened, authenticated mask of
+    /// its wire and C's own digest bit. Returns whether all matched (the
+    /// caller aborts in `c_stage`, after evaluating, like for any other
+    /// failed check of the stage).
+    async fn c_next_digests(&mut self, s: usize, th: &[u8; 32]) -> Result<bool> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
-        let lay = lay(self.variant);
+        let lay = lay();
         let sp = lay.sp;
-        let st = self.cst()?;
-        let blocks = circuits::digest_blocks(s, th);
         let digs = sp.digs_of(s);
-        let gi = is_group(sp, s);
-        let is = st.vals[gi].clone().ok_or(Error::State("no inner state"))?;
-        if !lay.proven() {
-            for (n, blk) in blocks.iter().enumerate() {
-                st.dig[digs[n]] = Some((Zeroizing::new(circuits::inner_digest(&is, blk)), SecretBlocks::default()));
+        {
+            let st = self.cst()?;
+            let is = st.vals[is_group(sp, s)].clone().ok_or(Error::State("no inner state"))?;
+            for (n, blk) in circuits::digest_blocks(s, th).iter().enumerate() {
+                st.dig[digs[n]] = Some(Zeroizing::new(circuits::inner_digest(&is, blk)));
             }
-            return Ok(Vec::new());
         }
-        let (boff, blen) = lay.batch[s - 1];
-        let conv = lay.conv_off[gi].expect("converted group");
-        let state: Vec<PW> = (0..256).map(|i| PW::secret(is[i], st.cot_msgs[conv + i])).collect();
-        let cd: Vec<bool> = (0..256).map(|i| is[i] ^ st.cot_choices[conv + i]).collect();
-        let mut prover = zk::Prover::new(&st.cot_choices[boff..boff + blen], &st.cot_msgs[boff..boff + blen]);
-        let mut proven = Vec::new();
-        #[allow(unused_variables)]
-        for (n, blk) in blocks.iter().enumerate() {
-            #[allow(unused_mut)]
-            let mut blk = *blk;
-            #[cfg(test)]
-            if cheat == Cheat::WrongLabel && s == 3 && n == 1 {
-                blk = blocks[0];
-            }
-            let out = circuits::digest_perm(&prover.compress(&state, &zk::pub_block_p(&blk)));
-            let bits: Vec<bool> = out.iter().map(|w| w.v).collect();
-            debug_assert_eq!(bits, circuits::inner_digest(&is, &blk));
-            proven.push((Zeroizing::new(bits), SecretBlocks(out.iter().map(|w| w.m).collect())));
-        }
-        #[allow(unused_mut)]
-        let mut d_bytes = prover.d_bytes();
-        #[cfg(test)]
-        if cheat == Cheat::BadProofBit(s) {
-            d_bytes[5] ^= 0x04;
-        }
-        let chi = fs_chi(&st.seed, s as u8, &blocks, &from_bits(&cd), &d_bytes);
-        let (u, v) = prover.finish(chi);
-        for (n, p) in proven.into_iter().enumerate() {
-            st.dig[digs[n]] = Some(p);
-        }
-        let mut msg = d_bytes;
-        msg.extend_from_slice(&blocks_to_bytes(&[u, v]));
-        Ok(msg)
-    }
-
-    /// Sets the labels of stage `s`'s digest inputs from N's message and
-    /// checks their pointer bits against the opened masks and C's own digest
-    /// bits. `Proven`: the label is C's MAC on the proven bit plus N's
-    /// correction, so C holds a label only for the digest it proved.
-    fn c_set_digest_labels(&mut self, s: usize, msg: &[u8]) -> Result<bool> {
-        #[allow(unused_variables)]
-        let cheat = self.cheat();
-        let lay = lay(self.variant);
-        let sp = lay.sp;
+        let msg = self.c_recv(16 * 256 * digs.len()).await?;
+        let blocks = SecretBlocks(bytes_to_blocks(&msg));
         let st = self.cst()?;
-        let blocks = bytes_to_blocks(msg);
         let mut ok = true;
-        for (n, j) in sp.digs_of(s).into_iter().enumerate() {
-            let (bits, macs) = st.dig[j].take().ok_or(Error::State("digest missing"))?;
+        for (n, &j) in digs.iter().enumerate() {
+            let bits = st.dig[j].take().ok_or(Error::State("digest missing"))?;
             for (i, w) in sp.dig[j].clone().enumerate() {
-                let lab = blocks[256 * n + i] ^ macs.get(i).copied().unwrap_or(Block::ZERO);
+                let lab = blocks[256 * n + i];
                 st.l[w] = lab;
                 ok &= lab.lsb() == bits[i] ^ st.lam_in[w];
             }
@@ -2263,7 +1939,7 @@ impl Party {
         if cheat == Cheat::FeedOther(s) {
             // "Another digest": C has no other label, the best it can do is
             // to guess one (here: a random offset with the pointer flipped).
-            let w = sp.dig[sp.digs_of(s)[0]].start + 5;
+            let w = sp.dig[digs[0]].start + 5;
             let mut x = Block::random(&mut self.rng);
             x.set_lsb(true);
             let st = self.cst()?;
@@ -2271,111 +1947,36 @@ impl Party {
         }
         Ok(ok)
     }
-
-    /// `Proven`: C proves h1 = SHA256(c_ap_1) and h2 = SHA256(s_ap_0) over
-    /// its commitments to those outputs and opens both hashes.
-    fn c_prove_anchors(&mut self) -> Result<(Vec<u8>, [u8; 32], [u8; 32])> {
-        #[allow(unused_variables)]
-        let cheat = self.cheat();
-        let lay = lay(self.variant);
-        let sp = lay.sp;
-        let st = self.cst()?;
-        let (boff, blen) = lay.batch[4];
-        let pad = circuits::msg_block(0, &[0u8; 32]);
-        let iv: Vec<PW> = iv_bits().into_iter().map(PW::public).collect();
-        let mut prover = zk::Prover::new(&st.cot_choices[boff..boff + blen], &st.cot_msgs[boff..boff + blen]);
-        let mut commit = Vec::new();
-        let mut outs = Vec::new();
-        for name in ["c_ap_1", "s_ap_0"] {
-            let gi = sp.group(name);
-            let conv = lay.conv_off[gi].expect("converted group");
-            let v = st.vals[gi].as_ref().ok_or(Error::State("output missing"))?;
-            let cd: Vec<bool> = (0..256).map(|i| v[i] ^ st.cot_choices[conv + i]).collect();
-            commit.extend_from_slice(&from_bits(&cd));
-            let mut blk = zk::pub_block_p(&pad);
-            for i in 0..256 {
-                blk[i] = PW::secret(v[i], st.cot_msgs[conv + i]);
-            }
-            outs.extend(circuits::digest_perm(&prover.compress(&iv, &blk)));
-        }
-        let d_bytes = prover.d_bytes();
-        let chi = fs_chi(&st.seed, 5, &[pad], &commit, &d_bytes);
-        let (u, v) = prover.finish(chi);
-        let bits: Vec<bool> = outs.iter().map(|w| w.v).collect();
-        let hb = from_bits(&bits);
-        let mut h = Sha256::new();
-        h.update(TAG_ZOPEN);
-        for w in &outs {
-            h.update(w.m.as_bytes());
-        }
-        let hd: [u8; 32] = h.finalize().into();
-        let mut msg = d_bytes;
-        msg.extend_from_slice(&blocks_to_bytes(&[u, v]));
-        #[allow(unused_mut)]
-        let mut sent = hb.clone();
-        #[cfg(test)]
-        if cheat == Cheat::LieAnchor {
-            sent[3] ^= 0x20;
-        }
-        msg.extend_from_slice(&sent);
-        msg.extend_from_slice(&hd);
-        Ok((msg, hb[..32].try_into().unwrap(), hb[32..].try_into().unwrap()))
-    }
-
-    /// `Proven`: verifies N's proof of hk over N's committed K_0 ‖ IV_0.
-    fn c_verify_hk(&mut self, msg: &[u8]) -> Result<[u8; 32]> {
-        let lay = lay(self.variant);
-        let sp = lay.sp;
-        let delta_b = self.delta;
-        let st = self.cst()?;
-        let gi = sp.group("kiv");
-        let g = &sp.outs[gi];
-        let d_len = (lay.hk_len - 128).div_ceil(8);
-        let reject = || Error::Abort("hk proof rejected".into());
-        let mut ver = zk::Verifier::new(&st.hk_k, delta_b, &msg[..d_len]).ok_or_else(reject)?;
-        let pbits = st.vals[gi].as_ref().ok_or(Error::State("output missing"))?;
-        let pad = circuits::msg_block(0, &[0u8; 28]);
-        let mut blk = zk::pub_block_v(&pad, delta_b);
-        for i in 0..g.len {
-            blk[i] = VW::secret(st.key_out[g.off + i] ^ sel(pbits[i], delta_b));
-        }
-        let iv: Vec<VW> = iv_bits().into_iter().map(|b| VW::public(b, delta_b)).collect();
-        let out = circuits::digest_perm(&ver.compress(&iv, &blk).ok_or_else(reject)?);
-        let chi = fs_chi(&st.seed, 6, &[pad], &from_bits(pbits), &msg[..d_len]);
-        let uv = bytes_to_blocks(&msg[d_len..d_len + 32]);
-        if !ver.finish(chi, uv[0], uv[1]) {
-            return Err(reject());
-        }
-        let hb = &msg[d_len + 32..d_len + 64];
-        let mut h = Sha256::new();
-        h.update(TAG_ZOPEN);
-        for (w, b) in out.iter().zip(to_bits(hb)) {
-            h.update((w.k ^ sel(b, delta_b)).as_bytes());
-        }
-        let hd: [u8; 32] = h.finalize().into();
-        if hd[..] != msg[d_len + 64..] {
-            return Err(Error::Abort("hk opening rejected".into()));
-        }
-        Ok(hb.try_into().unwrap())
-    }
 }
 
 /// Bytes of the protocol messages per session, by direction (C→N, N→C), as
-/// computed from the circuit sizes (for reports). Excludes OT traffic.
-pub fn message_sizes(variant: Variant) -> (usize, usize) {
-    let l = lay(variant);
+/// computed from the circuit sizes (for reports). Excludes OT traffic and
+/// the version tag.
+pub fn message_sizes() -> (usize, usize) {
+    let l = lay();
     let sp = l.sp;
     let mut n2c = gc::tables_len(l.n_and) + l.mac_fixed.div_ceil(8) + 32 + 32 * l.n_pairs;
-    n2c += (l.open_in.len() + l.n_out).div_ceil(8) + 32;
+    let n_open: usize = l.open_in.len()
+        + sp.outs.iter().enumerate().filter(|(gi, _)| l.opened(*gi)).map(|(_, g)| g.len).sum::<usize>();
+    n2c += n_open.div_ceil(8) + 32;
     n2c += l.shapes.iter().map(|s| 8 * s.rows.len() + 8).sum::<usize>();
-    n2c += 16 * l.n_in; // online labels and corrections
-    let mut c2n = 32 + 32;
+    n2c += 16 * l.n_in + 65; // online labels and corrections, N's key share
+    let mut c2n = 32 + 32 + 32 + 97; // seed, d, key-share commitment and opening
     for s in 0..N_STAGES {
-        c2n += 1 + 32 + l.reported(s).iter().map(|&g| sp.outs[g].len / 8).sum::<usize>() + l.proof_len(s);
-    }
-    if l.proven() {
-        c2n += l.anchors_len();
-        n2c += l.hk_proof_len();
+        c2n += 1 + 32 + l.reported(s).iter().map(|&g| sp.outs[g].len / 8).sum::<usize>();
     }
     (c2n, n2c)
+}
+
+/// Bytes N→C by kind (tables, check rows and Y_N, mask commitment bits,
+/// label-check pairs, online labels), for reports.
+pub fn download_breakdown() -> [(&'static str, usize); 5] {
+    let l = lay();
+    [
+        ("three-halves tables", gc::tables_len(l.n_and)),
+        ("check rows and Y_N", l.shapes.iter().map(|s| 8 * s.rows.len() + 8).sum()),
+        ("mask commitment bits", l.mac_fixed.div_ceil(8)),
+        ("label-check pairs", 32 * l.n_pairs),
+        ("online labels and corrections", 16 * l.n_in),
+    ]
 }

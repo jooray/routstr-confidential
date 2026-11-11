@@ -1,8 +1,10 @@
 //! End-to-end tests: correctness against cu-crypto's reference key schedule,
-//! the three-halves gate in isolation, and malicious-party tests (each
-//! deviation of N must make C abort before any output of that stage is used,
-//! and C must not be able to change N's outputs, prove a digest it should not,
-//! or feed the garbled circuit anything else than what it proved).
+//! the three-halves gate in isolation, the version tag, and malicious-party
+//! tests: each deviation of N must make C abort before any output of that
+//! stage is used, with one message that looks the same whatever failed, and
+//! C must not be able to change what N learns (the public `IS_k`, the
+//! handshake secrets, K_0, the anchors) or evaluate a stage on another inner
+//! digest than the one N labelled.
 //!
 //! Cheats that name a stage run once per stage (A1, A2, A3, B1, B2 = 0..5);
 //! stages 0..3 belong to `handshake`, 3..5 to `application`.
@@ -50,6 +52,8 @@ struct Outcome {
     ks: Result<[u8; 65]>,
     hs: Result<HsSecrets>,
     ap: Result<ApOut>,
+    /// (step, bytes received) of every step that ran.
+    recv: Vec<(&'static str, u64)>,
 }
 
 fn skipped<T>() -> Result<T> {
@@ -58,28 +62,29 @@ fn skipped<T>() -> Result<T> {
 
 type Ths = ([u8; 32], [u8; 32]);
 
-async fn session_v(v: Variant, cheat_c: Cheat, cheat_n: Cheat, c_th: Ths, n_th: Ths, srv: &Server) -> (Outcome, Outcome) {
+async fn session_v(cheat_c: Cheat, cheat_n: Cheat, c_th: Ths, n_th: Ths, srv: &Server) -> (Outcome, Outcome) {
     let (io_c, io_n) = emulated_pair(Duration::ZERO, f64::INFINITY);
     let share = srv.share;
     let run = move |role: Role, io, cheat: Cheat, th: Ths| async move {
         let mut p = Party::new(role, io).await.unwrap();
-        p.set_variant(v);
         p.cheat = cheat;
+        let recv = |p: &mut Party| p.take_timings().iter().map(|t| (t.step, t.bytes_recv)).collect();
         let pre = p.preprocess().await;
         if pre.is_err() {
-            return Outcome { pre, ks: skipped(), hs: skipped(), ap: skipped() };
+            return Outcome { pre, ks: skipped(), hs: skipped(), ap: skipped(), recv: recv(&mut p) };
         }
         let ks = p.key_share().await;
         if ks.is_err() {
-            return Outcome { pre, ks, hs: skipped(), ap: skipped() };
+            return Outcome { pre, ks, hs: skipped(), ap: skipped(), recv: recv(&mut p) };
         }
         let hs = p.handshake(&share, th.0).await;
         if hs.is_err() {
-            return Outcome { pre, ks, hs, ap: skipped() };
+            return Outcome { pre, ks, hs, ap: skipped(), recv: recv(&mut p) };
         }
         let ap = p.application(th.1).await;
+        let recv = recv(&mut p);
         p.close().await;
-        Outcome { pre, ks, hs, ap }
+        Outcome { pre, ks, hs, ap, recv }
     };
     let c = tokio::spawn(run(Role::C, io_c, cheat_c, c_th));
     let n = tokio::spawn(run(Role::N, io_n, cheat_n, n_th));
@@ -87,16 +92,14 @@ async fn session_v(v: Variant, cheat_c: Cheat, cheat_n: Cheat, c_th: Ths, n_th: 
     (c.unwrap(), n.unwrap())
 }
 
-async fn session(v: Variant, cheat_c: Cheat, cheat_n: Cheat, th: Ths, srv: &Server) -> (Outcome, Outcome) {
-    session_v(v, cheat_c, cheat_n, th, th, srv).await
+async fn session(cheat_c: Cheat, cheat_n: Cheat, th: Ths, srv: &Server) -> (Outcome, Outcome) {
+    session_v(cheat_c, cheat_n, th, th, srv).await
 }
 
 fn ths() -> Ths {
     let mut rng = os_rng();
     (rng.random(), rng.random())
 }
-
-const VARIANTS: [Variant; 2] = [Variant::Proven, Variant::PublicIs];
 
 fn check_honest(c: Outcome, n: Outcome, srv: &Server, th: Ths) {
     c.pre.unwrap();
@@ -133,7 +136,7 @@ fn check_honest(c: Outcome, n: Outcome, srv: &Server, th: Ths) {
 fn garble_evaluate_matches_plaintext() {
     // The bare three-halves garbler/evaluator of this crate on the split
     // circuit, evaluated stage by stage.
-    let sp = circuits::split(Variant::Proven);
+    let sp = &*circuits::SPLIT;
     let mut rng = os_rng();
     let mut delta = Block::random(&mut rng);
     delta.set_lsb(true);
@@ -158,98 +161,80 @@ fn garble_evaluate_matches_plaintext() {
 #[test]
 fn stage_rows_cover_every_and_input() {
     // The row wires of a stage: the wires entering it (C's and N's inputs,
-    // the digest inputs, the OS_k wires crossing from earlier stages) and
-    // every AND output of the stage. Every AND input of the stage must be a
-    // linear combination of row wires of that stage.
-    for v in VARIANTS {
-        let sp = circuits::split(v);
-        let shapes = gc::stage_shapes(&sp.circ, &sp.gate_end);
-        let ands = gc::and_gates(&sp.circ);
-        let mut total = 0;
-        for (s, sh) in shapes.iter().enumerate() {
-            assert_eq!(sh.rows.len(), sh.entering + sh.ands.len());
-            let mut lin = vec![false; sp.circ.feed_count()];
-            for &w in &sh.rows[..sh.entering] {
-                lin[w] = true;
-            }
-            for g in &sp.circ.gates()[sh.gates.clone()] {
-                match g {
-                    mpz_circuits::Gate::Xor { x, y, z } => lin[z.id()] = lin[x.id()] && lin[y.id()],
-                    mpz_circuits::Gate::Inv { x, z } | mpz_circuits::Gate::Id { x, z } => lin[z.id()] = lin[x.id()],
-                    mpz_circuits::Gate::And { x, y, z } => {
-                        assert!(lin[x.id()] && lin[y.id()], "stage {s}: an AND input is not covered");
-                        lin[z.id()] = true;
-                    }
+    // the digest inputs, the wires crossing from earlier stages) and every
+    // AND output of the stage. Every AND input of the stage must be a linear
+    // combination of row wires of that stage.
+    let sp = &*circuits::SPLIT;
+    let shapes = gc::stage_shapes(&sp.circ, &sp.gate_end);
+    let ands = gc::and_gates(&sp.circ);
+    let n_in = sp.circ.inputs().len();
+    let mut total = 0;
+    for (s, sh) in shapes.iter().enumerate() {
+        assert_eq!(sh.rows.len(), sh.entering + sh.ands.len());
+        let mut lin = vec![false; sp.circ.feed_count()];
+        for &w in &sh.rows[..sh.entering] {
+            lin[w] = true;
+        }
+        for g in &sp.circ.gates()[sh.gates.clone()] {
+            match g {
+                mpz_circuits::Gate::Xor { x, y, z } => lin[z.id()] = lin[x.id()] && lin[y.id()],
+                mpz_circuits::Gate::Inv { x, z } | mpz_circuits::Gate::Id { x, z } => lin[z.id()] = lin[x.id()],
+                mpz_circuits::Gate::And { x, y, z } => {
+                    assert!(lin[x.id()] && lin[y.id()], "stage {s}: an AND input is not covered");
+                    lin[z.id()] = true;
                 }
             }
-            for (k, &(_, _, o)) in ands[sh.ands.clone()].iter().enumerate() {
-                assert_eq!(sh.rows[sh.entering + k], o);
-            }
-            // Crossing wires: 256 (one OS_k) besides the stage's inputs.
-            let n_in = sp.circ.inputs().len();
-            let crossing = sh.rows[..sh.entering].iter().filter(|&&w| w >= n_in).count();
-            assert_eq!(crossing, if s == 0 { 0 } else { 256 }, "stage {s}");
-            total += sh.rows.len();
-            eprintln!("{v:?} stage {s}: {} AND, {} entering wires ({crossing} crossing)", sh.ands.len(), sh.entering);
         }
-        assert!(total < sp.circ.and_count() + 5000);
+        for (k, &(_, _, o)) in ands[sh.ands.clone()].iter().enumerate() {
+            assert_eq!(sh.rows[sh.entering + k], o);
+        }
+        // Every input wire of the stage has a row of its own: a label N
+        // sends online that is not one of the wire's two labels changes the
+        // check sum. (C's and N's x shares in A1, the digests later.)
+        let entering = &sh.rows[..sh.entering];
+        let mut inputs: Vec<usize> = sp.digs_of(s).iter().flat_map(|&j| sp.dig[j].clone()).collect();
+        if s == 0 {
+            inputs.extend(sp.xc.clone().chain(sp.xn.clone()));
+        }
+        for w in &inputs {
+            assert!(entering.contains(w), "stage {s}: input wire {w} has no check row");
+        }
+        assert_eq!(entering.iter().filter(|&&w| w < n_in).count(), inputs.len(), "stage {s}");
+        // Crossing wires: one OS_k (256) from the stage before; B2 also
+        // takes s_ap_0 (for h2).
+        let crossing = entering.iter().filter(|&&w| w >= n_in).count();
+        assert_eq!(crossing, [0, 256, 256, 256, 512][s], "stage {s}");
+        total += sh.rows.len();
+        eprintln!("stage {s}: {} AND, {} entering wires ({crossing} crossing)", sh.ands.len(), sh.entering);
     }
+    assert!(total < sp.circ.and_count() + 5000);
 }
 
+/// The outputs, their stage and who learns them, as the specification's
+/// stage table has them; the reported ones get a label-check pair each.
 #[test]
-fn zk_proof_of_a_compression() {
-    // The proof engine alone: a compression over a committed state.
-    let mut rng = os_rng();
-    let mut delta = Block::random(&mut rng);
-    delta.set_lsb(true);
-    let n = zk::compress_ands_secret_state() + 128;
-    eprintln!(
-        "COT-ANDs per compression: committed state, public block {}; public IV, 256 committed block bits {}; 224 bits {}; all inputs committed {}",
-        zk::compress_ands_secret_state(),
-        zk::compress_ands_secret_prefix(256),
-        zk::compress_ands_secret_prefix(224),
-        mpz_circuits::SHA256_COMPRESS.and_count()
-    );
-    let r: Vec<bool> = (0..n).map(|_| rng.random()).collect();
-    let keys: Vec<Block> = (0..n).map(|_| Block::random(&mut rng)).collect();
-    let macs: Vec<Block> = keys.iter().zip(&r).map(|(k, r)| *k ^ sel(*r, delta)).collect();
-    let state_bits: Vec<bool> = (0..256).map(|_| rng.random()).collect();
-    let state_keys: Vec<Block> = (0..256).map(|_| Block::random(&mut rng)).collect();
-    let block = circuits::hkdf_block("c hs traffic", &[7u8; 32], 32);
-    let run = |flip_d: bool, other_block: bool, flip_in: bool| -> bool {
-        let state_p: Vec<PW> =
-            state_bits.iter().zip(&state_keys).map(|(b, k)| PW::secret(*b, *k ^ sel(*b, delta))).collect();
-        let mut p = zk::Prover::new(&r, &macs);
-        let pb = if other_block { circuits::hkdf_block("s hs traffic", &[7u8; 32], 32) } else { block };
-        let out = p.compress(&state_p, &zk::pub_block_p(&pb));
-        if !other_block {
-            let want = circuits::compress_native(&circuits::state_words(&state_bits), &block);
-            assert_eq!(circuits::state_words(&out.iter().map(|w| w.v).collect::<Vec<_>>()), want);
-        }
-        let mut d = p.d_bytes();
-        if flip_d {
-            d[100] ^= 1;
-        }
-        let chi = chi(&d, b"t");
-        let (u, v) = p.finish(chi);
-        let mut ver = zk::Verifier::new(&keys, delta, &d).unwrap();
-        let mut state_v: Vec<VW> = state_keys.iter().map(|k| VW::secret(*k)).collect();
-        if flip_in {
-            state_v[3].k = state_v[3].k ^ delta;
-        }
-        let out_v = ver.compress(&state_v, &zk::pub_block_v(&block, delta)).unwrap();
-        let ok = ver.finish(chi, u, v);
-        if ok {
-            for (a, b) in out.iter().zip(&out_v) {
-                assert_eq!(a.m, b.k ^ sel(a.v, delta));
-            }
-        }
-        ok
-    };
-    assert!(run(false, false, false));
-    assert!(!run(true, false, false), "a wrong wire value");
-    assert!(!run(false, true, false), "another message block");
-    assert!(!run(false, false, true), "another committed state");
+fn output_groups_are_as_specified() {
+    use circuits::OutKind::*;
+    let want = [
+        ("IS_HS", 0, Pub, 256),
+        ("c_hs", 1, Pub, 256),
+        ("s_hs", 1, Pub, 256),
+        ("IS_dHS", 1, Pub, 256),
+        ("IS_MS", 2, Pub, 256),
+        ("s_ap_0", 3, ToC, 256),
+        ("IS_c0", 3, Pub, 256),
+        ("c_ap_1", 4, ToC, 256),
+        ("kiv", 4, ToN, 224),
+        ("h1", 4, Pub, 256),
+        ("h2", 4, Pub, 256),
+        ("hk", 4, Pub, 256),
+    ];
+    let got: Vec<_> = circuits::SPLIT.outs.iter().map(|g| (g.name, g.stage, g.kind, g.len)).collect();
+    assert_eq!(got, want);
+    // 2 528 reported wires, one label-check pair each.
+    assert_eq!(lay().n_pairs, 9 * 256 + 224);
+    // Opened to C: its 256 input wires and the 9 × 256 digest wires.
+    assert_eq!(lay().open_in.len(), 256 + 9 * 256);
 }
 
 #[test]
@@ -361,13 +346,43 @@ fn tables_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn honest_matches_reference() {
-    for v in VARIANTS {
-        for _ in 0..2 {
-            let srv = server();
-            let th = ths();
-            let (c, n) = session(v, Cheat::None, Cheat::None, th, &srv).await;
-            check_honest(c, n, &srv, th);
+    for _ in 0..3 {
+        let srv = server();
+        let th = ths();
+        let (c, n) = session(Cheat::None, Cheat::None, th, &srv).await;
+        check_honest(c, n, &srv, th);
+    }
+}
+
+/// The version tag (spec §4): the first bytes on the transport in each
+/// direction. A peer that sends anything else is refused with
+/// `twopc_version_mismatch`, for either role, before any protocol message.
+#[tokio::test(flavor = "multi_thread")]
+async fn version_tag_first_and_mismatch_refused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    assert_eq!(VERSION_TAG, b"routstr-2pc/split-public-1\n");
+    let v2_frame: &[u8] = &[1, 0, 0, 0, 16, 9, 9, 9];
+    for role in [Role::C, Role::N] {
+        for other in [&b"routstr-2pc/split-proven-1\n"[..], v2_frame, &b"routstr-2pc/split-public-1 "[..]] {
+            let (a, mut b) = tokio::io::duplex(1 << 16);
+            b.write_all(other).await.unwrap();
+            let r = Party::new(role, a.compat()).await;
+            let e = r.err().expect("a peer with another tag is refused");
+            assert!(matches!(e, Error::VersionMismatch(_)), "{e:?}");
+            assert!(e.to_string().starts_with("twopc_version_mismatch: "), "{e}");
+            assert!(e.to_string().starts_with(VERSION_MISMATCH));
+            // This side's own first bytes are the tag, and nothing follows.
+            let mut got = Vec::new();
+            b.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, VERSION_TAG);
         }
+        // The right tag is accepted (and counted as transport bytes).
+        let (a, mut b) = tokio::io::duplex(1 << 16);
+        b.write_all(VERSION_TAG).await.unwrap();
+        let p = Party::new(role, a.compat()).await.unwrap();
+        assert_eq!(p.counters().recv(), VERSION_TAG.len() as u64);
+        assert_eq!(p.counters().sent(), VERSION_TAG.len() as u64);
     }
 }
 
@@ -421,12 +436,7 @@ async fn n_cheat_all_stages(cheat: fn(usize) -> Cheat, what: &str) {
     let srv = server();
     let th = ths();
     for stage in 0..N_STAGES {
-        let (c, n) = session(Variant::Proven, Cheat::None, cheat(stage), th, &srv).await;
-        assert_c_aborts_with(&c, &n, stage, what);
-    }
-    // The other variant shares the code; one stage of each call.
-    for stage in [1, 4] {
-        let (c, n) = session(Variant::PublicIs, Cheat::None, cheat(stage), th, &srv).await;
+        let (c, n) = session(Cheat::None, cheat(stage), th, &srv).await;
         assert_c_aborts_with(&c, &n, stage, what);
     }
 }
@@ -471,16 +481,25 @@ async fn bad_check_value_detected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_label_check_pair_detected() {
-    // N's pair for one reported / converted wire does not match the labels:
-    // C aborts before it sends anything derived from its labels.
+    // N's pair for one reported wire does not match the labels: C aborts
+    // before it sends anything derived from its labels.
     n_cheat_all_stages(Cheat::BadPair, "output label check").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inconsistent_label_check_pair_is_a_selective_abort() {
+    // The pairs of a stage's first reported group are right for the bit 0
+    // and wrong for the bit 1 (N expects labels that are not the wire's):
+    // C aborts unless all 256 (224) pointer bits are 0, and tells N nothing
+    // else: no pointer bit, no label hash.
+    n_cheat_all_stages(Cheat::BadPairHalf, "output label check").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_and_product_detected_in_preprocessing() {
     let srv = server();
     let th = ths();
-    let (c, n) = session(Variant::Proven, Cheat::None, Cheat::BadT, th, &srv).await;
+    let (c, n) = session(Cheat::None, Cheat::BadT, th, &srv).await;
     assert!(matches!(&c.pre, Err(Error::Abort(m)) if m.contains("AND-product")), "{:?}", c.pre);
     assert!(n.pre.is_err() || n.ks.is_err());
 }
@@ -490,7 +509,23 @@ async fn lying_about_output_mask_detected() {
     let srv = server();
     let th = ths();
     for stage in 0..N_STAGES {
-        let (c, _n) = session(Variant::Proven, Cheat::None, Cheat::LieOpen(stage), th, &srv).await;
+        let (c, _n) = session(Cheat::None, Cheat::LieOpen(stage), th, &srv).await;
+        assert!(matches!(&c.pre, Err(Error::Abort(m)) if m.contains("opened masks")), "{:?}", c.pre);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lying_about_an_input_mask_detected() {
+    // The masks C checks pointer bits against (its own input wires and the
+    // digest input wires) are opened in preprocessing under their MACs. A
+    // lie about one of them (it would let N pass the label of the other
+    // digest bit) fails the MAC hash there, before any input exists.
+    let srv = server();
+    let th = ths();
+    // C's first input wire; a wire of the first, of a middle and of the last
+    // digest (d_c in A2, d_c0 in B1, d_upd in B2).
+    for j in [0, 256, 256 + 4 * 256 + 17, 256 + 9 * 256 - 1] {
+        let (c, _n) = session(Cheat::None, Cheat::LieOpenIn(j), th, &srv).await;
         assert!(matches!(&c.pre, Err(Error::Abort(m)) if m.contains("opened masks")), "{:?}", c.pre);
     }
 }
@@ -498,14 +533,13 @@ async fn lying_about_output_mask_detected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn garbage_garbler_input_label_detected() {
     // Stage 0: N's own input label is not a label. Later stages: N's label
-    // (PublicIs) or label correction (Proven) for a digest input is wrong.
+    // for a digest input is not one of the wire's two labels (its pointer
+    // bit is right, so only the consistency check can catch it).
     let srv = server();
     let th = ths();
-    for v in VARIANTS {
-        for stage in 0..N_STAGES {
-            let (c, n) = session(v, Cheat::None, Cheat::BadInputLabel(stage), th, &srv).await;
-            assert_c_aborts_with(&c, &n, stage, "consistency check");
-        }
+    for stage in 0..N_STAGES {
+        let (c, n) = session(Cheat::None, Cheat::BadInputLabel(stage), th, &srv).await;
+        assert_c_aborts_with(&c, &n, stage, "consistency check");
     }
 }
 
@@ -516,120 +550,133 @@ async fn wrong_digest_label_from_garbler_detected() {
     // the pointer bit does not match the opened mask and C's own digest.
     let srv = server();
     let th = ths();
-    for v in VARIANTS {
-        for stage in 1..N_STAGES {
-            let (c, n) = session(v, Cheat::None, Cheat::FlipDigestLabel(stage), th, &srv).await;
-            assert_c_aborts_with(&c, &n, stage, "pointer bits");
-        }
+    for stage in 1..N_STAGES {
+        let (c, n) = session(Cheat::None, Cheat::FlipDigestLabel(stage), th, &srv).await;
+        assert_c_aborts_with(&c, &n, stage, "pointer bits");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn labels_for_another_digest_detected() {
+    // N sends valid labels, but of another inner digest: the digest of the
+    // stage's next message block (in B2 that would put c_ap_1's digest on
+    // the wires of K_0's, so that N's output is half of c_ap_1; in B1 it
+    // would swap c_ap_0 and s_ap_0), or of a modified block where the stage
+    // has one digest. C computed the digests itself and aborts.
+    let srv = server();
+    let th = ths();
+    for stage in 1..N_STAGES {
+        let (c, n) = session(Cheat::None, Cheat::OtherDigest(stage), th, &srv).await;
+        assert_c_aborts_with(&c, &n, stage, "pointer bits");
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_ot_correlation_detected() {
-    // N runs the COTs for C's inputs (and, in Proven, for C's commitments
-    // and proofs) with a Δ other than the garbling Δ.
+    // N runs the COTs for C's inputs with a Δ other than the garbling Δ.
     let srv = server();
     let th = ths();
-    for v in VARIANTS {
-        let (c, n) = session(v, Cheat::None, Cheat::KosDelta, th, &srv).await;
-        assert_c_aborts_at(&c, &n, 0);
-    }
+    let (c, n) = session(Cheat::None, Cheat::KosDelta, th, &srv).await;
+    assert_c_aborts_at(&c, &n, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn different_transcript_hash_detected() {
-    // The transcript hashes enter the inner digests. Proven: C proves them
-    // over its own hash, N verifies over its own, so N rejects the proof.
-    // PublicIs: N's digest labels do not match C's digests (pointer bits).
+    // The transcript hashes enter the inner digests: N's digest labels do
+    // not match the digests C computed over its own hash (pointer bits).
     let srv = server();
     let th = ths();
     let mut other_sh = th;
     other_sh.0[5] ^= 1;
     let mut other_sf = th;
     other_sf.1[31] ^= 0x80;
-    let (c, n) = session_v(Variant::Proven, Cheat::None, Cheat::None, th, other_sh, &srv).await;
-    assert_n_rejects(&c, &n, true, "inner-digest proof", true);
-    let (c, n) = session_v(Variant::Proven, Cheat::None, Cheat::None, th, other_sf, &srv).await;
-    assert_n_rejects(&c, &n, false, "inner-digest proof", true);
-    let (c, n) = session_v(Variant::PublicIs, Cheat::None, Cheat::None, th, other_sh, &srv).await;
+    let (c, n) = session_v(Cheat::None, Cheat::None, th, other_sh, &srv).await;
     assert_c_aborts_with(&c, &n, 1, "pointer bits");
-    let (c, n) = session_v(Variant::PublicIs, Cheat::None, Cheat::None, th, other_sf, &srv).await;
+    let (c, n) = session_v(Cheat::None, Cheat::None, th, other_sf, &srv).await;
     assert_c_aborts_with(&c, &n, 3, "pointer bits");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cheating_evaluator_cannot_change_n_outputs() {
-    // C reports a flipped bit: an output bit (c_hs, K_0, a public IS or
-    // anchor) or, in Proven, a conversion bit (it tries to commit to another
-    // IS / s_ap_0 than the circuit computed). Without the inactive label it
-    // cannot authenticate it.
+async fn abort_looks_the_same_whatever_failed() {
+    // One observable outcome per stage: whichever of C's checks fails (the
+    // pointer bits of N's digest labels, the consistency check, the label
+    // check), N receives the same single byte at the same point, after C
+    // evaluated the whole stage. N's view: the same error and the same
+    // number of bytes received in that call.
     let srv = server();
     let th = ths();
-    for v in VARIANTS {
-        for stage in 0..N_STAGES {
-            let (c, n) = session(v, Cheat::FlipOutput(stage), Cheat::None, th, &srv).await;
-            assert_n_rejects(&c, &n, is_hs(stage), "output labels", false);
+    for (stage, step) in [(1, "phase_a"), (4, "phase_b")] {
+        let mut views = Vec::new();
+        for cheat in [
+            Cheat::FlipDigestLabel(stage),
+            Cheat::OtherDigest(stage),
+            Cheat::BadInputLabel(stage),
+            Cheat::CorruptGate(stage),
+            Cheat::BadPair(stage),
+            Cheat::BadPairHalf(stage),
+        ] {
+            let (c, n) = session(Cheat::None, cheat, th, &srv).await;
+            assert_c_aborts_at(&c, &n, stage);
+            let e = if is_hs(stage) { n.hs.err() } else { n.ap.err() };
+            let bytes = n.recv.iter().find(|(s, _)| *s == step).expect("the step ran").1;
+            views.push((format!("{:?}", e.unwrap()), bytes));
+        }
+        assert!(views.windows(2).all(|w| w[0] == w[1]), "stage {stage}: {views:?}");
+        assert!(views[0].0.contains("peer aborted"), "{views:?}");
+    }
+}
+
+/// The output groups C reports, with their stage.
+const REPORTED: [(&str, usize); 10] = [
+    ("IS_HS", 0),
+    ("c_hs", 1),
+    ("s_hs", 1),
+    ("IS_dHS", 1),
+    ("IS_MS", 2),
+    ("IS_c0", 3),
+    ("kiv", 4),
+    ("h1", 4),
+    ("h2", 4),
+    ("hk", 4),
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cheating_evaluator_cannot_misreport() {
+    // C reports a flipped bit of a public inner state `IS_k` (N would label
+    // the digests of a state C chose), of c_hs / s_hs, of N's K_0 ‖ IV_0 or
+    // of an anchor. Without the inactive label it cannot authenticate it; N
+    // rejects before it sends the next stage's labels.
+    let srv = server();
+    let th = ths();
+    assert_eq!(
+        REPORTED.to_vec(),
+        (0..N_STAGES)
+            .flat_map(|s| lay().reported(s).into_iter().map(move |gi| (lay().sp.outs[gi].name, s)))
+            .collect::<Vec<_>>()
+    );
+    for (name, stage) in REPORTED {
+        let (c, n) = session(Cheat::FlipReported(name), Cheat::None, th, &srv).await;
+        // Except in the last stage of a call, C needs N's next labels.
+        let c_needs_n = stage != HS_STAGES - 1 && stage != N_STAGES - 1;
+        assert_n_rejects(&c, &n, is_hs(stage), "output labels", c_needs_n);
+        if c_needs_n {
+            let e = c_err(&c, stage);
+            assert!(e.contains("N rejected"), "{name}: {e}");
         }
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn digest_for_the_wrong_label_rejected() {
-    // C proves f(IS_MS, "c ap traffic" block) where the digest of the
-    // "s ap traffic" block belongs (it would make its s_ap_0 equal c_ap_0).
-    let srv = server();
-    let th = ths();
-    let (c, n) = session(Variant::Proven, Cheat::WrongLabel, Cheat::None, th, &srv).await;
-    assert_n_rejects(&c, &n, false, "inner-digest proof", true);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn wrong_proof_bit_rejected() {
-    // C commits a wrong wire value inside a digest proof.
+async fn evaluating_with_another_digest_rejected() {
+    // C evaluates a stage with another label than the one N sent for a
+    // digest input (C has one label per wire; the label of the other bit
+    // needs Δ_A, so it can only guess), ignores its own checks and reports
+    // what it computed: N's label hash fails.
     let srv = server();
     let th = ths();
     for stage in 1..N_STAGES {
-        let (c, n) = session(Variant::Proven, Cheat::BadProofBit(stage), Cheat::None, th, &srv).await;
-        assert_n_rejects(&c, &n, is_hs(stage), "inner-digest proof", true);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn feeding_another_digest_than_proven_rejected() {
-    // C evaluates a stage with a label it did not get from N for the digest
-    // it proved, and reports what it computed: N's label hash fails. (In
-    // stages A3 and B1 of Proven nothing but conversions is reported; they
-    // are bound to the labels in the same way.)
-    let srv = server();
-    let th = ths();
-    for v in VARIANTS {
-        for stage in 1..N_STAGES {
-            let (c, n) = session(v, Cheat::FeedOther(stage), Cheat::None, th, &srv).await;
-            assert_n_rejects(&c, &n, is_hs(stage), "output labels", false);
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn lying_about_an_anchor_rejected() {
-    let srv = server();
-    let th = ths();
-    let (c, n) = session(Variant::Proven, Cheat::LieAnchor, Cheat::None, th, &srv).await;
-    assert_n_rejects(&c, &n, false, "anchor opening", true);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn lying_about_hk_detected() {
-    // N opens another hk than the one it proved, or proves the hash of
-    // another K_0 than the one the circuit gave it.
-    let srv = server();
-    let th = ths();
-    for (cheat, what) in [(Cheat::LieHk, "hk opening"), (Cheat::WrongHkWitness, "hk proof")] {
-        let (c, n) = session(Variant::Proven, Cheat::None, cheat, th, &srv).await;
-        c.hs.as_ref().unwrap();
-        n.hs.as_ref().unwrap();
-        assert!(matches!(&c.ap, Err(Error::Abort(m)) if m.contains(what)), "{:?}", c.ap);
-        assert!(matches!(&n.ap, Err(Error::Abort(_))), "N must see the abort: {:?}", n.ap);
+        let (c, n) = session(Cheat::FeedOther(stage), Cheat::None, th, &srv).await;
+        assert_n_rejects(&c, &n, is_hs(stage), "output labels", false);
     }
 }
 
@@ -637,7 +684,7 @@ async fn lying_about_hk_detected() {
 async fn rogue_key_share_aborts() {
     let srv = server();
     let th = ths();
-    let (_c, n) = session(Variant::Proven, Cheat::BadOpen, Cheat::None, th, &srv).await;
+    let (_c, n) = session(Cheat::BadOpen, Cheat::None, th, &srv).await;
     assert!(matches!(n.ks, Err(Error::Abort(_))), "{:?}", n.ks);
 }
 

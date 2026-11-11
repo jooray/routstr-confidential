@@ -13,6 +13,11 @@
 //! out {"ev":"error","msg":..} and exit 1 on any failure
 //! ```
 //!
+//! A peer that speaks another version of the two-party key schedule (its
+//! first bytes are not `routstr-2pc/split-public-1\n`) is reported as
+//! `{"ev":"error","code":"twopc_version_mismatch","msg":"twopc_version_mismatch: .."}`,
+//! one line `twopc_version_mismatch` on stderr, and exit status 3.
+//!
 //! Secrets are only ever written to the control channel (stdout), never to
 //! stderr.
 
@@ -32,6 +37,9 @@ const MAX_FRAME: usize = 16 << 20;
 /// Generous next to the node's limits (180 s preprocessing) and the SDK's
 /// defaults; waiting for the next control command is not bounded, since a
 /// pre-warmed session waits there for a request.
+/// Exit status when the peer speaks another 2PC version.
+const EXIT_VERSION_MISMATCH: i32 = 3;
+
 const PREPROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -100,7 +108,7 @@ async fn next_cmd(ctl: &mut mpsc::UnboundedReceiver<Value>, want: &str) -> Resul
 }
 
 async fn run(out: Out, mut ctl: mpsc::UnboundedReceiver<Value>, io: tokio::io::DuplexStream) -> Result<(), String> {
-    let mut p = Party::new(Role::C, io.compat()).await.map_err(|e| e.to_string())?;
+    let mut p = step("version", STEP_TIMEOUT, Party::new(Role::C, io.compat())).await?;
     step("preprocess", PREPROCESS_TIMEOUT, p.preprocess()).await?;
     emit_timings(&out, &mut p);
     let joint = step("key_share", STEP_TIMEOUT, p.key_share()).await?;
@@ -226,6 +234,12 @@ async fn main() {
     let res = run(out_tx.clone(), ctl_rx, party_io).await;
     let code = match res {
         Ok(()) => 0,
+        // `twopc::Error::VersionMismatch` prints with this code first.
+        Err(msg) if msg.starts_with(twopc::VERSION_MISMATCH) => {
+            eprintln!("{}", twopc::VERSION_MISMATCH);
+            emit(&out_tx, json!({"ev":"error","code":twopc::VERSION_MISMATCH,"msg":msg}));
+            EXIT_VERSION_MISMATCH
+        }
         Err(msg) => {
             emit(&out_tx, json!({"ev":"error","msg":msg}));
             1
