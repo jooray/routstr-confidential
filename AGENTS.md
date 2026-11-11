@@ -258,19 +258,32 @@ Option A, `http: 2`: one two-party handshake per HTTP/2 connection, the credenti
 statement `pi_win` (`zkbench`), the sidecar mode (`relay/src/{h2,h2_session,hpack}.rs`, offered only with an
 `h2` block: `relay/offer.venice.h2.json`), the reference driver (`--http2 --requests N`,
 `client/src/{h2,driver-h2}.ts`), and the node (routstr-core branch `confidential-v3`, local only, from
-`confidential-2pc`: the setup checks the credential and reserves nothing, each `request` is reserved and
-settled as a v2 session; `routstr/confidential_ws.py` `_run_h2_session`, tests
+`confidential-2pc`: the setup checks the credential and reserves the connection deposit, each `request` is
+reserved and settled as a v2 session; `routstr/confidential_ws.py` `_run_h2_session`, tests
 `tests/unit/test_confidential_http2.py`; A.11 "Through a node" is the client-facing wire format). Not built:
 the web library. v2 is untouched and the default. Gates: `crypto/tools/v3-h2-check.sh`
 (starts its own sidecar; honest cases, five attacks, a v2 control) and `crypto/tools/v3-h2-node-check.sh`
 (starts a sidecar and a node on scratch state, needs routstr-core on `confidential-v3`; checks every case's
-money outcome in the node's database); offline: `node --experimental-strip-types src/h2-selfcheck.ts` in
-`crypto/client`.
+money outcome in the node's database, the deposit cases included); offline:
+`node --experimental-strip-types src/h2-selfcheck.ts` in `crypto/client`.
+
+Connection deposit and idle timeout (A.12, which has the rule for every way a connection can end): the
+node's signed `h2` block adds `connection_deposit_msat` (`CONFIDENTIAL_H2_CONNECTION_DEPOSIT_MSAT`, default
+-1 = the abandon fee, so 0 unless the operator sets a fee) and `idle_timeout_s`
+(`CONFIDENTIAL_H2_IDLE_TIMEOUT_S`, default 120, at most the sidecar's `h2.idle_secs`). The setup reserves the
+deposit through the ordinary reservation path (`reserve_deposit` in `routstr/confidential.py`); the first
+settled request releases it (`deposit_released_msat` in its receipt); a connection that ends without one
+loses it unless the node, the sidecar or the provider failed (`_h2_deposit_verdict`; the sidecar marks its
+own failures with `fault` in its `error` frame), and the connection's last frame carries the signed outcome.
+The node closes a connection with no request in flight for `idle_timeout_s` (`closed`, reason `idle`). The
+driver: `--requests 0`, `--linger-ms`, `--max-deposit`.
 
 The clients (local branches `confidential-v3` in routstr-sdk, from `confidential-2pc`, and in routstrd, from
 `confidential-upstream`): the SDK runs chat on pooled `http: 2` connections when the verified offer lists
 `"2"` (`client/confidential/{h2,h2conn,h2pool}.ts`, `confidential.http2`, on by default; images, one-off Cashu
-bearers and other nodes keep the v2 flow), routstrd passes `confidentialUpstream.http2` through. Live checks:
+bearers and other nodes keep the v2 flow; a node whose deposit exceeds `http2.maxConnectionDepositMsat`,
+default 100 000 msat, also gets the v2 flow; the pool's idle time stays below the node's `idle_timeout_s`),
+routstrd passes `confidentialUpstream.http2` through. Live checks:
 `bun scripts/confidential-h2-e2e.ts <node> <sk-key> <model>` in routstr-sdk (SDK level, against a node you
 started), and `crypto/tools/v3-h2-routstrd-check.sh`, which starts a sidecar, a node, a stub mint
 (`crypto/tools/v3-h2-routstrd/`) and a scratch routstrd (scratch HOME/ROUTSTRD_DIR/COCOD_DIR, dead proxy for

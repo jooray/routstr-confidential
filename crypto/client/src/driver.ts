@@ -82,7 +82,7 @@ import { checkHeadTemplate, checkPiC2SParams, checkPiC3SParams, serverTailEpoch,
 import { TwoPc, type ApOut } from './twopc.ts'
 import { ZkChan } from './zkchan.ts'
 import { H2Conn, runHttp2, type H2Ctx } from './driver-h2.ts'
-import { MAX_DATA_IN_RECORD, checkH2Offer, checkPiNKParamsH2 } from './h2.ts'
+import { MAX_DATA_IN_RECORD, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
 
 setCryptoImplementation(webcryptoCrypto)
 
@@ -187,7 +187,12 @@ const H2_CHUNK = Number(arg('--h2-chunk', String(MAX_DATA_IN_RECORD)))
 const ADV_H2 = arg('--adv-h2')
 const ADV_H2_AT = Number(arg('--adv-at', ADV_H2 === 'replay-usage' ? '2' : '1'))
 const ADV_H2_PATH = arg('--adv-h2-path', '/api/v1/api_keys/abcdefg')
-let H2_BLOCK: { probe_path: string; idle_secs: number; max_requests: number } | undefined
+// --linger-ms N: after the last request (or with --requests 0, after the
+// connection opened) wait up to N ms for the node to close the idle connection.
+const H2_LINGER_MS = Number(arg('--linger-ms', '0'))
+// --max-deposit N: the largest connection deposit (msat) accepted from an offer.
+const H2_MAX_DEPOSIT = Number(arg('--max-deposit', '100000'))
+let H2_BLOCK: H2OfferBlock | undefined
 // The only protocol version: 2 = two-party handshake (docs/TWOPC-DESIGN.md).
 // Protocol v1 is retired (branch v1-poc); an offer naming it is refused.
 const PROTO = 2
@@ -1756,8 +1761,12 @@ async function mainHttp2(): Promise<void> {
   const bases = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
   // Refuse before any setup if the verified offer does not list http 2.
   H2_BLOCK = checkH2Offer(OFFER, bases)
-  if (!(Number.isSafeInteger(H2_REQUESTS) && H2_REQUESTS >= 1 && H2_REQUESTS <= H2_BLOCK.max_requests)) {
-    throw new Error(`--requests must be 1..${H2_BLOCK.max_requests}`)
+  if (!(Number.isSafeInteger(H2_REQUESTS) && H2_REQUESTS >= 0 && H2_REQUESTS <= H2_BLOCK.max_requests)) {
+    throw new Error(`--requests must be 0..${H2_BLOCK.max_requests}`)
+  }
+  // The deposit is reserved by the setup: refuse before sending one.
+  if (H2_BLOCK.connection_deposit_msat > H2_MAX_DEPOSIT) {
+    throw new Error(`the node's connection deposit of ${H2_BLOCK.connection_deposit_msat} msat exceeds --max-deposit ${H2_MAX_DEPOSIT}`)
   }
   const enc = new TextEncoder()
   const ctx: H2Ctx = {
@@ -1767,6 +1776,7 @@ async function mainHttp2(): Promise<void> {
     requestExtras: {},
     requests: H2_REQUESTS,
     pauseMs: H2_PAUSE_MS,
+    lingerMs: H2_LINGER_MS,
     chunk: H2_CHUNK,
     buildBody: (n: number) => {
       const model = H2_MODELS[n - 1] ?? MODEL
@@ -1832,6 +1842,8 @@ async function mainHttp2(): Promise<void> {
   s.twopc?.close()
   s.close()
   const honestOk = out.requests.length === (ADV_H2 ? ADV_H2_AT - 1 : H2_REQUESTS) || out.requests.some((r: any) => r.status >= 400)
+  // A connection opened and left without a request (--requests 0): nothing to verify but its end.
+  if (H2_REQUESTS === 0) process.exit(0)
   // Exit codes: 0 = every request settled (or the attack was refused), 3 = a
   // receipt was not verified, 5 = an attack was not refused.
   if (ADV_H2) process.exit(out.adv?.refused ? 0 : 5)

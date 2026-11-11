@@ -1488,10 +1488,14 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     st.deadline = Some(deadline_at);
     let deadline = tokio::time::sleep_until(deadline_at);
     tokio::pin!(deadline);
+    // A failure to reach the upstream is nobody's protocol error: the error
+    // frame says so (`fault`), and the node does not hold the client to it.
+    st.fault = Some("upstream");
     let tcp = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(&app.upstream))
         .await
         .map_err(|_| anyhow!("connecting to {} timed out after {}s", app.upstream, UPSTREAM_CONNECT_TIMEOUT.as_secs()))?
         .with_context(|| format!("connecting to {}", app.upstream))?;
+    st.fault = None;
     let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
     {
         let evt = evt_tx.clone();
@@ -1770,14 +1774,18 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     .await
     // A bug that panics ends the session like an error: the client still gets
     // its error frame, the log is written, and `cleanup` runs.
-    .unwrap_or_else(|_| Err(anyhow!("internal error in the session")));
+    .unwrap_or_else(|_| Err(anyhow!(INTERNAL_ERROR)));
 
     if let Err(e) = &result {
         // Send an explicit error frame so the client fails fast instead of
         // waiting out its protocol timeout (the timeout remains the backstop).
-        let _ = to_client.send(Message::Text(
-            serde_json::json!({"type":"error","reason":e.to_string()}).to_string().into(),
-        ));
+        // `fault` is set when the cause is not the client: the upstream could
+        // not be reached ("upstream"), or this sidecar failed ("node").
+        let mut frame = serde_json::json!({"type":"error","reason":e.to_string()});
+        if let Some(fault) = st.fault.or((e.to_string() == INTERNAL_ERROR).then_some("node")) {
+            frame["fault"] = fault.into();
+        }
+        let _ = to_client.send(Message::Text(frame.to_string().into()));
     }
     if let Some(dir) = &st.run_dir {
         // Keep a record only of sessions that wrote a credential record: the rest
@@ -1796,6 +1804,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send_task).await;
     result
 }
+
+/// The reason of a session that ended in a panic.
+const INTERNAL_ERROR: &str = "internal error in the session";
 
 /// Releases what a session holds however its task ends (error, panic or
 /// cancellation): the upstream reader (which may be parked on a read while
@@ -1884,6 +1895,9 @@ struct Session {
     side_log: Vec<String>,
     /// `Some` for an `http: 2` session (protocol v3 option A).
     h2: Option<Box<h2_session::H2>>,
+    /// Set while a failure would not be the client's doing (reaching the
+    /// upstream): the error frame then carries it as `fault`.
+    fault: Option<&'static str>,
 }
 
 fn side(st: &mut Session, ev: String) {

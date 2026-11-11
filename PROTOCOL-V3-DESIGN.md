@@ -173,11 +173,12 @@ disclosure is verified.
 
 ### A.8 Limits and lifecycle
 
-- Idle: the sidecar closes a connection `h2.idle_secs` after its last settlement (or after `connected`).
+- Idle: the node closes a connection `h2.idle_timeout_s` after `head_written` or its last settlement (A.12);
+  the sidecar's own limit, `h2.idle_secs`, is a backstop that is never shorter.
   `h2.max_requests` per connection. The existing per-session time limits apply per request.
 - GOAWAY from U, or U closing: the session ends; a request in flight settles by the usual abort rules.
 - C keeps no armed objects other than connections. A connection opened ahead of need is the same object.
-- Fees: none new in the prototype. (Later: the abandon fee becomes a per-connection deposit.)
+- Fees: the connection deposit (A.12), reserved at the setup and released with the first settled request.
 
 ### A.9 Why the credential cannot be read back (answer to "is it echoed?")
 
@@ -202,7 +203,7 @@ disclosure is verified.
 ### A.10 Out of scope for the prototype
 
 Parallel streams on one connection; client KeyUpdates after epoch 0; image requests over `http: 2` (the
-design allows them; build chat first); connection deposits; the browser library.
+design allows them; build chat first); the browser library.
 
 ### A.11 Wire format (as implemented)
 
@@ -224,8 +225,14 @@ bytes; host under 127 bytes; key at most 119 bytes). The sidecar's `/offer` then
 and `"http": ["1.1", "2"]`; without the block `"http": ["1.1"]`. The node copies both into its signed offer.
 The request path is not a new field: it is the path of the offer's `head_template` (`POST <path> HTTP/1.1`).
 
+A node's signed offer adds two fields to the block (A.12; a sidecar's own offer has neither):
+`"connection_deposit_msat"` (integer ≥ 0; absent = 0) and `"idle_timeout_s"` (integer, 10..`idle_secs`; absent =
+`idle_secs`).
+
 Client checks before a `setup` with `http: 2`: `http` lists `"2"`; the `h2` block is in range; `probe_path` is a
-trusted API base plus `/models` (`checkH2Offer`); the usual v2 offer checks (host, chat block, head template).
+trusted API base plus `/models` (`checkH2Offer`); `connection_deposit_msat` is at most the client's configured
+maximum (default 100 000 msat; above it the client opens no connection and uses the v2 flow); the usual v2 offer
+checks (host, chat block, head template).
 
 #### Setup
 
@@ -406,11 +413,15 @@ so a node on an HTTP/1.1-only sidecar signs what it signed before.
 - The node checks, before it dials the sidecar: its sidecar offers `http: 2` (else 400); `offer_sig` names an
   offer it signed and still remembers (else 409 `offer_expired`); the credential is valid with an available
   balance of at least `max(1 msat, MIN_REQUEST_MSAT, that offer's session fee, its abandon fee)` (else 401/402
-  with the node's usual error body). A Cashu token is redeemed here. **Nothing is reserved.** A client without
-  funds gets no garbled circuit.
-- The sidecar sees `{"type":"setup","http":2,"nonce_c","armed","escrow":"h2-<random>"}`: no credential, no
-  offer signature. `escrow` only makes the sid unique (v2 passes the reservation id there).
-- `ready` gains `zk_token`, `pubkey` (the node's) and `sig_scheme`, as for v2.
+  with the node's usual error body). A Cashu token is redeemed here. Then it **reserves the connection
+  deposit** of that offer (A.12) from the credential; a balance that does not cover it is refused with 402,
+  `detail.error.type = "connection_deposit_unfunded"` (the node's usual 402 body otherwise, plus
+  `connection_deposit_msat`). No request is reserved. A client without funds gets no garbled circuit.
+- The sidecar sees `{"type":"setup","http":2,"nonce_c","armed","escrow":"h2-<id>"}`: no credential, no
+  offer signature. `escrow` only makes the sid unique (the deposit's reservation id, or a random one when the
+  offer asks for no deposit; v2 passes the session's reservation id there).
+- `ready` gains `zk_token`, `pubkey` (the node's) and `sig_scheme`, as for v2, and `deposit_msat`: what the
+  setup reserved, which the client requires to equal the offer's `connection_deposit_msat`.
 
 **Request.** `C → node  {"type":"request","n":k,"kind":"chat","model","max_tokens","body_len","auth","offer_sig"
 [,"session_fee_msat","abandon_fee_msat"][,"suffix"]}`.
@@ -441,7 +452,8 @@ the frozen rates plus the session fee; an error head by v2's status rules) and s
 
 `{"type":"receipt","receipt":{…v2's fields…,"http":2,"n":k},"receipt_json","sig","sig_scheme"}`.
 
-`receipt.sid` is the connection's sid, `receipt.n` the request, `attestation_hash` the SHA-256 of that
+The receipt of the connection's first settled request also carries `"deposit_released_msat": <the deposit>`
+(A.12); no other receipt does. `receipt.sid` is the connection's sid, `receipt.n` the request, `attestation_hash` the SHA-256 of that
 request's `a_json`. `reserved_msats`, `cost_msats`, `balance_msats`, `rates` and the fee fields are that
 request's. The client checks what it checks for v2 plus `http`, `n` and that the attestation's `n`, `stream`
 and `s_k` are its own. An `attestation` or `usage` that names another request than the one in flight is
@@ -452,9 +464,9 @@ dropped by the node. If the node cannot sign a receipt (no attestation, a failed
 
 | The connection ends… | The request's reservation |
 |---|---|
-| with no request in flight (idle, `closed`, the client leaves, never used) | nothing is held, nothing is charged |
+| with no request in flight (idle, `closed`, the client leaves, never used) | nothing is held for a request (the deposit: A.12) |
 | before the sidecar's `request_ok` | released in full |
-| after `request_ok`, before `body_released` (a failed π_WIN, the client leaves) | released; the abandon fee is kept if the offer has one |
+| after `request_ok`, before `body_released` (a failed π_WIN, the client leaves) | released; the abandon fee is kept if the offer has one, except when this is the connection's first request and the deposit is charged for it (A.12: one price for the unused handshake, not two) |
 | before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes) | released; the session fee is kept if the offer has one |
 | after `body_released` with no settlement | charged in full |
 
@@ -462,19 +474,19 @@ dropped by the node. If the node cannot sign a receipt (no attestation, a failed
 life. It counts against its address's unused-session limit (`CONFIDENTIAL_MAX_UNUSED_PER_IP`, default 12) from
 the setup until its **first `body_released`** (differs from v2, where `head_written` ends it: there a
 reservation is held by then, here none is). Time limits: 10 minutes from the websocket accept to
-`head_written` (an armed connection included); idle, the sidecar's `idle_secs` (it sends `closed`), with the
-node cutting the connection 15 s later if it did not; per request, 10 minutes from `request` to
+`head_written` (an armed connection included); idle, the offer's `h2.idle_timeout_s` (A.12; the node sends
+`closed`, reason `idle`); per request, 10 minutes from `request` to
 `body_released` and 10 minutes from there to the settlement, as for v2 (`error` with status 408). Each
 request's reservation has its own lease, taken at the `request`.
 
 **Open, by design of the prototype** (see also "Not implemented"):
 
-- An unused connection is free. The setup needs a funded credential but holds nothing, so a client can make
-  the node garble a key schedule (~22 MB, ~0.5 s of CPU) and drop the connection at no cost, and can hold up
-  to the per-address limit of session slots idle for `idle_secs` each, where v2 would hold a full-context
-  reservation per session. `CONFIDENTIAL_ABANDON_FEE_MSAT` does not cover it: with nothing reserved there is
-  nothing to keep the fee from. The fix is A.8's connection deposit (reserve the abandon fee at the setup,
-  release it with the first settlement).
+- With the node's default settings the connection deposit is 0 (it defaults to the abandon fee, which is
+  off by default), and an unused connection is then free as before A.12.
+- A first request that the node refuses for lack of funds costs the deposit: the refusal ends the
+  connection, and the connection carried no request. A client must hold the deposit plus the request's
+  reservation when it sends request 1. The `request_refused` frame below would let it top up and retry on
+  the same connection.
 - The session fee is charged per request, as the v2 code does per session, although the 2PC it pays for now
   happens once per connection. Whether it should move to the connection is undecided.
 - The setup's `offer_sig` is checked only for being known. The node does not record which offer a connection
@@ -487,7 +499,84 @@ request's reservation has its own lease, taken at the `request`.
 
 Images over `http: 2`; client KeyUpdates; parallel streams; a server KeyUpdate inside or after a disclosed tail
 (the disclosure then fails; one before the tail is handled by `key_updates`/`epoch_start` but is untested live);
-connection deposits and per-connection fees; the SDK, routstrd and the web library.
+a session fee per connection instead of per request; the web library.
+
+### A.12 Connection deposit and idle timeout
+
+Opening a connection makes N garble a key schedule (about 22 MB, 0.5 s of CPU) before any request exists. The
+setup therefore reserves a deposit, and the node closes connections that sit idle.
+
+**Offer.** The node adds to the signed `h2` block `connection_deposit_msat` (node setting
+`CONFIDENTIAL_H2_CONNECTION_DEPOSIT_MSAT`; default: the abandon fee, the price the node already puts on a
+handshake nobody used; never below the node's minimum reservation when above 0; 0 = no deposit) and
+`idle_timeout_s` (`CONFIDENTIAL_H2_IDLE_TIMEOUT_S`, default 120, at least 10, never above the sidecar's
+`idle_secs`). The client knows both before it opens. (`PROTOCOL-V3.md` lists the two at the offer's top level,
+because there they apply to both framings; in this prototype only `http: 2` connections have them.)
+
+**Reservation.** The deposit goes through the node's ordinary reservation (`pay_for_request`, a
+`ReservationRelease` row with a lease, the calls `release` and `finalize_ehbp_actual_cost_payment`): there is
+no second ledger. It is reserved from the setup's credential after the credential check and before the
+sidecar is dialed. The setup's `offer_sig` names the offer whose deposit is taken; the setup carries no extra
+acceptance field (the client verified that offer). Its lease covers the setup phase, one idle period and a
+first request.
+
+**Release.** The deposit is released when the connection's first request reaches a settlement: a usage
+disclosure or an error head of any status, i.e. any request the provider answered. That request's receipt
+carries `deposit_released_msat`. From then on the connection holds nothing between requests.
+
+**A connection that ends with no settled request.** Exactly one of these rows applies, top to bottom:
+
+| # | How the connection ended | Deposit | `reason` |
+|---|---|---|---|
+| 1 | the setup was refused before the sidecar was dialed: bad credential, balance below the deposit, unknown offer | never reserved | (the `error`) |
+| 2 | no session slot, or the sidecar unreachable, after the deposit was reserved | released | `not_started` |
+| 3 | the sidecar refused the setup (no `ready`) | released | `not_started` |
+| 4 | the sidecar could not reach the provider (`error` with `"fault":"upstream"`: the TCP connect failed or timed out) | released | `provider_unreachable` |
+| 5 | the sidecar failed (`error` with `"fault":"node"`: a panic), or its socket ended without `error` or `closed` while the client was connected | released | `sidecar_failure` |
+| 6 | the provider closed the open, idle connection before any request (`closed`, reason `upstream_closed`) | released | `provider_closed` |
+| 7 | the node refused the first request with a 5xx (its reservation or its sidecar offer failed) | released | `node_failure` |
+| 8 | the first request was settled by the sidecar and the node's billing write failed, or the usage came without an attestation | released | `node_failure` |
+| 9 | the first request was written to the provider in full (`body_released`) and never settled | released (the request's reservation is charged in full) | `request_received` |
+| 10 | the provider answered the first request and closed before its body was complete (`upstream_closed_early` with response bytes) | released (the request keeps the session fee) | `provider_refused` |
+| 11 | the first request was reserved and ended before `body_released` for any other reason: a failed π_WIN, a malformed record, the client leaving, the request's time limit | **charged**; the request's reservation is released in full | `request_abandoned` |
+| 12 | the node refused the first request with a 4xx: 402 on its reservation, an expired offer, a model it does not serve, a malformed `request` | **charged** | `request_refused` |
+| 13 | no request in flight for `idle_timeout_s` after `head_written` | **charged** | `idle` |
+| 14 | `head_written` not reached within 10 minutes of the socket's accept (an armed connection included) | **charged** | `setup_timeout` |
+| 15 | anything else with no request: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake | **charged** | `unused` |
+
+Rows 4-8 are "the node, the sidecar or the provider failed before the client could have a request settled".
+Row 15 includes failures a client can cause at will (a bad Finished makes the provider close), which is why
+a provider closing during the handshake is charged; row 4 is limited to what the client cannot cause. If the
+node process dies, the lease lapses and the node's stale-reservation sweeper releases the deposit.
+
+**Telling the client.** Release by a settlement: the signed receipt (`deposit_released_msat`). Otherwise the
+connection's last frame carries the outcome, signed with the node's key like a receipt:
+
+```
+{"type":"closed"|"error", …the frame's own fields…,
+ "deposit":{"sid","msat","outcome":"released"|"charged","reason","cost_msats","balance_msats","time"},
+ "deposit_json":<the signed bytes>,"deposit_sig":<hex>,"sig_scheme":"schnorr-secp256k1"}
+```
+
+For that, the node holds the sidecar's `error` or `closed` back until the deposit is decided and sends it
+last; when the node ends the connection itself the frame is its own (`closed` reason `idle`; `error` 408;
+the refusal of a request; `error` 502 "confidential sidecar connection lost"; `closed` reason `ended` when
+neither side had a last word). A client that already left learns nothing; row 8 sends its `error` before the
+deposit is decided and so reports no outcome (the deposit is released).
+
+**Idle.** The node closes a connection that had no request in flight for `idle_timeout_s`, counted from
+`head_written` or from the last settlement: `{"type":"closed","reason":"idle"}` (with `deposit` under row 13).
+After its first settled request an idle connection holds no reservation. A client's pool closes its idle
+connections earlier (the SDK: 20 s earlier, at most a quarter of the timeout) and never keeps one longer than
+the node would. The sidecar's limits are unchanged and fit: its idle limit `h2.idle_secs` (300 s in the
+shipped offer) is the ceiling of `idle_timeout_s`, so the node always closes first; before `head_written`
+the sidecar allows 600 s like the node. How long the provider keeps an idle HTTP/2 connection was not
+measured for this section (the gate idles for 12 s); row 6 covers a provider that closes earlier than the
+node, and a client's pool treats a dead connection as a cache miss.
+
+**Checked by** `crypto/tools/v3-h2-node-check.sh` (cases `low-balance`, `open-drop`, `idle-drop`,
+`idle-after`, and the deposit's return in every case whose first request settles; balances exact) and the
+unit tests `tests/unit/test_confidential_http2.py` in routstr-core (every row).
 
 ---
 

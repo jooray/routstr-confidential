@@ -14,14 +14,14 @@ import { createHash } from 'node:crypto'
 import { concat, hex, sha256 } from './advice.ts'
 import {
   FLAG, FRAME, FrameReader, MAX_DATA_IN_RECORD, chatPath, checkPiWinParams, decodeBlock, frame, frameHeader,
-  requestBlock, requestStream, splitBody, type RxFrame, type WinSource,
+  requestBlock, requestStream, splitBody, type H2OfferBlock, type RxFrame, type WinSource,
 } from './h2.ts'
 import { checkPiC3SParams, serverTailEpoch } from './params.ts'
 
 /** What the driver hands this module (its flags, offer and helpers). */
 export interface H2Ctx {
   offer: any
-  h2: { probe_path: string; idle_secs: number; max_requests: number }
+  h2: H2OfferBlock
   nodeMode: boolean
   /** Node mode: fields every `request` carries (credential, offer signature, fees). */
   requestExtras: Record<string, unknown>
@@ -29,6 +29,8 @@ export interface H2Ctx {
   checkReceipt?: (receipt: any, q: { n: number; model: string; status: number; usage: any }) => void
   requests: number
   pauseMs: number
+  /** After the last request: wait this long for the node to close the idle connection. */
+  lingerMs?: number
   /** Largest DATA payload per record. */
   chunk: number
   /** The body of request `n`: model, cap, bytes and the pinned suffix. */
@@ -155,6 +157,32 @@ export class H2Conn {
       this.cur.released = true
       this.cur.tReleased = Date.now()
     }
+    if (m.type === 'closed' || m.type === 'error') this.onLastFrame(m)
+  }
+
+  /** The connection deposit's outcome, as the node reported it (a receipt, or its last frame). */
+  deposit: { msat: number; outcome: string; reason: string; signed: boolean } | undefined
+  closedReason: string | undefined
+
+  /** The node's last frame (`closed` or `error`): it may carry the deposit's outcome, signed. */
+  private onLastFrame(m: any): void {
+    if (m.type === 'closed') this.closedReason = String(m.reason ?? '')
+    if (m.deposit === undefined) return
+    const { s, ctx } = this
+    const json: string = typeof m.deposit_json === 'string' ? m.deposit_json : JSON.stringify(m.deposit)
+    let signed = false
+    let d: any
+    try {
+      d = JSON.parse(json)
+      signed = ctx.verifySig(json, m.deposit_sig, s.ready?.pubkey, m.sig_scheme) && (d.sid === s.sid || d.sid === null)
+    } catch {
+      d = {}
+    }
+    this.deposit = { msat: Number(d.msat), outcome: String(d.outcome), reason: String(d.reason), signed }
+    console.log(
+      `[client ${s.label}] deposit: outcome=${ctx.shown(d.outcome)} reason=${ctx.shown(d.reason)} msat=${ctx.shown(d.msat)} ` +
+        `balance_msats=${ctx.shown(d.balance_msats)} signed=${signed}`,
+    )
   }
 
   private onFrame(f: RxFrame): void {
@@ -439,6 +467,14 @@ export class H2Conn {
     }
     ctx.checkReceipt?.(receipt, { n, model: b.model, status, usage: ownUsage?.usage })
     const tEnd = Date.now()
+    if (receipt.deposit_released_msat !== undefined) {
+      // The connection's first settled request: its (signed) receipt returns the deposit.
+      if (receipt.deposit_released_msat !== ctx.h2.connection_deposit_msat) {
+        throw new Error(`receipt ${n} releases a deposit of ${ctx.shown(receipt.deposit_released_msat)} msat, the offer's is ${ctx.h2.connection_deposit_msat}`)
+      }
+      this.deposit = { msat: receipt.deposit_released_msat, outcome: 'released', reason: 'request_settled', signed: !receipt.unsigned }
+      console.log(`[client ${s.label}] deposit: outcome=released reason=request_settled msat=${receipt.deposit_released_msat} signed=${!receipt.unsigned}`)
+    }
 
     // The request is settled: its records and its part of the stream go.
     this.connCredit -= bodyLen
@@ -736,6 +772,9 @@ export async function runHttp2(s: any, conn: H2Conn, tClaim: number): Promise<an
   await conn.open()
   const tOpen = Date.now()
   const setupBytes = { ...conn.bytes, ...conn.channelBytes() }
+  if (ctx.nodeMode && s.ready.deposit_msat !== undefined && s.ready.deposit_msat !== ctx.h2.connection_deposit_msat) {
+    throw new Error(`the node reserved a deposit of ${ctx.shown(s.ready.deposit_msat)} msat, the signed offer's is ${ctx.h2.connection_deposit_msat}`)
+  }
   const results: any[] = []
   let adv: any
   for (let n = 1; n <= ctx.requests; n++) {
@@ -767,6 +806,15 @@ export async function runHttp2(s: any, conn: H2Conn, tClaim: number): Promise<an
       break
     }
   }
+  let lingered: number | undefined
+  if ((ctx.lingerMs ?? 0) > 0 && !adv && !results.some((r) => r.status >= 400)) {
+    // Stay idle: the node closes the connection after its `idle_timeout_s`.
+    const t0 = Date.now()
+    console.log(`[client ${s.label}] idle for up to ${ctx.lingerMs} ms, waiting for the node to close the connection`)
+    await Promise.race([s.waitT('closed', ctx.lingerMs!).catch(() => {}), conn.failP.catch(() => {})])
+    lingered = Date.now() - t0
+    console.log(`[client ${s.label}] connection closed: reason=${ctx.shown(conn.closedReason)} after_ms=${lingered}`)
+  }
   const phases = {
     ready_ms: Math.max(0, s.tReady - tClaim),
     twopc_key_share_ms: s.tKeyShare - s.tReady,
@@ -796,6 +844,8 @@ export async function runHttp2(s: any, conn: H2Conn, tClaim: number): Promise<an
     http: 2,
     requests: results,
     adv,
+    deposit: conn.deposit,
+    closed: conn.closedReason === undefined ? undefined : { reason: conn.closedReason, idle_ms: lingered },
     phases,
     setup_bytes: setupBytes,
     total_bytes: { ...conn.bytes, ...conn.channelBytes() },
