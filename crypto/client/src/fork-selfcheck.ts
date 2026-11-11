@@ -1,6 +1,7 @@
-// Offline self-check of the fork's v2 hooks (external key schedule).
+// Offline self-check of the fork's external key-schedule hooks (the two-party
+// handshake of protocol v3; the hooks carry the marker `FORK PATCH (v2)`).
 //
-//   node --experimental-strip-types src/v2-fork-selfcheck.ts
+//   node --experimental-strip-types src/fork-selfcheck.ts
 //
 // Checks: the ClientHello shape in external mode (one secp256r1 key share,
 // supported_groups = [secp256r1], one suite, TLS 1.3 only, no PSK /

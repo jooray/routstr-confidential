@@ -73,7 +73,7 @@ external: {
   is `undefined`); client certificates are refused.
 - `getTranscriptHashes()` returns `{ thSH, thSF }`.
 
-Checks: `src/v2-fork-selfcheck.ts` (offline) and `src/v2-layout-test.ts` (live
+Checks: `src/fork-selfcheck.ts` (offline) and `src/layout-test.ts` (live
 against the provider, 2PC simulated locally, N's epoch-0 records emulated).
 
 ## Protocol v3 hook: `writeInner`

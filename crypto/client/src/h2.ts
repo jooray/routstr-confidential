@@ -1,8 +1,9 @@
-// HTTP/2 for protocol v3, option A (`http: 2`; PROTOCOL-V3-DESIGN.md A): the
-// minimal framing layer of the reference client, an HPACK decoder for
-// response header blocks (static table, literals, Huffman; no dynamic table,
-// which the node's epoch-0 SETTINGS switch off), and the client-side checks
-// of the proof parameters the node sends for an `http: 2` session.
+// Framing "2" of protocol v3 (PROTOCOL-V3.md §5, §12.6): the minimal HTTP/2
+// framing layer of the reference client, an HPACK decoder for response header
+// blocks (static table, literals, Huffman; no dynamic table, which the node's
+// epoch-0 SETTINGS switch off), and the client-side checks of the proof
+// parameters the node sends: π_NK over the HTTP/2 connection head, and π_WIN
+// for both framings.
 //
 // The client is the prover of π_WIN and the node chooses its windows. The
 // equality bit must never become an oracle on private bytes, so every window
@@ -300,18 +301,17 @@ export interface H2OfferBlock {
   /** The sidecar's own idle limit (seconds). */
   idle_secs: number
   max_requests: number
-  /** Reserved at the setup, released after the connection's first settled request (msat; 0: none). */
-  connection_deposit_msat: number
-  /** The node closes a connection with no request in flight for this long (seconds). */
-  idle_timeout_s: number
+  /** A connection is closed at the first settlement after this long since `head_written` (seconds). */
+  max_lifetime_s: number
   /** The request kinds a connection serves: `chat`, and `images` when the offer has an images block. */
   kinds: string[]
 }
 
 /**
- * The signed offer's `h2` block, held to what the node's sidecar enforces at
- * startup: `http` lists "2", the probe is a canonical path that is a trusted
- * API base plus `/models`, and the limits are in range. Returns the block.
+ * The offer's `h2` block (PROTOCOL-V3.md §12.1), held to what the sidecar
+ * enforces at startup: `http` lists "2", the probe is a canonical path that
+ * is a trusted API base plus `/models`, and the limits are in range. Returns
+ * the block.
  */
 export function checkH2Offer(offer: any, apiBases: string[]): H2OfferBlock {
   if (!Array.isArray(offer?.http) || !offer.http.includes('2')) fail('offer_no_http2: the offer does not list http 2')
@@ -323,16 +323,12 @@ export function checkH2Offer(offer: any, apiBases: string[]): H2OfferBlock {
   if (!apiBases.some((base) => b.probe_path === `${base}/models`)) fail('offer_malformed: h2 probe_path is not a trusted API base plus /models')
   const idle = b.idle_secs ?? 300
   const max = b.max_requests ?? 100
+  const life = b.max_lifetime_s ?? 3600
+  if (!(Number.isSafeInteger(life) && life >= 60 && life <= 86400)) fail('offer_malformed: h2 max_lifetime_s')
   if (!(Number.isSafeInteger(idle) && idle >= 10 && idle <= 3600)) fail('offer_malformed: h2 idle_secs')
   if (!(Number.isSafeInteger(max) && max >= 1 && max <= 1000)) fail('offer_malformed: h2 max_requests')
   const host = offer.upstream_host
   if (typeof host !== 'string' || host.length >= 127 || !/^[A-Za-z0-9.-]+$/.test(host)) fail('offer_malformed: upstream_host')
-  // A node's two terms (absent from a sidecar's own offer): the deposit it
-  // reserves when a connection is opened, and how long it keeps an idle one.
-  const deposit = b.connection_deposit_msat === undefined ? 0 : b.connection_deposit_msat
-  const idleTimeout = b.idle_timeout_s === undefined ? idle : b.idle_timeout_s
-  if (!(Number.isSafeInteger(deposit) && deposit >= 0)) fail('offer_malformed: h2 connection_deposit_msat')
-  if (!(Number.isSafeInteger(idleTimeout) && idleTimeout >= 10 && idleTimeout <= idle)) fail('offer_malformed: h2 idle_timeout_s')
   // The request kinds: chat, or chat and images (absent: chat only).
   const kinds = b.kinds === undefined ? ['chat'] : b.kinds
   if (
@@ -347,13 +343,12 @@ export function checkH2Offer(offer: any, apiBases: string[]): H2OfferBlock {
     probe_path: b.probe_path,
     idle_secs: idle,
     max_requests: max,
-    connection_deposit_msat: deposit,
-    idle_timeout_s: idleTimeout,
+    max_lifetime_s: life,
     kinds: [...kinds],
   }
 }
 
-/** The request path of an `http: 2` chat request: the route of the offer's (already checked) head template. */
+/** The request path of a framing-"2" request: the route of the offer's (already checked) head template of its kind. */
 export function chatPath(headTemplate: string): string {
   const m = /^POST (\/[\x21-\x7e]*) HTTP\/1\.1\r\n/.exec(headTemplate)
   if (!m || m[1]!.length >= 127 || !CANONICAL_PATH.test(m[1]!)) fail('offer_malformed: no usable request path')
@@ -361,10 +356,10 @@ export function chatPath(headTemplate: string): string {
 }
 
 /**
- * π_NK for an `http: 2` session (the client verifies): the statement is
+ * π_NK for a framing-"2" connection (the client verifies): the statement is
  * rebuilt from the signed offer (host, probe path, key length) and the
  * anchor hk of our own 2PC output, so the node can only prove the connection
- * head of A.3: its SETTINGS (no dynamic table for responses, no push), its
+ * head of §5.2: its SETTINGS (no dynamic table for responses, no push), its
  * one probe request, and the credential as the one table entry.
  */
 export function checkPiNKParamsH2(
@@ -453,4 +448,29 @@ export function checkPiWinParams(
   if (ctBytes > MAX_WIN_BYTES) bad('too much ciphertext')
   for (const seq of own.covered ?? []) if (!seen.has(seq)) bad(`no window covers record ${seq}`)
   return { windows: ws.length, ctBytes }
+}
+
+/**
+ * π_WIN in framing "1.1" (§12.7): one batch of one record, our own final
+ * record at its own sequence number, and one window that is the whole record:
+ * the canonical suffix followed by the content-type byte `0x17`.
+ */
+export function checkPiWinFinalRecord(
+  m: { first_seq?: unknown; count?: unknown; params?: unknown },
+  own: { anchor: Uint8Array; seq: number; wire: Uint8Array; suffix: Uint8Array },
+): { windows: number; ctBytes: number } {
+  const bad = (what: string): never => fail(`π_WIN: node-supplied parameters rejected (${what})`)
+  if (m.first_seq !== own.seq || m.count !== 1) bad(`the batch is not our final record (sequence number ${own.seq})`)
+  const plain = cat(own.suffix, Uint8Array.from([0x17]))
+  const ct = own.wire.subarray(5, own.wire.length - 16)
+  if (ct.length !== plain.length) bad('our final record is not the suffix alone')
+  const ws = (m.params as { PiWin?: Record<string, any> } | null)?.PiWin?.windows
+  if (!Array.isArray(ws) || ws.length !== 1) bad('not exactly one window')
+  const w = ws[0] as Record<string, any>
+  if ((w.off ?? 0) !== 0 || (w.sel_start ?? 0) !== 0 || w.expected?.length !== plain.length) bad('the window is not the whole record')
+  return checkPiWinParams(m.params, {
+    anchor: own.anchor,
+    lookup: (seq) => (seq === own.seq ? { ct, plain, pub: [[0, plain.length]] } : undefined),
+    covered: [own.seq],
+  })
 }

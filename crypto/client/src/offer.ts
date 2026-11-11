@@ -1,0 +1,183 @@
+// What the reference client holds an offer to before it opens a connection
+// (PROTOCOL-V3.md §2.3, §12.1), and the byte-exact suffixes it renders from
+// it (docs/CHAT-SUFFIX.md, docs/CONFIDENTIAL-IMAGES.md).
+
+/** Compact JSON with object members sorted (the sidecar's serde_json form). */
+export function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`
+  if (v !== null && typeof v === 'object') {
+    const o = v as Record<string, unknown>
+    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(',')}}`
+  }
+  return JSON.stringify(v)
+}
+
+/** The chat suffix the offer's `chat` block defines (docs/CHAT-SUFFIX.md). */
+export function renderChatSuffix(chat: any, model: string, maxTokens: number): string {
+  const parts = [`"model":${JSON.stringify(model)}`]
+  for (const k of chat.cap_keys) parts.push(`${JSON.stringify(k)}:${maxTokens}`)
+  for (const [k, v] of chat.fixed_pins) parts.push(`${JSON.stringify(k)}:${canonicalJson(v)}`)
+  return `,${parts.join(',')}}`
+}
+
+const CAP_KEYS = ['max_tokens', 'max_completion_tokens', 'max_output_tokens']
+const PIN_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
+const pinValueOk = (v: unknown): boolean =>
+  typeof v === 'boolean' ||
+  (typeof v === 'number' && Number.isSafeInteger(v)) ||
+  (typeof v === 'string' && /^[\x20-\x7e]*$/.test(v) && !/["\\]/.test(v)) ||
+  (Array.isArray(v) && v.every(pinValueOk)) ||
+  (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.entries(v).every(([k, x]) => PIN_KEY.test(k) && pinValueOk(x)))
+/** A pin that switches something off: `false`, `"off"`, `[]`, or a non-empty object of those. */
+const pinIsOff = (v: unknown): boolean =>
+  v === false || v === 'off' || (Array.isArray(v) && v.length === 0) ||
+  (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 && Object.values(v).every(pinIsOff))
+/** Key prefixes under which `false` turns a feature on. */
+const NEGATING_PREFIXES = ['disable', 'no_', 'skip', 'without', 'exclude', 'omit', 'hide']
+/** Key words naming a protection: pinning one can only switch it off, so it stays the provider's default. */
+const PROTECTION_WORDS = ['safe', 'moderat', 'filter', 'nsfw', 'censor', 'guard']
+/** The first pin key, at any depth, that is negating or names a protection, or null. */
+export function refusedPinKey(k: string, v: unknown): string | null {
+  const l = k.toLowerCase()
+  if (NEGATING_PREFIXES.some((p) => l.startsWith(p)) || PROTECTION_WORDS.some((w) => l.includes(w))) return k
+  return refusedMemberKey(v)
+}
+function refusedMemberKey(v: unknown): string | null {
+  const members: [string | null, unknown][] = Array.isArray(v)
+    ? v.map((x) => [null, x])
+    : v !== null && typeof v === 'object' ? Object.entries(v) : []
+  for (const [m, x] of members) {
+    const bad = m === null ? refusedMemberKey(x) : refusedPinKey(m, x)
+    if (bad !== null) return bad
+  }
+  return null
+}
+
+/** Why the offer's chat block is outside the policy every client applies, or null. */
+export function chatBlockProblem(offer: any): string | null {
+  const c = offer?.chat
+  if (!c || typeof c !== 'object' || !Array.isArray(c.cap_keys) || !Array.isArray(c.fixed_pins)) return 'no chat block'
+  if (c.cap_keys.length === 0) return 'no cap key'
+  const seen = new Set<string>()
+  for (const k of c.cap_keys) {
+    if (!CAP_KEYS.includes(k) || seen.has(k)) return `cap key ${JSON.stringify(k)}`
+    seen.add(k)
+  }
+  for (const p of c.fixed_pins) {
+    if (!Array.isArray(p) || p.length !== 2 || typeof p[0] !== 'string') return 'a malformed pin'
+    const [k, v] = p
+    if (!PIN_KEY.test(k) || k === 'model' || CAP_KEYS.includes(k) || seen.has(k)) return `pin key ${JSON.stringify(k)}`
+    seen.add(k)
+    if (!pinValueOk(v)) return `pin ${k} outside the grammar`
+    const refused = refusedPinKey(k, v)
+    if (refused !== null) return `pin key ${JSON.stringify(refused)} negates or names a protection`
+    const ok = k === 'stream' ? v === true
+      : k === 'n' ? v === 1
+      : k === 'stream_options' ? canonicalJson(v) === '{"include_usage":true}'
+      : pinIsOff(v)
+    if (!ok) return `pin ${k}=${JSON.stringify(v)} is not allowed`
+  }
+  if (!seen.has('stream') || !seen.has('stream_options')) return 'stream and stream_options must be pinned'
+  const pins = c.fixed_pins.map(([k, v]: [string, unknown]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')
+  if (pins.length > 1024) return 'pins too long'
+  const keys = ['model', ...c.cap_keys, ...c.fixed_pins.map((p: [string, unknown]) => p[0])]
+  if (JSON.stringify(offer.suffix_keys) !== JSON.stringify(keys)) return `suffix_keys ${JSON.stringify(offer.suffix_keys)} are not ${JSON.stringify(keys)}`
+  return null
+}
+
+/** The variant pin keys a client lets the node pin (the price axes). */
+const VARIANT_PIN_KEYS = new Set(['resolution', 'quality', 'format'])
+
+/**
+ * The node signs the images block, but its pins reach the provider as the
+ * request's last word: a fixed pin may only switch a provider extra off
+ * (`false` or `[]`), a variant may only pin a price axis to a value the
+ * offer's parameter space lists, and the numbers stay in the ranges the relay
+ * enforces. Anything else is refused rather than rendered.
+ */
+export function checkImagesBlock(im: any): void {
+  const bad = (why: string): never => {
+    throw new Error(`offer_malformed: images block ${why}`)
+  }
+  const countKey = im.count_key ?? 'variants'
+  if (typeof countKey !== 'string' || !countKey) bad('count_key')
+  if (!(Number.isSafeInteger(im.max_count) && im.max_count >= 1 && im.max_count <= 4)) bad('max_count must be 1..4')
+  if (im.response_idle_s !== undefined && !(Number.isSafeInteger(im.response_idle_s) && im.response_idle_s >= 30 && im.response_idle_s <= 600)) {
+    bad('response_idle_s must be 30..600')
+  }
+  const space = im.param_space ?? {}
+  if (typeof space !== 'object' || Array.isArray(space)) bad('param_space')
+  for (const [k, v] of Object.entries(space)) {
+    if (!Array.isArray(v) || !v.every((x) => typeof x === 'string')) bad(`param_space.${k}`)
+  }
+  const fixed: unknown[] = im.fixed_pins ?? []
+  if (!Array.isArray(fixed)) bad('fixed_pins')
+  const fixedKeys = new Set<string>()
+  for (const pin of fixed) {
+    if (!Array.isArray(pin) || pin.length !== 2 || typeof pin[0] !== 'string') bad('fixed_pins entry')
+    const [k, v] = pin as [string, unknown]
+    if (!(v === false || (Array.isArray(v) && v.length === 0))) bad(`fixed pin ${k} does not switch an extra off`)
+    if (refusedPinKey(k, v) !== null) bad(`fixed pin ${k} negates or names a protection`)
+    if (k === 'model' || k === countKey || fixedKeys.has(k)) bad(`fixed pin ${k} repeats a pinned key`)
+    fixedKeys.add(k)
+  }
+  for (const [model, variants] of Object.entries(im.price_list ?? {})) {
+    if (!Array.isArray(variants) || variants.length === 0) bad(`price_list.${model}`)
+    const ids = new Set<string>()
+    for (const v of variants as any[]) {
+      if (typeof v?.id !== 'string' || ids.has(v.id)) bad(`variant ids of ${model}`)
+      ids.add(v.id)
+      if (!(Number.isSafeInteger(v.msat_per_image) && v.msat_per_image > 0)) bad(`${model}/${v.id} msat_per_image`)
+      if (v.max_count !== undefined && !(Number.isSafeInteger(v.max_count) && v.max_count >= 1 && v.max_count <= im.max_count)) {
+        bad(`${model}/${v.id} max_count`)
+      }
+      const keys = new Set<string>()
+      for (const pin of v.pins ?? []) {
+        if (!Array.isArray(pin) || pin.length !== 2) bad(`${model}/${v.id} pin`)
+        const [k, val] = pin
+        if (!VARIANT_PIN_KEYS.has(k) || keys.has(k) || fixedKeys.has(k)) bad(`${model}/${v.id} pins ${k}`)
+        if (typeof val !== 'string' || !(space[k] ?? []).includes(val)) bad(`${model}/${v.id} pins ${k} outside param_space`)
+        keys.add(k)
+      }
+    }
+  }
+}
+
+/** The pinned image suffix (docs/CONFIDENTIAL-IMAGES.md §0.3), byte-exact. */
+export function renderImagesSuffix(im: any, model: string, count: number, pins: [string, unknown][]): string {
+  const parts = [`"model":${JSON.stringify(model)}`, `${JSON.stringify(im.count_key)}:${JSON.stringify(count)}`]
+  for (const [k, v] of [...(im.fixed_pins ?? []), ...pins]) parts.push(`${JSON.stringify(k)}:${JSON.stringify(v)}`)
+  return `,${parts.join(',')}}`
+}
+
+/** A token count as the node reads one (a non-negative integer, else 0). */
+export function tokenCount(v: unknown): number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v > 0 ? v : 0
+}
+
+/**
+ * The most the node may charge for a usage at the signed rates (msats, no
+ * fee): prompt tokens at `in`, less cached reads at `cached_in` (never above
+ * `in`) and prompt-cache writes at `cache_write` (`in` when the offer has
+ * none), both counted inside `prompt_tokens`; the larger of that, the formula
+ * without writes and the uncached one (as the SDK's maxChargeMsats).
+ */
+export function maxUsageCharge(rates: any, usage: any): number {
+  const inRate = Number(rates.in)
+  const outRate = Number(rates.out)
+  const prompt = tokenCount(usage.prompt_tokens)
+  const completion = tokenCount(usage.completion_tokens)
+  const d = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object' ? usage.prompt_tokens_details : {}
+  const cached = Math.min(tokenCount(d.cached_tokens), prompt)
+  const written = Math.min(
+    [d.cache_creation_input_tokens, d.cache_write_tokens, d.cache_creation_tokens, usage.cache_creation_input_tokens]
+      .map(tokenCount)
+      .find((n) => n > 0) ?? 0,
+    prompt - cached,
+  )
+  const cachedRate = Math.min(Number(rates.cached_in ?? inRate), inRate)
+  const writeRate = Number(rates.cache_write ?? inRate)
+  const cost = (c: number, w: number) =>
+    Math.ceil((inRate * (prompt - c - w) + cachedRate * c + writeRate * w + outRate * completion) / 1000)
+  return Math.max(cost(0, 0), cost(cached, 0), cost(cached, written))
+}

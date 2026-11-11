@@ -1,5 +1,7 @@
-// Bridge between a spawned `cu-2pc` process (the client side of the protocol
-// v2 two-party handshake) and the node's `twopc` WebSocket.
+// Bridge between a spawned `cu-2pc` process (the client side of the two-party
+// key schedule `split-public-1`, PROTOCOL-V3.md §4) and the node's `twopc`
+// WebSocket. A peer that speaks another 2PC version ends cu-2pc with status 3
+// and the code `twopc_version_mismatch`, which is in the error it reports.
 //
 // stdin/stdout carry frames [channel u8][len u32 BE][payload]: channel 0 is
 // the 2PC protocol (relayed to the WebSocket), channel 1 is control JSON.
@@ -117,7 +119,7 @@ export class TwoPc {
       return
     }
     if (m.ev === 'error') {
-      this.fail(new Error(`cu-2pc: ${m.msg}`))
+      this.fail(new Error(`cu-2pc: ${typeof m.code === 'string' && !String(m.msg).includes(m.code) ? `${m.code}: ` : ''}${m.msg}`))
       return
     }
     const w = this.waiters.get(m.ev)

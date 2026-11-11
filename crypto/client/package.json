@@ -7,8 +7,8 @@
   "scripts": {
     "e2e": "node --experimental-strip-types src/driver.ts",
     "baseline": "node --experimental-strip-types src/baseline.ts",
-    "v2-layout": "node --experimental-strip-types src/v2-layout-test.ts",
-    "v2-selfcheck": "node --experimental-strip-types src/v2-fork-selfcheck.ts",
+    "layout": "node --experimental-strip-types src/layout-test.ts",
+    "fork-selfcheck": "node --experimental-strip-types src/fork-selfcheck.ts",
     "tls-records-check": "node --experimental-strip-types test/tls-fork-records-check.ts",
     "h2-selfcheck": "node --experimental-strip-types src/h2-selfcheck.ts",
     "h2-conn-test": "node --experimental-strip-types src/h2-conn-test.ts"

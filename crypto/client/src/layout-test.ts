@@ -1,6 +1,6 @@
-// v2 wire-layout test against the real provider (no node, no 2PC).
+// Wire-layout test of framing "1.1" against the real provider (no node, no 2PC).
 //
-// Simulates the protocol-v2 two-party handshake locally: two random P-256
+// Simulates the two-party handshake locally: two random P-256
 // scalars a_C, a_N, key share (a_C + a_N)·G, and the TLS 1.3 key schedule
 // computed here to answer the fork's external hooks. Then it emulates N:
 // the credential record at epoch-0 seq 0 under K_0/IV_0 and
@@ -11,7 +11,7 @@
 // First lists the provider's text models over a plain handshake (X25519, no
 // hooks), which also checks that the fork's default path still works.
 //
-//   VENICE_API_KEY=… node --experimental-strip-types src/v2-layout-test.ts [--model m] [--max-tokens n]
+//   VENICE_API_KEY=… node --experimental-strip-types src/layout-test.ts [--model m] [--max-tokens n]
 //
 // The API key is only ever placed inside the encrypted credential record; it
 // is never printed, logged or written anywhere.

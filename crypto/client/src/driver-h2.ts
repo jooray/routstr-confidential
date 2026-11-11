@@ -1,56 +1,25 @@
-// The `--http2` mode of the reference driver: protocol v3, option A
-// (PROTOCOL-V3-DESIGN.md A). One two-party handshake, the node writes the
-// HTTP/2 connection head with the credential in epoch 0, and this client then
-// sends sequential chat requests on the same TLS connection, naming the
-// credential by HPACK index.
+// Framing "2" of the reference driver (PROTOCOL-V3.md §5, §12.6, §12.8): one
+// two-party handshake, the node writes the HTTP/2 connection head with the
+// credential in epoch 0, and this client then sends sequential requests on
+// the same TLS connection, naming the credential by HPACK index.
 //
-// Everything up to π_NK (setup, 2PC, handshake) is the driver's `Session`;
-// this file is the connection after `head_written`: the frame layer, the
-// proof pump for the client's records (π_WIN), flow control by `release`,
-// and the per-request disclosure, attestation and receipt.
+// Everything up to `head_written` (setup, 2PC, handshake, π_NK) is the
+// driver's `Session`; this file is the connection after it: the frame layer,
+// `settings_seen`, the proof pump for the client's records (π_WIN), flow
+// control by `release`, and the per-request disclosure, attestation and
+// receipt.
 
 import { createHash } from 'node:crypto'
 
-import { concat, hex, sha256 } from './advice.ts'
+import { concat, hex } from './advice.ts'
+import { advOutcome, noteDepositRelease, openRequest, takeReceipt, type Ctx, type ImageTerms } from './ctx.ts'
 import {
-  FLAG, FRAME, FrameReader, MAX_DATA_IN_RECORD, chatPath, checkPiWinParams, decodeBlock, frame, frameHeader,
-  requestBlock, requestStream, splitBody, type H2OfferBlock, type RxFrame, type WinSource,
+  FLAG, FRAME, FrameReader, chatPath, checkPiWinParams, decodeBlock, frame, frameHeader,
+  requestBlock, requestStream, splitBody, type RxFrame, type WinSource,
 } from './h2.ts'
 import { checkPiC3SParams, serverTailEpoch } from './params.ts'
 
-/** What the driver hands this module (its flags, offer and helpers). */
-export interface H2Ctx {
-  offer: any
-  h2: H2OfferBlock
-  nodeMode: boolean
-  /** Node mode: fields every `request` carries (credential, offer signature, fees). */
-  requestExtras: Record<string, unknown>
-  /** Node mode: check a request's signed receipt (the charge against our own usage or the error status); throws. */
-  checkReceipt?: (receipt: any, q: { n: number; model: string; status: number; usage: any; image?: H2Image }) => void
-  requests: number
-  pauseMs: number
-  /** After the last request: wait this long for the node to close the idle connection. */
-  lingerMs?: number
-  /** Largest DATA payload per record. */
-  chunk: number
-  /** The body of request `n`: model, cap, bytes and the pinned suffix; `image` for an image request (A.13). */
-  buildBody: (n: number) => { model: string; maxTokens: number; body: Uint8Array; suffix: Uint8Array; canonicalSuffix: string; image?: H2Image }
-  /** Adversarial mode and the request it applies to. */
-  adv?: { mode: string; at: number; path?: string }
-  verifySig: (json: string, sig: string | undefined, pub: string, scheme: string | undefined) => boolean
-  shown: (v: unknown, max?: number) => string
-  writePrivate: (path: string, data: string | Uint8Array) => void
-  log: (o: unknown) => void
-}
-
-/** The terms of an image request: the offered variant (a node's offer), the count, the images route and the price. */
-export interface H2Image {
-  variant?: string
-  count: number
-  path: string
-  responseShape: string
-  msatPerImage: number
-}
+export type H2Ctx = Ctx
 
 /** One record this client sent after the handshake. */
 interface OutRec {
@@ -118,8 +87,9 @@ export class H2Conn {
   proofs: any[] = []
   /** The last usage disclosure sent (the replay probe presents it again). */
   private lastDisclosure: any
-  /** Bytes on the client-node channels. */
-  bytes = { relay_sent: 0, relay_recv: 0, control_sent: 0, control_recv: 0 }
+  /** The provider's SETTINGS_HEADER_TABLE_SIZE (the last value it sent; null: never, the default 4096). */
+  tableSize: number | null = null
+  private settingsSeenSent = false
 
   constructor(s: any, ctx: H2Ctx) {
     this.s = s
@@ -166,52 +136,39 @@ export class H2Conn {
       this.cur.released = true
       this.cur.tReleased = Date.now()
     }
-    if (m.type === 'closed' || m.type === 'error') this.onLastFrame(m)
   }
 
-  /** The connection deposit's outcome, as the node reported it (a receipt, or its last frame). */
-  deposit: { msat: number; outcome: string; reason: string; signed: boolean } | undefined
-  closedReason: string | undefined
-
-  /** The node's last frame (`closed` or `error`): it may carry the deposit's outcome, signed. */
-  private onLastFrame(m: any): void {
-    if (m.type === 'closed') this.closedReason = String(m.reason ?? '')
-    if (m.deposit === undefined) return
-    const { s, ctx } = this
-    const json: string = typeof m.deposit_json === 'string' ? m.deposit_json : JSON.stringify(m.deposit)
-    let signed = false
-    let d: any
-    try {
-      d = JSON.parse(json)
-      signed = ctx.verifySig(json, m.deposit_sig, s.ready?.pubkey, m.sig_scheme) && (d.sid === s.sid || d.sid === null)
-    } catch {
-      d = {}
-    }
-    this.deposit = { msat: Number(d.msat), outcome: String(d.outcome), reason: String(d.reason), signed }
-    console.log(
-      `[client ${s.label}] deposit: outcome=${ctx.shown(d.outcome)} reason=${ctx.shown(d.reason)} msat=${ctx.shown(d.msat)} ` +
-        `balance_msats=${ctx.shown(d.balance_msats)} signed=${signed}`,
-    )
+  /** §12.6: the provider's HEADER_TABLE_SIZE so far; before the first request and whenever a later SETTINGS carries it. */
+  sendSettingsSeen(): void {
+    this.settingsSeenSent = true
+    this.sendOrdered({ type: 'settings_seen', header_table_size: this.tableSize })
   }
 
   private onFrame(f: RxFrame): void {
     const cur = this.cur
     if (cur && f.stream === cur.stream && cur.firstFrameOff === undefined) cur.firstFrameOff = f.off
     switch (f.type) {
-      case FRAME.SETTINGS:
+      case FRAME.SETTINGS: {
         if (f.flags & FLAG.ACK) break
+        let carried = false
         for (let i = 0; i + 6 <= f.payload.length; i += 6) {
           const id = (f.payload[i]! << 8) | f.payload[i + 1]!
           const v = u32(f.payload, i + 2)
           if (id === 4) this.initialWindow = v
+          if (id === 1) {
+            this.tableSize = v
+            carried = true
+          }
         }
         this.gotSettings = true
-        this.ctx.log({ ev: 'h2_settings', initial_window: this.initialWindow })
+        this.ctx.log({ ev: 'h2_settings', initial_window: this.initialWindow, header_table_size: this.tableSize })
+        if (carried && this.settingsSeenSent) this.sendSettingsSeen()
         // Acknowledged with the next request's records (one π_WIN for both)
         // when none is open, else at once.
         if (this.requestOpen) void this.sendCtl('settings_ack', new Uint8Array(0))
         else this.unackedSettings++
         break
+      }
       case FRAME.PING:
         if (!(f.flags & FLAG.ACK)) void this.sendCtl('ping_ack', f.payload)
         break
@@ -339,7 +296,7 @@ export class H2Conn {
       })
     }
     const t = Date.now()
-    await this.s.proofV2('pi_win', 'prove', m.params, { Secret: Array.from(this.s.ap.clientAp1) })
+    await this.s.proof('pi_win', 'prove', m.params, { Secret: Array.from(this.s.ap.clientAp1) })
     const z = this.s.zkTimes.pi_win
     this.proofs.push({ proof: 'pi_win', purpose: 'records', n: this.cur?.n ?? 0, records: count, ...shape, ms: Date.now() - t, inner_ms: z?.inner_ms, bytes_sent: z?.bytes_sent, bytes_recv: z?.bytes_recv })
     this.ctx.log({ ev: 'pi_win_ok', first_seq: first, count, windows: shape.windows })
@@ -409,7 +366,7 @@ export class H2Conn {
     if (adv === 'hidden-headers') {
       // (a) A HEADERS frame for another stream inside what the node takes for
       // a DATA record: a short DATA frame, then the hidden frame.
-      const hidden = frame(FRAME.HEADERS, FLAG.END_HEADERS | FLAG.END_STREAM, stream + 2, hiddenBlock(host, ctx.h2.probe_path))
+      const hidden = frame(FRAME.HEADERS, FLAG.END_HEADERS | FLAG.END_STREAM, stream + 2, hiddenBlock(host, ctx.h2!.probe_path))
       const first = parts.length > 1 ? parts[0]! : b.body.subarray(0, b.body.length - suffixLen)
       const rest = parts.length > 1 ? parts.slice(1) : [b.body.subarray(b.body.length - suffixLen)]
       const content = concat(frame(FRAME.DATA, 0, stream, first), hidden)
@@ -425,7 +382,7 @@ export class H2Conn {
       const aLen = Math.max(d + 1, Math.min(privLen, 200))
       const a = concat(frameHeader(aLen, FRAME.DATA, 0, stream), b.body.subarray(0, aLen - d))
       const rawA = concat(a, Uint8Array.from([0x17]), new Uint8Array(d))
-      const hidden = frame(FRAME.HEADERS, FLAG.END_HEADERS | FLAG.END_STREAM, stream + 2, hiddenBlock(host, ctx.h2.probe_path))
+      const hidden = frame(FRAME.HEADERS, FLAG.END_HEADERS | FLAG.END_STREAM, stream + 2, hiddenBlock(host, ctx.h2!.probe_path))
       const tail = frame(FRAME.DATA, FLAG.END_STREAM, stream, b.body.subarray(aLen - d))
       const bLen = d + hidden.length + tail.length - 9
       const bContent = concat(frameHeader(bLen, FRAME.DATA, FLAG.END_STREAM, stream), new Uint8Array(d - 9).fill(0x20), hidden, tail)
@@ -441,20 +398,22 @@ export class H2Conn {
       upto: 0, streamCredit: this.initialWindow, released: false, parts: [], ended: false,
     }
     this.cur = cur
-    const bytes0 = { ...this.bytes, ...this.channelBytes() }
+    const bytes0 = s.allBytes()
     const proofs0 = this.proofs.length
 
-    // `request` first, then the records: the node opens the request, takes
-    // any SETTINGS acknowledgement and the records as one π_WIN batch.
-    this.requestOpen = true
-    if (b.image) {
-      // An image request: a node takes the variant and renders the suffix
-      // itself; a sidecar without a node is handed the suffix.
-      const terms = ctx.nodeMode ? { variant: b.image.variant, count: b.image.count } : { count: b.image.count, suffix: b.canonicalSuffix }
-      this.sendOrdered({ type: 'request', n, kind: 'images', model: b.model, ...terms, body_len: bodyLen, ...ctx.requestExtras })
-    } else {
-      this.sendOrdered({ type: 'request', n, kind: 'chat', model: b.model, max_tokens: b.maxTokens, body_len: bodyLen, ...ctx.requestExtras })
+    if (adv === 'early-record') {
+      // A record of a request the node has not accepted: a protocol error, the connection ends.
+      await this.sendRecord(plan[0]!.content, plan[0]!.pub)
+      await this.wait('error', 15000)
+      throw new Error('the node answered a record with no request open with no error')
     }
+    // `request`, then its answer; only then the records (§12.4). A refused
+    // request leaves the connection READY and its number unused.
+    const { ok, refused } = await openRequest(s, ctx, n, b, bodyLen, ctx.refuseFirst && n === 1, (o) => this.sendOrdered(o), (t, ms) => this.wait(t, ms))
+    if (ok.stream !== stream) throw new Error('request_ok names another stream')
+    if (!adv && ok.suffix !== b.canonicalSuffix) throw new Error('node expects a different pinned suffix than ours')
+    // Any SETTINGS acknowledgement and the records go as one π_WIN batch.
+    this.requestOpen = true
     while (this.unackedSettings > 0) {
       this.unackedSettings--
       void this.sendCtl('settings_ack', new Uint8Array(0))
@@ -463,10 +422,6 @@ export class H2Conn {
     cur.dataLens = plan.slice(1).map((p) => p.data)
     this.updateRelease()
     ctx.log({ ev: 'h2_request_sent', n, records: plan.length, body_len: bodyLen })
-
-    const ok = await this.wait('request_ok', 30000)
-    if (ok.n !== n || ok.stream !== stream) throw new Error('request_ok names another request or stream')
-    if (!adv && ok.suffix !== b.canonicalSuffix) throw new Error('node expects a different pinned suffix than ours')
 
     if (adv === 'replay-usage') return await this.replayUsage(cur)
 
@@ -479,7 +434,7 @@ export class H2Conn {
     let ownUsage: any
     let text = ''
     let imageOut: any
-    if (status >= 200 && status < 300 && b.image) {
+    if (b.image && ((status >= 200 && status < 300) || (ctx.acceptAny && status > 0))) {
       await this.until(() => cur.ended, 'the end of the stream', 600000)
       receipt = await this.settleAccept(cur)
       imageOut = this.imageResult(cur, b.image)
@@ -495,16 +450,9 @@ export class H2Conn {
     } else {
       throw new Error(`request ${n}: status ${status} is neither a success nor a disclosable error`)
     }
-    ctx.checkReceipt?.(receipt, { n, model: b.model, status, usage: ownUsage?.usage, image: b.image })
+    ctx.checkReceipt?.(receipt, { n, http: '2', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce })
     const tEnd = Date.now()
-    if (receipt.deposit_released_msat !== undefined) {
-      // The connection's first settled request: its (signed) receipt returns the deposit.
-      if (receipt.deposit_released_msat !== ctx.h2.connection_deposit_msat) {
-        throw new Error(`receipt ${n} releases a deposit of ${ctx.shown(receipt.deposit_released_msat)} msat, the offer's is ${ctx.h2.connection_deposit_msat}`)
-      }
-      this.deposit = { msat: receipt.deposit_released_msat, outcome: 'released', reason: 'request_settled', signed: !receipt.unsigned }
-      console.log(`[client ${s.label}] deposit: outcome=released reason=request_settled msat=${receipt.deposit_released_msat} signed=${!receipt.unsigned}`)
-    }
+    noteDepositRelease(s, ctx, receipt, n)
 
     // The request is settled: its records and its part of the stream go.
     this.connCredit -= bodyLen
@@ -514,15 +462,17 @@ export class H2Conn {
     this.cur = undefined
     this.requestOpen = false
 
-    const bytes1 = { ...this.bytes, ...this.channelBytes() }
+    const bytes1 = s.allBytes()
     const delta: Record<string, number> = {}
     for (const k of Object.keys(bytes1)) delta[k] = (bytes1 as any)[k] - ((bytes0 as any)[k] ?? 0)
     ctx.writePrivate(`${s.runDir}/response-${n}.txt`, text)
     ctx.writePrivate(`${s.runDir}/receipt-${n}.json`, JSON.stringify(receipt, null, 2))
     return {
       n,
+      http: '2',
       stream,
       model: b.model,
+      refused_first: refused,
       ...(b.image ? { kind: 'images', variant: b.image.variant, count: b.image.count, ...imageOut } : {}),
       status,
       body_len: bodyLen,
@@ -538,17 +488,6 @@ export class H2Conn {
       at: { start: cur.tStart, released: cur.tReleased, first_data: cur.tFirstData },
       proofs: this.proofs.slice(proofs0),
       bytes: delta,
-    }
-  }
-
-  /** Bytes of the 2PC and proof channels so far. */
-  channelBytes(): Record<string, number> {
-    const { twopc, zkchan } = this.s
-    return {
-      twopc_sent: twopc?.bytesSent ?? 0,
-      twopc_recv: twopc?.bytesRecv ?? 0,
-      zk_sent: zkchan?.bytesSent ?? 0,
-      zk_recv: zkchan?.bytesRecv ?? 0,
     }
   }
 
@@ -632,7 +571,7 @@ export class H2Conn {
         tailLens: d.tailLens,
       })
       const t = Date.now()
-      await s.proofV2('pi_c3s', 'prove', c3.params, { Secret: Array.from(s.ap.serverAp0) })
+      await s.proof('pi_c3s', 'prove', c3.params, { Secret: Array.from(s.ap.serverAp0) })
       const z = s.zkTimes.pi_c3s
       this.proofs.push({ proof: 'pi_c3s', n: cur.n, r_len: d.r.length, records: d.tailLens.length, ms: Date.now() - t, inner_ms: z?.inner_ms, bytes_sent: z?.bytes_sent, bytes_recv: z?.bytes_recv })
       const receipt = await this.receipt(cur, attJson)
@@ -673,7 +612,7 @@ export class H2Conn {
   }
 
   /** The images of an accepted response: the body is the DATA payloads up to END_STREAM, one JSON object. */
-  private imageResult(cur: Cur, image: H2Image): any {
+  private imageResult(cur: Cur, image: ImageTerms): any {
     const { s, ctx } = this
     const bodyBytes = concat(...cur.parts.map((p) => p.data))
     const warnings: string[] = []
@@ -744,7 +683,7 @@ export class H2Conn {
       covered: [...chunks.keys()].map((abs) => abs - this.hsCipher - epochStart),
     })
     const t = Date.now()
-    await s.proofV2('pi_win', 'prove', m.params, { Secret: Array.from(s.ap.serverAp0) })
+    await s.proof('pi_win', 'prove', m.params, { Secret: Array.from(s.ap.serverAp0) })
     const z = s.zkTimes.pi_win
     this.proofs.push({ proof: 'pi_win', purpose: 'error_head', n: cur.n, ...shape, ms: Date.now() - t, inner_ms: z?.inner_ms, bytes_sent: z?.bytes_sent, bytes_recv: z?.bytes_recv })
     const receipt = await this.receipt(cur, attJson)
@@ -763,7 +702,7 @@ export class H2Conn {
     const attJson: string = m.a_json ?? JSON.stringify(m.a)
     if (!ctx.verifySig(attJson, m.sig, s.ready.pubkey, m.sig_scheme)) throw new Error('attestation signature invalid')
     const a = JSON.parse(attJson)
-    if (a.sid !== s.sid || a.http !== 2 || a.n !== cur.n || a.stream !== cur.stream) throw new Error('attestation names another session or request')
+    if (a.sid !== s.sid || a.http !== '2' || a.n !== cur.n || a.stream !== cur.stream) throw new Error('attestation names another session or request')
     if (a.th_sh !== hex(s.thSH) || a.th_sf !== hex(s.thSF)) throw new Error('attestation names another handshake')
     if (!s.cCommitHex || a.c_commit !== s.cCommitHex) throw new Error('attestation names a different head-record commitment')
     if (s.certChainHash && a.cert_chain_hash !== hex(s.certChainHash)) throw new Error('attestation names a different certificate chain')
@@ -794,22 +733,8 @@ export class H2Conn {
     return attJson
   }
 
-  /** The request's signed receipt (or, with a node that settles, the unsigned usage frame). */
-  private async receipt(cur: Cur, attJson: string): Promise<any> {
-    const { s, ctx } = this
-    const m = await this.wait(['receipt', 'usage'], 60000)
-    const terminal = { kind: m.type as 'receipt' | 'usage', m }
-    if (terminal.kind === 'usage') {
-      if (terminal.m.n !== cur.n) throw new Error('usage frame is for another request')
-      return { sid: s.sid, n: cur.n, model: terminal.m.model, usage: terminal.m.usage, unsigned: true }
-    }
-    const receiptJson: string = terminal.m.receipt_json ?? JSON.stringify(terminal.m.receipt)
-    const receipt = JSON.parse(receiptJson)
-    if (!ctx.verifySig(receiptJson, terminal.m.sig, s.ready.pubkey, terminal.m.sig_scheme)) throw new Error('receipt signature invalid')
-    if (receipt.sid !== s.sid || receipt.n !== cur.n) throw new Error('receipt is for another session or request')
-    if (receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(attJson)))) throw new Error("receipt is not bound to this request's attestation")
-    ctx.log({ ev: 'receipt', n: cur.n, receipt })
-    return receipt
+  private receipt(cur: Cur, attJson: string): Promise<any> {
+    return takeReceipt(this.s, this.ctx, cur.n, attJson, (t, ms) => this.wait(t, ms))
   }
 
   /**
@@ -838,24 +763,26 @@ function hiddenBlock(host: string, path: string): Uint8Array {
   return concat(Uint8Array.from([0x82, 0x87, 0x01]), str(host), Uint8Array.from([0x04]), str(path), Uint8Array.from([0xbe]))
 }
 
-/** Run an `--http2` session on an armed, π_NK-verified driver session. */
-export async function runHttp2(s: any, conn: H2Conn, tClaim: number): Promise<any> {
+/**
+ * Serve requests `from`… on a framing-"2" connection whose head is proven
+ * (π_NK) and not yet written. Returns the settled requests and, for an
+ * attack, how it ended.
+ */
+export async function runHttp2(s: any, conn: H2Conn, from: number): Promise<{ results: any[]; adv?: any; lingered?: number }> {
   const { ctx } = conn
   s.sendText({ type: 'release_head' })
   await Promise.race([s.waitT('head_written', 30000), conn.failP])
-  const tHead = Date.now()
+  s.tHeadWritten = Date.now()
   ctx.log({ ev: 'head_written' })
   void conn.proofPump()
   await conn.open()
-  const tOpen = Date.now()
-  const setupBytes = { ...conn.bytes, ...conn.channelBytes() }
-  if (ctx.nodeMode && s.ready.deposit_msat !== undefined && s.ready.deposit_msat !== ctx.h2.connection_deposit_msat) {
-    throw new Error(`the node reserved a deposit of ${ctx.shown(s.ready.deposit_msat)} msat, the signed offer's is ${ctx.h2.connection_deposit_msat}`)
-  }
+  conn.sendSettingsSeen()
+  s.tOpen = Date.now()
+  s.setupBytes = s.allBytes()
   const results: any[] = []
   let adv: any
-  for (let n = 1; n <= ctx.requests; n++) {
-    if (n > 1 && ctx.pauseMs > 0) {
+  for (let n = from; n <= ctx.requests; n++) {
+    if (n > from && ctx.pauseMs > 0) {
       console.log(`[client ${s.label}] idle for ${ctx.pauseMs} ms before request ${n}`)
       await Promise.race([sleep(ctx.pauseMs), s.errP, conn.failP])
     }
@@ -863,7 +790,7 @@ export async function runHttp2(s: any, conn: H2Conn, tClaim: number): Promise<an
     try {
       const r = await conn.request(n)
       if (r.adv) {
-        adv = { mode: ctx.adv!.mode, at: n, refused: false, detail: r }
+        adv = { mode: ctx.adv!.mode, http: '2', at: n, refused: false, detail: r }
         break
       }
       results.push(r)
@@ -872,60 +799,28 @@ export async function runHttp2(s: any, conn: H2Conn, tClaim: number): Promise<an
           `usage=${JSON.stringify(r.usage ?? null)} receipt_sig_ok=${r.receipt_sig_ok}`,
       )
       if (attack) {
-        adv = { mode: ctx.adv!.mode, at: n, refused: false, detail: 'the request settled' }
+        adv = { mode: ctx.adv!.mode, http: '2', at: n, refused: false, detail: 'the request settled' }
         break
       }
       if (r.status >= 400) break // the node closes the connection after an error
     } catch (e) {
       if (!attack) throw e
       const cur = conn.cur
-      adv = { mode: ctx.adv!.mode, at: n, refused: true, reason: String((e as Error).message), body_released: !!cur?.released, response_frames: cur?.parts.length ?? 0, status: cur?.status ?? null }
+      adv = await advOutcome(s, ctx, e, { at: n, body_released: !!cur?.released, response_frames: cur?.parts.length ?? 0, status: cur?.status ?? null })
       break
     }
   }
   let lingered: number | undefined
-  if ((ctx.lingerMs ?? 0) > 0 && !adv && !results.some((r) => r.status >= 400)) {
+  if (results.some((r) => r.status >= 400)) {
+    // An error head was settled: the node ends the connection (`closed`, `error_settled`).
+    await Promise.race([s.waitT('closed', 5000).catch(() => {}), conn.failP.catch(() => {})])
+  } else if ((ctx.lingerMs ?? 0) > 0 && !adv) {
     // Stay idle: the node closes the connection after its `idle_timeout_s`.
     const t0 = Date.now()
     console.log(`[client ${s.label}] idle for up to ${ctx.lingerMs} ms, waiting for the node to close the connection`)
     await Promise.race([s.waitT('closed', ctx.lingerMs!).catch(() => {}), conn.failP.catch(() => {})])
     lingered = Date.now() - t0
-    console.log(`[client ${s.label}] connection closed: reason=${ctx.shown(conn.closedReason)} after_ms=${lingered}`)
+    console.log(`[client ${s.label}] connection closed: reason=${ctx.shown(s.closedReason)} after_ms=${lingered}`)
   }
-  const phases = {
-    ready_ms: Math.max(0, s.tReady - tClaim),
-    twopc_key_share_ms: s.tKeyShare - s.tReady,
-    twopc_phase_a_ms: s.tPhaseA,
-    twopc_phase_b_ms: s.tPhaseB,
-    handshake_ms: Math.max(0, s.tHs - s.tReady),
-    pi_nk_ms: s.tProofsReady - s.tNkStart,
-    head_ms: tHead - s.tProofsReady,
-    settings_ms: tOpen - tHead,
-    connect_ms: tOpen - tClaim,
-    zk_nk: s.zkTimes.pi_nk,
-    zkchan_ready_ms: s.zkchan?.tReady ? s.zkchan.tReady - s.zkchan.tStart : undefined,
-    twopc: s.twopc?.timings,
-  }
-  ctx.writePrivate(`${s.runDir}/client.jsonl`, s.logLines.join('\n') + '\n')
-  // The cold path: from the claim (the connection's start) to request 1.
-  const first = results[0]?.at
-  const cold = first && {
-    released_ms: first.released ? first.released - tClaim : undefined,
-    ttft_ms: first.first_data ? first.first_data - tClaim : undefined,
-  }
-  for (const r of results) delete r.at
-  return {
-    cold,
-    sid: s.sid,
-    protocol: 2,
-    http: 2,
-    requests: results,
-    adv,
-    deposit: conn.deposit,
-    closed: conn.closedReason === undefined ? undefined : { reason: conn.closedReason, idle_ms: lingered },
-    phases,
-    setup_bytes: setupBytes,
-    total_bytes: { ...conn.bytes, ...conn.channelBytes() },
-    receipt_sig_ok: results.length > 0 && results.every((r) => r.receipt_sig_ok),
-  }
+  return { results, adv, lingered }
 }

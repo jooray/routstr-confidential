@@ -1,13 +1,13 @@
 /**
- * Client-side checks of the proof parameters the node sends for π_NK, π_C2S
- * and π_C3S (protocol v2; protocol v1 and its π_C1/π_C2/π_C3 are retired).
+ * Client-side checks of the proof parameters the node sends for π_NK
+ * (framing "1.1") and π_C3S (protocol v3, PROTOCOL-V3.md §9.3; the π_WIN
+ * checks and the framing-"2" π_NK check are in h2.ts).
  *
  * The client is the prover and the node chooses the public parameters, so the
- * client only proves statements about data it already agreed to disclose: its
- * own final body record carrying the pinned suffix (π_C2S), and the final
- * server records covering its own disclosure (π_C3S). The circuits reveal
- * only an equality bit; these checks make sure the node cannot point even
- * that bit at other plaintext.
+ * client only proves statements about data it already agreed to disclose: the
+ * final server records covering its own disclosure (π_C3S). The circuits
+ * reveal only an equality bit; these checks make sure the node cannot point
+ * even that bit at other plaintext.
  */
 
 class SessionProtocolError extends Error {}
@@ -24,29 +24,6 @@ function fail(proof: string, what: string): never {
   throw new SessionProtocolError(`${proof}: node-supplied parameters rejected (${what})`);
 }
 
-function checkSuffixWindow(
-  proof: string,
-  p: Record<string, any>,
-  own: { seq: number; record: Uint8Array; suffix: Uint8Array },
-): void {
-  const payload = own.record.subarray(5);
-  const ctLen = payload.length - 16; // inner plaintext length (content + type byte)
-  const selLen = own.suffix.length;
-  const w = Math.min(selLen + 1 + 13, ctLen);
-  const off = ctLen - w;
-  const selStart = w - 1 - selLen;
-  if (selStart < 0) fail(proof, "suffix does not fit in our final record");
-  if (p.seq !== own.seq) fail(proof, `seq ${p.seq} is not our final record ${own.seq}`);
-  // v2 compares our suffix followed by the record's inner content type
-  // (0x17, public too); v1's π_C2 compares the suffix alone.
-  const want = proof === "π_C2S" ? Uint8Array.from([...own.suffix, 0x17]) : own.suffix;
-  if (p.off !== off || p.w !== w || p.sel_start !== selStart || p.sel_len !== want.length) {
-    fail(proof, "window is not the end of our final record");
-  }
-  if (!eq(p.ct_window, payload.subarray(off, off + w))) fail(proof, "ciphertext is not ours");
-  if (!eq(p.expected, want)) fail(proof, "expected bytes are not our suffix");
-}
-
 function checkTailRecords(
   proof: string,
   p: Record<string, any>,
@@ -54,7 +31,7 @@ function checkTailRecords(
     serverRecords: Uint8Array[];
     r: Uint8Array;
     skip: number;
-    /** Server KeyUpdates we saw before the covered records (v2). */
+    /** Server KeyUpdates we saw before the covered records. */
     keyUpdates?: number;
     /**
      * Records after the covered ones that carry no response bytes (KeyUpdates,
@@ -141,21 +118,9 @@ export function firstTailOffset(firstContent: number, rest: number, need: number
 }
 
 // ---------------------------------------------------------------------------
-// Protocol v2 (two-party handshake, docs/TWOPC-DESIGN.md). The proofs anchor
-// on public hashes of the secrets our 2PC output gave us (h1 = SHA256(c_ap_1),
-// h2 = SHA256(s_ap_0), hk = SHA256(K_0 ‖ IV_0)).
+// The proofs anchor on public hashes of the secrets our 2PC output gave us
+// (h1 = SHA256(c_ap_1), h2 = SHA256(s_ap_0), hk = SHA256(K_0 ‖ IV_0)).
 // ---------------------------------------------------------------------------
-
-/** π_C2S: the end of our own final epoch-1 body record, anchored on our h1. */
-export function checkPiC2SParams(
-  params: unknown,
-  own: { h1: Uint8Array; seq: number; record: Uint8Array; suffix: Uint8Array },
-): void {
-  const p = (params as { PiC2S?: Record<string, any> } | null)?.PiC2S;
-  if (!p) fail("π_C2S", "missing");
-  if (!eq(p.h1, own.h1)) fail("π_C2S", "anchor h1 is not the one from our 2PC");
-  checkSuffixWindow("π_C2S", p, own);
-}
 
 /** π_C3S: the final server records as we received them, anchored on our h2. */
 export function checkPiC3SParams(
@@ -219,9 +184,11 @@ export function serverTailEpoch(
 }
 
 /**
- * π_NK (the client verifies): rebuild the statement from the *signed* offer,
- * our own body length and the anchor hk from our own 2PC output, so the node
- * cannot prove a different template, key placement, alphabet or key (K_0).
+ * π_NK in framing "1.1" (the client verifies; PROTOCOL-V3.md §12.5): rebuild
+ * the statement from the *signed* offer's head template of the request's
+ * kind, the body length of our own request 1 and the anchor hk from our own
+ * 2PC output, so the node cannot prove a different template, key placement,
+ * alphabet or key (K_0).
  */
 export function checkPiNKParams(
   params: unknown,
@@ -230,12 +197,21 @@ export function checkPiNKParams(
     hk: Uint8Array;
     bodyLen: number;
     kind?: "chat" | "images";
+    /** When given: the route must be one of these API bases plus the endpoint of the kind. */
+    apiBases?: string[];
   },
 ): void {
   const p = (params as { PiNK?: Record<string, any> } | null)?.PiNK;
   if (!p) fail("π_NK", "missing");
   const tpl = own.offer.head_template ?? "";
   checkHeadTemplate(tpl, own.offer.upstream_host ?? "", own.kind ?? "chat");
+  if (own.apiBases) {
+    const ends = own.kind === "images" ? ["/image/generate", "/images/generations"] : ["/chat/completions"];
+    const route = /^POST (\S+) /.exec(tpl)?.[1];
+    if (!own.apiBases.some((b) => ends.some((e) => route === b + e))) {
+      fail("π_NK", "the template's route is not a trusted API base plus the endpoint");
+    }
+  }
   const keyLen = own.offer.key_length;
   if (typeof keyLen !== "number" || !Number.isInteger(keyLen) || keyLen <= 0) {
     fail("π_NK", "signed offer has no key length");

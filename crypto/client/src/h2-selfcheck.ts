@@ -1,14 +1,15 @@
 // Offline self-check of the reference client's HTTP/2 layer (protocol v3,
-// option A) against the vectors the sidecar's tests generate
-// (`h2-vectors.json`, `cargo test -p cu-sidecar client_vectors`), and of the
-// π_WIN parameter checks.
+// framing "2") against the vectors the sidecar's tests generate
+// (`h2-vectors.json`, `cargo test -p cu-sidecar client_vectors`), of the
+// π_WIN parameter checks of both framings, and of the `request` message.
 //
 //   node --experimental-strip-types src/h2-selfcheck.ts
 
 import { readFileSync } from 'node:fs'
 
+import { RequestRefused, openRequest, requestMessage, type ReqBody } from './ctx.ts'
 import {
-  FLAG, FRAME, FrameReader, checkH2Offer, checkPiNKParamsH2, checkPiWinParams, decodeBlock, frame, h2Head, huffmanDecode,
+  FLAG, FRAME, FrameReader, checkH2Offer, checkPiNKParamsH2, checkPiWinFinalRecord, checkPiWinParams, decodeBlock, frame, h2Head, huffmanDecode,
   requestBlock, splitBody, type WinSource,
 } from './h2.ts'
 
@@ -66,7 +67,7 @@ for (const [len, sfx, chunk] of [[10, 4, 100], [100, 30, 40], [81, 30, 40], [163
 }
 
 // The offer's h2 block.
-const offer = { http: ['1.1', '2'], upstream_host: 'api.venice.ai', h2: { probe_path: '/api/v1/models', idle_secs: 300, max_requests: 100 } }
+const offer = { http: ['2', '1.1'], upstream_host: 'api.venice.ai', h2: { probe_path: '/api/v1/models', idle_secs: 300, max_requests: 100, max_lifetime_s: 3600 } }
 const bases = ['/v1', '/api/v1']
 ok(checkH2Offer(offer, bases).probe_path === '/api/v1/models', 'offer accepted')
 throws(() => checkH2Offer({ ...offer, http: ['1.1'] }, bases), 'offer without http 2', /offer_no_http2/)
@@ -76,6 +77,8 @@ for (const probe_path of ['/api/v1/api_keys', '/api/v1/../v1/models', '/api/v1/m
 }
 throws(() => checkH2Offer({ ...offer, h2: { ...offer.h2, idle_secs: 0 } }, bases), 'idle_secs')
 throws(() => checkH2Offer({ ...offer, h2: { ...offer.h2, max_requests: 100000 } }, bases), 'max_requests')
+throws(() => checkH2Offer({ ...offer, h2: { ...offer.h2, max_lifetime_s: 30 } }, bases), 'max_lifetime_s')
+ok(checkH2Offer({ ...offer, h2: { probe_path: '/api/v1/models' } }, bases).max_lifetime_s === 3600, 'h2 defaults')
 
 // π_NK: only the offer's connection head.
 const hk = new Uint8Array(32).fill(9)
@@ -140,5 +143,63 @@ ok(
   checkPiWinParams({ PiWin: { anchor: Array.from(anchor), windows: [whole] } }, { anchor, lookup: () => ({ ct: sc, plain: sp, pub: [[0, 9], [9, sp.length]] }) }).windows === 1,
   'adjacent public ranges',
 )
+
+// Framing "1.1": one window, the whole final record = suffix ‖ 0x17, at our own sequence number.
+{
+  const suffix = new TextEncoder().encode(',"model":"m","max_tokens":12,"stream":true}')
+  const fp = Uint8Array.from([...suffix, 0x17])
+  const fc = fp.map((b, i) => b ^ ((i * 11 + 1) & 0xff))
+  const wire = Uint8Array.from([0x17, 3, 3, 0, fc.length + 16, ...fc, ...new Uint8Array(16)])
+  const own = { anchor, seq: 13, wire, suffix }
+  const msg = (w: Record<string, unknown>[], first_seq = 13, count = 1) => ({ first_seq, count, params: { PiWin: { anchor: Array.from(anchor), windows: w } } })
+  const full = { seq: 13, ct: Array.from(fc), expected: Array.from(fp) }
+  ok(checkPiWinFinalRecord(msg([full]), own).windows === 1, 'framing 1.1: the whole final record')
+  const refuse = (m: any, what: string, o: any = own) => throws(() => checkPiWinFinalRecord(m, o), `framing 1.1: ${what}`, /π_WIN/)
+  refuse(msg([full], 12), 'another sequence number')
+  refuse(msg([{ ...full, seq: 12 }]), 'a window on another record')
+  refuse(msg([full], 13, 2), 'a batch of two records')
+  refuse(msg([full, full]), 'two windows')
+  refuse(msg([{ seq: 13, ct: Array.from(fc.subarray(0, 16)), expected: Array.from(fp.subarray(0, 16)) }]), 'a partial window')
+  refuse(msg([{ ...full, expected: Array.from(fp).map((b, i) => (i === 3 ? b ^ 1 : b)) }]), 'bytes that are not our suffix')
+  refuse(msg([{ ...full, ct: Array.from(fc).map((b, i) => (i === 0 ? b ^ 1 : b)) }]), 'ciphertext not ours')
+  // Our own final record must be the suffix alone: a longer record is not proven as a whole.
+  const longer = Uint8Array.from([0x17, 3, 3, 0, fc.length + 17, 0x20, ...fc, ...new Uint8Array(16)])
+  refuse(msg([full]), 'a final record that is not the suffix alone', { ...own, wire: longer })
+}
+
+// The `request` message (§12.4) and its answer: nothing is sent between `request` and `request_ok`;
+// a refused request is followed by the good one with the same n.
+{
+  const enc = new TextEncoder()
+  const b: ReqBody = { kind: 'chat', model: 'm', maxTokens: 12, body: enc.encode('{"messages":[],"model":"m"}'), suffix: enc.encode(',"model":"m"}'), canonicalSuffix: ',"model":"m"}' }
+  const base: any = { offer: { max_tokens_cap: 4096 }, nodeMode: false, requestExtras: {}, shown: String }
+  const direct = requestMessage(base, 1, b, 27)
+  ok(JSON.stringify(direct) === '{"type":"request","n":1,"kind":"chat","model":"m","max_tokens":12,"body_len":27}', 'request to a sidecar')
+  ok((requestMessage(base, 1, b, 27, true) as any).max_tokens === 4097, 'a request a sidecar must refuse: max_tokens above the cap')
+  const node: any = { ...base, nodeMode: true, requestExtras: { auth: 'sk-x', offer_sig: 'ab', session_fee_msat: 5, abandon_fee_msat: 7 } }
+  const viaNode: any = requestMessage(node, 2, b, 27)
+  ok(viaNode.auth === 'sk-x' && viaNode.offer_sig === 'ab' && viaNode.session_fee_msat === 5 && viaNode.abandon_fee_msat === 7 && viaNode.n === 2, 'request to a node')
+  ok((requestMessage(node, 1, b, 27, true) as any).model !== 'm', 'a request a node must refuse: a model it does not serve')
+  const img: ReqBody = { ...b, kind: 'images', image: { variant: 'v1', count: 2, path: '/api/v1/image/generate', headTemplate: '', responseShape: 'venice', msatPerImage: 9 } }
+  const im: any = requestMessage(base, 1, img, 30)
+  ok(im.kind === 'images' && im.count === 2 && im.suffix === b.canonicalSuffix && im.variant === undefined && im.max_tokens === undefined, 'image request to a sidecar')
+  const imN: any = requestMessage(node, 1, img, 30)
+  ok(imN.variant === 'v1' && imN.count === 2 && imN.suffix === undefined, 'image request to a node')
+
+  const sent: any[] = []
+  const answers: any[] = [{ type: 'request_refused', n: 1, status: 400, reason: 'max_tokens above the cap' }, { type: 'request_ok', sid: 's', n: 1, suffix: b.canonicalSuffix, stream: 3 }]
+  const quiet = console.log
+  console.log = () => {}
+  const r = await openRequest({ sid: 's', label: 't' }, base, 1, b, 27, true, (o) => sent.push(o), async () => answers.shift())
+  console.log = quiet
+  ok(sent.length === 2 && sent[0].n === 1 && sent[1].n === 1 && sent[0].max_tokens === 4097 && sent[1].max_tokens === 12, 'refuse-first: the good request carries the same n')
+  ok(r.refused?.status === 400 && r.ok.stream === 3, 'refuse-first: outcome')
+  const refused = await openRequest({ sid: 's', label: 't' }, base, 1, b, 27, false, () => {}, async () => ({ type: 'request_refused', n: 1, status: 402, reason: 'balance' })).catch((e) => e)
+  ok(refused instanceof RequestRefused && refused.status === 402, 'a refused request is reported as such')
+  const other = await openRequest({ sid: 's', label: 't' }, base, 1, b, 27, false, () => {}, async () => ({ type: 'request_ok', sid: 'x', n: 1, suffix: '' })).catch((e) => e)
+  ok(other instanceof Error && !(other instanceof RequestRefused), 'request_ok for another connection')
+  const accepted = await openRequest({ sid: 's', label: 't' }, base, 1, b, 27, true, () => {}, async () => ({ type: 'request_ok', sid: 's', n: 1, suffix: '' })).catch((e) => e)
+  ok(String(accepted).includes('had to refuse'), 'refuse-first: an accepted bad request is a failure')
+}
 
 console.log(`h2-selfcheck: ${checks} checks passed`)

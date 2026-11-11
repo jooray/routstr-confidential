@@ -1,7 +1,7 @@
 // Bridge between a long-lived `cu-prover --channel` process and the node's
-// `zkchan` WebSocket: the v2 session's proof channel. The OT/VOLE setup for
-// π_NK, π_C2S and π_C3S runs once, when the session is armed; each proof at
-// claim time then costs a couple of round trips.
+// `zkchan` WebSocket: the connection's proof channel. The OT/VOLE setup for
+// π_NK, π_WIN and π_C3S runs once, when the connection is opened (or armed);
+// each proof then costs a couple of round trips.
 //
 // stdin/stdout carry frames [channel u8][len u32 BE][payload]: channel 0 is
 // the proof protocol (relayed to the WebSocket), channel 1 is control JSON.
@@ -66,8 +66,8 @@ export class ZkChan {
     this.readyP.catch(() => {})
   }
 
-  /** `multi`: an `http: 2` session, where π_WIN and π_C3S run once per request. */
-  start(url: string, multi = false): void {
+  /** π_NK runs once on the channel; π_WIN and π_C3S once per `zk_params`. */
+  start(url: string): void {
     this.ws = new WebSocket(url)
     this.ws.binaryType = 'arraybuffer'
     this.ws.onopen = () => {
@@ -87,7 +87,6 @@ export class ZkChan {
     this.ws.onerror = () => this.fail(new Error('proof channel websocket error'))
     this.ws.onclose = () => this.fail(new Error('proof channel websocket closed'))
     const args = ['--channel']
-    if (multi) args.push('--multi')
     if (process.env.CU_PREALLOC_NK) args.push('--prealloc-nk', process.env.CU_PREALLOC_NK)
     if (process.env.CU_PREALLOC_CP) args.push('--prealloc-cp', process.env.CU_PREALLOC_CP)
     this.child = spawn(CU_PROVER, args, { stdio: ['pipe', 'pipe', 'inherit'], env: process.env })

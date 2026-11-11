@@ -1,70 +1,87 @@
-// Session driver: C side of the confidential-upstream protocol (v2,
-// docs/TWOPC-DESIGN.md).
+// Reference driver: the client (C) of routstr-confidential protocol v3
+// (PROTOCOL-V3.md; the wire format is its §12), for both framings.
 //
-// C is the TLS 1.3 client of the upstream session. It runs the key schedule
-// with the node as a two-party computation and gets c_ap_1 and s_ap_0; the
-// node gets only K_0/IV_0, the key of the credential record, which C never
-// holds.
+// C is the TLS 1.3 client of the provider. It runs the key schedule with the
+// node as a two-party computation and gets c_ap_1 and s_ap_0; the node gets
+// only K_0/IV_0, the key of the head record with the credential, which C
+// never holds. A connection carries requests: many, one after another, in
+// framing "2" (HTTP/2, driver-h2.ts), exactly one in framing "1.1"
+// (HTTP/1.1, driver-h11.ts).
 //
 // Two deployments:
-//   * direct  (--sidecar http://127.0.0.1:7443): the prototype layout, C talks
-//     to cu-sidecar's /session and /zk directly (sidecar signs with ed25519).
+//   * direct  (--sidecar http://127.0.0.1:7443): C talks to cu-sidecar's
+//     /offer, /session and /zk (the "S" messages of §12; ed25519 signatures).
 //   * node    (--node http://127.0.0.1:8000): C talks to the routstr node's
-//     /v1/confidential/ws and /v1/confidential/zk proxies; the node reserves
-//     the model's max cost on the bearer (--auth: sk- key or Cashu token),
-//     settles the verified usage on it and signs with its Nostr key (schnorr).
+//     /v1/confidential/{offer,ws,zk} (the "N" messages; the node reserves a
+//     connection deposit at the setup and each request at its `request`,
+//     settles the verified usage and signs with its Nostr key).
 //
-// Pre-warm: --arm performs everything up to π_NK (setup, 2PC, TLS handshake,
-// node handshake verification, π_NK on the credential record) and then waits
-// for a claim; --pool N keeps N armed sessions ready.
+// Flags (defaults in brackets):
+//   --http 2|1.1|auto [auto]   the framing; auto = the first entry of the verified offer's `http`,
+//                              with the fallback of §2.3 (--http2 = --http 2)
+//   --requests N [1]           N requests: on one connection (framing "2"), or one connection each ("1.1")
+//   --model M  --max-tokens N  --prompt TEXT  --attach IMAGE  --private-extra JSON-MEMBERS [--private-extra-at N]
+//   --models a,b,…  --kinds chat,images,…   per-request model and kind (also --h2-models, --h2-kinds)
+//   --image [--image-model M] [--variant ID] [--count N] [--resolution 1K|2K|4K]
+//   --body-bytes N             pad the prompt to about N bytes (a big body)
+//   --arm                      pre-warm: setup with armed:true, 2PC preprocessing, key share and proof
+//                              channel, then wait for "go" on stdin and send the request
+//   --abandon                  arm a connection and close it unused
+//   --refuse-first             before request 1, send a request the peer must refuse (request_refused),
+//                              then the good one on the same connection with the same n
+//   --pause-ms N  --linger-ms N  --h2-chunk N  --max-deposit MSAT [100000]  --no-zkchan
+//   --auth CREDENTIAL  --node-pubkey HEX|npub  --trusted-host H  --runs-dir DIR  --no-accept-fee
+//   --legacy-v2-socket [--legacy-no-v]   open a protocol-v2 socket and print the peer's answer (LEGACY_JSON)
+//   --adv MODE [--adv-at N]    an attack on request N (also --adv-h2):
+//       both framings: suffix (another suffix: --adv-suffix-model M = model swap, --adv-body-max-tokens N =
+//                      cap swap, --adv-image-count N), padding, early-record, no-proof, own-keyshare, twopc-tag
+//       framing "2":   hidden-headers, path [--adv-h2-path P], replay-usage
+//       framing "1.1": not-alone (the suffix is not alone in the final record)
+//     --adv-accept-any (accept an image response whatever its status), --decoy-model M (neutralised)
 //
-// See docs/TWOPC-DESIGN.md and docs/APPROACH.md.
+// Output: `E2E_JSON {…}` (every request with its bytes each way and times), one `BENCH {…}` line per
+// request (cold / armed / open), `ADV {…}` for an attack. Exit: 0 every request settled (or the attack
+// was refused), 1 failure, 2 usage, 3 a receipt was not verified, 4 the offer is refused, 5 an attack
+// was not refused, 6 node_protocol_outdated, 7 upgrade_required (the peer refused our protocol version).
 
-import { createHash, createPublicKey, randomUUID, verify as cryptoVerify } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { argv } from 'node:process'
 import { fileURLToPath } from 'node:url'
 
-// Temporary/low-noise tracing: `CU_TRACE=1` prints every control frame with a
-// millisecond timestamp to stderr. Off by default so normal runs stay quiet.
+// `CU_TRACE=1` prints every control frame with a millisecond timestamp to stderr.
 const T0 = Date.now()
 const TRACE = process.env.CU_TRACE === '1'
 const trace = (label: string, extra = '') =>
   TRACE ? process.stderr.write(`[t+${String(Date.now() - T0).padStart(6)}] ${label} ${extra}\n`) : undefined
 
-import { schnorr } from '@noble/curves/secp256k1'
+import { makeTLSClient } from '../vendor/tls/lib/index.js'
+import { setCryptoImplementation } from '../vendor/tls/lib/crypto/index.js'
+import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
 
-/**
- * A node-chosen value as it may appear on the terminal: a number or a plain
- * token as is, anything else truncated, JSON-quoted and ASCII only (no
- * terminal escapes).
- */
-export function shown(v: unknown, max = 120): string {
-  if (typeof v === 'number' || typeof v === 'boolean' || v === undefined || v === null) return String(v)
-  let s = typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v))
-  if (/^[A-Za-z0-9_.:/+-]+$/.test(s) && s.length <= max) return s
-  if (s.length > max) s = `${s.slice(0, max)}...`
-  return termSafe(JSON.stringify(s))
-}
+import { concat, hex, sha256 } from './advice.ts'
+import { Bus, waitMsg } from './bus.ts'
+import { RequestRefused, advOutcome, type Ctx, type Framing, type ImageTerms, type ReqBody } from './ctx.ts'
+import { H11 } from './driver-h11.ts'
+import { H2Conn, runHttp2 } from './driver-h2.ts'
+import { MAX_DATA_IN_RECORD, chatPath, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
+import { chatBlockProblem, checkImagesBlock, maxUsageCharge, renderChatSuffix, renderImagesSuffix } from './offer.ts'
+import { checkHeadTemplate, checkPiNKParams, type ServerPostRecord } from './params.ts'
+import { pubkeyHex, verifySig } from './sig.ts'
+import { errText, shown, termSafe } from './term.ts'
+import { TwoPc, type ApOut } from './twopc.ts'
+import { runZk } from './zkbridge.ts'
+import { ZkChan } from './zkchan.ts'
 
-/**
- * Text for the terminal: control and format characters (escape sequences,
- * bidi overrides, line separators) escaped, newlines too unless kept.
- */
-export function termSafe(s: string, keepNewlines = false): string {
-  return s.replace(/[\p{C}\p{Zl}\p{Zp}]/gu, (c) => {
-    if (keepNewlines && c === '\n') return c
-    const cp = c.codePointAt(0)!
-    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, '0')}`
-  })
-}
+export { shown, termSafe } from './term.ts'
+export { chatBlockProblem, checkImagesBlock, refusedPinKey, renderChatSuffix, renderImagesSuffix } from './offer.ts'
 
-/** An error for the terminal: its message escaped and bounded (the stack only under CU_TRACE). */
-const errText = (e: unknown): string => {
-  const text = e instanceof Error ? (TRACE && e.stack ? e.stack : `${e.name}: ${e.message}`) : String(e)
-  return termSafe(text.length > 2000 ? `${text.slice(0, 2000)}...` : text, TRACE)
-}
+setCryptoImplementation(webcryptoCrypto)
+
+/** The protocol version, and the key-schedule protocol this client implements (§4). */
+const PROTO = 3
+const TWOPC = 'split-public-1'
 
 /** The protocol sid: a 32-byte digest in lowercase hex. */
 export const SID_RE = /^[0-9a-f]{64}$/
@@ -72,175 +89,90 @@ export const SID_RE = /^[0-9a-f]{64}$/
 /** Evidence files hold plaintext (prompt, response, receipt): owner-only. */
 const writePrivate = (path: string, data: string | Uint8Array) => writeFileSync(path, data, { mode: 0o600 })
 
-import { makeTLSClient } from '../vendor/tls/lib/index.js'
-import { setCryptoImplementation } from '../vendor/tls/lib/crypto/index.js'
-import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
-
-import { concat, hex, sha256 } from './advice.ts'
-import { runZk } from './zkbridge.ts'
-import { checkHeadTemplate, checkPiC2SParams, checkPiC3SParams, serverTailEpoch, type ServerPostRecord } from './params.ts'
-import { TwoPc, type ApOut } from './twopc.ts'
-import { ZkChan } from './zkchan.ts'
-import { Bus, waitMsg } from './bus.ts'
-import { H2Conn, runHttp2, type H2Ctx } from './driver-h2.ts'
-import { MAX_DATA_IN_RECORD, chatPath, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
-
-setCryptoImplementation(webcryptoCrypto)
-
 function arg(name: string, dflt?: string): string | undefined {
   const i = argv.indexOf(name)
   return i >= 0 ? argv[i + 1] : dflt
 }
-
-/** A Nostr pubkey as lower-case x-only hex, from 64-hex or an `npub1…`; null if neither. */
-function pubkeyHex(input: string): string | null {
-  const s = input.trim()
-  if (/^[0-9a-fA-F]{64}$/.test(s)) return s.toLowerCase()
-  const lower = s.toLowerCase()
-  if (!lower.startsWith('npub1') || lower.length < 12) return null
-  const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
-  const data: number[] = []
-  for (const c of lower.slice(5)) {
-    const v = CHARSET.indexOf(c)
-    if (v < 0) return null
-    data.push(v)
-  }
-  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
-  let chk = 1
-  const hrp = [...'npub'].map((c) => c.charCodeAt(0))
-  for (const v of [...hrp.map((c) => c >> 5), 0, ...hrp.map((c) => c & 31), ...data]) {
-    const top = chk >>> 25
-    chk = ((chk & 0x1ffffff) << 5) ^ v
-    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= GEN[i]!
-  }
-  if (chk !== 1) return null
-  let acc = 0
-  let bits = 0
-  const out: number[] = []
-  for (const v of data.slice(0, -6)) {
-    acc = ((acc << 5) | v) & 0xfff
-    bits += 5
-    if (bits >= 8) {
-      bits -= 8
-      out.push((acc >> bits) & 0xff)
-    }
-  }
-  if (bits >= 5 || (acc & ((1 << bits) - 1)) !== 0 || out.length !== 32) return null
-  return out.map((b) => b.toString(16).padStart(2, '0')).join('')
+const usage = (what: string): never => {
+  console.error(`[client] ${what}`)
+  process.exit(2)
 }
 
 const NODE = arg('--node')
 const SIDECAR = arg('--sidecar', 'http://127.0.0.1:7443')!
+const NODE_MODE = !!NODE
 const MODEL = arg('--model', 'mistral-small-3-2-24b-instruct')!
 const MAX_TOKENS = Number(arg('--max-tokens', '12'))
 const PROMPT = arg('--prompt', 'Say hi in three words.')!
 // Chat with an image input: --attach PATH puts the file in the private body as
 // a data URI image part (the node never sees it; the provider bills it as
-// prompt tokens, provider-profile-check.py A13). Needs a vision model.
+// prompt tokens). Needs a vision model.
 const ATTACH = arg('--attach')
-// Image generation (docs/CONFIDENTIAL-IMAGES.md): --image [--count N]
-// [--variant <id>] (node offer) or [--resolution 1K|2K|4K] (direct sidecar).
+const HTTP_MODE = arg('--http') ?? (argv.includes('--http2') ? '2' : 'auto')
+if (!['2', '1.1', 'auto'].includes(HTTP_MODE)) usage('--http must be 2, 1.1 or auto')
+const REQUESTS = Number(arg('--requests', '1'))
+// Per-request models and kinds (request i uses entry i, then --model / chat or, with --image, images).
+const MODELS = (arg('--models') ?? arg('--h2-models') ?? '').split(',').filter(Boolean)
+const KINDS = (arg('--kinds') ?? arg('--h2-kinds') ?? '').split(',').filter(Boolean)
 const IMAGE = argv.includes('--image')
+const IMAGE_MODEL = arg('--image-model')
 const IMAGE_COUNT = Number(arg('--count', '1'))
 const IMAGE_VARIANT = arg('--variant')
 const IMAGE_RESOLUTION = arg('--resolution')
-// Adversarial image probes: pin a different count in the body suffix than the
-// setup names, and accept the response whatever its status (a dishonest client).
+// Test hook: extra private JSON members (e.g. a field the provider rejects, to
+// exercise the error-head path); --private-extra-at N: for request N only.
+const PRIVATE_EXTRA = arg('--private-extra')
+const PRIVATE_EXTRA_AT = Number(arg('--private-extra-at', '0'))
+// A second `model` member in the private part: neutralised (the pinned suffix comes last).
+const DECOY = arg('--decoy-model')
+const PAUSE_MS = Number(arg('--pause-ms', '0'))
+const BODY_BYTES = Number(arg('--body-bytes', '0'))
+const H2_CHUNK = Number(arg('--h2-chunk', String(MAX_DATA_IN_RECORD)))
+const LINGER_MS = Number(arg('--linger-ms', '0'))
+const MAX_DEPOSIT = Number(arg('--max-deposit', '100000'))
+const ARM = argv.includes('--arm')
+const ABANDON = argv.includes('--abandon')
+const REFUSE_FIRST = argv.includes('--refuse-first')
+// Behave like a client that does not echo the offer's fees.
+const NO_ACCEPT_FEE = argv.includes('--no-accept-fee')
+// Proofs run over the connection's pre-warmed proof channel; `--no-zkchan`
+// forces one socket per proof (at most 6 `/zk` sockets per connection).
+const ZKCHAN = !argv.includes('--no-zkchan')
+const LEGACY = argv.includes('--legacy-v2-socket')
+// --- attacks by a malicious client (crypto/tools/v3-check.sh) -----------------
+const ADV_SUFFIX_MODEL = arg('--adv-suffix-model')
+const ADV_BODY_MAX_TOKENS = arg('--adv-body-max-tokens') === undefined ? undefined : Number(arg('--adv-body-max-tokens'))
 const ADV_IMAGE_COUNT = arg('--adv-image-count') === undefined ? undefined : Number(arg('--adv-image-count'))
 const ADV_ACCEPT_ANY = argv.includes('--adv-accept-any')
-const DECOY = arg('--decoy-model')
-// --- adversarial GAP-1 probes (crypto/tools/adversarial-model-swap) ---------
-// Craft a suffix whose model differs from the setup model, ignoring the node's
-// canonical suffix — the sidecar must reject it.
-const ADV_SUFFIX_MODEL = arg('--adv-suffix-model')
-// Never declare the body suffix at all; harvest whatever response the sidecar
-// forwards, to measure the residual exposure of a client that withholds π_C2S.
-const ADV_NO_SUFFIX = argv.includes('--adv-no-suffix')
-// Claim the node's canonical suffix in `body_suffix` while the body actually
-// ends with ADV_SUFFIX_MODEL's suffix: π_C2S itself must then fail.
-const ADV_CLAIM_CANONICAL = argv.includes('--adv-claim-canonical')
-// Adversarial probe: put our own P-256 key share in the ClientHello instead
-// of the joint one (we would then hold the whole ECDHE secret). The node must
-// refuse to relay it.
-const ADV_OWN_SHARE = argv.includes('--adv-own-keyshare')
-// --- protocol v3, option A (PROTOCOL-V3-DESIGN.md): --http2 -----------------
-// One two-party handshake per HTTP/2 connection, the credential by HPACK
-// index, `--requests N` sequential chat requests on it.
-const HTTP2 = argv.includes('--http2')
-const H2_REQUESTS = Number(arg('--requests', '1'))
-// --private-extra-at N: with --http2, --private-extra applies to request N only
-// (for example a parameter the provider refuses, to get an error head on one request).
-const H2_PRIVATE_EXTRA_AT = Number(arg('--private-extra-at', '0'))
-// Idle time before every request after the first (ms).
-const H2_PAUSE_MS = Number(arg('--pause-ms', '0'))
-// Per-request models (comma-separated; request i uses entry i, then --model).
-const H2_MODELS = (arg('--h2-models') ?? '').split(',').filter(Boolean)
-// Pad the prompt so the request body has about this many bytes (flow control).
-const H2_BODY_BYTES = Number(arg('--body-bytes', '0'))
-// Largest DATA payload per record.
-const H2_CHUNK = Number(arg('--h2-chunk', String(MAX_DATA_IN_RECORD)))
-// Adversarial probes (crypto/tools/v3-h2-check.sh), applied to request --adv-at:
-//   hidden-headers  a HEADERS frame for another stream inside a "DATA" record
-//   padding         TLS record padding that shifts the frame boundary
-//   path            a HEADERS block with --adv-h2-path as :path
-//   replay-usage    the previous request's usage tail as this one's disclosure
-//   suffix          another model's suffix (--adv-suffix-model)
-const ADV_H2 = arg('--adv-h2')
-const ADV_H2_AT = Number(arg('--adv-at', ADV_H2 === 'replay-usage' ? '2' : '1'))
-const ADV_H2_PATH = arg('--adv-h2-path', '/api/v1/api_keys/abcdefg')
-// --h2-kinds chat,images,…: the kind of each request on the connection
-// (default: `images` for every request with --image, else `chat`). An image
-// request uses --image-model (default: --model with --image), --variant, --count.
-const H2_KINDS = (arg('--h2-kinds') ?? '').split(',').filter(Boolean)
-const H2_IMAGE_MODEL = arg('--image-model')
-// --linger-ms N: after the last request (or with --requests 0, after the
-// connection opened) wait up to N ms for the node to close the idle connection.
-const H2_LINGER_MS = Number(arg('--linger-ms', '0'))
-// --max-deposit N: the largest connection deposit (msat) accepted from an offer.
-const H2_MAX_DEPOSIT = Number(arg('--max-deposit', '100000'))
-let H2_BLOCK: H2OfferBlock | undefined
-// The only protocol version: 2 = two-party handshake (docs/TWOPC-DESIGN.md).
-// Protocol v1 is retired (branch v1-poc); an offer naming it is refused.
-const PROTO = 2
-const ARM = argv.includes('--arm')
-// Arm one session (setup, 2PC preprocessing, proof channel) and close it
-// unused: with an abandon fee, the node charges exactly that fee.
-const ABANDON = argv.includes('--abandon')
-// Behave like a client that does not know about session fees (no echo).
-const NO_ACCEPT_FEE = argv.includes('--no-accept-fee')
-// π_C2S and π_C3S both run in one session. Serial (default) waits for π_C2S
-// before starting π_C3S; `--parallel-proofs` lets them overlap, for the stall study.
-const SERIAL_PROOFS = !argv.includes('--parallel-proofs')
-const POOL = Number(arg('--pool', '0'))
-// Run π_NK/π_C2S/π_C3S over the session's pre-warmed proof channel
-// (`zkchan`, OT/VOLE set up while arming). `--no-zkchan` forces the per-proof
-// path (fresh OT per proof), e.g. for before/after measurements.
-const ZKCHAN = !argv.includes('--no-zkchan')
-// The node bearer(s): an sk- key or Cashu token(s), comma-separated for --pool.
-// (--escrow-token is accepted as an alias.)
-const ESCROW_TOKENS = (arg('--auth') ?? arg('--escrow-token') ?? '')
-  .split(',')
-  .map((t) => t.trim())
-  .filter(Boolean)
+const ADV_MODE: string | undefined =
+  arg('--adv') ?? arg('--adv-h2') ??
+  (argv.includes('--adv-no-proof') || argv.includes('--adv-no-suffix') ? 'no-proof'
+    : argv.includes('--adv-own-keyshare') ? 'own-keyshare'
+    : ADV_SUFFIX_MODEL !== undefined || ADV_BODY_MAX_TOKENS !== undefined || ADV_IMAGE_COUNT !== undefined ? 'suffix'
+    : undefined)
+const ADV_MODES: Record<string, Framing[]> = {
+  suffix: ['2', '1.1'], padding: ['2', '1.1'], 'early-record': ['2', '1.1'], 'no-proof': ['2', '1.1'], 'own-keyshare': ['2', '1.1'], 'twopc-tag': ['2', '1.1'],
+  'hidden-headers': ['2'], path: ['2'], 'replay-usage': ['2'], 'not-alone': ['1.1'],
+}
+if (ADV_MODE !== undefined && !ADV_MODES[ADV_MODE]) usage(`--adv ${ADV_MODE}: one of ${Object.keys(ADV_MODES).join(', ')}`)
+const ADV_AT = Number(arg('--adv-at', ADV_MODE === 'replay-usage' ? '2' : '1'))
+const ADV_PATH = arg('--adv-h2-path', '/api/v1/api_keys/abcdefg')
+// The node credential: an sk- key or a Cashu token (--escrow-token is an alias).
+const AUTH = (arg('--auth') ?? arg('--escrow-token') ?? '').trim()
 // Skipping the offer signature check is for tests against a throwaway node
 // only, as in the SDK: it needs ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1.
 if (NODE && argv.includes('--no-verify-offer') && process.env.ROUTSTR_CONFIDENTIAL_INSECURE_TESTING !== '1') {
-  console.error('[client] --no-verify-offer needs ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1 (tests only)')
-  process.exit(2)
+  usage('--no-verify-offer needs ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1 (tests only)')
 }
 const VERIFY_OFFER = NODE ? !argv.includes('--no-verify-offer') : false
 const RUNS = arg('--runs-dir', new URL('../../runs', import.meta.url).pathname)!
-const NODE_MODE = !!NODE
 // Pin of the node's signing key (hex x-only, e.g. from its Nostr
 // announcement; also CU_NODE_PUBKEY). Without it the offer is only
 // self-consistent, not authentic, so it is required for a node off this host
 // unless --allow-unpinned.
 const NODE_PUBKEY_RAW = arg('--node-pubkey') ?? (process.env.CU_NODE_PUBKEY || undefined)
 const NODE_PUBKEY = NODE_PUBKEY_RAW === undefined ? undefined : pubkeyHex(NODE_PUBKEY_RAW)
-if (NODE_PUBKEY_RAW !== undefined && NODE_PUBKEY === null) {
-  console.error(`[client] --node-pubkey ${shown(NODE_PUBKEY_RAW)} is neither a 64-hex key nor an npub`)
-  process.exit(2)
-}
+if (NODE_PUBKEY_RAW !== undefined && NODE_PUBKEY === null) usage(`--node-pubkey ${shown(NODE_PUBKEY_RAW)} is neither a 64-hex key nor an npub`)
 // Provider hosts this client will run a TLS session with: the offer's
 // upstream_host must be one of them (as the SDK's trusted hosts). The default
 // is the case-study provider; extend with --trusted-host (repeatable) or
@@ -275,134 +207,143 @@ if (NODE) {
     process.exit(2)
   }
 }
+/** The trusted API bases: a route is one of them plus the endpoint (CU_API_BASES, comma-separated). */
+const API_BASES = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
+
 let OFFER_PUBKEY: string | undefined
-// Escrow (sats) the node requires for this body: MODEL at MAX_TOKENS.
 let OFFER: any = null
-// The signature of the offer we verified: the node settles at its rates.
+/** The signature of the offer we verified: every `setup` and `request` names it. */
 let OFFER_SIG: string | undefined
-/** The signed offer's fee on a completed request (msats); 0 when none. */
+/** The signed offer's fee on a connection's first settled request (msats); 0 when none. */
 let SESSION_FEE = 0
-/** The signed offer's fee for a session that ends unused (msats, ≥ SESSION_FEE). */
+/** The signed offer's fee for a request that is dropped before its body is released (msats, ≥ SESSION_FEE). */
 let ABANDON_FEE = 0
+/** The signed offer's connection deposit (msats; a sidecar's own offer has none). */
+let DEPOSIT = 0
+/** The framings of the offer this client supports, in the operator's order. */
+let OFFER_HTTP: Framing[] = []
+let H2_BLOCK: H2OfferBlock | undefined
 
 // ---------------------------------------------------------------------------
-// Body construction (SPEC §5.5)
+// Offer (§2.3, §12.1)
 // ---------------------------------------------------------------------------
 
-const SUFFIX_MODEL = ADV_SUFFIX_MODEL ?? MODEL
-// Adversarial probe only: pin a *different* max_tokens in the body than in the
-// setup (the body is what the upstream sees; the suffix check is what would
-// catch it, so this matters only when the suffix is withheld).
-const BODY_MAX_TOKENS = Number(arg('--adv-body-max-tokens', String(MAX_TOKENS)))
+function offerRefused(what: string, code = 4): never {
+  console.error(`[client] ${what}`)
+  process.exit(code)
+}
+
+/** Everything the client holds an offer to before a `setup`. */
+function checkOffer(offer: any): void {
+  if (!offer || typeof offer !== 'object') offerRefused('no offer')
+  // An older node: not used for confidential requests (§11).
+  if (offer.v === undefined || (typeof offer.v === 'number' && offer.v < PROTO)) {
+    offerRefused(`node_protocol_outdated: the offer is for protocol v${shown(offer.v ?? 'unknown')}; this client speaks only v${PROTO} (the node needs an update)`, 6)
+  }
+  if (offer.v !== PROTO) offerRefused(`offer_unsupported_version: the offer is for protocol v${shown(offer.v)}; this client speaks only v${PROTO}`)
+  if (offer.twopc !== TWOPC) offerRefused(`offer_unsupported_twopc: the offer names the key-schedule protocol ${shown(offer.twopc)}; this client implements ${TWOPC}`)
+  const http = offer.http === undefined ? ['1.1'] : offer.http
+  if (!Array.isArray(http) || http.length === 0 || new Set(http).size !== http.length || !http.every((h: unknown) => h === '2' || h === '1.1')) {
+    offerRefused(`offer_malformed: http ${shown(offer.http)} is not a list of "2" and "1.1"`)
+  }
+  OFFER_HTTP = [...http]
+  const host = typeof offer.upstream_host === 'string' ? offer.upstream_host.toLowerCase() : ''
+  if (!TRUSTED_HOSTS.includes(host)) {
+    offerRefused(`the offer's upstream_host ${shown(offer.upstream_host)} is not trusted (${TRUSTED_HOSTS.join(', ')}; --trusted-host or CU_TRUSTED_HOSTS to add one)`)
+  }
+  const problem = chatBlockProblem(offer)
+  if (problem) offerRefused(`the offer's chat block is refused: ${termSafe(problem)}`)
+  try {
+    // The head template is held to its syntax before any setup (π_NK checks it again in framing "1.1").
+    checkHeadTemplate(offer.head_template ?? '', offer.upstream_host ?? '', 'chat')
+    if (OFFER_HTTP.includes('2')) H2_BLOCK = checkH2Offer(offer, API_BASES)
+    else H2_BLOCK = undefined
+  } catch (e) {
+    offerRefused(`the offer is refused: ${errText(e)}`)
+  }
+  if (NODE_MODE) {
+    const d = offer.connection_deposit_msat
+    if (!(Number.isSafeInteger(d) && d >= 0)) offerRefused('offer_malformed: connection_deposit_msat')
+    if (d > MAX_DEPOSIT) offerRefused(`the node's connection deposit of ${d} msat exceeds --max-deposit ${MAX_DEPOSIT}`)
+    DEPOSIT = d
+    const idle = offer.idle_timeout_s
+    if (!(Number.isSafeInteger(idle) && idle >= 10 && (!H2_BLOCK || idle <= H2_BLOCK.idle_secs))) offerRefused('offer_malformed: idle_timeout_s')
+  }
+}
+
+/** The provider host of the TLS session: the offer's `upstream_host`, which `checkOffer` held to the trusted list. */
+function upstreamHost(): string {
+  const h = typeof OFFER?.upstream_host === 'string' ? OFFER.upstream_host.toLowerCase() : undefined
+  if (h === undefined || !TRUSTED_HOSTS.includes(h)) throw new Error(`upstream host ${shown(h)} is not trusted`)
+  return h
+}
+
+async function fetchOffer(): Promise<void> {
+  if (!NODE) {
+    // A sidecar's own offer (no price list, no signature).
+    let offer: any
+    try {
+      offer = await (await fetch(`${SIDECAR.replace(/\/$/, '')}/offer`)).json()
+    } catch (e) {
+      offerRefused(`could not fetch the offer: ${errText(e)}`, 1)
+    }
+    OFFER = offer
+    checkOffer(OFFER)
+    return
+  }
+  // `?v=3`: an old node's access log shows that v3 clients are asking (§11).
+  const url = `${NODE.replace(/\/$/, '')}/v1/confidential/offer?v=${PROTO}`
+  let raw: any
+  try {
+    raw = await (await fetch(url)).json()
+  } catch (e) {
+    offerRefused(`could not fetch the offer: ${errText(e)}`, 1)
+  }
+  const payload: string = raw.sig_payload ?? JSON.stringify(raw)
+  let parsed: any
+  try {
+    parsed = raw.sig_payload ? JSON.parse(raw.sig_payload) : raw
+  } catch {
+    offerRefused('offer_malformed: the signed payload is not JSON')
+  }
+  if (VERIFY_OFFER) {
+    const ok = verifySig(payload, raw.sig, parsed.notary_pubkey, 'schnorr-secp256k1')
+    console.log(
+      `[client] offer v=${shown(parsed.v)} http=${shown(parsed.http)} host=${shown(parsed.upstream_host)} ` +
+        `models=${Object.keys(parsed.price_list ?? {}).length} sig_ok=${ok}`,
+    )
+    if (!ok) offerRefused('offer verification failed: offer signature invalid')
+    if (NODE_PUBKEY && (typeof parsed.notary_pubkey !== 'string' || pubkeyHex(parsed.notary_pubkey) !== NODE_PUBKEY)) {
+      offerRefused('offer verification failed: the offer is not signed by the pinned node key')
+    }
+    OFFER_PUBKEY = parsed.notary_pubkey
+  }
+  OFFER = parsed
+  OFFER_SIG = raw.sig
+  checkOffer(OFFER)
+  for (const k of ['session_fee_msat', 'abandon_fee_msat']) {
+    const v = parsed[k]
+    if (v !== undefined && !(Number.isSafeInteger(v) && v >= 0)) offerRefused(`offer_malformed: ${k}`)
+  }
+  SESSION_FEE = parsed.session_fee_msat ?? 0
+  ABANDON_FEE = Math.max(parsed.abandon_fee_msat ?? 0, SESSION_FEE)
+  console.log(
+    `[client] offer session_fee_msat=${SESSION_FEE} abandon_fee_msat=${ABANDON_FEE} connection_deposit_msat=${DEPOSIT} ` +
+      `idle_timeout_s=${shown(parsed.idle_timeout_s)} rate_surcharge_pct=${shown(parsed.rate_surcharge_pct ?? 0)}`,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Request bodies: the private part, then the pinned suffix
+// ---------------------------------------------------------------------------
+
 const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }
-function userContent(): unknown {
-  if (!ATTACH) return PROMPT
+function userContent(text: string): unknown {
+  if (!ATTACH) return text
   const mime = IMAGE_MIME[ATTACH.split('.').pop()!.toLowerCase()]
   if (!mime) throw new Error(`--attach: not an image file (${Object.keys(IMAGE_MIME).join(', ')}): ${ATTACH}`)
   const url = `data:${mime};base64,${readFileSync(ATTACH).toString('base64')}`
-  return [{ type: 'text', text: PROMPT }, { type: 'image_url', image_url: { url } }]
-}
-let priv = `{"messages":[{"role":"user","content":${JSON.stringify(userContent())}}]`
-if (DECOY) priv += `,"model":${JSON.stringify(DECOY)}`
-// Test hook: extra private JSON members (e.g. a field the provider rejects, to
-// exercise the upstream-error path).
-const PRIVATE_EXTRA = arg('--private-extra')
-if (PRIVATE_EXTRA) priv += `,${PRIVATE_EXTRA}`
-let suffix = ''
-let bodyText = ''
-let body = new Uint8Array(0)
-let suffixBytes = new Uint8Array(0)
-
-/** Compact JSON with object members sorted (the sidecar's serde_json form). */
-function canonicalJson(v: unknown): string {
-  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`
-  if (v !== null && typeof v === 'object') {
-    const o = v as Record<string, unknown>
-    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(',')}}`
-  }
-  return JSON.stringify(v)
-}
-
-/** The chat suffix the offer's `chat` block defines (docs/CHAT-SUFFIX.md). */
-export function renderChatSuffix(chat: any, model: string, maxTokens: number): string {
-  const parts = [`"model":${JSON.stringify(model)}`]
-  for (const k of chat.cap_keys) parts.push(`${JSON.stringify(k)}:${maxTokens}`)
-  for (const [k, v] of chat.fixed_pins) parts.push(`${JSON.stringify(k)}:${canonicalJson(v)}`)
-  return `,${parts.join(',')}}`
-}
-
-const CAP_KEYS = ['max_tokens', 'max_completion_tokens', 'max_output_tokens']
-const PIN_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
-const pinValueOk = (v: unknown): boolean =>
-  typeof v === 'boolean' ||
-  (typeof v === 'number' && Number.isSafeInteger(v)) ||
-  (typeof v === 'string' && /^[\x20-\x7e]*$/.test(v) && !/["\\]/.test(v)) ||
-  (Array.isArray(v) && v.every(pinValueOk)) ||
-  (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.entries(v).every(([k, x]) => PIN_KEY.test(k) && pinValueOk(x)))
-/** A pin that switches something off: `false`, `"off"`, `[]`, or a non-empty object of those. */
-const pinIsOff = (v: unknown): boolean =>
-  v === false || v === 'off' || (Array.isArray(v) && v.length === 0) ||
-  (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 && Object.values(v).every(pinIsOff))
-/** Key prefixes under which `false` turns a feature on. */
-const NEGATING_PREFIXES = ['disable', 'no_', 'skip', 'without', 'exclude', 'omit', 'hide']
-/** Key words naming a protection: pinning one can only switch it off, so it stays the provider's default. */
-const PROTECTION_WORDS = ['safe', 'moderat', 'filter', 'nsfw', 'censor', 'guard']
-/** The first pin key, at any depth, that is negating or names a protection, or null. */
-export function refusedPinKey(k: string, v: unknown): string | null {
-  const l = k.toLowerCase()
-  if (NEGATING_PREFIXES.some((p) => l.startsWith(p)) || PROTECTION_WORDS.some((w) => l.includes(w))) return k
-  return refusedMemberKey(v)
-}
-function refusedMemberKey(v: unknown): string | null {
-  const members: [string | null, unknown][] = Array.isArray(v)
-    ? v.map((x) => [null, x])
-    : v !== null && typeof v === 'object' ? Object.entries(v) : []
-  for (const [m, x] of members) {
-    const bad = m === null ? refusedMemberKey(x) : refusedPinKey(m, x)
-    if (bad !== null) return bad
-  }
-  return null
-}
-
-/** Why the offer's chat block is outside the policy every client applies, or null. */
-export function chatBlockProblem(offer: any): string | null {
-  const c = offer?.chat
-  if (!c || typeof c !== 'object' || !Array.isArray(c.cap_keys) || !Array.isArray(c.fixed_pins)) return 'no chat block'
-  if (c.cap_keys.length === 0) return 'no cap key'
-  const seen = new Set<string>()
-  for (const k of c.cap_keys) {
-    if (!CAP_KEYS.includes(k) || seen.has(k)) return `cap key ${JSON.stringify(k)}`
-    seen.add(k)
-  }
-  for (const p of c.fixed_pins) {
-    if (!Array.isArray(p) || p.length !== 2 || typeof p[0] !== 'string') return 'a malformed pin'
-    const [k, v] = p
-    if (!PIN_KEY.test(k) || k === 'model' || CAP_KEYS.includes(k) || seen.has(k)) return `pin key ${JSON.stringify(k)}`
-    seen.add(k)
-    if (!pinValueOk(v)) return `pin ${k} outside the grammar`
-    const refused = refusedPinKey(k, v)
-    if (refused !== null) return `pin key ${JSON.stringify(refused)} negates or names a protection`
-    const ok = k === 'stream' ? v === true
-      : k === 'n' ? v === 1
-      : k === 'stream_options' ? canonicalJson(v) === '{"include_usage":true}'
-      : pinIsOff(v)
-    if (!ok) return `pin ${k}=${JSON.stringify(v)} is not allowed`
-  }
-  if (!seen.has('stream') || !seen.has('stream_options')) return 'stream and stream_options must be pinned'
-  const pins = c.fixed_pins.map(([k, v]: [string, unknown]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')
-  if (pins.length > 1024) return 'pins too long'
-  const keys = ['model', ...c.cap_keys, ...c.fixed_pins.map((p: [string, unknown]) => p[0])]
-  if (JSON.stringify(offer.suffix_keys) !== JSON.stringify(keys)) return `suffix_keys ${JSON.stringify(offer.suffix_keys)} are not ${JSON.stringify(keys)}`
-  return null
-}
-
-/** Build the chat body once the offer is known: private messages + pinned suffix. */
-function setupChatBody(): void {
-  if (chatBlockProblem(OFFER)) throw new Error(`the offer's chat block is refused: ${chatBlockProblem(OFFER)}`)
-  suffix = renderChatSuffix(OFFER.chat, SUFFIX_MODEL, BODY_MAX_TOKENS)
-  bodyText = priv + suffix
-  body = new TextEncoder().encode(bodyText)
-  suffixBytes = new TextEncoder().encode(suffix)
+  return [{ type: 'text', text }, { type: 'image_url', image_url: { url } }]
 }
 
 /** The offer's images block: the node's signed one, or the sidecar's endpoint. */
@@ -410,145 +351,89 @@ function imagesOffer(): any {
   const im = OFFER?.images ?? OFFER?.endpoints?.images
   if (!im) throw new Error('offer_no_images: the offer has no images endpoint')
   checkImagesBlock(im)
+  checkHeadTemplate(im.head_template ?? '', OFFER.upstream_host ?? '', 'images')
   return im
 }
 
-/** The variant pin keys a client lets the node pin (the price axes). */
-const VARIANT_PIN_KEYS = new Set(['resolution', 'quality', 'format'])
+const kindOf = (g: number): 'chat' | 'images' => ((KINDS[g - 1] ?? (IMAGE ? 'images' : 'chat')) === 'images' ? 'images' : 'chat')
 
-/**
- * The node signs the images block, but its pins reach the provider as the
- * request's last word: a fixed pin may only switch a provider extra off
- * (`false` or `[]`), a variant may only pin a price axis to a value the
- * offer's parameter space lists, and the numbers stay in the ranges the relay
- * enforces. Anything else is refused rather than rendered.
- */
-export function checkImagesBlock(im: any): void {
-  const bad = (why: string): never => {
-    throw new Error(`offer_malformed: images block ${why}`)
-  }
-  const countKey = im.count_key ?? 'variants'
-  if (typeof countKey !== 'string' || !countKey) bad('count_key')
-  if (!(Number.isSafeInteger(im.max_count) && im.max_count >= 1 && im.max_count <= 4)) bad('max_count must be 1..4')
-  if (im.response_idle_s !== undefined && !(Number.isSafeInteger(im.response_idle_s) && im.response_idle_s >= 30 && im.response_idle_s <= 600)) {
-    bad('response_idle_s must be 30..600')
-  }
-  const space = im.param_space ?? {}
-  if (typeof space !== 'object' || Array.isArray(space)) bad('param_space')
-  for (const [k, v] of Object.entries(space)) {
-    if (!Array.isArray(v) || !v.every((x) => typeof x === 'string')) bad(`param_space.${k}`)
-  }
-  const fixed: unknown[] = im.fixed_pins ?? []
-  if (!Array.isArray(fixed)) bad('fixed_pins')
-  const fixedKeys = new Set<string>()
-  for (const pin of fixed) {
-    if (!Array.isArray(pin) || pin.length !== 2 || typeof pin[0] !== 'string') bad('fixed_pins entry')
-    const [k, v] = pin as [string, unknown]
-    if (!(v === false || (Array.isArray(v) && v.length === 0))) bad(`fixed pin ${k} does not switch an extra off`)
-    if (refusedPinKey(k, v) !== null) bad(`fixed pin ${k} negates or names a protection`)
-    if (k === 'model' || k === countKey || fixedKeys.has(k)) bad(`fixed pin ${k} repeats a pinned key`)
-    fixedKeys.add(k)
-  }
-  for (const [model, variants] of Object.entries(im.price_list ?? {})) {
-    if (!Array.isArray(variants) || variants.length === 0) bad(`price_list.${model}`)
-    const ids = new Set<string>()
-    for (const v of variants as any[]) {
-      if (typeof v?.id !== 'string' || ids.has(v.id)) bad(`variant ids of ${model}`)
-      ids.add(v.id)
-      if (!(Number.isSafeInteger(v.msat_per_image) && v.msat_per_image > 0)) bad(`${model}/${v.id} msat_per_image`)
-      if (v.max_count !== undefined && !(Number.isSafeInteger(v.max_count) && v.max_count >= 1 && v.max_count <= im.max_count)) {
-        bad(`${model}/${v.id} max_count`)
-      }
-      const keys = new Set<string>()
-      for (const pin of v.pins ?? []) {
-        if (!Array.isArray(pin) || pin.length !== 2) bad(`${model}/${v.id} pin`)
-        const [k, val] = pin
-        if (!VARIANT_PIN_KEYS.has(k) || keys.has(k) || fixedKeys.has(k)) bad(`${model}/${v.id} pins ${k}`)
-        if (typeof val !== 'string' || !(space[k] ?? []).includes(val)) bad(`${model}/${v.id} pins ${k} outside param_space`)
-        keys.add(k)
-      }
-    }
-  }
-}
-
-/** The pinned image suffix (docs/CONFIDENTIAL-IMAGES.md §0.3), byte-exact. */
-export function renderImagesSuffix(im: any, model: string, count: number, pins: [string, unknown][]): string {
-  const parts = [`"model":${JSON.stringify(model)}`, `${JSON.stringify(im.count_key)}:${JSON.stringify(count)}`]
-  for (const [k, v] of [...(im.fixed_pins ?? []), ...pins]) parts.push(`${JSON.stringify(k)}:${JSON.stringify(v)}`)
-  return `,${parts.join(',')}}`
-}
-
-let IMAGE_PINS: [string, unknown][] = []
-let IMAGE_VARIANT_ID: string | undefined
-let IMAGE_MSAT = 0
-
-/** Build the image body once the offer is known: private prompt + suffix. */
-function setupImageBody(): void {
+let imageTerms: { model: string; im: any; pins: [string, unknown][]; terms: ImageTerms } | undefined
+/** The variant, its price and the images route, from the offer's images block. */
+function imageRequest(): NonNullable<typeof imageTerms> {
+  if (imageTerms) return imageTerms
   const im = imagesOffer()
-  const variants: any[] | undefined = im.price_list?.[MODEL]
-  const chosen = variants ? (IMAGE_VARIANT ? variants.find((x) => x.id === IMAGE_VARIANT) : variants[0]) : undefined
-  // A variant may allow fewer images per request than the offer (4K: one).
-  const maxCount = Math.min(im.max_count, chosen?.max_count ?? im.max_count)
-  if (!(Number.isSafeInteger(IMAGE_COUNT) && IMAGE_COUNT >= 1 && IMAGE_COUNT <= maxCount)) {
-    throw new Error(`--count must be 1..${maxCount}`)
+  const model = IMAGE_MODEL ?? (IMAGE ? MODEL : undefined)
+  if (!model) throw new Error('an image request needs --image-model')
+  const variants: any[] | undefined = im.price_list?.[model]
+  const v = variants ? (IMAGE_VARIANT ? variants.find((x) => x.id === IMAGE_VARIANT) : variants[0]) : undefined
+  if (variants && !v) throw new Error(`no offered variant ${IMAGE_VARIANT ?? ''} for ${model}`)
+  if (NODE_MODE && !v) throw new Error(`the signed offer does not price images of ${model}`)
+  // A variant may allow fewer images per request than the offer.
+  const maxCount = Math.min(im.max_count, v?.max_count ?? im.max_count)
+  if (!(Number.isSafeInteger(IMAGE_COUNT) && IMAGE_COUNT >= 1 && IMAGE_COUNT <= maxCount)) throw new Error(`--count must be 1..${maxCount}`)
+  // Without a node (a sidecar's own offer has no variants): WebP at the default tier.
+  const pins: [string, unknown][] = v ? v.pins ?? [] : [...(IMAGE_RESOLUTION ? [['resolution', IMAGE_RESOLUTION] as [string, unknown]] : []), ['format', 'webp']]
+  imageTerms = {
+    model, im, pins,
+    terms: { variant: v?.id, count: IMAGE_COUNT, path: chatPath(im.head_template), headTemplate: im.head_template, responseShape: im.response_shape, msatPerImage: v?.msat_per_image ?? 0 },
   }
-  if (variants) {
-    const v = chosen
-    if (!v) throw new Error(`no offered variant ${IMAGE_VARIANT ?? ''} for ${MODEL}`)
-    IMAGE_PINS = v.pins
-    IMAGE_VARIANT_ID = v.id
-    IMAGE_MSAT = v.msat_per_image
-  } else {
-    if (IMAGE_RESOLUTION) IMAGE_PINS.push(['resolution', IMAGE_RESOLUTION])
-    IMAGE_PINS.push(['format', 'webp'])
+  return imageTerms
+}
+
+/** Another model id of the same length (so that only the proof can tell the suffixes apart). */
+const otherModel = (m: string) => m.slice(0, -1) + (m.endsWith('x') ? 'y' : 'x')
+
+function buildBody(g: number): ReqBody {
+  const enc = new TextEncoder()
+  // The attacks that put another suffix at the end of the body than the request names.
+  const wrong = !!ADV_MODE && ['suffix', 'no-proof'].includes(ADV_MODE) && ADV_AT === g
+  const extra = PRIVATE_EXTRA && (PRIVATE_EXTRA_AT === 0 || PRIVATE_EXTRA_AT === g) ? `,${PRIVATE_EXTRA}` : ''
+  if (kindOf(g) === 'images') {
+    const { model, im, pins, terms } = imageRequest()
+    const canonicalSuffix = renderImagesSuffix(im, model, terms.count, pins)
+    // The attack: a suffix that orders more images than the request pays for, or another model.
+    const sfx = wrong ? renderImagesSuffix(im, ADV_SUFFIX_MODEL ?? model, ADV_SUFFIX_MODEL !== undefined ? ADV_IMAGE_COUNT ?? terms.count : ADV_IMAGE_COUNT ?? terms.count + 1, pins) : canonicalSuffix
+    const p = `{"prompt":${JSON.stringify(PROMPT)}${extra}`
+    return { kind: 'images', model, maxTokens: 0, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix, image: terms }
   }
-  suffix = renderImagesSuffix(im, SUFFIX_MODEL, ADV_IMAGE_COUNT ?? IMAGE_COUNT, IMAGE_PINS)
-  let p = `{"prompt":${JSON.stringify(PROMPT)}`
-  if (PRIVATE_EXTRA) p += `,${PRIVATE_EXTRA}`
-  bodyText = p + suffix
-  body = new TextEncoder().encode(bodyText)
-  suffixBytes = new TextEncoder().encode(suffix)
+  const model = MODELS[g - 1] ?? MODEL
+  const canonicalSuffix = renderChatSuffix(OFFER.chat, model, MAX_TOKENS)
+  const sfx = wrong
+    ? renderChatSuffix(OFFER.chat, ADV_SUFFIX_MODEL ?? (ADV_BODY_MAX_TOKENS === undefined ? otherModel(model) : model), ADV_BODY_MAX_TOKENS ?? MAX_TOKENS)
+    : canonicalSuffix
+  let content = REQUESTS > 1 ? `${PROMPT} (request ${g})` : PROMPT
+  if (BODY_BYTES > content.length) content += ` Ignore this filler: ${'lorem ipsum '.repeat(Math.ceil((BODY_BYTES - content.length) / 12))}`
+  let p = `{"messages":[{"role":"user","content":${JSON.stringify(userContent(content))}}]`
+  if (DECOY) p += `,"model":${JSON.stringify(DECOY)}`
+  p += extra
+  return { kind: 'chat', model, maxTokens: MAX_TOKENS, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix }
 }
 
 // ---------------------------------------------------------------------------
-// Signature verification
+// One connection: what both framings share (§3, §12.2-12.5)
 // ---------------------------------------------------------------------------
 
-function verifyEd25519Raw(json: string, sigHex: string, pubHex: string): boolean {
-  try {
-    const raw = Buffer.concat([
-      Buffer.from('302a300506032b6570032100', 'hex'),
-      Buffer.from(pubHex, 'hex'),
-    ])
-    const key = createPublicKey({ key: raw, format: 'der', type: 'spki' })
-    return cryptoVerify(null, Buffer.from(json), key, Buffer.from(sigHex, 'hex'))
-  } catch {
-    return false
+/** The peer's `error` frame: it ends the connection. */
+class PeerError extends Error {
+  readonly frame: any
+  constructor(m: any) {
+    const parts = [`sidecar rejected: ${shown(m.reason, 300)}`]
+    if (typeof m.code === 'string') parts.push(`code ${shown(m.code)}`)
+    if (typeof m.status === 'number') parts.push(`node status ${m.status}`)
+    if (typeof m.fault === 'string') parts.push(`fault ${shown(m.fault)}`)
+    super(parts.length > 1 ? `${parts[0]} (${parts.slice(1).join(', ')})` : parts[0])
+    this.frame = m
   }
 }
 
-function verifySchnorrRaw(json: string, sigHex: string, pubHex: string): boolean {
-  try {
-    const msg = createHash('sha256').update(Buffer.from(json, 'utf8')).digest()
-    return schnorr.verify(Buffer.from(sigHex, 'hex'), msg, Buffer.from(pubHex, 'hex'))
-  } catch {
-    return false
-  }
-}
+/** The peer speaks another protocol version (a 426 `upgrade_required`, or a sidecar's `code`). */
+const isUpgradeRequired = (m: any): boolean => m?.type === 'error' && (m.code === 'upgrade_required' || (m.status === 426 && m.reason === 'upgrade_required'))
 
-function verifySig(json: string, sigHex: string | undefined, pubHex: string, scheme: string | undefined): boolean {
-  if (!sigHex || !pubHex) return false
-  if (scheme === 'schnorr-secp256k1') return verifySchnorrRaw(json, sigHex, pubHex)
-  return verifyEd25519Raw(json, sigHex, pubHex)
-}
-
-// ---------------------------------------------------------------------------
-// One session
-// ---------------------------------------------------------------------------
+const wsBase = () => (NODE_MODE ? NODE! : SIDECAR).replace(/^http/, 'ws').replace(/\/$/, '')
 
 class Session {
   readonly label: string
-  readonly token: string | undefined
+  readonly framing: Framing
   readonly uuid = randomUUID()
   readonly bus = new Bus()
   ws!: WebSocket
@@ -556,27 +441,169 @@ class Session {
   private outbox: Uint8Array[] = []
   private wsResolve!: () => void
   readonly wsReady: Promise<void>
-  // Set when the sidecar sends an explicit {type:"error"} (e.g. the GAP-3
-  // modality gate). Every protocol wait races it so the session fails fast.
+  // Rejected by the peer's `error` frame, a refused or failed socket: every protocol wait races it.
   private errRej!: (e: Error) => void
-  private errP!: Promise<never>
+  readonly errP: Promise<never>
+  /** The peer's `error` frame, when it sent one. */
+  peerError: any
   tls!: ReturnType<typeof makeTLSClient>
   handshakeP!: Promise<void>
+  private handshakeDone!: () => void
   flushChain: Promise<void> = Promise.resolve()
+  // Framing "1.1": the response as it arrives.
   responseChunks: Uint8Array[] = []
   responseBytes = new Uint8Array(0)
-  responseRecordCount = 0
+  /** Encrypted server records (payloads of outer type 23), handshake flight included. */
   serverRecords: Uint8Array[] = []
   // Encrypted server records after the handshake (π_C3S derives the covered
-  // records' key epoch and counts seqs from its start).
+  // records' key epoch and counts sequence numbers from its start).
   postHandshake = false
   serverPost: ServerPostRecord[] = []
   serverPending: Uint8Array = new Uint8Array(0)
-  // Set once the body is written: its records are kept for the π_C2S check.
+  /** Framing "1.1": set once the head is written; the body's records are kept for the π_WIN check. */
   inBody = false
   bodyRecords: Uint8Array[] = []
-  attJson: string | undefined
   cCommitHex: string | undefined
+  /** SHA-256 of every upstream byte and the count of complete upstream records (every content type). */
+  recvHash = createHash('sha256')
+  recvRecords = 0
+  /** SHA-256 of the provider's certificate DERs, concatenated in order. */
+  certChainHash: Uint8Array | undefined
+  ttft = 0
+  sid = ''
+  ready: any = null
+  tlsEnded = false
+  /** A `body_released` arrived: from here no retry elsewhere (§2.3). */
+  bodyReleased = false
+  /** A request of the connection was settled (the deposit is released by the first). */
+  settledOnce = false
+  /** The connection deposit's outcome, as the node reported it (a receipt, or its last frame). */
+  deposit: { msat: number; outcome: string; reason: string; signed: boolean } | undefined
+  closedReason: string | undefined
+  /** When each kind of control frame first arrived (measurements). */
+  tFirst: Record<string, number> = {}
+  /** Bytes on the session socket: control frames and relayed TLS records, each way. */
+  bytes = { control_sent: 0, control_recv: 0, relay_sent: 0, relay_recv: 0 }
+  private zkExtra = { sent: 0, recv: 0 }
+  /** The byte counters when the request was claimed (0, or after arming). */
+  claimBytes: Record<string, number> = {}
+  setupBytes: Record<string, number> | undefined
+  /** The HTTP/2 connection of a framing-"2" session. */
+  h2: H2Conn | undefined
+  twopc: TwoPc | undefined
+  zkchan: ZkChan | undefined
+  zkTimes: Record<string, any> = {}
+  ap: ApOut | undefined
+  thSH!: Uint8Array
+  thSF!: Uint8Array
+  tStart = Date.now()
+  tReady = 0
+  tKeyShare = 0
+  tPhaseA = 0
+  tPhaseB = 0
+  tHs = 0
+  tNkStart = 0
+  tProofsReady = 0
+  tHeadWritten = 0
+  tOpen = 0
+  runDir = ''
+  logLines: string[] = []
+  log = (o: unknown): void => void this.logLines.push(JSON.stringify(o))
+
+  constructor(label: string, framing: Framing) {
+    this.label = label
+    this.framing = framing
+    this.wsReady = new Promise<void>((r) => (this.wsResolve = r))
+    this.errP = new Promise<never>((_, rej) => (this.errRej = rej))
+    this.errP.catch(() => {}) // never an unhandled rejection when not raced
+  }
+
+  private controlUrl(): string {
+    return NODE_MODE ? `${wsBase()}/v1/confidential/ws?session_id=${this.uuid}&v=${PROTO}` : `${wsBase()}/session`
+  }
+
+  zkUrl(proof: string): string {
+    const sid = encodeURIComponent(this.sid)
+    if (!NODE_MODE) return `${wsBase()}/zk?proof=${encodeURIComponent(proof)}&sid=${sid}`
+    // The node's per-connection /zk token (from `ready`): the sid alone admits nothing.
+    const token = typeof this.ready?.zk_token === 'string' ? `&zk_token=${encodeURIComponent(this.ready.zk_token)}` : ''
+    return `${wsBase()}/v1/confidential/zk?proof=${encodeURIComponent(proof)}&sid=${sid}&session_id=${sid}${token}`
+  }
+
+  async connect(): Promise<void> {
+    this.ws = new WebSocket(this.controlUrl())
+    this.ws.binaryType = 'arraybuffer'
+    this.ws.onopen = () => {
+      this.wsOpen = true
+      for (const b of this.outbox) this.ws.send(b)
+      this.outbox.length = 0
+      this.wsResolve()
+    }
+    this.ws.onerror = () => this.errRej(new Error('session websocket error'))
+    this.ws.onclose = (ev: any) => {
+      this.errRej(new Error(`connection closed${ev?.reason ? `: ${shown(ev.reason, 300)}` : ''}`))
+    }
+    this.ws.onmessage = (ev) => {
+      const d = ev.data
+      if (typeof d === 'string') {
+        this.bytes.control_recv += d.length
+        const m = JSON.parse(d)
+        process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
+        trace('<-', shown(m.type))
+        if (typeof m.type === 'string' && this.tFirst[m.type] === undefined) this.tFirst[m.type] = Date.now()
+        if (m.type === 'body_released') this.bodyReleased = true
+        if (m.type === 'upstream_closed_early') {
+          console.log(`[client ${this.label}] the provider closed before the request was written in full (response_bytes=${shown(m.response_bytes)})`)
+        }
+        if (m.type === 'closed' || m.type === 'error') this.onLastFrame(m)
+        if (m.type === 'error') {
+          this.peerError = m
+          if (isUpgradeRequired(m)) {
+            console.error(`[client ${this.label}] upgrade_required: the peer refuses protocol v${PROTO} (min_v=${shown(m.min_v)}): ${shown(m.detail ?? m.reason, 300)}`)
+          }
+          this.errRej(new PeerError(m))
+        }
+        this.h2?.onControl(m)
+        // A connection runs many proofs: their parameters are keyed by proof and purpose.
+        if (m.type === 'zk_params') m.type = `zk_params:${m.proof}:${m.purpose ?? ''}`
+        this.bus.emit(m)
+        return
+      }
+      const bytes = new Uint8Array(d as ArrayBuffer)
+      this.bytes.relay_recv += bytes.length
+      this.trackServerRecords(bytes)
+      this.flushChain = this.flushChain
+        .then(() => this.tls.handleReceivedBytes(bytes))
+        .catch((e) => {
+          console.error(`[client ${this.label}] handleReceivedBytes: ${errText(e)}`)
+          this.errRej(e as Error)
+        })
+    }
+    await Promise.race([this.wsReady, this.errP])
+  }
+
+  /** The node's last frame (`closed` or `error`): it may carry the deposit's outcome, signed (§12.9). */
+  private onLastFrame(m: any): void {
+    if (m.type === 'closed') {
+      this.closedReason = String(m.reason ?? '')
+      console.log(`[client ${this.label}] closed: reason=${shown(m.reason)}`)
+    }
+    if (m.deposit === undefined) return
+    const json: string = typeof m.deposit_json === 'string' ? m.deposit_json : JSON.stringify(m.deposit)
+    let signed = false
+    let d: any
+    try {
+      d = JSON.parse(json)
+      signed = verifySig(json, m.deposit_sig, this.ready?.pubkey, m.sig_scheme) && (d.sid === this.sid || d.sid === null)
+    } catch {
+      d = {}
+    }
+    this.deposit = { msat: Number(d.msat), outcome: String(d.outcome), reason: String(d.reason), signed }
+    console.log(
+      `[client ${this.label}] deposit: outcome=${shown(d.outcome)} reason=${shown(d.reason)} msat=${shown(d.msat)} ` +
+        `balance_msats=${shown(d.balance_msats)} signed=${signed}`,
+    )
+  }
 
   trackServerRecords(bytes: Uint8Array): void {
     this.recvHash.update(bytes)
@@ -590,162 +617,35 @@ class Session {
     }
     this.serverPending = buf.slice()
   }
-  ttft = 0
-  sid = ''
-  ready: any = null
-  log: (o: unknown) => void = () => {}
-  tlsEnded = false
 
-  constructor(label: string, token?: string) {
-    this.label = label
-    this.token = token
-    this.wsReady = new Promise<void>((r) => (this.wsResolve = r))
-    this.errP = new Promise<never>((_, rej) => (this.errRej = rej))
-    this.errP.catch(() => {}) // avoid an unhandled rejection when not raced
-  }
-
-  private controlUrl(): string {
-    if (NODE_MODE) {
-      const base = NODE!.replace(/^http/, 'ws').replace(/\/$/, '')
-      return `${base}/v1/confidential/ws?session_id=${this.uuid}&v=${PROTO}`
-    }
-    return `${SIDECAR.replace(/^http/, 'ws')}/session`
-  }
-
-  zkUrl(proof: string, sid: string): string {
-    if (NODE_MODE) {
-      const base = NODE!.replace(/^http/, 'ws').replace(/\/$/, '')
-      // The node's per-session /zk token (from `ready`): the sid alone admits nothing.
-      const token = typeof this.ready?.zk_token === 'string' ? `&zk_token=${encodeURIComponent(this.ready.zk_token)}` : ''
-      return `${base}/v1/confidential/zk?proof=${encodeURIComponent(proof)}&session_id=${encodeURIComponent(sid)}${token}`
-    }
-    return `${SIDECAR.replace(/^http/, 'ws')}/zk?proof=${encodeURIComponent(proof)}&sid=${encodeURIComponent(sid)}`
-  }
-
-  connect(): Promise<void> {
-    this.ws = new WebSocket(this.controlUrl())
-    this.ws.binaryType = 'arraybuffer'
-    this.ws.onopen = () => {
-      this.wsOpen = true
-      for (const b of this.outbox) this.ws.send(b)
-      this.outbox.length = 0
-      this.wsResolve()
-    }
-    this.ws.onerror = () => {
-      console.error(`[client ${this.label}] websocket error`)
-      process.exit(2)
-    }
-    this.ws.onclose = (ev: any) => {
-      // A close with a reason is a rejection (e.g. the node's escrow check);
-      // surface it instead of waiting out a protocol timeout.
-      const reason = ev?.reason
-      if (reason) this.errRej(new Error(`connection closed: ${shown(reason, 300)}`))
-    }
-    this.ws.onmessage = (ev) => {
-      const d = ev.data
-      if (typeof d === 'string') {
-        const m = JSON.parse(d)
-        process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
-        trace('<-', shown(m.type))
-        if (typeof m.type === 'string' && this.tFirst[m.type] === undefined) this.tFirst[m.type] = Date.now()
-        // A node's own refusals carry an HTTP-style status; errors it relays from the sidecar do not.
-        if (m.type === 'error') {
-          this.errRej(new Error(`sidecar rejected: ${shown(m.reason, 300)}${typeof m.status === 'number' ? ` (node status ${m.status})` : ''}`))
-        }
-        if (this.h2) {
-          // An http: 2 session runs many proofs: their parameters are keyed
-          // by proof and purpose.
-          this.h2.bytes.control_recv += d.length
-          this.h2.onControl(m)
-          if (m.type === 'zk_params') m.type = `zk_params:${m.proof}:${m.purpose ?? ''}`
-        }
-        this.bus.emit(m)
-        return
-      }
-      const bytes = new Uint8Array(d as ArrayBuffer)
-      if (this.h2) this.h2.bytes.relay_recv += bytes.length
-      this.trackServerRecords(bytes)
-      this.flushChain = this.flushChain
-        .then(() => this.tls.handleReceivedBytes(bytes))
-        .catch((e) => console.error(`[client ${this.label}] handleReceivedBytes: ${errText(e)}`))
-    }
-    return this.wsReady
-  }
-
-  /** SHA-256 of every upstream byte and the count of complete upstream
-   * records (every content type), checked against the attestation. */
-  recvHash = createHash('sha256')
-  recvRecords = 0
-  /** SHA-256 of the provider's certificate DERs, concatenated in order. */
-  certChainHash: Uint8Array | undefined
-
-  /** The TLS client; `external` hands its key schedule to the 2PC. */
-  makeTls(external: any): void {
-      this.tls = makeTLSClient({
-        external,
-        host: upstreamHost(),
-        verifyServerCertificate: true,
-        cipherSuites: ['TLS_AES_128_GCM_SHA256'],
-        supportedProtocolVersions: ['TLS1_3'],
-        namedCurves: ['SECP256R1'],
-        applicationLayerProtocols: [HTTP2 ? 'h2' : 'http/1.1'],
-        write: (packet: { header: Uint8Array; content: Uint8Array }) => {
-          const record = concat(packet.header, packet.content)
-          if (this.inBody) this.bodyRecords.push(record)
-          this.h2?.onWrite(record)
-          this.sendBytes(record)
-        },
-        onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
-          this.h2?.onRead(ctx)
-          if (!this.postHandshake || ctx?.type !== 'ciphertext') return
-          this.serverPost.push({
-            data: ctx.contentType === 'APPLICATION_DATA',
-            keyUpdates: ctx.contentType === 'HANDSHAKE' ? countKeyUpdates(rec.content) : 0,
-          })
-        },
-        onApplicationData: (rec: Uint8Array) => {
-          if (this.h2) return this.h2.onData(rec)
-          if (!this.ttft) this.ttft = Date.now()
-          this.responseChunks.push(rec)
-          this.responseBytes = concat(this.responseBytes, rec)
-          this.responseRecordCount++
-        },
-        onRecvCertificates: ({ certificates }: { certificates: { internal: { rawData: ArrayBuffer } }[] }) => {
-          // After the fork validated the chain: checked against the attestation.
-          this.certChainHash = sha256(concat(...certificates.map((c) => new Uint8Array(c.internal.rawData))))
-        },
-        onTlsEnd: () => {
-          this.tlsEnded = true
-        },
-        onHandshake: () => {
-          this.postHandshake = true
-          this.handshakeDone()
-        },
-        logger: { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } as any,
-      })
-  }
-
-  private handshakeDone!: () => void
-  sendText(obj: unknown) {
+  sendText(obj: unknown): void {
     const text = JSON.stringify(obj)
-    if (this.h2) this.h2.bytes.control_sent += text.length
+    this.bytes.control_sent += text.length
+    trace('->', shown((obj as any)?.type))
     this.ws.send(text)
   }
-  /** When each kind of control frame first arrived (measurements). */
-  tFirst: Record<string, number> = {}
-  /** The HTTP/2 connection of an `--http2` session. */
-  h2: H2Conn | undefined
+  sendBytes(b: Uint8Array): void {
+    this.bytes.relay_sent += b.length
+    if (this.wsOpen) this.ws.send(b)
+    else this.outbox.push(b)
+  }
   /** The next control frame of `type` (or of any of several types); also ends on `stops`. */
   waitT(type: string | string[], ms: number, ...stops: Promise<unknown>[]): Promise<any> {
     return waitMsg(this.bus, type, ms, this.errP, ...stops)
   }
-  sendBytes(b: Uint8Array) {
-    if (this.h2) this.h2.bytes.relay_sent += b.length
-    if (this.wsOpen) this.ws.send(b)
-    else this.outbox.push(b)
+  /** Bytes each way so far: the session socket, the 2PC channel and the proof channel (or proof sockets). */
+  allBytes(): Record<string, number> {
+    return {
+      ...this.bytes,
+      twopc_sent: this.twopc?.bytesSent ?? 0,
+      twopc_recv: this.twopc?.bytesRecv ?? 0,
+      zk_sent: (this.zkchan?.bytesSent ?? 0) + this.zkExtra.sent,
+      zk_recv: (this.zkchan?.bytesRecv ?? 0) + this.zkExtra.recv,
+    }
   }
-  close() {
+  close(): void {
     this.zkchan?.close()
+    this.twopc?.close()
     try {
       this.ws.close()
     } catch {
@@ -753,114 +653,164 @@ class Session {
     }
   }
 
-  /** setup → ready → 2PC → TLS handshake → hs_verified. Leaves the session armed. */
-  async arm(): Promise<void> {
-    await this.wsReady
-    const nonceC = hex(cryptoRandom(32))
-    if (HTTP2) {
-      // The setup names the connection only; the terms come with each request.
-      const setup: any = { type: 'setup', http: 2, nonce_c: nonceC, armed: ARM }
-      if (NODE_MODE) {
-        setup.auth = this.token ?? ''
-        if (OFFER_SIG) setup.offer_sig = OFFER_SIG
-      } else setup.escrow_e = 1000
-      this.sendText(setup)
-    } else if (NODE_MODE) {
-      const setup: any = IMAGE
-        ? { type: 'setup', kind: 'images', nonce_c: nonceC, model: MODEL, variant: IMAGE_VARIANT_ID, count: IMAGE_COUNT, len: body.length }
-        : {
-            type: 'setup',
-            nonce_c: nonceC,
-            model: MODEL,
-            max_tokens: MAX_TOKENS,
-            len: body.length,
-            armed: ARM,
-          }
-      setup.auth = this.token ?? ''
+  /** `setup` → `ready` (§12.3): no request terms; a node gets the credential and the offer's signature. */
+  async setup(armed: boolean): Promise<void> {
+    const setup: any = { type: 'setup', v: PROTO, http: this.framing, nonce_c: hex(cryptoRandom(32)), armed }
+    if (NODE_MODE) {
+      setup.auth = AUTH
       if (OFFER_SIG) setup.offer_sig = OFFER_SIG
-      // Accept the signed offer's fees (the node refuses a setup that does
-      // not echo them).
-      if (SESSION_FEE > 0 && !NO_ACCEPT_FEE) setup.session_fee_msat = SESSION_FEE
-      if (ABANDON_FEE > 0 && !NO_ACCEPT_FEE) setup.abandon_fee_msat = ABANDON_FEE
-      this.sendText(setup)
-    } else {
-      this.sendText(
-        IMAGE
-          ? { type: 'setup', kind: 'images', nonce_c: nonceC, model: MODEL, count: IMAGE_COUNT, suffix, len: body.length, escrow_e: 1000 }
-          : {
-              type: 'setup',
-              nonce_c: nonceC,
-              model: MODEL,
-              max_tokens: MAX_TOKENS,
-              len: body.length,
-              escrow_e: 1000,
-            },
-      )
-    }
-    this.ready = await this.waitT('ready', 30000)
+    } else setup.escrow_e = 1000
+    this.sendText(setup)
+    const ready = (this.ready = await this.waitT('ready', 30000))
     // The sid names the run directory and goes into URLs: only the digest form.
-    if (typeof this.ready?.sid !== 'string' || !SID_RE.test(this.ready.sid)) {
-      throw new Error(`the node's sid ${shown(this.ready?.sid)} is not a 64-digit hex digest`)
-    }
-    this.sid = this.ready.sid
+    if (typeof ready?.sid !== 'string' || !SID_RE.test(ready.sid)) throw new Error(`the node's sid ${shown(ready?.sid)} is not a 64-digit hex digest`)
+    this.sid = ready.sid
     this.tReady = Date.now()
-    console.log(`[client ${this.label}] sid=${this.sid} head_len=${shown(this.ready.head_len)}`)
+    console.log(`[client ${this.label}] sid=${this.sid} http=${shown(ready.http)} armed=${shown(ready.armed)} head_len=${shown(ready.head_len)}`)
+    if (ready.v !== PROTO) throw new Error(`the node did not open a v${PROTO} connection`)
+    if (ready.http !== this.framing) throw new Error(`the node opened framing ${shown(ready.http)}, not "${this.framing}"`)
+    if (ready.armed !== undefined && ready.armed !== armed) throw new Error('ready names another armed state than the setup')
+    if (OFFER_PUBKEY && ready.pubkey !== OFFER_PUBKEY) throw new Error('the connection key differs from the signed offer key')
+    if (NODE_MODE && ready.deposit_msat !== DEPOSIT) {
+      throw new Error(`the node reserved a deposit of ${shown(ready.deposit_msat)} msat, the signed offer's is ${DEPOSIT}`)
+    }
+    this.runDir = `${RUNS}/${this.sid}`
+    mkdirSync(this.runDir, { recursive: true, mode: 0o700 })
+  }
 
-    if (this.ready.v !== 2) throw new Error('node did not start a v2 session')
-    if (HTTP2 && this.ready.http !== 2) throw new Error('node did not start an http: 2 session')
+  /** 2PC preprocessing, the joint key share and the proof channel: an armed connection stops here. */
+  async prewarm(adv?: string): Promise<Uint8Array> {
+    if (adv === 'twopc-tag') {
+      // A 2PC peer of another version: the first bytes on the channel are another tag.
+      const ws = new WebSocket(this.zkUrl('twopc'))
+      ws.binaryType = 'arraybuffer'
+      ws.onopen = () => ws.send(new TextEncoder().encode('routstr-2pc/split-proven-1\n'))
+      await this.waitT('error', 30000)
+      throw new Error('the node answered another 2PC version tag with no error')
+    }
     this.twopc = new TwoPc()
-    this.twopc.start(this.zkUrl('twopc', this.sid))
+    this.twopc.start(this.zkUrl('twopc'))
     if (ZKCHAN) {
       // The proof channel's OT/VOLE setup runs alongside the 2PC preprocessing.
       this.zkchan = new ZkChan()
-      this.zkchan.start(this.zkUrl('zkchan', this.sid), HTTP2)
+      this.zkchan.start(this.zkUrl('zkchan'))
     }
-    const t2pc = Date.now()
-    let keyShare = await this.twopc.keyShare()
-    if (ADV_OWN_SHARE) {
+    let keyShare = await Promise.race([this.twopc.keyShare(180_000), this.errP])
+    if (adv === 'own-keyshare') {
+      // Our own share instead of the joint one: we would hold the whole ECDHE secret.
       const { p256 } = await import('@noble/curves/p256')
       keyShare = p256.getPublicKey(p256.utils.randomPrivateKey(), false)
     }
     this.tKeyShare = Date.now()
-    this.log({ ev: 'twopc_key_share', ms: this.tKeyShare - t2pc })
-    // A TLS handshake with no local ECDHE: the fork hands the key schedule to
-    // the 2PC.
-    this.makeTls({
-      keyShare,
-      onServerHello: async (serverShare: Uint8Array, thSH: Uint8Array) => {
-        this.thSH = thSH
-        const t = Date.now()
-        const out = await this.twopc!.handshake(serverShare, thSH)
-        this.tPhaseA = Date.now() - t
-        return out
+    this.log({ ev: 'twopc_key_share', ms: this.tKeyShare - this.tReady })
+    return keyShare
+  }
+
+  /** The ClientHello with exactly the joint share; the key schedule runs on the 2PC channel (§12.5). */
+  startTls(keyShare: Uint8Array): Promise<void> {
+    this.tls = makeTLSClient({
+      // No local ECDHE: the fork hands the key schedule to the 2PC.
+      external: {
+        keyShare,
+        onServerHello: async (serverShare: Uint8Array, thSH: Uint8Array) => {
+          this.thSH = thSH
+          const t = Date.now()
+          const out = await this.twopc!.handshake(serverShare, thSH)
+          this.tPhaseA = Date.now() - t
+          return out
+        },
+        onServerFinished: async (thSF: Uint8Array) => {
+          this.thSF = thSF
+          const t = Date.now()
+          this.ap = await this.twopc!.application(thSF)
+          this.tPhaseB = Date.now() - t
+          return { serverAp0: this.ap.serverAp0, clientAp1: this.ap.clientAp1 }
+        },
       },
-      onServerFinished: async (thSF: Uint8Array) => {
-        this.thSF = thSF
-        const t = Date.now()
-        this.ap = await this.twopc!.application(thSF)
-        this.tPhaseB = Date.now() - t
-        return { serverAp0: this.ap.serverAp0, clientAp1: this.ap.clientAp1 }
+      host: upstreamHost(),
+      verifyServerCertificate: true,
+      cipherSuites: ['TLS_AES_128_GCM_SHA256'],
+      supportedProtocolVersions: ['TLS1_3'],
+      namedCurves: ['SECP256R1'],
+      applicationLayerProtocols: [this.framing === '2' ? 'h2' : 'http/1.1'],
+      write: (packet: { header: Uint8Array; content: Uint8Array }) => {
+        const record = concat(packet.header, packet.content)
+        if (this.inBody) this.bodyRecords.push(record)
+        this.h2?.onWrite(record)
+        this.sendBytes(record)
       },
-    })
+      onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
+        this.h2?.onRead(ctx)
+        if (!this.postHandshake || ctx?.type !== 'ciphertext') return
+        this.serverPost.push({
+          data: ctx.contentType === 'APPLICATION_DATA',
+          keyUpdates: ctx.contentType === 'HANDSHAKE' ? countKeyUpdates(rec.content) : 0,
+        })
+      },
+      onApplicationData: (rec: Uint8Array) => {
+        if (this.h2) return this.h2.onData(rec)
+        if (!this.ttft) this.ttft = Date.now()
+        this.responseChunks.push(rec)
+        this.responseBytes = concat(this.responseBytes, rec)
+      },
+      onRecvCertificates: ({ certificates }: { certificates: { internal: { rawData: ArrayBuffer } }[] }) => {
+        // After the fork validated the chain: checked against the attestation.
+        this.certChainHash = sha256(concat(...certificates.map((c) => new Uint8Array(c.internal.rawData))))
+      },
+      onTlsEnd: () => {
+        this.tlsEnded = true
+      },
+      onHandshake: () => {
+        this.postHandshake = true
+        this.handshakeDone()
+      },
+      logger: { trace: () => {}, debug: () => {}, info: () => {}, warn: () => {}, error: () => {} } as any,
+    } as any)
     this.handshakeP = new Promise<void>((res) => (this.handshakeDone = res))
-    await this.tls.startHandshake()
+    return this.tls.startHandshake()
+  }
+
+  /** The handshake to `hs_verified`: the node verified chain, hostname, CertificateVerify and both Finished. */
+  async handshake(keyShare: Uint8Array): Promise<void> {
+    await this.startTls(keyShare)
     await Promise.race([this.handshakeP, this.errP, timeout(30000, 'handshake')])
     await this.waitT('hs_verified', 30000)
     this.tHs = Date.now()
     this.log({ ev: 'hs_verified', phase_a_ms: this.tPhaseA, phase_b_ms: this.tPhaseB })
   }
 
-  twopc: TwoPc | undefined
-  zkchan: ZkChan | undefined
-  zkTimes: Record<string, any> = {}
-  ap: ApOut | undefined
+  /**
+   * `c_commit` and π_NK: the node's head record under K_0 is the head of the
+   * framing with a key of the offer's alphabet, and K_0 is the one the 2PC
+   * anchored (hk). Framing "1.1": the head of our request 1.
+   */
+  async proveHead(req?: { kind: 'chat' | 'images'; bodyLen: number; headLen: number; headTemplate: string }): Promise<void> {
+    this.tNkStart = Date.now()
+    const commit = await this.waitT('c_commit', 60000)
+    if (this.framing === '2') {
+      checkPiNKParamsH2(commit.params, { host: OFFER.upstream_host, probePath: H2_BLOCK!.probe_path, keyLength: OFFER.key_length, keyAlphabet: OFFER.key_alphabet, hk: this.ap!.hk })
+      if (this.ready.head_len !== commit.params.PiNK.head_len) throw new Error('ready names another head length than π_NK proves')
+    } else {
+      checkPiNKParams(commit.params, { offer: { ...OFFER, head_template: req!.headTemplate }, hk: this.ap!.hk, bodyLen: req!.bodyLen, kind: req!.kind, apiBases: API_BASES })
+      if (req!.headLen !== commit.params.PiNK.head_len) throw new Error('request_ok names another head length than π_NK proves')
+    }
+    // The attestation must later name the commitment π_NK proves; the frame has to carry exactly it.
+    this.cCommitHex = hex(Uint8Array.from(commit.params.PiNK.c_commit))
+    if (commit.c_commit !== this.cCommitHex) throw new Error("c_commit: the frame's commitment is not the one π_NK proves")
+    for (const [k, v] of [['h1', this.ap!.h1], ['h2', this.ap!.h2], ['hk', this.ap!.hk]] as const) {
+      if (commit[k] !== undefined && commit[k] !== hex(v)) throw new Error(`c_commit: anchor ${k} is not the one from our 2PC`)
+    }
+    await this.proof('pi_nk', 'verify', commit.params)
+    this.log({ ev: 'pi_nk_ok' })
+    this.tProofsReady = Date.now()
+  }
 
   /**
-   * One proof, over the pre-warmed channel when it is usable, else the
-   * per-proof path. Fallback only while no proof has started on the channel:
-   * once one has, a channel failure ends the session (the node aborts it).
+   * One proof, over the pre-warmed channel when it is usable, else on a
+   * socket of its own. Fallback only while no proof has started on the
+   * channel: once one has, a channel failure ends the connection.
    */
-  async proofV2(proof: string, cmd: 'prove' | 'verify', params: unknown, witness?: unknown): Promise<void> {
+  async proof(proof: string, cmd: 'prove' | 'verify', params: unknown, witness?: unknown): Promise<void> {
     const t = Date.now()
     const ch = this.zkchan
     if (ch && (ch.used || (await ch.ready(120_000)))) {
@@ -870,604 +820,31 @@ class Session {
       return
     }
     if (ch) this.log({ ev: 'zkchan_fallback', proof, err: String(ch.failure) })
-    const prof = await runZk(this.zkUrl(proof, this.sid), { proof, role: cmd === 'prove' ? 'prover' : 'verifier', params, witness })
+    const prof = await runZk(this.zkUrl(proof), { proof, role: cmd === 'prove' ? 'prover' : 'verifier', params, witness })
+    this.zkExtra.sent += prof.bytes_sent
+    this.zkExtra.recv += prof.bytes_recv
     this.zkTimes[proof] = { via: 'per-proof', ms: Date.now() - t, ...prof }
     trace(`zk ${proof}`, `per-proof ${Date.now() - t}ms`)
   }
-  tKeyShare = 0
-  tPhaseA = 0
-  tPhaseB = 0
 
-  thSH!: Uint8Array
-  thSF!: Uint8Array
-  tReady = 0
-  tHs = 0
-  tNkStart = 0
-  tProofsReady = 0
-  tRecordStart = 0
-  tHeadWritten = 0
-  tBodyWrite = 0
-  prepared = false
-  runDir = ''
-  logLines: string[] = []
-
-  /** Phase 1, safe to run while arming: π_NK on the credential record. */
-  async prepareProofs(): Promise<void> {
-    if (this.prepared) return
-    this.runDir = `${RUNS}/${this.sid}`
-    mkdirSync(this.runDir, { recursive: true, mode: 0o700 })
-    this.log = (o: unknown) => this.logLines.push(JSON.stringify(o))
-
-    // π_NK: the node's head record under K_0 is the published template with
-    // an alphabet key, and K_0 is the one the 2PC anchored (hk).
-    this.tNkStart = Date.now()
-    const commit = await this.waitT('c_commit', 60000)
-    if (HTTP2) {
-      checkPiNKParamsH2(commit.params, {
-        host: OFFER.upstream_host,
-        probePath: H2_BLOCK!.probe_path,
-        keyLength: OFFER.key_length,
-        keyAlphabet: OFFER.key_alphabet,
-        hk: this.ap!.hk,
-      })
-    } else checkPiNKParams(commit.params, IMAGE ? { ...OFFER, head_template: imagesOffer().head_template } : OFFER, this.ap!, body.length)
-    // The attestation must later name the commitment π_NK proves; the frame
-    // has to carry exactly it.
-    this.cCommitHex = hex(Uint8Array.from(commit.params.PiNK.c_commit))
-    if (commit.c_commit !== this.cCommitHex) throw new Error("c_commit: the frame's commitment is not the one π_NK proves")
-    await this.proofV2('pi_nk', 'verify', commit.params)
-    this.log({ ev: 'pi_nk_ok' })
-    this.tProofsReady = Date.now()
-    this.prepared = true
-  }
-
-  /** Phase 2, request-bound: credential record, body, response, settle. */
-  async finish(tClaim: number): Promise<any> {
-    const runDir = this.runDir
-    const logLines = this.logLines
-
-    this.tRecordStart = Date.now()
-    // The node writes epoch 0 (credential + KeyUpdate); we start epoch 1.
-    this.sendText({ type: 'release_head' })
-    await this.waitT('head_written', 30000)
-    this.tHeadWritten = Date.now()
-    this.log({ ev: 'head_written' })
-
-    const tBodyWrite = Date.now()
-    this.tBodyWrite = tBodyWrite
-    // The pinned suffix in its own final record (held by the node until π_C2S).
-    this.inBody = true
-    await this.tls.write(body.subarray(0, body.length - suffixBytes.length))
-    await this.tls.write(suffixBytes)
-    this.log({ ev: 'body_sent', len: body.length })
-
-    if (ADV_NO_SUFFIX) {
-      // Malicious probe: never declare the suffix, just harvest whatever the
-      // sidecar forwards before the idle upstream closes. Records the response
-      // and exits without settling.
-      const t0 = Date.now()
-      while (!this.tlsEnded && Date.now() - t0 < 20_000) {
-        await new Promise((r) => setTimeout(r, 20))
-      }
-      const text = Buffer.from(this.responseBytes).toString('utf8')
-      writePrivate(`${runDir}/adv-response.txt`, text)
-      const hasContent = /"content":\s*"[^"]/.test(text) || /"images"\s*:\s*\[\s*"/.test(text)
-      console.log(
-        `ADV_NO_SUFFIX ${JSON.stringify({
-          response_bytes: this.responseBytes.length,
-          tls_ended: this.tlsEnded,
-          has_model_output: hasContent,
-          snippet: text.slice(-300),
-        })}`,
-      )
-      return { adv: 'no-suffix', response_bytes: this.responseBytes.length, has_model_output: hasContent, sid: this.sid }
-    }
-
-    // π_C2S runs concurrently with generation and does not gate settlement on
-    // the client side; a failure is logged but never stalls the receipt.
-    // (A malicious client ignores the node's canonical suffix — ADV_* probes.)
-    if (IMAGE && this.ready.suffix === undefined) throw new Error('the node named no pinned suffix for this image session')
-    if (!ADV_SUFFIX_MODEL && ADV_IMAGE_COUNT === undefined && this.ready.suffix !== undefined && this.ready.suffix !== suffix) {
-      throw new Error('node expects a different pinned suffix than ours')
-    }
-    const claimed = ADV_CLAIM_CANONICAL ? new TextEncoder().encode(this.ready.suffix) : suffixBytes
-    this.sendText({ type: 'body_suffix', suffix: hex(claimed) })
-    const c2params = await this.waitT('zk_params', 30000)
-    const lastBody = this.bodyRecords[this.bodyRecords.length - 1] ?? new Uint8Array(0)
-    if (!ADV_SUFFIX_MODEL && ADV_IMAGE_COUNT === undefined && !ADV_CLAIM_CANONICAL) {
-      checkPiC2SParams(c2params.params, { h1: this.ap!.h1, seq: this.bodyRecords.length - 1, record: lastBody, suffix: suffixBytes })
-    }
-    const c2Promise = this.proofV2('pi_c2s', 'prove', c2params.params, { Secret: Array.from(this.ap!.clientAp1) })
-      .then(() => this.log({ ev: 'pi_c2_ok' }))
-      .catch((e) => this.log({ ev: 'pi_c2_fail', err: String(e) }))
-
-    const attMsg = await Promise.race([
-      this.bus.wait('attestation'),
-      this.errP,
-      timeout(600000, 'attestation'), // the node attests when the response ends: long answers take minutes
-    ])
-    // The signed bytes, or the attestation as we serialize it (as the SDK):
-    // the receipt must hash exactly what we verified.
-    const attJson: string = attMsg.a_json ?? JSON.stringify(attMsg.a)
-    this.attJson = attJson
-    if (OFFER_PUBKEY && this.ready.pubkey !== OFFER_PUBKEY) {
-      throw new Error('session pubkey differs from the signed offer key')
-    }
-    const attOk = verifySig(attJson, attMsg.sig, this.ready.pubkey, attMsg.sig_scheme)
-    this.log({ ev: 'attestation', sig_ok: attOk })
-    if (!attOk) throw new Error('attestation signature invalid')
-    // The signed attestation must name this session and the handshake we did.
-    const a = JSON.parse(attJson)
-    if (a?.sid !== this.sid || a.th_sh !== hex(this.thSH) || a.th_sf !== hex(this.thSF)) {
-      throw new Error('attestation names another session or handshake')
-    }
-    if (!this.cCommitHex || a.c_commit !== this.cCommitHex) {
-      throw new Error('attestation names a different head-record commitment')
-    }
-    // The rest of what we can recompute from our own records.
-    if (this.certChainHash && a.cert_chain_hash !== hex(this.certChainHash)) {
-      throw new Error('attestation names a different certificate chain')
-    }
-    if (a.server_records !== this.recvRecords) {
-      throw new Error(`attestation counts ${shown(a.server_records)} upstream records, we received ${this.recvRecords}`)
-    }
-    if (a.sha256_recv !== this.recvHash.copy().digest('hex')) {
-      throw new Error('attestation hashes different upstream bytes than we received')
-    }
-
-    await settleFlush(this)
-    // Serial mode (default): finish π_C2S before starting π_C3S. The node
-    // refuses to settle without a verified π_C2S, so a failure here is fatal. The stall
-    // study's `--parallel-proofs` skips this to test proof overlap.
-    if (SERIAL_PROOFS) {
-      await c2Promise
-      if (this.logLines.some((l) => l.includes('"pi_c2_fail"'))) {
-        throw new Error('π_C2S failed; the node will not settle without it')
-      }
-    }
-
-    // An upstream HTTP error carries no usage event: disclose only its head
-    // (status line + headers); π_C3S proves where it sits and the body stays
-    // private (the node settles 4xx/503 at zero cost).
-    // Interim 1xx heads are skipped; the final head is the status. (The
-    // template never asks for one, so an interim head before an error means
-    // the error head cannot start the first record: it is not disclosed.)
-    const finalHead = finalHeadOffset(this.responseBytes)
-    const statusLine = Buffer.from(this.responseBytes.subarray(finalHead, finalHead + 64)).toString('latin1')
-    const upstreamStatus = Number(/^HTTP\/1\.\d (\d{3})/.exec(statusLine)?.[1] ?? 0)
-    if (finalHead > 0 && upstreamStatus >= 400) throw new Error('an interim 1xx head precedes the error head; it cannot be disclosed')
-    if (upstreamStatus >= 400) {
-      console.log(`[client ${this.label}] upstream error ${upstreamStatus}: ${shown(Buffer.from(this.responseBytes).toString('utf8').split('\r\n\r\n')[1], 200)}`)
-    }
-    // Only a 2xx is accepted; any other status either discloses its error head
-    // (>= 400) or fails without accepting. ADV_ACCEPT_ANY is the dishonest client.
-    if (IMAGE && ((upstreamStatus >= 200 && upstreamStatus < 300) || (ADV_ACCEPT_ANY && upstreamStatus > 0))) {
-      return await this.acceptImages(runDir, tClaim, tBodyWrite, attMsg, attOk)
-    }
-    let r: Uint8Array | null
-    let skip = 0
-    if (upstreamStatus >= 400) {
-      const headEnd = Buffer.from(this.responseBytes).indexOf('\r\n\r\n')
-      if (headEnd < 0) throw new Error('upstream error response has no head')
-      r = this.responseBytes.slice(0, headEnd + 4)
-      skip = this.responseBytes.length - r.length
-    } else {
-      r = extractR(this.responseBytes)
-    }
-    if (!r) throw new Error('could not extract a valid usage disclosure R')
-    const tailLens: number[] = []
-    let acc = 0
-    for (let i = this.responseChunks.length - 1; i >= 0 && acc < r.length + skip; i--) {
-      tailLens.push(this.responseChunks[i]!.length + 1)
-      acc += this.responseChunks[i]!.length
-    }
-    const epoch = serverTailEpoch(this.serverPost, tailLens.length)
-    const disclose: any = { type: 'disclose', r: hex(r), tail_lens: tailLens, skip, trailing: epoch.trailing }
-    if (epoch.keyUpdates > 0) {
-      disclose.key_updates = epoch.keyUpdates
-      disclose.epoch_start = epoch.epochStart
-    }
-    this.sendText(disclose)
-
-    const c3 = await this.waitT('zk_params', 30000)
-    const handshakeRecords = this.serverRecords.length - this.serverPost.length
-    checkPiC3SParams(c3.params, {
-      h2: this.ap!.h2,
-      serverRecords: this.serverRecords,
-      r,
-      skip,
-      keyUpdates: epoch.keyUpdates,
-      epochBase: handshakeRecords >= 0 ? handshakeRecords + epoch.epochStart : undefined,
-      trailing: epoch.trailing,
-      tailLens,
-    })
-    await this.proofV2('pi_c3s', 'prove', c3.params, { Secret: Array.from(this.ap!.serverAp0) })
-    this.twopc?.close()
-    this.zkchan?.close()
-    this.log({ ev: 'pi_c3_ok' })
-
-    const terminal = await Promise.race([
-      this.bus.wait('receipt').then((m) => ({ kind: 'receipt' as const, m })),
-      this.bus.wait('usage').then((m) => ({ kind: 'usage' as const, m })),
-      this.errP,
-      timeout(60000, 'receipt/usage'),
-    ])
-    let receipt: any
-    let receiptJson: string
-    let sigHex: string | undefined
-    let scheme: string | undefined
-    if (terminal.kind === 'receipt') {
-      // The signed bytes are the receipt; the envelope beside them is ignored.
-      receiptJson = terminal.m.receipt_json ?? JSON.stringify(terminal.m.receipt)
-      receipt = JSON.parse(receiptJson)
-      sigHex = terminal.m.sig
-      scheme = terminal.m.sig_scheme
-    } else {
-      // Direct-sidecar node-settles deployment: the node (absent here) would
-      // have signed. Record the verified usage unsigned so the flow completes.
-      receipt = { sid: this.sid, model: terminal.m.model, usage: terminal.m.usage, unsigned: true }
-      receiptJson = JSON.stringify(receipt)
-      sigHex = undefined
-    }
-    const okSig = verifySig(receiptJson, sigHex, this.ready.pubkey, scheme)
-    if (terminal.kind === 'receipt') {
-      if (!okSig) throw new Error('receipt signature invalid')
-      if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${shown(receipt.sid)}, not ${this.sid}`)
-      if (
-        this.attJson === undefined ||
-        typeof receipt.attestation_hash !== 'string' ||
-        receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))
-      ) {
-        throw new Error("receipt is not bound to this session's attestation")
-      }
-    }
-
-    // A receipt may never name a larger session fee than the signed offer.
-    if ((receipt.session_fee_msat ?? 0) > SESSION_FEE || (receipt.abandon_fee_msat ?? 0) > ABANDON_FEE) {
-      throw new Error('receipt names larger fees than the signed offer')
-    }
-    if (upstreamStatus >= 400) {
-      // A request the provider rejected (a 4xx other than those below) costs
-      // the abandon fee: the node did the 2PC for it. Refusals for the
-      // provider's capacity (429, 503) or the node's own key or account (401,
-      // 402, 403) cost the session fee. Any other error costs at most the
-      // reservation, which for an image session is its flat price plus the
-      // larger fee.
-      const cost = receipt.cost_msats
-      let costOk: boolean
-      // Less than the rule allows only favours us, so the checks are bounds.
-      if ([401, 402, 403, 429, 503].includes(upstreamStatus)) costOk = cost <= SESSION_FEE
-      else if (upstreamStatus < 500) costOk = cost <= Math.max(SESSION_FEE, ABANDON_FEE)
-      else {
-        const bound = IMAGE
-          ? IMAGE_MSAT * IMAGE_COUNT + ABANDON_FEE
-          : Math.max(SESSION_FEE, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
-        costOk = Number.isSafeInteger(cost) && cost >= 0 && cost <= bound
-      }
-      // An image session's error receipt carries its terms.
-      const termsOk =
-        !IMAGE ||
-        !NODE_MODE ||
-        (receipt.kind === 'images' && receipt.model === MODEL && receipt.variant === IMAGE_VARIANT_ID && receipt.count === IMAGE_COUNT)
-      const errOk = receipt.usage?.error_status === upstreamStatus && (!NODE_MODE || (costOk && termsOk))
-      console.log(
-        `[client ${this.label}] error receipt: status=${upstreamStatus} cost_msats=${shown(receipt.cost_msats)} ok=${errOk} signature_ok=${okSig}`,
-      )
-      if (!errOk) throw new Error('error receipt does not match the disclosed upstream error')
-      return { sid: this.sid, upstream_status: upstreamStatus, cost_msats: receipt.cost_msats, receipt_sig_ok: okSig }
-    }
-
-    const text = Buffer.from(this.responseBytes).toString('utf8')
-    const parts = Buffer.from(r).toString('utf8').split('data: ')
-    const usageSeg = parts.length >= 2 ? parts[parts.length - 2]! : '{}'
-    const ownUsage = JSON.parse(usageSeg.split('\r\n')[0]!.split('\n\n')[0]!.trim())
-    const usageMatch =
-      receipt.usage?.usage?.prompt_tokens === ownUsage.usage?.prompt_tokens &&
-      receipt.usage?.usage?.completion_tokens === ownUsage.usage?.completion_tokens &&
-      // The node settles at the pinned model (π_C2S proved the request names
-      // it); the provider may report another spelling of it.
-      (receipt.model === MODEL || receipt.model === ownUsage.model)
-    if (ownUsage.model !== MODEL) {
-      console.log(`[client ${this.label}] note: the provider reported model ${shown(ownUsage.model)} for the pinned ${MODEL}`)
-    }
-    // The node may charge less than the signed rates (cached input), never
-    // more; the rates include any surcharge, the session fee comes on top.
-    const rates = OFFER?.price_list?.[MODEL]
-    const maxCost = rates ? maxUsageCharge(rates, ownUsage.usage ?? {}) + SESSION_FEE : Infinity
-    const costOk = (receipt.cost_msats ?? 0) <= maxCost
-    console.log(
-      `[client ${this.label}] receipt: model=${shown(receipt.model)} cost_msats=${shown(receipt.cost_msats)} ` +
-        `reserved_msats=${shown(receipt.reserved_msats)} balance_msats=${shown(receipt.balance_msats)} ` +
-        `session_fee_msat=${shown(receipt.session_fee_msat ?? 0)} abandon_fee_msat=${shown(receipt.abandon_fee_msat ?? 0)} ` +
-        `rate_surcharge_pct=${shown(receipt.rate_surcharge_pct ?? 0)} ` +
-        `usage_match=${usageMatch} cost_ok=${costOk} signature_ok=${okSig}`,
-    )
-    if (!usageMatch) throw new Error('receipt usage does not match our own plaintext')
-    if (!costOk) throw new Error(`receipt cost exceeds the usage at the signed rates + session fee (${maxCost} msats)`)
-
-    const modelMatch = [...text.matchAll(/"model":"([^"]+)"/g)].map((m) => m[1])
-    const effective = modelMatch[modelMatch.length - 1]
-    if (effective !== MODEL) {
-      // Not fatal: the request named MODEL (π_C2S) and the charge is at its
-      // rates; the provider's echo is another spelling (an alias, a canonical id).
-      console.log(`[client ${this.label}] note: the response names model ${shown(effective)}, the request pinned ${MODEL}`)
-    }
-
-    this.log({ ev: 'receipt', ok_sig: okSig, receipt })
-    writePrivate(`${runDir}/client.jsonl`, logLines.join('\n') + '\n')
-    writePrivate(`${runDir}/response.txt`, text)
-    writePrivate(`${runDir}/receipt.json`, JSON.stringify(receipt, null, 2))
-    if (attMsg.a) writePrivate(`${runDir}/attestation.json`, JSON.stringify(attMsg.a, null, 2))
-
-    const tEnd = Date.now()
-    const ttftAbs = this.ttft || tEnd
-    const phases = {
-      ready_ms: Math.max(0, this.tReady - tClaim),
-      handshake_ms: Math.max(0, this.tHs - this.tReady),
-      pi_nk_ms: this.tProofsReady - this.tNkStart,
+  /** The connection's phases, for the measurements. */
+  phases(tClaim: number): Record<string, unknown> {
+    return {
+      ready_ms: this.tReady - this.tStart,
       twopc_key_share_ms: this.tKeyShare - this.tReady,
       twopc_phase_a_ms: this.tPhaseA,
       twopc_phase_b_ms: this.tPhaseB,
-      twopc: this.twopc?.timings,
-      record_ms: this.tHeadWritten - this.tRecordStart,
-      zk: this.zkTimes,
+      handshake_ms: this.tHs ? this.tHs - Math.max(tClaim, this.tKeyShare) : undefined,
+      pi_nk_ms: this.tProofsReady ? this.tProofsReady - this.tNkStart : undefined,
+      head_ms: this.tHeadWritten ? this.tHeadWritten - this.tProofsReady : undefined,
+      settings_ms: this.tOpen ? this.tOpen - this.tHeadWritten : undefined,
+      connect_ms: (this.tOpen || this.tHeadWritten) ? (this.tOpen || this.tHeadWritten) - tClaim : undefined,
+      zk_nk: this.zkTimes.pi_nk,
       zkchan_ready_ms: this.zkchan?.tReady ? this.zkchan.tReady - this.zkchan.tStart : undefined,
       zkchan_setup: this.zkchan?.readyInfo?.timings,
-      claim_to_body_ms: tBodyWrite - tClaim,
-      // The node released the final body record (π_C2S verified).
-      claim_to_released_ms: this.tFirst.body_released ? this.tFirst.body_released - tClaim : undefined,
-      upstream_ttft_ms: ttftAbs - tBodyWrite,
-    }
-    return {
-      sid: this.sid,
-      uuid: this.uuid,
-      armed: ARM || POOL > 0,
-      ttft_ms: ttftAbs - tClaim,
-      ttft_body_ms: ttftAbs - tBodyWrite,
-      total_ms: tEnd - tClaim,
-      model: effective,
-      receipt_sig_ok: okSig,
-      usage_match: usageMatch,
-      cost_ok: costOk,
-      cost_msats: receipt.cost_msats,
-      reserved_msats: receipt.reserved_msats,
-      balance_msats: receipt.balance_msats,
-      phases,
-      protocol: PROTO,
-      proofs: ['twopc', 'pi_nk', 'pi_c2s', 'pi_c3s'],
+      twopc: this.twopc?.timings,
     }
   }
-
-  /** A successful image response: accept it (no disclosure) and check the flat charge. */
-  async acceptImages(runDir: string, tClaim: number, tBodyWrite: number, attMsg: any, attOk: boolean): Promise<any> {
-    this.sendText({ type: 'accept' })
-    const terminal = await Promise.race([
-      this.bus.wait('receipt').then((m) => ({ kind: 'receipt' as const, m })),
-      this.bus.wait('usage').then((m) => ({ kind: 'usage' as const, m })),
-      this.errP,
-      timeout(60000, 'receipt/usage'),
-    ])
-    this.twopc?.close()
-    this.zkchan?.close()
-    let receipt: any
-    let okSig = false
-    if (terminal.kind === 'receipt') {
-      const receiptJson = terminal.m.receipt_json ?? JSON.stringify(terminal.m.receipt)
-      receipt = JSON.parse(receiptJson)
-      okSig = verifySig(receiptJson, terminal.m.sig, this.ready.pubkey, terminal.m.sig_scheme)
-      if (!okSig) throw new Error('receipt signature invalid')
-      if (receipt.sid !== this.sid) throw new Error(`receipt is for session ${shown(receipt.sid)}, not ${this.sid}`)
-      if (
-        this.attJson === undefined ||
-        typeof receipt.attestation_hash !== 'string' ||
-        receipt.attestation_hash !== hex(sha256(new TextEncoder().encode(this.attJson)))
-      ) {
-        throw new Error("receipt is not bound to this session's attestation")
-      }
-    } else {
-      receipt = { sid: this.sid, model: terminal.m.model, usage: terminal.m.usage, unsigned: true }
-    }
-    // Flat charge: exactly the signed per-image price × count + the session fee.
-    let costOk = true
-    if (NODE_MODE) {
-      const want = IMAGE_MSAT * IMAGE_COUNT + SESSION_FEE
-      costOk = receipt.cost_msats === want && receipt.variant === IMAGE_VARIANT_ID && receipt.count === IMAGE_COUNT
-      if (!costOk) throw new Error(`image receipt charges ${shown(receipt.cost_msats)}, not ${want} for ${IMAGE_COUNT} × ${IMAGE_VARIANT_ID}`)
-    } else if (receipt.usage?.flat !== true || receipt.usage?.count !== IMAGE_COUNT) {
-      throw new Error('usage frame is not a flat charge for the pinned count')
-    }
-    // The charge was fixed at setup and accepting cannot change it (not
-    // accepting would cost the reservation), so what the response is short of
-    // is reported, not thrown: framing, image count, the provider's echo.
-    const warnings: string[] = []
-    let json: any = {}
-    try {
-      json = JSON.parse(Buffer.from(responseBody(this.responseBytes)).toString('utf8'))
-    } catch (e) {
-      warnings.push(`response body is incomplete or not JSON: ${String(e)}`)
-    }
-    const shape = imagesOffer().response_shape
-    const images: string[] = shape === 'venice' ? json.images ?? [] : (json.data ?? []).map((d: any) => d.b64_json)
-    if (images.length !== IMAGE_COUNT) warnings.push(`${images.length} of ${IMAGE_COUNT} images returned`)
-    // What the provider says it ran (Venice echoes the effective request).
-    const meta: Record<string, unknown> = { ...json }
-    delete meta.images
-    delete meta.data
-    writePrivate(`${runDir}/response-meta.json`, JSON.stringify(meta, null, 2))
-    const req = json.request?.data ?? json.request ?? {}
-    const echo: Record<string, unknown> = {}
-    for (const k of ['model', 'variants', 'resolution', 'format', 'enhance_prompt', 'enable_web_search', 'return_binary', 'style_references']) {
-      if (k in req) echo[k] = req[k]
-    }
-    const countKey = imagesOffer().count_key ?? 'variants'
-    if ('model' in req && req.model !== MODEL) warnings.push(`the provider ran ${shown(req.model)}, not ${MODEL}`)
-    if (countKey in req && req[countKey] !== IMAGE_COUNT) warnings.push(`the provider ran ${shown(req[countKey])} images, not ${IMAGE_COUNT}`)
-    for (const w of warnings) console.log(`[client ${this.label}] warning: ${w}`)
-    const files = images.map((b64, i) => {
-      const f = `${runDir}/image-${i}.webp`
-      writePrivate(f, Buffer.from(b64, 'base64'))
-      return f
-    })
-    writePrivate(`${runDir}/client.jsonl`, this.logLines.join('\n') + '\n')
-    writePrivate(`${runDir}/receipt.json`, JSON.stringify(receipt, null, 2))
-    if (attMsg.a) writePrivate(`${runDir}/attestation.json`, JSON.stringify(attMsg.a, null, 2))
-    const tEnd = Date.now()
-    console.log(
-      `[client ${this.label}] images: ${images.length} of ${IMAGE_COUNT} (${files.join(', ')}) response_bytes=${this.responseBytes.length} ` +
-        `cost_msats=${shown(receipt.cost_msats)} cost_ok=${costOk} signature_ok=${okSig} attestation_ok=${attOk}`,
-    )
-    return {
-      sid: this.sid,
-      kind: 'images',
-      model: MODEL,
-      count: IMAGE_COUNT,
-      images: images.length,
-      files,
-      response_bytes: this.responseBytes.length,
-      upstream_status: Number(/^HTTP\/1\.\d (\d{3})/.exec(Buffer.from(this.responseBytes.subarray(finalHeadOffset(this.responseBytes), finalHeadOffset(this.responseBytes) + 64)).toString('latin1'))?.[1] ?? 0),
-      echo,
-      warnings,
-      cost_msats: receipt.cost_msats,
-      cost_ok: costOk,
-      receipt_sig_ok: okSig || !NODE_MODE,
-      total_ms: tEnd - tClaim,
-      upstream_ms: (this.ttft || tEnd) - tBodyWrite,
-      zk: this.zkTimes,
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// R extraction
-// ---------------------------------------------------------------------------
-
-/** Where the final response head starts, after any interim 1xx heads. */
-function finalHeadOffset(b: Uint8Array): number {
-  let off = 0
-  for (;;) {
-    const line = Buffer.from(b.subarray(off, off + 16)).toString('latin1')
-    if (!/^HTTP\/1\.\d 1\d\d/.test(line)) return off
-    const end = Buffer.from(b).indexOf('\r\n\r\n', off)
-    if (end < 0) return off
-    off = end + 4
-  }
-}
-
-/** The HTTP response body (de-chunked when chunked), after any interim heads. */
-function responseBody(full: Uint8Array): Uint8Array {
-  const b = full.subarray(finalHeadOffset(full))
-  const headEnd = Buffer.from(b).indexOf('\r\n\r\n')
-  if (headEnd < 0) throw new Error('response has no head')
-  const head = Buffer.from(b.subarray(0, headEnd)).toString('latin1').toLowerCase()
-  const rest = b.subarray(headEnd + 4)
-  if (!/\r\ntransfer-encoding:\s*chunked/.test(head)) {
-    const len = /\r\ncontent-length:\s*(\d+)/.exec(head)
-    if (len && rest.length !== Number(len[1])) throw new Error(`body is ${rest.length} bytes, Content-Length says ${len[1]}`)
-    return rest
-  }
-  const out: Uint8Array[] = []
-  let i = 0
-  for (;;) {
-    const eol = Buffer.from(rest.subarray(i)).indexOf('\r\n')
-    if (eol < 0) throw new Error('truncated chunk size')
-    const n = parseInt(Buffer.from(rest.subarray(i, i + eol)).toString('latin1'), 16)
-    if (!Number.isFinite(n)) throw new Error('bad chunk size')
-    i += eol + 2
-    if (n === 0) break
-    out.push(rest.subarray(i, i + n))
-    i += n + 2
-  }
-  return Buffer.concat(out)
-}
-
-function parseChunks(b: Uint8Array): { start: number; data: Uint8Array }[] | null {
-  let off = 0
-  const out: { start: number; data: Uint8Array }[] = []
-  for (;;) {
-    let nl = -1
-    for (let i = off; i + 1 < b.length; i++) {
-      if (b[i] === 13 && b[i + 1] === 10) {
-        nl = i
-        break
-      }
-    }
-    if (nl < 0) return null
-    const line = Buffer.from(b.subarray(off, nl)).toString('ascii').trim()
-    if (!/^[0-9a-fA-F]+$/.test(line)) return null
-    const len = parseInt(line, 16)
-    const dataStart = nl + 2
-    if (len === 0) {
-      if (b.length !== dataStart + 2) return null
-      return out
-    }
-    if (b.length < dataStart + len + 2) return null
-    if (b[dataStart + len] !== 13 || b[dataStart + len + 1] !== 10) return null
-    out.push({ start: off, data: b.subarray(dataStart, dataStart + len) })
-    off = dataStart + len + 2
-  }
-}
-
-function endsWithUsageEvent(joined: Uint8Array): boolean {
-  const text = Buffer.from(joined).toString('utf8')
-  const tail = 'data: [DONE]\n\n'
-  if (!text.endsWith(tail)) return false
-  const before = text.slice(0, text.length - tail.length)
-  const idx = before.lastIndexOf('data: ')
-  const evText = (idx >= 0 ? before.slice(idx + 6) : before).trim()
-  if (!evText) return false
-  try {
-    const v = JSON.parse(evText)
-    return Array.isArray(v.choices) && v.choices.length === 0 && v.usage && v.usage.prompt_tokens !== undefined
-  } catch {
-    return false
-  }
-}
-
-/** SSE data of an R that starts at "\ndata: " inside a chunk (data runs to the first CRLF). */
-function dechunkLineStart(r: Uint8Array): Uint8Array | null {
-  if (Buffer.from(r.subarray(0, 7)).toString('latin1') !== '\ndata: ') return null
-  let end = -1
-  for (let i = 0; i + 1 < r.length; i++) {
-    if (r[i] === 13 && r[i + 1] === 10) {
-      end = i
-      break
-    }
-  }
-  if (end < 0) return null
-  const rest = parseChunks(r.subarray(end + 2))
-  if (!rest) return null
-  return concat(r.subarray(1, end), ...rest.map((c) => c.data))
-}
-
-function extractR(b: Uint8Array): Uint8Array | null {
-  let bodyStart = 0
-  for (let i = 0; i + 3 < b.length; i++) {
-    if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) {
-      bodyStart = i + 4
-      break
-    }
-  }
-  const body = b.subarray(bodyStart)
-  const all = parseChunks(body)
-  if (!all) return null
-  // Prefer R starting at the usage event's own line ("\ndata: " inside a
-  // chunk), so the proof's work follows the event, not the chunk size.
-  for (let i = body.length - 7; i >= 0 && body.length - i <= 1 << 16; i--) {
-    if (body[i] !== 10 || body[i + 1] !== 100) continue
-    const r = body.subarray(i)
-    const joined = dechunkLineStart(r)
-    if (!joined || !endsWithUsageEvent(joined)) continue
-    const text = Buffer.from(joined).toString('utf8')
-    if (text.startsWith('data: ') && text.indexOf('\n\ndata: ') === text.lastIndexOf('\n\ndata: ')) return r
-  }
-  for (let i = all.length - 1; i >= 0; i--) {
-    const r = body.subarray(all[i].start)
-    const chunks = parseChunks(r)
-    if (!chunks) continue
-    const joined = concat(...chunks.map((c) => c.data))
-    if (endsWithUsageEvent(joined)) return r
-  }
-  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,16 +861,7 @@ function timeout(ms: number, what: string): Promise<never> {
   return new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout waiting for ${what}`)), ms))
 }
 
-async function settleFlush(s: Session): Promise<void> {
-  // Let every queued handleReceivedBytes call finish so the last records
-  // (with data: [DONE] and the terminal chunk) are decrypted.
-  for (let i = 0; i < 200; i++) {
-    const c = s.flushChain
-    await c
-    if (c === s.flushChain && s.tlsEnded) break
-    await new Promise((r) => setTimeout(r, 5))
-  }
-}
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 function waitForGo(): Promise<void> {
   return new Promise((resolve) => {
@@ -1507,389 +875,6 @@ function waitForGo(): Promise<void> {
   })
 }
 
-/**
- * π_NK: rebuild the statement from the signed offer, our body length and
- * the anchor hk our own 2PC output, so the node cannot prove a different
- * template, key placement or key.
- */
-function checkPiNKParams(params: any, offer: any, ap: ApOut, bodyLen: number): void {
-  const p = params?.PiNK
-  if (!p) throw new Error('π_NK params missing')
-  const tpl: string = offer?.head_template ?? ''
-  const keyLen: number = offer?.key_length
-  if (!(Number.isSafeInteger(keyLen) && keyLen > 0)) throw new Error('π_NK: the offer names no key length')
-  const alphabet: string = offer?.key_alphabet ?? '[A-Za-z0-9_-]'
-  const token = `{KEY:${keyLen}}`
-  if (!tpl.includes(token)) throw new Error('π_NK: template lacks key token')
-  checkHeadTemplate(tpl, offer?.upstream_host ?? '', IMAGE ? 'images' : 'chat')
-  // The route is exactly a trusted API base plus the endpoint (CU_API_BASES,
-  // comma-separated; default the two common bases, as the SDK's bare host).
-  const bases = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
-  const ends = IMAGE ? ['/image/generate', '/images/generations'] : ['/chat/completions']
-  const route = /^POST (\S+) /.exec(tpl)?.[1]
-  if (!bases.some((b) => ends.some((e) => route === b + e))) throw new Error(`π_NK: route ${shown(route)} is not a trusted API base plus the endpoint`)
-  if ((p.key_alphabet ?? alphabet) !== alphabet) throw new Error('π_NK: key alphabet differs from the offer')
-  const filled = new TextEncoder().encode(tpl.replace(token, '\u0000'.repeat(keyLen)).replace('{LEN}', String(bodyLen)))
-  const offs: number[] = []
-  filled.forEach((b, i) => b === 0 && offs.push(i))
-  const eq = (a: ArrayLike<number>, b: ArrayLike<number>) => a.length === b.length && Array.from(a).every((x, i) => x === b[i])
-  if (p.key_len !== keyLen || offs.length !== keyLen) throw new Error('π_NK: key length mismatch')
-  if (!eq(p.template, filled)) throw new Error('π_NK: template differs from the published one')
-  if (!eq(p.key_offsets, offs)) throw new Error('π_NK: key offsets differ from the template')
-  if (p.head_len !== filled.length) throw new Error('π_NK: head_len mismatch')
-  if (!eq(p.hk, ap.hk)) throw new Error('π_NK: hk is not the anchor from our 2PC')
-  const n = filled.length + 1
-  if (!eq(p.header, [0x17, 0x03, 0x03, (n + 16) >> 8, (n + 16) & 0xff])) throw new Error('π_NK: record header mismatch')
-  if (!Array.isArray(p.c_commit) || p.c_commit.length !== 32) throw new Error('π_NK: c_commit missing')
-}
-
-/**
- * An offer that names another protocol than v2 (v1 is retired), or a chat
- * block outside the policy (docs/CHAT-SUFFIX.md), is refused.
- */
-function checkOfferVersion(offer: any): void {
-  if (offer && offer.v !== undefined && offer.v !== PROTO) {
-    console.error(`[client] the offer is for protocol v${shown(offer.v)}; this client speaks only v${PROTO}`)
-    process.exit(4)
-  }
-  if (offer) {
-    const host = typeof offer.upstream_host === 'string' ? offer.upstream_host.toLowerCase() : ''
-    if (!TRUSTED_HOSTS.includes(host)) {
-      console.error(
-        `[client] the offer's upstream_host ${shown(offer.upstream_host)} is not trusted (${TRUSTED_HOSTS.join(', ')}; --trusted-host or CU_TRUSTED_HOSTS to add one)`,
-      )
-      process.exit(4)
-    }
-  }
-  const problem = offer ? chatBlockProblem(offer) : null
-  if (problem) {
-    console.error(`[client] the offer's chat block is refused: ${termSafe(problem)}`)
-    process.exit(4)
-  }
-  // The chat head template is held to its syntax before any setup (π_NK checks it again).
-  if (offer && !IMAGE) {
-    try {
-      checkHeadTemplate(offer.head_template ?? '', offer.upstream_host ?? '', 'chat')
-    } catch (e) {
-      console.error(`[client] the offer's head template is refused: ${errText(e)}`)
-      process.exit(4)
-    }
-  }
-}
-
-/** The provider host for the TLS session: the offer's `upstream_host`, which
- * `checkOfferVersion` held to the trusted list. Without an offer (only in the
- * insecure testing path, when it could not be fetched) the first trusted host. */
-function upstreamHost(): string {
-  const h = typeof OFFER?.upstream_host === 'string' ? OFFER.upstream_host.toLowerCase() : undefined
-  if (h !== undefined && !TRUSTED_HOSTS.includes(h)) throw new Error(`upstream host ${shown(h)} is not trusted`)
-  return h ?? TRUSTED_HOSTS[0]!
-}
-
-/** A token count as the node reads one (a non-negative integer, else 0). */
-function tokenCount(v: unknown): number {
-  return typeof v === 'number' && Number.isSafeInteger(v) && v > 0 ? v : 0
-}
-
-/**
- * The most the node may charge for a usage at the signed rates (msats, no
- * fee): prompt tokens at `in`, less cached reads at `cached_in` (never above
- * `in`) and prompt-cache writes at `cache_write` (`in` when the offer has
- * none), both counted inside `prompt_tokens`; the larger of that, the formula
- * without writes and the uncached one (as the SDK's maxChargeMsats).
- */
-function maxUsageCharge(rates: any, usage: any): number {
-  const inRate = Number(rates.in)
-  const outRate = Number(rates.out)
-  const prompt = tokenCount(usage.prompt_tokens)
-  const completion = tokenCount(usage.completion_tokens)
-  const d = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object' ? usage.prompt_tokens_details : {}
-  const cached = Math.min(tokenCount(d.cached_tokens), prompt)
-  const written = Math.min(
-    [d.cache_creation_input_tokens, d.cache_write_tokens, d.cache_creation_tokens, usage.cache_creation_input_tokens]
-      .map(tokenCount)
-      .find((n) => n > 0) ?? 0,
-    prompt - cached,
-  )
-  const cachedRate = Math.min(Number(rates.cached_in ?? inRate), inRate)
-  const writeRate = Number(rates.cache_write ?? inRate)
-  const cost = (c: number, w: number) =>
-    Math.ceil((inRate * (prompt - c - w) + cachedRate * c + writeRate * w + outRate * completion) / 1000)
-  return Math.max(cost(0, 0), cost(cached, 0), cost(cached, written))
-}
-
-async function verifyOffer(): Promise<void> {
-  if (!VERIFY_OFFER) {
-    try {
-      if (!NODE) {
-        // Direct sidecar mode: the sidecar's /offer (template, no price list).
-        OFFER = await (await fetch(`${SIDECAR.replace(/\/$/, '')}/offer`)).json()
-        checkOfferVersion(OFFER)
-        return
-      }
-      const raw = await (await fetch(`${NODE!.replace(/\/$/, '')}/v1/confidential/offer`)).json()
-      OFFER = raw.sig_payload ? JSON.parse(raw.sig_payload) : raw
-      OFFER_SIG = raw.sig
-    } catch (e) {
-      console.error(`[client] could not fetch the offer: ${errText(e)}`)
-    }
-    checkOfferVersion(OFFER)
-    return
-  }
-  try {
-    const base = NODE!.replace(/\/$/, '')
-    const resp = await fetch(`${base}/v1/confidential/offer`)
-    const offer = await resp.json()
-    const payload: string = offer.sig_payload ?? JSON.stringify(offer)
-    const parsed = offer.sig_payload ? JSON.parse(offer.sig_payload) : offer
-    const ok = verifySig(payload, offer.sig, parsed.notary_pubkey, 'schnorr-secp256k1')
-    console.log(
-      `[client] offer v=${shown(parsed.v)} host=${shown(parsed.upstream_host)} prewarm=${shown(parsed.prewarm)} ` +
-        `models=${Object.keys(parsed.price_list ?? {}).length} sig_ok=${ok}`,
-    )
-    if (!ok) throw new Error('offer signature invalid')
-    if (NODE_PUBKEY && (typeof parsed.notary_pubkey !== 'string' || pubkeyHex(parsed.notary_pubkey) !== NODE_PUBKEY)) {
-      throw new Error('offer is not signed by the pinned node key')
-    }
-    OFFER_PUBKEY = parsed.notary_pubkey
-    OFFER = parsed
-    checkOfferVersion(OFFER)
-    OFFER_SIG = offer.sig
-    for (const k of ['session_fee_msat', 'abandon_fee_msat']) {
-      const v = parsed[k]
-      if (v !== undefined && !(Number.isSafeInteger(v) && v >= 0)) throw new Error(`offer ${k} is malformed`)
-    }
-    SESSION_FEE = parsed.session_fee_msat ?? 0
-    ABANDON_FEE = Math.max(parsed.abandon_fee_msat ?? 0, SESSION_FEE)
-    console.log(
-      `[client] offer session_fee_msat=${SESSION_FEE} abandon_fee_msat=${ABANDON_FEE} ` +
-        `rate_surcharge_pct=${shown(parsed.rate_surcharge_pct ?? 0)}`,
-    )
-  } catch (e) {
-    console.error(`[client] offer verification failed: ${errText(e)}`)
-    process.exit(4)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
-async function main() {
-  await verifyOffer()
-  if (IMAGE) {
-    if (ARM || POOL > 0) throw new Error('image sessions are never armed')
-    setupImageBody()
-  } else {
-    setupChatBody()
-  }
-
-  if (HTTP2) return await mainHttp2()
-
-  if (ABANDON) {
-    const s = new Session('abandon', ESCROW_TOKENS[0])
-    await s.connect()
-    await s.arm()
-    await s.prepareProofs()
-    console.log(`ABANDONED sid=${s.sid} (armed, closed unused; abandon fee ${ABANDON_FEE} msats)`)
-    s.close()
-    process.exit(0)
-  }
-
-  if (ARM || POOL > 0) {
-    const n = Math.max(1, POOL || 1)
-    const sessions: Session[] = []
-    for (let i = 0; i < n; i++) {
-      const s = new Session(`pool-${i}`, ESCROW_TOKENS[i] ?? ESCROW_TOKENS[0])
-      sessions.push(s)
-    }
-    const tArmStart = Date.now()
-    await Promise.all(sessions.map((s) => s.connect()))
-    await Promise.all(sessions.map((s) => s.arm()))
-    // Run π_NK while arming: it is bound to the session keys and the head
-    // length, not to the request content, so the claim path is just the
-    // credential record + body.
-    await Promise.all(sessions.map((s) => s.prepareProofs()))
-    const tArmDone = Date.now()
-    console.log(`ARMED pool=${n} sids=${sessions.map((s) => s.sid).join(',')}`)
-    console.log('READY (send "go" on stdin to claim a session)')
-    await waitForGo()
-    const tClaim = Date.now()
-    const out = await sessions[0]!.finish(tClaim)
-    out.arm_ms = tArmDone - tArmStart
-    for (const s of sessions.slice(1)) s.close()
-    console.log('E2E_JSON ' + JSON.stringify(out))
-    sessions[0]!.close()
-    process.exit(0)
-  }
-
-  const s = new Session('single', ESCROW_TOKENS[0])
-  await s.connect()
-  const tClaim = Date.now()
-  await s.arm()
-  await s.prepareProofs()
-  const out = await s.finish(tClaim)
-  console.log('E2E_JSON ' + JSON.stringify(out))
-  s.close()
-  process.exit(out.receipt_sig_ok ? 0 : 3)
-}
-
-/** `--http2`: one connection, `--requests N` sequential chat requests. */
-async function mainHttp2(): Promise<void> {
-  if (POOL > 0 || ABANDON) throw new Error('--http2 serves its requests on one connection (no --pool, --abandon)')
-  if (!ZKCHAN) throw new Error('--http2 needs the proof channel (no --no-zkchan)')
-  const bases = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
-  // Refuse before any setup if the verified offer does not list http 2.
-  H2_BLOCK = checkH2Offer(OFFER, bases)
-  if (!(Number.isSafeInteger(H2_REQUESTS) && H2_REQUESTS >= 0 && H2_REQUESTS <= H2_BLOCK.max_requests)) {
-    throw new Error(`--requests must be 0..${H2_BLOCK.max_requests}`)
-  }
-  // The deposit is reserved by the setup: refuse before sending one.
-  if (H2_BLOCK.connection_deposit_msat > H2_MAX_DEPOSIT) {
-    throw new Error(`the node's connection deposit of ${H2_BLOCK.connection_deposit_msat} msat exceeds --max-deposit ${H2_MAX_DEPOSIT}`)
-  }
-  const enc = new TextEncoder()
-  // Image requests on the connection (A.13): the variant, its price and the
-  // images route come from the offer's images block.
-  const kindOf = (n: number): string => H2_KINDS[n - 1] ?? (IMAGE ? 'images' : 'chat')
-  const anyImages = Array.from({ length: H2_REQUESTS }, (_, i) => kindOf(i + 1)).includes('images')
-  let image: { model: string; variant?: string; count: number; pins: [string, unknown][]; msat: number; path: string; im: any } | undefined
-  if (anyImages) {
-    if (!H2_BLOCK.kinds.includes('images')) throw new Error('offer_no_http2_images: the offer serves no image requests over http 2')
-    const im = imagesOffer()
-    const model = H2_IMAGE_MODEL ?? (IMAGE ? MODEL : undefined)
-    if (!model) throw new Error('an image request needs --image-model')
-    const variants: any[] | undefined = im.price_list?.[model]
-    const v = variants ? (IMAGE_VARIANT ? variants.find((x) => x.id === IMAGE_VARIANT) : variants[0]) : undefined
-    if (variants && !v) throw new Error(`no offered variant ${IMAGE_VARIANT ?? ''} for ${model}`)
-    const maxCount = Math.min(im.max_count, v?.max_count ?? im.max_count)
-    if (!(Number.isSafeInteger(IMAGE_COUNT) && IMAGE_COUNT >= 1 && IMAGE_COUNT <= maxCount)) throw new Error(`--count must be 1..${maxCount}`)
-    // Without a node (a sidecar's own offer has no variants): WebP at the default tier.
-    const pins: [string, unknown][] = v ? v.pins : [...(IMAGE_RESOLUTION ? [['resolution', IMAGE_RESOLUTION] as [string, unknown]] : []), ['format', 'webp']]
-    image = { model, variant: v?.id, count: IMAGE_COUNT, pins, msat: v?.msat_per_image ?? 0, path: chatPath(im.head_template), im }
-  }
-  const ctx: H2Ctx = {
-    offer: OFFER,
-    h2: H2_BLOCK,
-    nodeMode: NODE_MODE,
-    requestExtras: {},
-    requests: H2_REQUESTS,
-    pauseMs: H2_PAUSE_MS,
-    lingerMs: H2_LINGER_MS,
-    chunk: H2_CHUNK,
-    buildBody: (n: number) => {
-      if (kindOf(n) === 'images') {
-        const im = image!
-        const wrong = ADV_H2 === 'suffix' && ADV_H2_AT === n
-        const canonicalSuffix = renderImagesSuffix(im.im, im.model, im.count, im.pins)
-        // The attack: the body ends in a suffix that orders more images than the request pays for.
-        const sfx = wrong ? renderImagesSuffix(im.im, im.model, ADV_IMAGE_COUNT ?? im.count + 1, im.pins) : canonicalSuffix
-        let p = `{"prompt":${JSON.stringify(PROMPT)}`
-        if (PRIVATE_EXTRA && (H2_PRIVATE_EXTRA_AT === 0 || H2_PRIVATE_EXTRA_AT === n)) p += `,${PRIVATE_EXTRA}`
-        return {
-          model: im.model, maxTokens: 0, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix,
-          image: { variant: im.variant, count: im.count, path: im.path, responseShape: im.im.response_shape, msatPerImage: im.msat },
-        }
-      }
-      const model = H2_MODELS[n - 1] ?? MODEL
-      const wrong = ADV_H2 === 'suffix' && ADV_H2_AT === n
-      const canonicalSuffix = renderChatSuffix(OFFER.chat, model, MAX_TOKENS)
-      const sfx = wrong ? renderChatSuffix(OFFER.chat, ADV_SUFFIX_MODEL ?? `${model}-x`, MAX_TOKENS) : canonicalSuffix
-      let content = H2_REQUESTS > 1 ? `${PROMPT} (request ${n})` : PROMPT
-      if (H2_BODY_BYTES > content.length) content += ` Ignore this filler: ${'lorem ipsum '.repeat(Math.ceil((H2_BODY_BYTES - content.length) / 12))}`
-      let p = `{"messages":[{"role":"user","content":${JSON.stringify(content)}}]`
-      if (PRIVATE_EXTRA && (H2_PRIVATE_EXTRA_AT === 0 || H2_PRIVATE_EXTRA_AT === n)) p += `,${PRIVATE_EXTRA}`
-      return { model, maxTokens: MAX_TOKENS, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix }
-    },
-    adv: ADV_H2 ? { mode: ADV_H2, at: ADV_H2_AT, path: ADV_H2_PATH } : undefined,
-    verifySig,
-    shown,
-    writePrivate,
-    log: () => {},
-  }
-  const s = new Session('h2', ESCROW_TOKENS[0])
-  if (NODE_MODE) {
-    ctx.requestExtras = { auth: s.token ?? '', ...(OFFER_SIG ? { offer_sig: OFFER_SIG } : {}) }
-    if (SESSION_FEE > 0 && !NO_ACCEPT_FEE) ctx.requestExtras.session_fee_msat = SESSION_FEE
-    if (ABANDON_FEE > 0 && !NO_ACCEPT_FEE) ctx.requestExtras.abandon_fee_msat = ABANDON_FEE
-    // The node's receipt, per request: the bounds a v2 receipt is held to.
-    ctx.checkReceipt = (receipt, q) => {
-      const cost = receipt.cost_msats
-      let bound: number
-      if (q.status >= 400) {
-        if ([401, 402, 403, 429, 503].includes(q.status)) bound = SESSION_FEE
-        else if (q.status < 500) bound = Math.max(SESSION_FEE, ABANDON_FEE)
-        else bound = Math.max(SESSION_FEE, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
-      } else if (q.image) {
-        // A flat charge: exactly the signed price per image × count + the session fee.
-        const want = q.image.msatPerImage * q.image.count + SESSION_FEE
-        const ok =
-          receipt.http === 2 && receipt.kind === 'images' && receipt.usage?.flat === true && receipt.model === q.model &&
-          receipt.variant === q.image.variant && receipt.count === q.image.count &&
-          receipt.msat_per_image === q.image.msatPerImage && receipt.cost_msats === want
-        console.log(
-          `[client ${s.label}] receipt ${q.n}: images variant=${shown(receipt.variant)} count=${shown(receipt.count)} cost_msats=${shown(receipt.cost_msats)} ` +
-            `reserved_msats=${shown(receipt.reserved_msats)} balance_msats=${shown(receipt.balance_msats)} want_msats=${want} cost_ok=${ok}`,
-        )
-        if (!ok) throw new Error(`image receipt ${q.n} is not ${q.image.count} × ${shown(q.image.variant)} at ${q.image.msatPerImage} msat + fee (${want} msat)`)
-        return
-      } else {
-        // At most the usage at the signed rates (the node may charge less,
-        // for cached input) plus the session fee.
-        const rates = OFFER?.price_list?.[q.model]
-        if (!rates) throw new Error(`the signed offer does not price ${shown(q.model)}`)
-        bound = maxUsageCharge(rates, q.usage ?? {}) + SESSION_FEE
-      }
-      const costOk = Number.isSafeInteger(cost) && cost >= 0 && cost <= bound
-      console.log(
-        `[client ${s.label}] receipt ${q.n}: status=${q.status} cost_msats=${shown(cost)} reserved_msats=${shown(receipt.reserved_msats)} ` +
-          `balance_msats=${shown(receipt.balance_msats)} bound_msats=${bound} cost_ok=${costOk}`,
-      )
-      if (receipt.http !== 2) throw new Error('the receipt does not name http 2')
-      if (!costOk) throw new Error(`receipt ${q.n} charges ${shown(cost)} msats, more than the ${bound} its ${q.status >= 400 ? 'error status' : 'usage at the signed rates'} allows`)
-    }
-  }
-  const conn = new H2Conn(s, ctx)
-  s.h2 = conn
-  await s.connect()
-  const tClaim = Date.now()
-  await s.arm()
-  await s.prepareProofs()
-  ctx.log = s.log
-  if (ARM) {
-    console.log(`ARMED sid=${s.sid} (http: 2 connection, no request yet)`)
-    console.log('READY (send "go" on stdin to open the connection)')
-    await waitForGo()
-  }
-  const out = await runHttp2(s, conn, ARM ? Date.now() : tClaim)
-  if (out.adv) console.log('ADV_H2 ' + JSON.stringify(out.adv))
-  console.log('E2E_JSON ' + JSON.stringify(out))
-  s.twopc?.close()
-  s.close()
-  const honestOk = out.requests.length === (ADV_H2 ? ADV_H2_AT - 1 : H2_REQUESTS) || out.requests.some((r: any) => r.status >= 400)
-  // A connection opened and left without a request (--requests 0): nothing to verify but its end.
-  if (H2_REQUESTS === 0) process.exit(0)
-  // Exit codes: 0 = every request settled (or the attack was refused), 3 = a
-  // receipt was not verified, 5 = an attack was not refused.
-  if (ADV_H2) process.exit(out.adv?.refused ? 0 : 5)
-  process.exit(honestOk && out.receipt_sig_ok ? 0 : 3)
-}
-
-// Run only as the entry point, so the offer checks above can be imported offline.
-const isEntry = (() => {
-  try {
-    return !!argv[1] && realpathSync(argv[1]) === realpathSync(fileURLToPath(import.meta.url))
-  } catch {
-    return false
-  }
-})()
-if (isEntry) {
-  main().catch((e) => {
-    console.error(`[client] FAILED: ${errText(e)}`)
-    process.exit(1)
-  })
-}
-
 /** KeyUpdate messages (type 24) in a decrypted handshake record. */
 function countKeyUpdates(content: Uint8Array): number {
   let n = 0
@@ -1899,4 +884,366 @@ function countKeyUpdates(content: Uint8Array): number {
     i += 4 + ((content[i + 1]! << 16) | (content[i + 2]! << 8) | content[i + 3]!)
   }
   return n
+}
+
+/**
+ * Node mode: a request's signed receipt against the signed offer. A receipt
+ * never names larger fees than the offer; the session fee is charged with the
+ * connection's first settlement only; the charge is at most what the usage at
+ * the signed rates (or the error status) allows, and exactly the flat price
+ * for accepted images.
+ */
+function checkReceipt(label: string): NonNullable<Ctx['checkReceipt']> {
+  return (receipt, q) => {
+    const feeDue = q.first ? SESSION_FEE : 0
+    if ((receipt.session_fee_msat ?? 0) > feeDue || (receipt.abandon_fee_msat ?? 0) > ABANDON_FEE) {
+      throw new Error(`receipt ${q.n} names larger fees than the signed offer allows for this request`)
+    }
+    const cost = receipt.cost_msats
+    let bound: number
+    if (q.status >= 400 && !(q.image && receipt.usage?.flat === true)) {
+      // 429/503 and 401/402/403 (the provider's capacity, the node's own key
+      // or account): the session fee if still due; any other 4xx: the abandon
+      // fee; other 5xx: at most the reservation.
+      if ([401, 402, 403, 429, 503].includes(q.status)) bound = feeDue
+      else if (q.status < 500) bound = Math.max(feeDue, ABANDON_FEE)
+      else bound = Math.max(feeDue, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
+      if (q.image && !(receipt.kind === 'images' && receipt.model === q.model && receipt.variant === q.image.variant && receipt.count === q.image.count)) {
+        throw new Error(`error receipt ${q.n} does not carry the image request's terms`)
+      }
+    } else if (q.image) {
+      const want = q.image.msatPerImage * q.image.count + feeDue
+      const ok =
+        receipt.kind === 'images' && receipt.usage?.flat === true && receipt.model === q.model && receipt.variant === q.image.variant &&
+        receipt.count === q.image.count && receipt.msat_per_image === q.image.msatPerImage && receipt.cost_msats === want
+      console.log(
+        `[client ${label}] receipt ${q.n}: images variant=${shown(receipt.variant)} count=${shown(receipt.count)} cost_msats=${shown(cost)} ` +
+          `reserved_msats=${shown(receipt.reserved_msats)} balance_msats=${shown(receipt.balance_msats)} want_msats=${want} cost_ok=${ok}`,
+      )
+      if (!ok) throw new Error(`image receipt ${q.n} is not ${q.image.count} × ${shown(q.image.variant)} at ${q.image.msatPerImage} msat + fee (${want} msat)`)
+      return
+    } else {
+      // At most the usage at the signed rates (the node may charge less, for cached input) plus the fee.
+      const rates = OFFER?.price_list?.[q.model]
+      if (!rates) throw new Error(`the signed offer does not price ${shown(q.model)}`)
+      bound = maxUsageCharge(rates, q.usage ?? {}) + feeDue
+    }
+    const costOk = Number.isSafeInteger(cost) && cost >= 0 && cost <= bound
+    console.log(
+      `[client ${label}] receipt ${q.n}: http=${q.http} status=${q.status} cost_msats=${shown(cost)} reserved_msats=${shown(receipt.reserved_msats)} ` +
+        `balance_msats=${shown(receipt.balance_msats)} session_fee_msat=${shown(receipt.session_fee_msat ?? 0)} bound_msats=${bound} cost_ok=${costOk}`,
+    )
+    if (!costOk) throw new Error(`receipt ${q.n} charges ${shown(cost)} msats, more than the ${bound} its ${q.status >= 400 ? 'error status' : 'usage at the signed rates'} allows`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+interface ConnOut {
+  s: Session
+  results: any[]
+  adv?: any
+  lingered?: number
+  tClaim: number
+  armed: boolean
+}
+
+function makeCtx(label: string): Ctx {
+  const requestExtras: Record<string, unknown> = {}
+  if (NODE_MODE) {
+    requestExtras.auth = AUTH
+    if (OFFER_SIG) requestExtras.offer_sig = OFFER_SIG
+    // The offer's fees are echoed (a request that does not is refused: session_fee_not_accepted).
+    if (!NO_ACCEPT_FEE) {
+      requestExtras.session_fee_msat = SESSION_FEE
+      requestExtras.abandon_fee_msat = ABANDON_FEE
+    }
+  }
+  return {
+    offer: OFFER,
+    h2: H2_BLOCK,
+    nodeMode: NODE_MODE,
+    depositMsat: DEPOSIT,
+    requestExtras,
+    checkReceipt: NODE_MODE ? checkReceipt(label) : undefined,
+    requests: REQUESTS,
+    pauseMs: PAUSE_MS,
+    lingerMs: LINGER_MS,
+    chunk: H2_CHUNK,
+    buildBody,
+    refuseFirst: REFUSE_FIRST,
+    adv: ADV_MODE ? { mode: ADV_MODE, at: ADV_AT, path: ADV_PATH } : undefined,
+    acceptAny: ADV_ACCEPT_ANY,
+    verifySig,
+    shown,
+    writePrivate,
+    log: () => {},
+  }
+}
+
+/** Opened or armed: setup, 2PC preprocessing, key share; with `arm`, wait for "go". */
+async function openConnection(framing: Framing, label: string, arm: boolean, ctx: Ctx): Promise<{ s: Session; keyShare: Uint8Array; tClaim: number }> {
+  const s = new Session(label, framing)
+  current = s
+  ctx.log = s.log
+  await s.connect()
+  await s.setup(arm)
+  const earlyAdv = ctx.adv && ['twopc-tag', 'own-keyshare'].includes(ctx.adv.mode) ? ctx.adv.mode : undefined
+  const keyShare = await s.prewarm(earlyAdv)
+  let tClaim = s.tStart
+  if (arm) {
+    // Pre-warm: the proof channel's correlations are part of it. Nothing binds
+    // the connection to a request: only the credential (a node) is named.
+    if (s.zkchan && !(await s.zkchan.ready(180_000))) throw new Error(`the proof channel did not come up: ${String(s.zkchan.failure)}`)
+    const armBytes = s.allBytes()
+    console.log(`ARMED sid=${s.sid} http=${framing} arm_ms=${Date.now() - s.tStart} arm_bytes=${JSON.stringify(armBytes)}`)
+    if (ABANDON) return { s, keyShare, tClaim }
+    console.log('READY (send "go" on stdin to send the request)')
+    await Promise.race([waitForGo(), s.errP])
+    tClaim = Date.now()
+    s.claimBytes = armBytes
+  }
+  return { s, keyShare, tClaim }
+}
+
+/** The session in flight (for the fallback decision and the attack's outcome). */
+let current: Session | undefined
+
+/** A framing-"2" connection: requests `from`… one after another. */
+async function serveH2(from: number, arm: boolean): Promise<ConnOut> {
+  const ctx = makeCtx('h2')
+  if (!H2_BLOCK) throw new Error('offer_no_http2: the offer does not list http 2')
+  for (let g = from; g <= REQUESTS; g++) {
+    if (kindOf(g) === 'images' && !H2_BLOCK.kinds.includes('images')) throw new Error('offer_no_http2_images: the offer serves no image requests on framing "2"')
+  }
+  const { s, keyShare, tClaim } = await openConnection('2', 'h2', arm, ctx)
+  const conn = new H2Conn(s, ctx)
+  s.h2 = conn
+  if (ABANDON) return { s, results: [], tClaim, armed: arm }
+  try {
+    await s.handshake(keyShare)
+    await s.proveHead()
+  } catch (e) {
+    // An attack on the handshake itself (our own key share) ends here.
+    if (ctx.adv && ['own-keyshare'].includes(ctx.adv.mode)) return { s, results: [], adv: await advOutcome(s, ctx, e, { at: 0 }), tClaim, armed: arm }
+    throw e
+  }
+  const out = await runHttp2(s, conn, from)
+  return { s, ...out, tClaim, armed: arm }
+}
+
+/** A framing-"1.1" connection: request `g` of the run, request 1 of the connection. */
+async function serve11(g: number, arm: boolean): Promise<ConnOut> {
+  const ctx = makeCtx('h11')
+  if (!OFFER_HTTP.includes('1.1')) throw new Error('offer_no_http11: the offer does not list http 1.1')
+  const attack = ctx.adv && ctx.adv.at === g ? ctx.adv.mode : undefined
+  const h = { v: undefined as H11 | undefined }
+  const { s, keyShare, tClaim } = await openConnection('1.1', REQUESTS > 1 ? `h11-${g}` : 'h11', arm, ctx)
+  if (ABANDON) return { s, results: [], tClaim, armed: arm }
+  try {
+    const h11 = (h.v = new H11(s, ctx, g))
+    if (attack === 'early-record') {
+      // The ClientHello before `request` 1 was accepted: a protocol error.
+      await s.startTls(keyShare)
+      await s.waitT('error', 15000)
+      throw new Error('the node answered a ClientHello with no request with no error')
+    }
+    await h11.open()
+    await s.handshake(keyShare)
+    const b = h11.b
+    await s.proveHead({ kind: b.kind, bodyLen: b.body.length, headLen: h11.ok.head_len, headTemplate: b.image ? b.image.headTemplate : OFFER.head_template })
+    const r = await h11.run(tClaim)
+    if (r.adv) {
+      // no-proof: the final record was withheld by the node, or it was not.
+      return { s, results: [], adv: { mode: attack, http: '1.1', at: g, refused: r.adv.withheld, reason: r.adv.withheld ? 'the final record was held' : 'the provider answered', ...r.adv }, tClaim, armed: arm }
+    }
+    console.log(
+      `[client ${s.label}] request ${g}: status=${r.status} released_ms=${r.released_ms} ttft_ms=${r.ttft_ms} total_ms=${r.total_ms} ` +
+        `usage=${JSON.stringify(r.usage ?? null)} receipt_sig_ok=${r.receipt_sig_ok}`,
+    )
+    r.g = g
+    if (attack) return { s, results: [r], adv: { mode: attack, http: '1.1', at: g, refused: false, detail: 'the request settled' }, tClaim, armed: arm }
+    return { s, results: [r], tClaim, armed: arm }
+  } catch (e) {
+    if (!attack) throw e
+    return { s, results: [], adv: await advOutcome(s, ctx, e, { at: g, body_released: s.bodyReleased, response_bytes: s.responseBytes.length }), tClaim, armed: arm }
+  }
+}
+
+/** `--legacy-v2-socket`: what a protocol-v2 client gets from this peer (§11, §12.2). */
+async function legacySocket(): Promise<never> {
+  const noV = argv.includes('--legacy-no-v')
+  const url = NODE_MODE ? `${wsBase()}/v1/confidential/ws?session_id=${randomUUID()}${noV ? '' : '&v=2'}` : `${wsBase()}/session`
+  const ws = new WebSocket(url)
+  const answer = await new Promise<any>((res) => {
+    const t = setTimeout(() => res({ timeout: true }), 15000)
+    const done = (v: any) => (clearTimeout(t), res(v))
+    // A v2-shaped setup: request terms, no `v`. No credential is sent to a peer that should refuse it.
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'setup', nonce_c: hex(cryptoRandom(32)), model: MODEL, max_tokens: MAX_TOKENS, len: 100, armed: false, ...(NODE_MODE ? { auth: '' } : { escrow_e: 1000 }) }))
+    ws.onmessage = (ev) => {
+      try {
+        done(typeof ev.data === 'string' ? JSON.parse(ev.data) : { binary: true })
+      } catch {
+        done({ unparsable: true })
+      }
+    }
+    ws.onerror = () => done({ socket_error: true })
+    ws.onclose = (ev: any) => done({ closed: true, code: ev?.code, reason: String(ev?.reason ?? '') })
+  })
+  try {
+    ws.close()
+  } catch {
+    /* ignore */
+  }
+  const upgrade = isUpgradeRequired(answer)
+  console.log(`[client] legacy v2 socket: ${upgrade ? 'refused with upgrade_required' : 'NOT refused with upgrade_required'}: ${shown(answer, 400)}`)
+  console.log('LEGACY_JSON ' + JSON.stringify({ upgrade_required: upgrade, answer }))
+  process.exit(upgrade ? 0 : 5)
+}
+
+async function main() {
+  if (LEGACY) await legacySocket()
+  await fetchOffer()
+  if (!(Number.isSafeInteger(REQUESTS) && REQUESTS >= 0 && REQUESTS <= 1000)) usage('--requests must be 0..1000')
+  if (HTTP_MODE !== 'auto' && !OFFER_HTTP.includes(HTTP_MODE as Framing)) {
+    throw new Error(`${HTTP_MODE === '2' ? 'offer_no_http2' : 'offer_no_http11'}: the offer lists http ${JSON.stringify(OFFER_HTTP)}, not "${HTTP_MODE}"`)
+  }
+  // §2.3: the first entry of the offer's list this client supports and has not marked bad.
+  const bad = new Set<Framing>()
+  const pick = (): Framing => {
+    const f = HTTP_MODE === 'auto' ? OFFER_HTTP.find((x) => !bad.has(x)) : (HTTP_MODE as Framing)
+    if (!f) throw new Error('no framing of the offer is left to try')
+    return f
+  }
+  if (ADV_MODE && !ADV_MODES[ADV_MODE]!.includes(pick())) usage(`--adv ${ADV_MODE} does not apply to framing "${pick()}"`)
+  if (REQUESTS === 0 && pick() !== '2' && !ABANDON) usage('--requests 0 needs framing "2" (a framing-"1.1" connection opens with its request)')
+  if (H2_BLOCK && pick() === '2' && REQUESTS > H2_BLOCK.max_requests) usage(`--requests must be 0..${H2_BLOCK.max_requests} on one framing-"2" connection`)
+  // Build every body before any setup: a bad flag or offer block fails here.
+  for (let g = 1; g <= REQUESTS; g++) buildBody(g)
+
+  const results: any[] = []
+  const conns: any[] = []
+  let adv: any
+  let fallback: any
+  let lastClosed: any
+  let g = 1
+  let first = true
+  while (g <= REQUESTS || first) {
+    const framing = pick()
+    const arm = (ARM || ABANDON) && first
+    let out: ConnOut
+    try {
+      out = framing === '2' ? await serveH2(g, arm) : await serve11(g, arm)
+    } catch (e) {
+      const s = current
+      const pe = s?.peerError
+      // §2.3: a framing-"2" connection that fails before the body of its first
+      // request was released is retried on "1.1" on the same node. Not after a
+      // body was released; not when the request itself or the setup was refused.
+      const refusedByTerms = e instanceof RequestRefused || (typeof pe?.status === 'number' && pe.status >= 400 && pe.status < 500)
+      if (HTTP_MODE === 'auto' && framing === '2' && OFFER_HTTP.includes('1.1') && s !== undefined && !s.bodyReleased && !refusedByTerms && !ADV_MODE) {
+        bad.add('2')
+        fallback = { from: '2', to: '1.1', at: g, reason: errText(e).slice(0, 300), code: pe?.code, fault: pe?.fault, sid: s.sid || undefined }
+        console.log(`[client] FALLBACK framing "2" failed before a body was released (${fallback.reason}); marked bad, serving request ${g} on "1.1"`)
+        s.close()
+        first = false
+        continue
+      }
+      throw e
+    }
+    first = false
+    const { s } = out
+    if (ABANDON) {
+      console.log(`ABANDONED sid=${s.sid} http=${framing} (armed, closed unused)`)
+      s.close()
+      await sleep(600)
+      process.exit(0)
+    }
+    // Per request: where it ran, and the measurement line.
+    out.results.forEach((r, i) => {
+      r.g = r.g ?? r.n
+      r.sid = s.sid
+      const firstOnConn = i === 0
+      r.mode = !firstOnConn ? 'open' : out.armed ? 'armed' : 'cold'
+      const at = r.at
+      delete r.at
+      if (firstOnConn && framing === '2') {
+        // From the claim (the connection's start, or "go" on an armed one) to request 1.
+        r.from_claim = { released_ms: at?.released ? at.released - out.tClaim : undefined, ttft_ms: at?.first_data ? at.first_data - out.tClaim : undefined }
+        const now = s.setupBytes ?? {}
+        r.connect_bytes = Object.fromEntries(Object.keys(now).map((k) => [k, now[k]! - (s.claimBytes[k] ?? 0)]))
+      }
+      const b = { ...r.bytes }
+      if (r.connect_bytes) for (const k of Object.keys(b)) b[k] += r.connect_bytes[k] ?? 0
+      console.log(
+        'BENCH ' +
+          JSON.stringify({
+            http: framing, mode: r.mode, g: r.g, n: r.n, kind: r.kind ?? 'chat', status: r.status, body_len: r.body_len,
+            ttft_ms: r.from_claim?.ttft_ms ?? r.ttft_ms, released_ms: r.from_claim?.released_ms ?? r.released_ms, total_ms: r.total_ms,
+            bytes: {
+              session_sent: b.control_sent + b.relay_sent, session_recv: b.control_recv + b.relay_recv,
+              twopc_sent: b.twopc_sent, twopc_recv: b.twopc_recv, zk_sent: b.zk_sent, zk_recv: b.zk_recv,
+            },
+          }),
+      )
+    })
+    results.push(...out.results)
+    lastClosed = s.closedReason === undefined ? undefined : { reason: s.closedReason, idle_ms: out.lingered }
+    conns.push({
+      sid: s.sid, http: framing, armed: out.armed, requests: out.results.length, phases: s.phases(out.tClaim),
+      setup_bytes: s.setupBytes, total_bytes: s.allBytes(), deposit: s.deposit, closed: lastClosed,
+    })
+    writePrivate(`${s.runDir}/client.jsonl`, s.logLines.join('\n') + '\n')
+    adv = out.adv
+    s.close()
+    g += Math.max(1, out.results.length)
+    // An attack ends the run; so does an error status (the connection is over, and so is the example).
+    if (adv || out.results.some((r) => r.status >= 400) || out.results.length === 0) break
+    if (g <= REQUESTS && framing === '1.1' && PAUSE_MS > 0) await sleep(PAUSE_MS)
+  }
+  const last = conns[conns.length - 1]
+  const summary = {
+    protocol: PROTO,
+    http: last?.http,
+    sid: last?.sid,
+    requests: results,
+    adv,
+    fallback,
+    deposit: last?.deposit,
+    closed: lastClosed,
+    phases: last?.phases,
+    setup_bytes: last?.setup_bytes,
+    total_bytes: last?.total_bytes,
+    connections: conns,
+    receipt_sig_ok: results.length > 0 && results.every((r) => r.receipt_sig_ok),
+  }
+  if (adv) console.log('ADV ' + JSON.stringify(adv))
+  console.log('E2E_JSON ' + JSON.stringify(summary))
+  await sleep(600) // the proof channel's orderly close
+  if (ADV_MODE) process.exit(adv?.refused ? 0 : 5)
+  // A connection opened and left without a request (--requests 0): nothing to verify but its end.
+  if (REQUESTS === 0) process.exit(0)
+  const complete = results.length === REQUESTS || results.some((r) => r.status >= 400)
+  process.exit(complete && summary.receipt_sig_ok ? 0 : 3)
+}
+
+// Run only as the entry point, so the checks above can be imported offline.
+const isEntry = (() => {
+  try {
+    return !!argv[1] && realpathSync(argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+})()
+if (isEntry) {
+  main().catch(async (e) => {
+    const pe = current?.peerError
+    if (e instanceof RequestRefused) console.error(`[client] REFUSED: ${errText(e)}`)
+    console.error(`[client] FAILED: ${errText(e)}`)
+    current?.close()
+    await sleep(100)
+    process.exit(pe && isUpgradeRequired(pe) ? 7 : 1)
+  })
 }

@@ -1,4 +1,4 @@
-// Offline tests of the `--http2` connection's message handling (H2Conn) with
+// Offline tests of the framing-"2" connection's message handling (H2Conn) with
 // a fake session: no node, no provider, no prover.
 //
 //   node --experimental-strip-types src/h2-conn-test.ts
@@ -32,6 +32,7 @@ function fakeSession(writeDelayMs = 0) {
     serverPost: [{ data: true, keyUpdates: 0 }],
     serverRecords: [],
     waitT: (type: string | string[], ms: number, ...stops: Promise<unknown>[]) => waitMsg(bus, type, ms, errP, ...stops),
+    framing: '2',
     sendText: (o: any) => wire.push(o.type === 'ctl' ? `ctl:${o.frame}` : o.type),
     tls: {
       writeInner: async (plain: Uint8Array) => {
