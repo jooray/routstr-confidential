@@ -202,8 +202,8 @@ disclosure is verified.
 
 ### A.10 Out of scope for the prototype
 
-Parallel streams on one connection; client KeyUpdates after epoch 0; image requests over `http: 2` (the
-design allows them; build chat first); the browser library.
+Parallel streams on one connection; client KeyUpdates after epoch 0; the browser library. (Image requests:
+A.13.)
 
 ### A.11 Wire format (as implemented)
 
@@ -219,9 +219,11 @@ of a node implements. All messages are JSON text frames on the session WebSocket
 
 #### Offer
 
-Sidecar offer file: optional block `"h2": {"probe_path": "/api/v1/models", "idle_secs": 300, "max_requests": 100}`
+Sidecar offer file: optional block `"h2": {"probe_path": "/api/v1/models", "idle_secs": 300, "max_requests": 100,
+"kinds": ["chat", "images"]}`
 (`idle_secs` 10..3600, default 300; `max_requests` 1..1000, default 100; `probe_path` canonical, under 127
-bytes; host under 127 bytes; key at most 119 bytes). The sidecar's `/offer` then carries the block unchanged
+bytes; host under 127 bytes; key at most 119 bytes; `kinds` is `["chat"]` (the default, and then not
+serialized) or `["chat", "images"]`, the latter only with an `endpoints.images` block: A.13). The sidecar's `/offer` then carries the block unchanged
 and `"http": ["1.1", "2"]`; without the block `"http": ["1.1"]`. The node copies both into its signed offer.
 The request path is not a new field: it is the path of the offer's `head_template` (`POST <path> HTTP/1.1`).
 
@@ -278,8 +280,11 @@ writes it to the provider only after a π_WIN that covers it verified (and, for 
 
 #### A request
 
-1. `C → N  {"type":"request","n":k,"kind":"chat","model","max_tokens","body_len"}` (`kind` optional; only chat;
-   `suffix` optional and must equal the canonical one). Towards a node it also carries what a v2 setup carries
+1. `C → N  {"type":"request","n":k,"kind":"chat","model","max_tokens","body_len"}` (`kind` optional, default
+   chat; `suffix` optional and must equal the canonical one). An image request (A.13) is
+   `{"type":"request","n":k,"kind":"images","model","count","body_len","suffix"}` towards the sidecar (no
+   `max_tokens`; the suffix is required and checked as for a v2 image setup) and
+   `{…,"kind":"images","model","variant","count","body_len"}` towards a node, which renders the suffix. Towards a node it also carries what a v2 setup carries
    for billing: `auth`, `offer_sig`, `session_fee_msat`, `abandon_fee_msat`; **the node reserves here** and
    forwards the request without those four ("Through a node"). `n` must be the previous `n` + 1 (first: 1), at most `max_requests`, and no
    request may be in flight. `body_len` is the sum of the DATA payloads (the JSON body), suffix included.
@@ -355,6 +360,10 @@ control records. The node re-signs it as for v2 (`a_json`, `sig_scheme`).
 handshake records − `epoch_start`. The client checks it as in v2 (`checkPiC3SParams` with `trailing: 0`) and
 proves with `s_ap_0`.
 
+An image request has no disclosure on success (A.13): `C → N  {"type":"accept","n":k,"server_records":m}`, answered
+by `{"type":"accept_retry","n":k,"server_records":<N's count>}` when N holds more records, else by the
+`attestation` (its interval ends at `m`) and the settlement with `usage = {"flat":true,"kind":"images","count"}`.
+
 Settlement, when the proof verifies: with `--node-settles`
 `{"type":"usage","sid","http":2,"n":k,"model":<pinned>,"usage":<the usage event>[,"reported_model"]}` (v2's frame
 plus `http` and `n`; the node settles and signs the receipt, which carries `http` and `n`); without it the sidecar's
@@ -382,8 +391,10 @@ error-head rules. Then `{"type":"closed","reason":"error_settled"}` and the sock
 
 #### Lifecycle and failures
 
-- `{"type":"closed","reason":"idle"|"max_requests"|"error_settled"|"upstream_closed"|"connection_lifetime"}`: an
-  orderly end with no request in flight. Idle: `h2.idle_secs` after `head_written` or the last settlement.
+- `{"type":"closed","reason":"idle"|"max_requests"|"max_bytes"|"error_settled"|"upstream_closed"|"connection_lifetime"}`: an
+  orderly end with no request in flight. `max_bytes`: the connection received 1 GiB from the provider (its
+  receive window is not replenished, A.13). A response past its request's cap (64 MiB for chat, the images
+  endpoint's `max_response_bytes` for an image) is an `error`. Idle: `h2.idle_secs` after `head_written` or the last settlement.
   Differs: a connection also ends 3 600 s after `head_written` (at its next settlement).
 - Time limits per request: 600 s from `request` to `body_released`, 600 s from there to settlement.
 - The provider closes: no request in flight → `closed`; a request not fully released →
@@ -402,7 +413,8 @@ The client talks to the node's `/v1/confidential/ws?session_id=<uuid>&v=2` and `
 for v2 (`zk_token` from `ready`; `/zk?proof=pi_win` is admitted). The node relays every frame not listed here
 unchanged, in both directions.
 
-**Offer.** The node's signed offer carries the sidecar's `http` and `h2` unchanged, and only when the sidecar
+**Offer.** The node's signed offer carries the sidecar's `http` and `h2` (plus the node's two terms of A.12;
+`kinds` lists `images` only when the node's offer also has the `images` block), and only when the sidecar
 offers `"2"` with an `h2` block. Without them the offer names neither (read an absent `http` as `["1.1"]`),
 so a node on an HTTP/1.1-only sidecar signs what it signed before.
 
@@ -426,7 +438,10 @@ so a node on an HTTP/1.1-only sidecar signs what it signed before.
 **Request.** `C → node  {"type":"request","n":k,"kind":"chat","model","max_tokens","body_len","auth","offer_sig"
 [,"session_fee_msat","abandon_fee_msat"][,"suffix"]}`.
 
-- The node validates the shape (`n` = the last forwarded request + 1; `kind` absent or `chat`; `max_tokens` in
+- An image request (`"kind":"images","variant","count"`, no `max_tokens`): A.13. The node refuses it (400) unless
+  its sidecar's `h2.kinds` lists `images` and has an images endpoint; it reserves with `reserve_image` and
+  forwards `kind`, `model`, `count`, `body_len` and its own rendering of the suffix.
+- The node validates the shape (`n` = the last forwarded request + 1; `kind` absent, `chat` or `images`; `max_tokens` in
   `[1, max_tokens_cap]`; `body_len` in `[1, 8 MiB]`), then does what it does for a v2 setup: the model must be
   one the node serves confidentially (400 otherwise) and priced by the offer `offer_sig` names (409
   `offer_expired`), the fees of that offer must be echoed (409 `session_fee_not_accepted`), the credential is
@@ -438,7 +453,8 @@ so a node on an HTTP/1.1-only sidecar signs what it signed before.
   `/v1/confidential/offer` within that time and use the signature it gets; the connection-level fields of the
   newer offer (`upstream_host`, `head_template`, `chat`, `h2`) must be the ones the connection was opened on,
   or the client opens a new connection.
-- The sidecar sees `{"type":"request","n","kind","model","max_tokens","body_len"[,"suffix"]}` only.
+- The sidecar sees `{"type":"request","n","kind","model","max_tokens","body_len"[,"suffix"]}` only (an image
+  request: `{"type":"request","n","kind":"images","model","count","body_len","suffix"}`).
 - **A request the node refuses ends the connection**: `{"type":"error","status","reason","detail"}` (the fields
   of a refused v2 setup), nothing reserved, socket closed. Reason: the client may send the request's records
   without waiting for `request_ok`, and the sidecar could not place them. Earlier requests stay settled.
@@ -497,7 +513,7 @@ request's reservation has its own lease, taken at the `request`.
 
 #### Not implemented
 
-Images over `http: 2`; client KeyUpdates; parallel streams; a server KeyUpdate inside or after a disclosed tail
+Client KeyUpdates; parallel streams; replenishing the connection window; a server KeyUpdate inside or after a disclosed tail
 (the disclosure then fails; one before the tail is handled by `key_updates`/`epoch_start` but is untested live);
 a session fee per connection instead of per request; the web library.
 
@@ -577,6 +593,102 @@ node, and a client's pool treats a dead connection as a cache miss.
 **Checked by** `crypto/tools/v3-h2-node-check.sh` (cases `low-balance`, `open-drop`, `idle-drop`,
 `idle-after`, and the deposit's return in every case whose first request settles; balances exact) and the
 unit tests `tests/unit/test_confidential_http2.py` in routstr-core (every row).
+
+### A.13 Images over `http: 2`
+
+An image request is one more request on an open connection: the same records, the same π_WIN, the same
+reservation per request. It differs from a chat request in three places: the path and the suffix come from
+the offer's `images` block, a success is settled by `accept` instead of a usage disclosure, and the response
+is one large JSON body instead of a short event stream. The rules of `docs/CONFIDENTIAL-IMAGES.md` carry
+over unchanged; nothing here is specific to one provider beyond what that block already describes (route,
+count key, fixed pins, variants, prices, response shape, limits).
+
+**Offer.** The `h2` block names the request kinds a connection serves: `"kinds": ["chat", "images"]`
+(absent = `["chat"]`). The sidecar accepts `"images"` there only with an `endpoints.images` block whose head
+template names a canonical path; the node signs `"images"` only when its offer also carries the `images`
+block (priced variants). Everything else an image request needs is the existing `images` block of the signed
+offer:
+
+| Needed | Where it comes from |
+|---|---|
+| `:path` | the route of `images.head_template` (`POST <path> HTTP/1.1`), as chat takes it from `head_template` |
+| the suffix | `images.count_key`, `images.fixed_pins`, the variant's `pins` (docs/CONFIDENTIAL-IMAGES.md §0.3, byte-exact) |
+| the price | the variant's `msat_per_image` in `images.price_list` |
+| how long the response may be silent | `images.response_idle_s` |
+| the response cap | `images.max_response_bytes` |
+| how to read the body | `images.response_shape` (client side only) |
+
+A client uses a connection for images only when the verified offer lists `"images"` in `h2.kinds` and has an
+`images` block it accepts; otherwise images keep the v2 flow. One connection serves both kinds in any order.
+
+**Request.** `C → node  {"type":"request","n":k,"kind":"images","model","variant","count","body_len","auth",
+"offer_sig"[,"session_fee_msat","abandon_fee_msat"]}`: no `max_tokens`, no `suffix`. The node does what it
+does for a v2 image setup (`reserve_image`): the variant and its price are frozen from the offer `offer_sig`
+names, `count` is within the offer's and the variant's `max_count`, and `msat_per_image × count + max(f_s,
+f_a)` is reserved. It renders the suffix from its own signed offer and forwards
+`{"type":"request","n","kind":"images","model","count","body_len","suffix"}`. The sidecar checks the suffix as
+for a v2 image setup (`check_suffix`: model first, the count key second, the fixed pins in order, variant pins
+within `param_space`, canonical form) and that `count` is the suffix's; it answers
+`request_ok` with that suffix, which the client requires to equal its own rendering from the signed offer.
+
+**Records and π_WIN.** As for chat (A.5), with the images path in the HEADERS block:
+`83 87 01 <len> <host> 04 <len> <images path> 0f 10 10 "application/json" be`. The windows are the same: the
+HEADERS record in full (so the path is the node's, per request), every DATA record's frame header and type
+byte, and the last record's tail = suffix ‖ `17`. The suffix is therefore proven byte-exactly before the
+last record is written, as π_C2S does for v2. The body is the private JSON (prompt and non-price options)
+followed by the suffix; no padding.
+
+**The response and its end.** The body is not streamed as events: the provider sends a HEADERS frame and
+then DATA frames until one carries END_STREAM. The client recognises the end by that flag on the request's
+stream (a DATA frame, or a HEADERS frame of trailers), never by a length: `content-length` is not required
+and not trusted. The body is the concatenation of the DATA payloads on the stream. N cannot see the flag
+(the frames are encrypted) and does not need to: the price is fixed, so N needs no proof of the response.
+
+**Success.** For a 2xx, when the stream ended:
+`C → N  {"type":"accept","n":k,"server_records":m}`, `m` = the server records (outer type 23, handshake flight
+included) the client had received. N requires the request to be fully written (`body_released`) and of kind
+`images`, with no disclosure before. If N holds more records: `{"type":"accept_retry","n":k,"server_records":
+<N's count>}` and the client sends `accept` again once it has them; fewer: error. Otherwise N closes the
+request's interval at `m`, sends the per-request `attestation` (A.11; the client checks it as for chat,
+including the hash of every record of the response) and settles: with `--node-settles`
+`{"type":"usage","sid","http":2,"n":k,"model","usage":{"flat":true,"kind":"images","count"}}`, which the node
+charges as `msat_per_image × count + f_s` (`settle_flat`) and answers with the receipt (v2's image fields
+`kind`, `variant`, `count`, `msat_per_image`, plus `http` and `n`). The connection is then idle. A usage
+disclosure (`disclose`) is refused for an image request, and `accept` for a chat request.
+
+`accept` is a claim, as in v2: nothing proves the status. A client that accepts a response that is not a 2xx
+pays the flat price where the error head might have cost less; one that accepts before the stream ended
+has paid in full and can only hurt its own next request (frames of the image stream then lie inside the
+next request's interval, where a usage disclosure refuses DATA frames of another stream). N is never short.
+
+**Errors.** A status ≥ 400: `disclose_head` and π_WIN under `s_ap_0`, exactly as for chat (A.7); the node
+applies v2's image error rules (429/503 and 401/402/403: the session fee; any other 4xx: the abandon fee;
+other 5xx: the reservation), and the receipt carries the image fields. Aborts: the chat table of A.11.
+
+**Flow control for a large response.** N's connection head (A.3) sets `INITIAL_WINDOW_SIZE = 2^31-1` and
+raises the connection window to `2^31-1`, so the provider may send a whole image response on its stream
+without a WINDOW_UPDATE from C, and about 2 GiB on the connection in total. C sends no flow-control frame
+for a response. The connection window is not replenished in the prototype; instead the connection is
+retired before it can run out: the sidecar closes a connection at the settlement after which it has received
+1 GiB from the provider (`closed`, reason `max_bytes`), and a client stops reusing one at 1 GiB of response
+DATA. Per request the sidecar caps the response: `images.max_response_bytes` for an image request (the
+offer's, at most 64 MiB), 64 MiB for a chat request; past the cap it ends the connection, and the request,
+already released, is charged (v2's rule for an oversized response). The connection cap is 1 GiB plus two
+request caps, below the window. Towards the client the relay is back-pressured as in v2 (the sidecar stops
+reading the provider while more than 4 MiB wait for the client), so a slow client slows the provider through
+TCP rather than growing a buffer. The sidecar keeps only the last records of a response (the tail an error
+head or a usage disclosure can name), not the image.
+
+**Time limits.** The sidecar's per-request limits are unchanged (600 s to `body_released`, 600 s from there).
+The client waits for the response `images.response_idle_s` without bytes (an image response is silent until
+the image is done) instead of chat's 60 s.
+
+**What N learns** is what v2 lets it learn for an image (model, variant, count, body length, response size
+and timing, the outcome), plus that the image and the chat requests of one connection come from one client.
+
+**Checked by** the gates: `v3-h2-check.sh` (an honest image, an image whose body ends in another variant's
+suffix: refused by π_WIN before the provider has the request) and `v3-h2-node-check.sh` (the same through a
+node with exact balances, and a chat request followed by an image request on one connection).
 
 ---
 

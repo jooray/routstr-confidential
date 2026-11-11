@@ -16,6 +16,9 @@ shapes need code. Clients take nothing in the offer's images block on trust: a f
 lowercased, docs/CHAT-SUFFIX.md rule 7), a variant pins only resolution, quality or format to a `param_space` value, a private option that names
 a pinned key is refused, the head template must be the image path with exactly the six fixed headers, and
 the numbers stay in range (integer prices, `max_count` 1..4, unique variant ids, `response_idle_s` 30..600).
+On a node whose offer lists `images` in `h2.kinds`, an image request can also run as one more request on an
+`http: 2` connection (protocol v3 prototype, `PROTOCOL-V3-DESIGN.md` A.13): same suffix, same price, `accept`
+on success, the error head otherwise; the `armed`/pre-arm rules below concern the v2 flow only.
 Errors: a 429 or 503 (capacity) or a 401, 402 or 403 (the node's provider key or account) costs the
 session fee, any other 4xx the abandon fee, other 5xx up to the reservation;
 an image error receipt carries the session's kind, model, variant and count.
