@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Regression gate for the intermittent proof stall (PROGRESS-CONFIDENTIAL.md
-# Deviation 5): N sequential cold end-to-end sessions against a live
-# node+sidecar; exit non-zero if the success rate is below a threshold.
+# Deviation 5): N sequential cold end-to-end connections (protocol v3, one
+# request each) against a live node+sidecar; exit non-zero if the success rate
+# is below a threshold.
 #
 #   crypto/tools/stall-repro.sh [--min-success PCT] [runs] [label]
 #
@@ -9,9 +10,10 @@
 #   label          output name (default "run")
 #   --min-success  required success rate in percent (default 100; env CU_MIN_SUCCESS)
 #
-# An attempt is "ok" only if the driver exits 0 AND prints E2E_JSON with a
-# verified receipt (receipt_sig_ok, usage_match, cost_ok all true). Anything
-# else is "fail", "timeout" (wall-clock limit hit) or "mint_fail".
+# An attempt is "ok" only if the driver exits 0 AND prints E2E_JSON with one
+# request that settled with status 200 and a verified receipt (the driver
+# itself fails on a usage or cost mismatch). Anything else is "fail",
+# "timeout" (wall-clock limit hit) or "mint_fail".
 #
 # Environment:
 #   CU_NODE     node base URL (default http://127.0.0.1:8000)
@@ -21,7 +23,8 @@
 #   CU_MODEL    model (default deepseek-v4-flash, gate-safe per GAP-3)
 #   CU_TIMEOUT  per-run wall-clock limit in seconds (default 75)
 #   CU_PROVER   cu-prover binary (default ../zkbench/target/release/cu-prover)
-#   CU_EXTRA    extra driver flags, word-split (e.g. "--parallel-proofs")
+#   CU_HTTP     the framing: 2, 1.1 or auto (default auto: the offer's first)
+#   CU_EXTRA    extra driver flags, word-split (e.g. "--no-zkchan")
 #   CU_DRIVER   command that runs the reference client (default
 #               "node --experimental-strip-types src/driver.ts", run from crypto/client)
 #   CU_STALL_OUT  output directory (default /tmp/cu-stall)
@@ -78,7 +81,8 @@ for line in out.splitlines():
         except ValueError: pass
 if rc in (124, 137):
     status = "timeout"
-elif rc == 0 and e2e and all(e2e.get(k) is True for k in ("receipt_sig_ok", "usage_match", "cost_ok")):
+elif (rc == 0 and e2e and e2e.get("protocol") == 3 and e2e.get("receipt_sig_ok") is True
+      and len(e2e.get("requests") or []) == 1 and e2e["requests"][0].get("status") == 200):
     status = "ok"
 else:
     status = "fail"
@@ -96,7 +100,7 @@ for i in $(seq 1 "$N"); do
     status=mint_fail; phase='{}'; rc=-1
   else
     CU_PROVER="$CU_PROVER" "$TIMEOUT_BIN" -k 5 "$TIMEOUT" "${DRIVER[@]}" \
-      --node "$NODE" --model "$MODEL" --max-tokens 12 --auth "$auth" \
+      --node "$NODE" --http "${CU_HTTP:-auto}" --model "$MODEL" --max-tokens 12 --auth "$auth" \
       ${EXTRA[@]+"${EXTRA[@]}"} --prompt 'Say hi in three words.' \
       > "$OUT/$LABEL.$i.out" 2> "$OUT/$LABEL.$i.err" || rc=$?
     res="$("$PY" -I -c "$CLASSIFY_PY" "$rc" "$OUT/$LABEL.$i.out" 2>/dev/null || printf 'fail\t{}')"

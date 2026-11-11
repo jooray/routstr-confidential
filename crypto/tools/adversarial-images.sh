@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Regression gate for confidential image generation: parameter-injection and
-# suffix attacks by a MALICIOUS client, plus an honest control. Exit 0 only if
-# every case ends exactly as expected. Same conventions as
-# adversarial-model-swap.sh (run from anywhere; a dedicated node).
+# Regression gate for confidential image generation (protocol v3, through a
+# node): parameter-injection and suffix attacks by a MALICIOUS client, plus an
+# honest control. Exit 0 only if every case ends exactly as expected. Run from
+# anywhere, against a dedicated node (it must serve no other confidential
+# connection meanwhile: the node's log lines are attributed by time window).
+# The sidecar-level image attacks of both framings are in v3-check.sh; this
+# gate is what needs a node: the signed prices and the provider's echo.
 #
 #   AUTH=sk-... CU_NODE=http://127.0.0.1:8010 NODE_LOG=.../routstr-core/logs/app_YYYY-MM-DD.log \
 #     crypto/tools/adversarial-images.sh
 #
 # Paid: about five cheap images (z-image-turbo $0.01, one qwen-image-2-1-turbo $0.02).
 #
-# Environment: AUTH, CU_NODE, NODE_LOG, NODE_LOG_WAIT, CU_CASES, CU_CASE_TIMEOUT,
-# CU_PROVER, CU_DRIVER, CU_ADV_OUT as in adversarial-model-swap.sh (no AUTH=mint).
+# Environment:
+#   AUTH        required: an sk- key of the node with a balance for the images
+#   CU_NODE     node base URL (default http://127.0.0.1:8000)
+#   CU_HTTP     the framing: 2, 1.1 or auto (default auto: the offer's first)
+#   NODE_LOG    optional: the node's JSON log file; when set, the money outcome
+#               is asserted from the node's own lines
+#   NODE_LOG_WAIT, CU_CASES, CU_CASE_TIMEOUT, CU_PROVER, CU_DRIVER, CU_ADV_OUT
 # CHEAP / TIERED   the flat and the tiered model (default z-image-turbo /
 #                  qwen-image-2-1-turbo); EXPENSIVE the decoy (nano-banana-pro).
 #
@@ -26,15 +34,13 @@
 #                         overridden by the pins (echo false), flat charge.
 #   img-resolution-inject private "resolution":"4K" on the 1K variant of a tiered
 #                         model: a 1K image (longest side <= 1536 px), 1K price.
-#   img-count-mismatch    setup count 1, body suffix pins 4 and declares it: the
-#                         sidecar refuses the suffix; final record never released;
-#                         node: outcome=released.
-#   img-count-claim       as above but claims the node's suffix: pi_C2S fails;
-#                         node: outcome=released.
-#   img-suffix-model      setup the cheap model, body suffix names the expensive
-#                         one: refused (suffix); node: outcome=released.
-#   img-no-suffix-swap    suffix pins count 4, never declared: the sidecar holds
-#                         the final record; zero response bytes; node: released.
+#   img-count-mismatch    the request names count 1, the body's suffix pins 4: the
+#                         proof of the suffix (pi_WIN) fails; the body is never
+#                         released; node: outcome=released.
+#   img-suffix-model      the request names the cheap model, the body's suffix the
+#                         expensive one: refused; node: outcome=released.
+#   img-no-proof-swap     the suffix pins count 4 and is never proven: the sidecar
+#                         holds the record(s); zero response bytes; node: released.
 #   img-error-honest      a field the provider rejects: 400, error head proven,
 #                         charged nothing (no session fee configured).
 #   img-accept-on-error   the same, but the client sends `accept` anyway: the node
@@ -69,7 +75,7 @@ fi
 
 # The signed per-image prices, for the flat-charge checks.
 OFFER_JSON="$OUT/offer.json"
-curl -sf "$NODE/v1/confidential/offer" > "$OFFER_JSON"
+curl -sf "$NODE/v1/confidential/offer?v=3" > "$OFFER_JSON"
 
 # Evaluate one case. Args: case expect reason_re rc out err nodelog_slice model variant count runs_dir_glob
 EVAL_PY=$(cat <<'PYEOF'
@@ -79,6 +85,7 @@ rc = int(rc); count = int(count)
 out = open(out_f, errors="replace").read(); err = open(err_f, errors="replace").read()
 both = out + "\n" + err
 offer = json.load(open(offer_f))
+if "sig_payload" in offer: offer = json.loads(offer["sig_payload"])
 def price(m, v):
     for x in offer["images"]["price_list"].get(m, []):
         if v in (None, "", x["id"]): return x["msat_per_image"], x["id"]
@@ -90,9 +97,11 @@ for line in out.splitlines():
     if line.startswith("E2E_JSON "):
         try: e2e = json.loads(line[9:])
         except ValueError: pass
-    if line.startswith("ADV_NO_SUFFIX "):
-        try: adv = json.loads(line[14:])
+    if line.startswith("ADV "):
+        try: adv = json.loads(line[4:])
         except ValueError: pass
+# One request per run: its result carries the image fields.
+req = ((e2e or {}).get("requests") or [None])[0]
 released_body = "<- body_released" in both
 m = re.search(r"(sidecar rejected: .*|connection closed: .*)", both)
 refusal = m.group(1)[:140] if m else None
@@ -111,17 +120,18 @@ drv = f"rc={rc}"
 if rc in (124, 137):
     dev.append(f"TIMEOUT (rc={rc})")
 elif expect in ("images", "accept-residual"):
-    if e2e is None:
-        dev.append("no E2E_JSON" + (f" ({refusal})" if refusal else ""))
+    if req is None:
+        dev.append("no settled request in E2E_JSON" + (f" ({refusal})" if refusal else ""))
     else:
+        e2e = req
         files = e2e.get("files") or []
         sizes = [webp_size(f) for f in files]
         want_images = count if expect == "images" else 0
         drv = (f"rc={rc} images={e2e.get('images')} sizes={sizes} cost_msats={e2e.get('cost_msats')} flat={flat}x{count} "
-               f"sig={e2e.get('receipt_sig_ok')} status={e2e.get('upstream_status')} echo={json.dumps(e2e.get('echo'), sort_keys=True)}")
+               f"sig={e2e.get('receipt_sig_ok')} status={e2e.get('status')} echo={json.dumps(e2e.get('echo'), sort_keys=True)}")
         if rc != 0: dev.append("driver failed")
         if e2e.get("images") != want_images: dev.append(f"expected {want_images} image(s)")
-        if e2e.get("receipt_sig_ok") is not True or e2e.get("cost_ok") is not True: dev.append("receipt not verified")
+        if e2e.get("receipt_sig_ok") is not True: dev.append("receipt not verified")
         if flat is None or e2e.get("cost_msats") != flat * count: dev.append("charge is not the signed flat price x count")
         echo = e2e.get("echo") or {}
         if expect == "images":
@@ -133,24 +143,25 @@ elif expect in ("images", "accept-residual"):
                 if not sizes or sizes[0] is None or max(sizes[0]) > 1536: dev.append(f"image larger than 1K: {sizes}")
                 if "resolution" in echo and str(echo["resolution"]).upper() != "1K": dev.append(f"provider ran resolution={echo['resolution']}")
         else:
-            if not (e2e.get("upstream_status") or 0) >= 400: dev.append("the residual case did not get an upstream error")
+            if not (e2e.get("status") or 0) >= 400: dev.append("the residual case did not get an upstream error")
 elif expect == "error-released":
-    m2 = re.search(r"error receipt: status=(\d+) cost_msats=(\d+) ok=(\w+) signature_ok=(\w+)", out)
-    drv = f"rc={rc} " + (m2.group(0) if m2 else "no error receipt")
-    if rc != 0 or not m2 or m2.group(2) != "0" or m2.group(3) != "true": dev.append("expected a verified zero-cost error receipt")
+    drv = f"rc={rc} " + (f"status={req.get('status')} cost_msats={req.get('cost_msats')} sig={req.get('receipt_sig_ok')}" if req else "no error receipt")
+    if rc != 0 or not req or not (req.get("status") or 0) >= 400 or req.get("cost_msats") != 0 or req.get("receipt_sig_ok") is not True:
+        dev.append("expected a verified zero-cost error receipt")
 else:  # refused / withheld
     if released_body: dev.append("final body record was released to the provider")
-    if e2e and e2e.get("receipt_sig_ok"): dev.append("attack produced a receipt")
-    if expect == "refused":
-        drv = f"rc={rc} refused: {refusal}"
-        if rc == 0: dev.append("driver exited 0")
-        if refusal is None: dev.append("no refusal")
-        elif not re.search(reason_re, refusal, re.I): dev.append(f"refused for the wrong reason (want /{reason_re}/)")
+    if req and req.get("receipt_sig_ok"): dev.append("attack produced a receipt")
+    # The driver exits 0 when the attack was refused (5 when it was not) and reports it in its ADV line.
+    if adv is None: dev.append("no ADV line (driver crash?)")
+    elif expect == "refused":
+        drv = f"rc={rc} refused={adv.get('refused')}: {str(adv.get('reason'))[:140]}"
+        if rc != 0 or adv.get("refused") is not True: dev.append("the attack was not refused")
+        elif adv.get("body_released"): dev.append("the body was released")
+        elif not re.search(reason_re, str(adv.get("reason")), re.I): dev.append(f"refused for the wrong reason (want /{reason_re}/)")
     else:
-        if adv is None: dev.append("no ADV_NO_SUFFIX line")
-        else:
-            drv = f"rc={rc} withheld: response_bytes={adv.get('response_bytes')} output={adv.get('has_model_output')}"
-            if adv.get("response_bytes") != 0 or adv.get("has_model_output"): dev.append("provider answered a request the sidecar should have held")
+        d = adv.get("detail") if isinstance(adv.get("detail"), dict) else adv
+        drv = f"rc={rc} withheld={adv.get('refused')}: response_bytes={d.get('response_bytes')} response_frames={d.get('response_frames')}"
+        if rc != 0 or adv.get("refused") is not True: dev.append("provider answered a request the sidecar should have held")
 node = "n/a (NODE_LOG unset)"
 if slice_f != "-":
     lines = []
@@ -190,7 +201,7 @@ run_case() {
   local rc=0
   local vargs=()
   if [ -n "$variant" ]; then vargs=(--variant "$variant"); fi
-  "$TIMEOUT_BIN" -k 5 "$CASE_TIMEOUT" "${DRIVER[@]}" --node "$NODE" --image --model "$model" --count "$count" \
+  "$TIMEOUT_BIN" -k 5 "$CASE_TIMEOUT" "${DRIVER[@]}" --node "$NODE" --http "${CU_HTTP:-auto}" --image --model "$model" --count "$count" \
     "${vargs[@]}" --runs-dir "$OUT/runs" --auth "$AUTH" "$@" > "$OUT/$id.out" 2> "$OUT/$id.err" || rc=$?
   local slice="-"
   if [ -n "$NODE_LOG" ]; then
@@ -226,10 +237,9 @@ run_case img-count-inject images '' "$CHEAP" '' 1 -- --prompt "$P" --private-ext
 run_case img-paid-extras images '' "$CHEAP" '' 1 -- --prompt "$P" \
   --private-extra '"enhance_prompt":true,"enable_web_search":true'
 run_case img-resolution-inject images '' "$TIERED" 1K-webp 1 -- --prompt "$P" --private-extra '"resolution":"4K"'
-run_case img-count-mismatch refused 'suffix' "$CHEAP" '' 1 -- --prompt "$P" --adv-image-count 4
-run_case img-count-claim refused 'pi_c2|π_C2' "$CHEAP" '' 1 -- --prompt "$P" --adv-image-count 4 --adv-claim-canonical
-run_case img-suffix-model refused 'suffix' "$CHEAP" '' 1 -- --prompt "$P" --adv-suffix-model "$EXPENSIVE"
-run_case img-no-suffix-swap withheld '' "$CHEAP" '' 1 -- --prompt "$P" --adv-image-count 4 --adv-no-suffix
+run_case img-count-mismatch refused 'pi_win' "$CHEAP" '' 1 -- --prompt "$P" --adv suffix --adv-image-count 4
+run_case img-suffix-model refused '.' "$CHEAP" '' 1 -- --prompt "$P" --adv suffix --adv-suffix-model "$EXPENSIVE"
+run_case img-no-proof-swap withheld '' "$CHEAP" '' 1 -- --prompt "$P" --adv no-proof --adv-image-count 4
 run_case img-error-honest error-released '' "$CHEAP" '' 1 -- --prompt "$P" --private-extra '"bogus_field_xyz":1'
 run_case img-accept-on-error accept-residual '' "$CHEAP" '' 1 -- --prompt "$P" --private-extra '"bogus_field_xyz":1' --adv-accept-any
 

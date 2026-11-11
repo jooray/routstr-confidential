@@ -1,4 +1,4 @@
-"""Evaluate one case of v3-h2-node-check.sh. Prints "VERDICT<TAB>evidence".
+"""Evaluate one case of v3-node-check.sh. Prints "VERDICT<TAB>evidence".
 
 Arguments: case expect driver_rc driver_out driver_err context.json
 The context names the node's database and log, the case's own credential (a
@@ -72,7 +72,7 @@ def tagged(tag):
 
 
 e2e = tagged("E2E_JSON")
-adv = tagged("ADV_H2")
+adv = tagged("ADV")
 sid = (re.search(r"\bsid=([0-9a-f]{64})", out) or [None, None])[1]
 offer = json.load(open(ctx["offer"]))
 
@@ -208,7 +208,7 @@ def check_image(r):
         dev.append(f"request {n}: the response does not hold the {r.get('count')} image(s) asked for")
     elif (rec.get("kind"), rec.get("variant"), rec.get("count"), rec.get("msat_per_image")) != ("images", r.get("variant"), r.get("count"), variant["msat_per_image"]):
         dev.append(f"request {n}: the receipt does not name the variant, the count and the signed price")
-    elif (rec.get("usage") or {}).get("flat") is not True or rec.get("http") != 2 or rec.get("n") != n:
+    elif (rec.get("usage") or {}).get("flat") is not True or rec.get("http") != "2" or rec.get("n") != n:
         dev.append(f"request {n}: the receipt is not a flat http 2 receipt for the request")
     elif not (r.get("cost_msats") == rec.get("cost_msats") == settled.get(n) == price + fee):
         dev.append(f"request {n}: charged {r.get('cost_msats')} (node log {settled.get(n)}), the signed price is {price} + fee {fee}")
@@ -237,7 +237,7 @@ def check_settled(count):
             dev.append(f"request {n}: the receipt's usage is not the client's own")
         elif not (r.get("cost_msats") == rec.get("cost_msats") == settled.get(n) == want):
             dev.append(f"request {n}: charged {r.get('cost_msats')} (node log {settled.get(n)}), the usage at the signed rates is {want}")
-        elif rec.get("http") != 2 or rec.get("n") != n:
+        elif rec.get("http") != "2" or rec.get("n") != n:
             dev.append(f"request {n}: the receipt does not name http 2 and the request")
         elif reserved.get(n) != rec.get("reserved_msats") or not reserved.get(n):
             dev.append(f"request {n}: the node log shows no reservation of the receipt's {rec.get('reserved_msats')} msats")
@@ -293,7 +293,7 @@ elif kind == "unused":
     dep = (e2e or {}).get("deposit") or {}
     closed = (e2e or {}).get("closed") or {}
     evidence += f" deposit={DEPOSIT} node={deposits} client={json.dumps(dep)} closed={json.dumps(closed)}"
-    if rc != 0 or not e2e or e2e.get("http") != 2 or reqs:
+    if rc != 0 or not e2e or e2e.get("http") != "2" or reqs:
         dev.append("expected an opened connection with no request")
     if not DEPOSIT:
         dev.append("the offer asks for no deposit")
@@ -323,7 +323,7 @@ elif kind in ("settled", "kinds"):
         n, _, then = rest.partition(":")
         n = int(n)
     evidence += " " + trace()
-    if rc != 0 or not e2e or e2e.get("http") != 2:
+    if rc != 0 or not e2e or e2e.get("http") != "2":
         dev.append("no http: 2 result")
     else:
         check_settled(n)
@@ -352,7 +352,7 @@ elif kind in ("settled", "kinds"):
 elif kind == "error":
     n, status = (int(x) for x in rest.split(":"))
     evidence += " " + trace()
-    if rc != 0 or not e2e or e2e.get("http") != 2:
+    if rc != 0 or not e2e or e2e.get("http") != "2":
         dev.append("no http: 2 result")
     else:
         check_settled(n - 1)
@@ -403,7 +403,7 @@ else:  # released / charged: an attack on request n
     n = int(n)
     evidence += f" {trace()} aborted={aborted} adv={json.dumps(adv)[:200] if adv else None}"
     if rc != 0 or not adv:
-        dev.append("CRASH or attack not refused (driver exit != 0 or no ADV_H2 line)")
+        dev.append("CRASH or attack not refused (driver exit != 0 or no ADV line)")
     elif adv.get("refused") is not True:
         dev.append("the attack was NOT refused")
     elif not re.search(reason, adv.get("reason", ""), re.I):

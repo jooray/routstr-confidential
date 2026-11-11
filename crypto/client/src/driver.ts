@@ -1022,14 +1022,8 @@ async function serveH2(from: number, arm: boolean): Promise<ConnOut> {
   const conn = new H2Conn(s, ctx)
   s.h2 = conn
   if (ABANDON) return { s, results: [], tClaim, armed: arm }
-  try {
-    await s.handshake(keyShare)
-    await s.proveHead()
-  } catch (e) {
-    // An attack on the handshake itself (our own key share) ends here.
-    if (ctx.adv && ['own-keyshare'].includes(ctx.adv.mode)) return { s, results: [], adv: await advOutcome(s, ctx, e, { at: 0 }), tClaim, armed: arm }
-    throw e
-  }
+  await s.handshake(keyShare)
+  await s.proveHead()
   const out = await runHttp2(s, conn, from)
   return { s, ...out, tClaim, armed: arm }
 }
@@ -1143,6 +1137,12 @@ async function main() {
       // request was released is retried on "1.1" on the same node. Not after a
       // body was released; not when the request itself or the setup was refused.
       const refusedByTerms = e instanceof RequestRefused || (typeof pe?.status === 'number' && pe.status >= 400 && pe.status < 500)
+      if (ADV_MODE && s !== undefined) {
+        // An attack on the connection itself (another 2PC version, our own key share): how it ended.
+        adv = await advOutcome(s, makeCtx(s.label), e, { at: 0 })
+        s.close()
+        break
+      }
       if (HTTP_MODE === 'auto' && framing === '2' && OFFER_HTTP.includes('1.1') && s !== undefined && !s.bodyReleased && !refusedByTerms && !ADV_MODE) {
         bad.add('2')
         fallback = { from: '2', to: '1.1', at: g, reason: errText(e).slice(0, 300), code: pe?.code, fault: pe?.fault, sid: s.sid || undefined }

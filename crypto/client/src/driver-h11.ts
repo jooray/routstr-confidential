@@ -178,6 +178,7 @@ export class H11 {
       status,
       body_len: b.body.length,
       records: s.bodyRecords.length,
+      reported_model: ownUsage?.model,
       usage: ownUsage?.usage && { prompt_tokens: ownUsage.usage.prompt_tokens, completion_tokens: ownUsage.usage.completion_tokens },
       receipt_sig_ok: receipt.unsigned ? false : true,
       cost_msats: receipt.cost_msats,

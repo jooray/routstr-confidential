@@ -6,7 +6,7 @@
 # outcome of each case in the node's database, stops everything. Exit 0 only
 # if every case ends exactly as expected.
 #
-#   VENICE_API_KEY=... crypto/tools/v3-h2-node-check.sh
+#   VENICE_API_KEY=... crypto/tools/v3-node-check.sh
 #
 # The node announces nothing (its relay list points nowhere) and runs with a
 # clean environment, so no other provider key seeds a provider. Its database
@@ -38,7 +38,7 @@
 #   CU_H2_NODE_OUT   scratch and evidence directory (default crypto/runs/v3-h2-node-check;
 #                    removed and recreated)
 #
-# Cases (machine-checked by v3_h2_node_eval.py; each has its own funded key):
+# Cases (machine-checked by v3_node_eval.py; each has its own funded key):
 #   v2              an unchanged protocol v2 session through the same node
 #   three           three requests on one connection: each reserved as a v2 setup
 #                   reserves, each settled at the usage the provider reported
@@ -239,7 +239,7 @@ json.dump({"db": "$DB", "key": "$key", "start_balance": $balance, "log_dir": "$O
            "sidecar_sessions": $(handshakes) - $hs0}, open(sys.argv[1], "w"))
 PYEOF
   local res verdict evidence
-  res="$("$PY" -I "$HERE/v3_h2_node_eval.py" "$id" "$expect" "$rc" "$OUT/$id.out" "$OUT/$id.err" "$OUT/$id.ctx.json" 2>&1)" \
+  res="$("$PY" -I "$HERE/v3_node_eval.py" "$id" "$expect" "$rc" "$OUT/$id.out" "$OUT/$id.err" "$OUT/$id.ctx.json" 2>&1)" \
     || res=$'DEVIATION: evaluator error\t'"${res//$'\n'/ }"
   IFS=$'\t' read -r verdict evidence <<< "$res"
   printf '%s\t%s\t%s\t%s\n' "$id" "$expect" "$verdict" "$evidence" >> "$SUMMARY"
@@ -248,7 +248,8 @@ PYEOF
   case "$verdict" in PASS) ;; *) failures=$((failures + 1)) ;; esac
 }
 
-run_case v2 "v2" "$START_BALANCE" --
+# (driver flags ported to the v3 driver; the expectation is still the v2 one: the node side is being ported)
+run_case v2 "v2" "$START_BALANCE" -- --http 1.1
 # What a v2 setup reserves for this model and cap: every http: 2 request must reserve the same.
 V2_RESERVED="$("$PY" -I -c '
 import json, sys
@@ -257,23 +258,23 @@ for line in open(sys.argv[1], errors="replace"):
         print(int(json.loads(line[9:]).get("reserved_msats") or 0)); break
 else:
     print(0)' "$OUT/v2.out")"
-run_case three          "settled:3" "$START_BALANCE" -- --http2 --requests 3
+run_case three          "settled:3" "$START_BALANCE" -- --http 2 --requests 3
 if [ "$PAUSE" -gt 0 ]; then
-  run_case idle         "settled:2" "$START_BALANCE" -- --http2 --requests 2 --pause-ms "$((PAUSE * 1000))"
+  run_case idle         "settled:2" "$START_BALANCE" -- --http 2 --requests 2 --pause-ms "$((PAUSE * 1000))"
 fi
-run_case provider-error "error:2:400" "$START_BALANCE" -- --http2 --requests 3 --private-extra '"temperature":"hot"' --private-extra-at 2
-run_case unknown-model  "node-refused:2:not served confidentially" "$START_BALANCE" -- --http2 --requests 3 --h2-models "$MODEL,no-such-model-xyz"
-run_case wrong-suffix   "released:2:pi_win failed" "$START_BALANCE" -- --http2 --requests 2 --adv-h2 suffix --adv-at 2
-run_case replay-usage   "charged:2:interval" "$START_BALANCE" -- --http2 --requests 2 --adv-h2 replay-usage
+run_case provider-error "error:2:400" "$START_BALANCE" -- --http 2 --requests 3 --private-extra '"temperature":"hot"' --private-extra-at 2
+run_case unknown-model  "node-refused:2:not served confidentially" "$START_BALANCE" -- --http 2 --requests 3 --models "$MODEL,no-such-model-xyz"
+run_case wrong-suffix   "released:2:pi_win failed" "$START_BALANCE" -- --http 2 --requests 2 --adv suffix --adv-at 2
+run_case replay-usage   "charged:2:interval" "$START_BALANCE" -- --http 2 --requests 2 --adv replay-usage
 IMG=(--image-model "$IMAGE_MODEL" --prompt "a red circle on a white background")
-run_case image          "kinds:images" "$START_BALANCE" -- --http2 --requests 1 --h2-kinds images "${IMG[@]}"
-run_case chat-image     "kinds:chat,images" "$START_BALANCE" -- --http2 --requests 2 --h2-kinds chat,images --image-model "$IMAGE_MODEL"
-run_case image-suffix   "released:2:pi_win failed" "$START_BALANCE" -- --http2 --requests 2 --h2-kinds chat,images --image-model "$IMAGE_MODEL" --adv-h2 suffix --adv-at 2
-run_case no-funds       "no-funds:402" 0 -- --http2
-run_case low-balance    "no-deposit:402" "$((DEPOSIT - 1))" -- --http2
-run_case open-drop      "unused:unused" "$START_BALANCE" -- --http2 --requests 0
-run_case idle-drop      "unused:idle" "$START_BALANCE" -- --http2 --requests 0 --linger-ms "$(((IDLE + 20) * 1000))"
-run_case idle-after     "settled:1:idle" "$START_BALANCE" -- --http2 --requests 1 --linger-ms "$(((IDLE + 20) * 1000))"
+run_case image          "kinds:images" "$START_BALANCE" -- --http 2 --requests 1 --kinds images "${IMG[@]}"
+run_case chat-image     "kinds:chat,images" "$START_BALANCE" -- --http 2 --requests 2 --kinds chat,images --image-model "$IMAGE_MODEL"
+run_case image-suffix   "released:2:pi_win failed" "$START_BALANCE" -- --http 2 --requests 2 --kinds chat,images --image-model "$IMAGE_MODEL" --adv suffix --adv-at 2
+run_case no-funds       "no-funds:402" 0 -- --http 2
+run_case low-balance    "no-deposit:402" "$((DEPOSIT - 1))" -- --http 2
+run_case open-drop      "unused:unused" "$START_BALANCE" -- --http 2 --requests 0
+run_case idle-drop      "unused:idle" "$START_BALANCE" -- --http 2 --requests 0 --linger-ms "$(((IDLE + 20) * 1000))"
+run_case idle-after     "settled:1:idle" "$START_BALANCE" -- --http 2 --requests 1 --linger-ms "$(((IDLE + 20) * 1000))"
 
 cleanup
 still=""

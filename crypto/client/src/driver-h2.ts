@@ -269,6 +269,7 @@ export class H2Conn {
     for (;;) {
       const m = await this.s.bus.wait('zk_params:pi_win:records')
       try {
+        if (this.withholdProofs) continue
         await this.proveRecords(m)
       } catch (e) {
         this.failRej(e as Error)
@@ -306,6 +307,8 @@ export class H2Conn {
     }
   }
   advActive = false
+  /** The `no-proof` attack: the node's `zk_params` for our records go unanswered. */
+  withholdProofs = false
 
   // --- waiting ----------------------------------------------------------------
 
@@ -347,6 +350,7 @@ export class H2Conn {
     const b = ctx.buildBody(n)
     const adv = ctx.adv && ctx.adv.at === n ? ctx.adv.mode : undefined
     if (adv) this.advActive = true
+    if (adv === 'no-proof') this.withholdProofs = true
     const stream = requestStream(n)
     const host: string = ctx.offer.upstream_host
     const path = adv === 'path' ? ctx.adv!.path! : b.image ? b.image.path : chatPath(ctx.offer.head_template)
@@ -424,6 +428,14 @@ export class H2Conn {
     ctx.log({ ev: 'h2_request_sent', n, records: plan.length, body_len: bodyLen })
 
     if (adv === 'replay-usage') return await this.replayUsage(cur)
+    if (adv === 'no-proof') {
+      // The records are never proven: the node must hold them all, so the
+      // provider sees nothing of the request and answers nothing.
+      const t0 = Date.now()
+      while (!s.peerError && !cur.released && Date.now() - t0 < 20_000) await sleep(20)
+      const withheld = !cur.released && cur.parts.length === 0 && cur.status === undefined
+      return { adv: 'no-proof', withheld, body_released: cur.released, response_frames: cur.parts.length, status: cur.status ?? null }
+    }
 
     // Released (in steps, as the provider's window opens) or refused early.
     await this.until(() => cur.released || (cur.status ?? 0) >= 400 || cur.reset !== undefined, `body_released for request ${n}`, 180000)
@@ -477,6 +489,7 @@ export class H2Conn {
       status,
       body_len: bodyLen,
       records: plan.length,
+      reported_model: ownUsage?.model,
       usage: ownUsage?.usage && { prompt_tokens: ownUsage.usage.prompt_tokens, completion_tokens: ownUsage.usage.completion_tokens },
       receipt_sig_ok: receipt.unsigned ? false : true,
       cost_msats: receipt.cost_msats,
@@ -790,7 +803,7 @@ export async function runHttp2(s: any, conn: H2Conn, from: number): Promise<{ re
     try {
       const r = await conn.request(n)
       if (r.adv) {
-        adv = { mode: ctx.adv!.mode, http: '2', at: n, refused: false, detail: r }
+        adv = { mode: ctx.adv!.mode, http: '2', at: n, refused: r.withheld === true, reason: r.withheld ? 'the records were held' : 'not refused', detail: r }
         break
       }
       results.push(r)
