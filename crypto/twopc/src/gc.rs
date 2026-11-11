@@ -617,24 +617,35 @@ pub fn check_material(
     pw: &[Block],
     delta_a: Block,
 ) -> CheckMaterial {
-    let mut x = vec![Block::ZERO; circ.feed_count()];
+    // X per wire. A stage touches the outputs of its own gates (a contiguous
+    // range of feed ids, since ids follow gate order) and the few wires that
+    // enter it, so X is kept for that range plus a small map, not for the
+    // whole circuit (which would be 46 MB per stage).
+    let stage_gates = &circ.gates()[gates];
+    let lo = stage_gates.iter().map(|g| g.z().id()).min().unwrap_or(0);
+    let hi = stage_gates.iter().map(|g| g.z().id() + 1).max().unwrap_or(0);
+    let mut x = StageX {
+        lo,
+        own: vec![Block::ZERO; hi - lo],
+        entering: Default::default(),
+    };
     let mut a_n = Block::ZERO;
     for (kk, &(i, j, o)) in ands.iter().enumerate() {
         let c = pw[kk];
         a_n ^= c.gfmul(mac[o] ^ t_mac[kk]);
-        x[i] ^= c.gfmul(mac[j]);
-        x[j] ^= c.gfmul(mac[i]);
+        *x.at(i) ^= c.gfmul(mac[j]);
+        *x.at(j) ^= c.gfmul(mac[i]);
     }
-    for g in circ.gates()[gates].iter().rev() {
+    for g in stage_gates.iter().rev() {
         match g {
             Gate::Xor { x: a, y: b, z } => {
-                let v = x[z.id()];
-                x[a.id()] ^= v;
-                x[b.id()] ^= v;
+                let v = x.get(z.id());
+                *x.at(a.id()) ^= v;
+                *x.at(b.id()) ^= v;
             }
             Gate::Inv { x: a, z } | Gate::Id { x: a, z } => {
-                let v = x[z.id()];
-                x[a.id()] ^= v;
+                let v = x.get(z.id());
+                *x.at(a.id()) ^= v;
             }
             Gate::And { .. } => {}
         }
@@ -647,10 +658,67 @@ pub fn check_material(
         let tw = check_tweak(salt, phase, idx);
         let h0 = cipher.tccr(tw, p0);
         let h1 = cipher.tccr(tw, p0 ^ delta_a);
-        rows.push(lo64(h0 ^ h1 ^ x[b]));
+        rows.push(lo64(h0 ^ h1 ^ x.get(b)));
         y_n ^= h0;
     }
     CheckMaterial { rows, y_n: lo64(y_n) }
+}
+
+/// The values X_w of one stage's check material, by feed id.
+struct StageX {
+    lo: usize,
+    /// Feeds `lo..lo + own.len()`: the outputs of the stage's gates.
+    own: Vec<Block>,
+    /// Every other feed the stage reads (circuit inputs, crossing wires).
+    entering: std::collections::HashMap<usize, Block, std::hash::BuildHasherDefault<IdHasher>>,
+}
+
+/// Hasher for feed ids (the map is hit once per gate that reads an entering
+/// wire; ids are not attacker-chosen).
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ *b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+impl StageX {
+    #[inline]
+    fn at(&mut self, id: usize) -> &mut Block {
+        if id >= self.lo && id - self.lo < self.own.len() {
+            &mut self.own[id - self.lo]
+        } else {
+            self.entering.entry(id).or_insert(Block::ZERO)
+        }
+    }
+    #[inline]
+    fn get(&self, id: usize) -> Block {
+        if id >= self.lo && id - self.lo < self.own.len() {
+            self.own[id - self.lo]
+        } else {
+            self.entering.get(&id).copied().unwrap_or(Block::ZERO)
+        }
+    }
+}
+
+impl Drop for StageX {
+    fn drop(&mut self) {
+        // Sums of χ^k·M: N's MACs.
+        wipe_blocks(&mut self.own);
+        for v in self.entering.values_mut() {
+            v.as_mut().zeroize();
+        }
+    }
 }
 
 /// C's preprocessed key material for the check of one phase:

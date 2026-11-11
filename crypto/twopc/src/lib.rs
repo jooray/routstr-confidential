@@ -382,9 +382,12 @@ pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-1\n";
 /// N streams the first part of the tables (stages A1–A3) once this many
 /// MAC-COT bytes from C arrived (C has N's OT bootstrap messages and is
 /// uploading the first part of the Ferret extension), and the rest once C is
-/// past the first part (measured with `TWOPC_TRACE=1`, see `BENCH.md`), i.e.
-/// past the last small N→C Ferret message. Either gate also opens when N's
-/// MAC COTs are complete, or after `TABLES_MAX_WAIT`.
+/// past the first part (484 184 bytes with mpz2 rev 8f89783, for this
+/// circuit's 960 988 COTs as for v2's 1.31 million; measured with
+/// `TWOPC_TRACE=1`), i.e. past the small N→C Ferret message between the two
+/// parts. Either gate also opens when N's MAC COTs are complete, or after
+/// `TABLES_MAX_WAIT`. Re-measured for this circuit (`BENCH.md`, "Table
+/// scheduling"): other thresholds were equal within noise or slower.
 const TABLES_GATE: [u64; 2] = [64 * 1024, 500_000];
 const TABLES_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
