@@ -638,9 +638,41 @@ async fn offer_http(State(app): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 /// Run-time guard of framing `"2"` (`PROTOCOL-V3.md` §2.1): after
-/// `H2_FAILS_TO_WITHDRAW` consecutive HTTP/2 connections that failed before
-/// their first request's response began, `"2"` is withdrawn from the offer
-/// (and refused at the setup) for `retry`, then offered again.
+/// `H2_FAILS_TO_WITHDRAW` consecutive HTTP/2 connections that failed to open,
+/// `"2"` is withdrawn from the offer (and refused at the setup) for `retry`,
+/// then offered again.
+///
+/// The withdrawal is for every client, so a **failed open is only something
+/// no client can cause**. Before the provider's first response a client has
+/// these levers, and none of them reaches a counted failure:
+///
+/// | Lever | Why it does not count |
+/// |---|---|
+/// | the ClientHello's bytes | canonical (`tls_v2::canonical_client_hello`): only the random and the session id are the client's, the joint share is a valid point it cannot choose; one record, version `03 03` |
+/// | when the ClientHello is written | the sidecar dials when the checked hello and the joint share are there and writes it at once |
+/// | its Finished, π_NK, `release_head` (wrong, late or never) | the provider has sent its flight by then, so bytes were received and the head is not written: "closed during the handshake", not counted |
+/// | leaving | the sidecar closes the connection itself; no provider close is seen |
+/// | a late `release_head`, so that a provider timer fires just after the head | the close after the head counts only when the head was written within `H2_HEAD_PROMPT` of the dial |
+/// | records after the head (control frames with free payloads, e.g. a WINDOW_UPDATE of 0; a request body) | the close after the head counts only while **no client record** was written to the provider |
+/// | `settings_seen` (its claim of the provider's table size) | ends the connection without counting (§5.6) |
+///
+/// What counts, and whose bytes the provider had seen then:
+///
+/// 1. The provider closed with **not one byte** received after the canonical
+///    ClientHello was written: only the hello (fixed up to opaque values).
+/// 2. A **verified** handshake did not select `h2`: EncryptedExtensions is
+///    the provider's, authenticated by its Finished, in answer to a hello
+///    whose ALPN is exactly `h2`.
+/// 3. The provider closed within `H2_OPEN_WINDOW` of the connection head,
+///    which was written within `H2_HEAD_PROMPT` of the dial, with no response
+///    to a request and no client record written: the hello, the client's
+///    Finished (verified by N) and N's own head and KeyUpdate.
+///
+/// A provider that closes an alert or a HelloRetryRequest into the hello
+/// (bytes received) fails framing "1.1" the same way and is not counted.
+/// A provider that fails only on a request's records is not seen here: the
+/// body is the client's. `provider-profile-check.py --h2` and the client's
+/// own fallback (§2.3) cover that.
 struct H2Guard {
     fails: std::sync::atomic::AtomicU32,
     until: StdMutex<Option<std::time::Instant>>,
@@ -655,6 +687,11 @@ const H2_WITHDRAW_FOR: std::time::Duration = std::time::Duration::from_secs(600)
 /// A provider that closes an HTTP/2 connection this soon after the head,
 /// with no response to a request yet, failed the open.
 const H2_OPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// ...when the head was written this soon after the dial. An honest client
+/// needs the handshake's round trips and π_NK (about a second, a few on a
+/// slow link); one that stalls its `release_head` to meet a timer of the
+/// provider is past this and its connection does not count.
+const H2_HEAD_PROMPT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl H2Guard {
     fn new(retry: std::time::Duration, fail_file: Option<std::path::PathBuf>) -> Self {
@@ -1610,7 +1647,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         tokio::pin!(armed);
         // Wait for a ClientHello that passes the checks: a client that
         // sends anything else never makes the sidecar dial the provider.
-        while !check_hello(&mut st, &client_pending)? {
+        while !check_hello(&mut st, &client_pending, &app.offer.upstream_host)? {
             tokio::select! {
                 _ = &mut prep, if st.joint.is_none() => bail!("2PC preprocessing did not finish within {}s", TWOPC_TIMEOUT.as_secs()),
                 _ = &mut armed => bail!("pre-warmed session unused for {}s", SESSION_TIMEOUT.as_secs()),
@@ -1689,6 +1726,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         .with_context(|| format!("connecting to {}", app.upstream))?;
     st.fault = None;
     st.code = None;
+    st.dialed_at = Some(std::time::Instant::now());
     let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
     {
         let evt = evt_tx.clone();
@@ -1841,10 +1879,18 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                     }
                     Ev::TcpClosed if st.h2.is_some() => {
                         info!("upstream closed the connection");
-                        // A failed open (§2.1): no ServerHello at all, or the
-                        // provider closing on the connection head.
-                        if log.recv_len == 0 || st.h2.as_ref().is_some_and(|h| h.open_failed()) {
-                            app.h2_guard.failed("the provider closed the connection");
+                        // A failed open (§2.1, `H2Guard`): not a byte in
+                        // answer to the canonical ClientHello, or the provider
+                        // closing on the connection head alone.
+                        let why = if st.ch_sent && log.recv_len == 0 {
+                            Some("the provider closed without answering the ClientHello")
+                        } else if st.h2.as_ref().is_some_and(|h| h.open_failed()) {
+                            Some("the provider closed on the connection head")
+                        } else {
+                            None
+                        };
+                        if let Some(why) = why {
+                            app.h2_guard.failed(why);
                             st.fault = Some("upstream");
                         }
                         if st.state != SessionState::Body {
@@ -2062,6 +2108,9 @@ struct Session {
     ch_checked: bool,
     /// The checked ClientHello was relayed to the upstream.
     ch_sent: bool,
+    /// When the TCP connection to the provider was up (the ClientHello is
+    /// written right after).
+    dialed_at: Option<std::time::Instant>,
     hs_cmd_sent: bool,
     /// The transcript hash through the server Finished fed to the 2PC
     /// application phase (the keys of the credential record derive from it).
@@ -2745,10 +2794,12 @@ async fn write_head(
     Ok(())
 }
 
-/// Whether `pending` starts with a ClientHello that offers exactly the joint
-/// key share (checked once, as soon as both are there): false while either is
-/// missing, an error for anything else.
-fn check_hello(st: &mut Session, pending: &[u8]) -> Result<bool> {
+/// Whether `pending` starts with the canonical ClientHello for this
+/// connection (`tls_v2::canonical_client_hello`: the offer's host, the joint
+/// key share, the framing's ALPN), alone in one record of version `03 03`.
+/// Checked once, as soon as the hello and the joint share are there: false
+/// while either is missing, an error for anything else.
+fn check_hello(st: &mut Session, pending: &[u8], host: &str) -> Result<bool> {
     if st.ch_checked {
         return Ok(true);
     }
@@ -2763,9 +2814,12 @@ fn check_hello(st: &mut Session, pending: &[u8]) -> Result<bool> {
     if *ty != tls::HS_CLIENT_HELLO || msg.len() != r.payload.len() {
         bail!("first client record must be exactly the ClientHello");
     }
-    tls_v2::check_client_hello(msg, &joint, st.h2.is_some())?;
+    if r.header[1..3] != tls_v2::RECORD_VERSION {
+        bail!("the ClientHello record must carry record version 03 03");
+    }
+    tls_v2::check_client_hello(msg, &joint, host, st.h2.is_some())?;
     st.ch_checked = true;
-    info!("ClientHello checked: one P-256 share, the joint key");
+    info!("ClientHello checked: canonical, one P-256 share, the joint key");
     Ok(true)
 }
 
@@ -2790,8 +2844,9 @@ async fn v2_pump_client(
             bail!("client record of {n} bytes exceeds the TLS 1.3 limit");
         }
         if !st.ch_sent {
-            if !check_hello(st, pending)? {
-                return Ok(()); // wait for the 2PC
+            // The session dials only after `check_hello` passed.
+            if !st.ch_checked {
+                bail!("the ClientHello was not checked before the dial");
             }
             st.ch_sent = true;
         } else if r.ctype == tls::CT_CHANGE_CIPHER_SPEC {
@@ -4436,17 +4491,64 @@ mod hardening_tests {
 
     #[test]
     fn anything_but_a_client_hello_is_refused_before_the_dial() {
+        const H: &str = "api.example.com";
         let mut st = Session::default();
         // Before the key share: a handshake record is awaited, anything else refused.
-        assert!(!check_hello(&mut st, &[]).unwrap());
-        assert!(!check_hello(&mut st, &[tls::CT_HANDSHAKE, 3, 1]).unwrap());
-        assert!(check_hello(&mut st, &[CT_APPLICATION_DATA]).is_err());
+        assert!(!check_hello(&mut st, &[], H).unwrap());
+        assert!(!check_hello(&mut st, &[tls::CT_HANDSHAKE, 3, 1], H).unwrap());
+        assert!(check_hello(&mut st, &[CT_APPLICATION_DATA], H).is_err());
         st.joint = Some([4; 65]);
         let mut garbage = rec(tls::CT_HANDSHAKE, 8).bytes();
-        assert!(!check_hello(&mut st, &garbage[..7]).unwrap());
+        assert!(!check_hello(&mut st, &garbage[..7], H).unwrap());
         garbage[5] = tls::HS_CLIENT_HELLO;
-        assert!(check_hello(&mut st, &garbage).is_err());
+        assert!(check_hello(&mut st, &garbage, H).is_err());
         assert!(!st.ch_checked);
+    }
+
+    /// The canonical ClientHello of `joint` in a record with the given version.
+    fn hello_record(joint: &[u8; 65], host: &str, h2: bool, version: [u8; 2]) -> Vec<u8> {
+        let msg = tls_v2::canonical_client_hello(&[5; 32], &[6; 32], host, joint, h2).unwrap();
+        let mut r = vec![tls::CT_HANDSHAKE, version[0], version[1], (msg.len() >> 8) as u8, msg.len() as u8];
+        r.extend_from_slice(&msg);
+        r
+    }
+
+    #[test]
+    fn only_the_canonical_client_hello_record_makes_the_sidecar_dial() {
+        const H: &str = "api.example.com";
+        let joint = [4u8; 65];
+        let fresh = || Session { joint: Some(joint), ..Session::default() };
+        // Framing "1.1" (no `h2` state): the http/1.1 hello, one record, version 03 03.
+        let ok = hello_record(&joint, H, false, [3, 3]);
+        let mut st = fresh();
+        assert!(check_hello(&mut st, &ok, H).unwrap());
+        assert!(st.ch_checked);
+        // Without the key share yet: wait, nothing checked.
+        let mut st = Session::default();
+        assert!(!check_hello(&mut st, &ok, H).unwrap());
+        assert!(!st.ch_checked);
+        let refused = |bytes: &[u8], host: &str, why: &str| {
+            let mut st = fresh();
+            assert!(check_hello(&mut st, bytes, host).is_err(), "{why}");
+            assert!(!st.ch_checked, "{why}");
+        };
+        refused(&hello_record(&joint, H, false, [3, 1]), H, "record version 03 01");
+        refused(&hello_record(&joint, H, true, [3, 3]), H, "the h2 hello on a framing-1.1 connection");
+        refused(&ok, "other.example.com", "another SNI than the offer's host");
+        let mut other = joint;
+        other[9] = 9;
+        refused(&hello_record(&other, H, false, [3, 3]), H, "another share");
+        // The hello split over two records, or followed by a second message.
+        let msg = &ok[5..];
+        let mut split = vec![tls::CT_HANDSHAKE, 3, 3, 0, 100];
+        split.extend_from_slice(&msg[..100]);
+        split.extend_from_slice(&[tls::CT_HANDSHAKE, 3, 3, 0, (msg.len() - 100) as u8]);
+        split.extend_from_slice(&msg[100..]);
+        refused(&split, H, "a fragmented hello");
+        let mut two = vec![tls::CT_HANDSHAKE, 3, 3, 0, (msg.len() + 4) as u8];
+        two.extend_from_slice(msg);
+        two.extend_from_slice(&[tls::HS_CLIENT_HELLO, 0, 0, 0]);
+        refused(&two, H, "two messages in the record");
     }
 
     #[test]

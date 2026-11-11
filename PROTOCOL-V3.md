@@ -54,11 +54,17 @@ The operator states what their upstream supports. Nothing is probed or assumed.
   idle limit and the ceiling of the node's `idle_timeout_s`; an operator sets it no longer than the idle
   time `provider-profile-check.py --h2` passed H5 with (the shipped Venice file: 300). `kinds`: §12.1.
 - The sidecar stops offering `"2"` after 5 consecutive HTTP/2 connections failed to open, logs it, and
-  offers it again after 10 minutes. A failed open is one of: the provider closed before it sent a
-  ServerHello; a verified handshake did not select `h2`; the provider closed within 10 s of the connection
-  head with no response to a request yet. (N cannot see a GOAWAY: it is encrypted. It sees the close that
-  follows.) A response to the connection's first request resets the count. While withdrawn, a `setup`
-  for `"2"` is refused with `code: "h2_withdrawn"` and `GET /offer` lists `"2"` no longer.
+  offers it again after 10 minutes. The withdrawal is for every client, so a failed open is only what no
+  client can cause. It is one of: the provider closed without sending a byte in answer to the ClientHello
+  (which is canonical, §12.5, so its bytes are the offer's up to three opaque values); a verified
+  handshake did not select `h2`; the provider closed within 10 s of the connection head, with no response
+  to a request yet, no client record written to it since the head, and the head written within 15 s of
+  the dial (a client that delays `release_head`, or whose own record made the provider close, is not
+  counted). (N cannot see a GOAWAY: it is encrypted. It sees the close that follows.) A response to the
+  connection's first request resets the count. A provider that fails only once a request's records
+  arrive is not detected here (the body is the client's): the profile check and the client's fallback
+  (§2.3) cover it. While withdrawn, a `setup` for `"2"` is refused with `code: "h2_withdrawn"` and
+  `GET /offer` lists `"2"` no longer.
 - `crypto/tools/provider-profile-check.py --h2` checks what framing `"2"` needs from a provider (§5.6) and
   is what an operator runs before adding `"2"`.
 
@@ -136,8 +142,9 @@ request.
 As v2 (ClientHello with exactly the joint share, one suite, no PSK; N verifies the certificate chain, the
 hostname, CertificateVerify and both Finished messages), with:
 
+- The ClientHello is the canonical one of §12.5; N relays no other.
 - ALPN: framing `"2"` exactly `h2`, and N requires EncryptedExtensions to select it; framing `"1.1"` exactly
-  `http/1.1` or none, as v2.
+  `http/1.1`.
 - C gets `c_hs`, `s_hs`, `s_ap_0`, `c_ap_1`; N gets `K_0`, `IV_0`. Anchors `h1 = SHA256(c_ap_1)`,
   `h2 = SHA256(s_ap_0)`, `hk` as v2.
 - `c_commit`, π_NK over the connection head template of the framing, `release_head`; N writes the head
@@ -620,9 +627,15 @@ record sent before `request_ok`.
 
 ### 12.5 Handshake and connection head (both framings)
 
-1. C sends the ClientHello (binary): one record, one message, one key share = the joint P-256 share, one
-   suite `TLS_AES_128_GCM_SHA256`, no PSK, ALPN exactly `h2` (framing `"2"`) or exactly `http/1.1` or none
-   (framing `"1.1"`). Framing `"1.1"`: only after `request_ok`. N dials the provider now.
+1. C sends the ClientHello (binary): one record (`16 03 03 <len>`), one message, **canonical**: N compares
+   every byte except the random and the session id and refuses anything else before it dials.
+   `01 <len:3> 0303 <random:32> 20 <session id:32> 0002 1301 0100 <len:2>` and exactly these extensions in
+   this order: `ff01 0001 00` (renegotiation_info), `0000` server_name = the offer's `upstream_host`,
+   `000a 0004 0002 0017` (secp256r1), `0023 0000` (session_ticket, empty), `002b 0003 02 0304`,
+   `000d 000e 000c 0403 0503 0804 0401 0501 0601`, `0033 0047 0045 0017 0041 <the joint P-256 share:65>`,
+   `0010` ALPN with one protocol: `h2` (framing `"2"`) or `http/1.1` (framing `"1.1"`). No PSK, no
+   `psk_key_exchange_modes`, nothing else. (This is what the reference client, the SDK and the browser
+   library write; the reason is §2.1.) Framing `"1.1"`: only after `request_ok`. N dials the provider now.
 2. The joint key schedule runs on the 2PC channel; C relays ChangeCipherSpec and its Finished.
 3. `N → C  {"type":"hs_verified"}`: N verified chain, hostname, CertificateVerify and both Finished;
    framing `"2"`: EncryptedExtensions selected `h2`, else `error` with `code: "h2_not_selected"`.

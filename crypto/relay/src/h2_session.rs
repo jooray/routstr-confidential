@@ -124,8 +124,12 @@ pub(crate) struct H2 {
     /// Set to end the session in order (the loop sends `closed`).
     pub(crate) closing: Option<&'static str>,
     conn_end: Option<tokio::time::Instant>,
-    /// When the connection head was written.
+    /// When the connection head was written, and whether that was within
+    /// `H2_HEAD_PROMPT` of the dial.
     head_at: Option<std::time::Instant>,
+    head_prompt: bool,
+    /// A client record was written to the provider on this connection.
+    client_written: bool,
     /// The client reported the provider's SETTINGS (`settings_seen`).
     settings_seen: bool,
     /// The first request's response began (told to the offer guard once).
@@ -151,6 +155,8 @@ impl H2 {
             closing: None,
             conn_end: None,
             head_at: None,
+            head_prompt: false,
+            client_written: false,
             settings_seen: false,
             responded: false,
             responded_told: false,
@@ -162,10 +168,18 @@ impl H2 {
         self.responded && !std::mem::replace(&mut self.responded_told, true)
     }
 
-    /// The provider closed the connection on its head: soon after it was
-    /// written, with no response to a request yet.
+    /// The provider closed the connection on its head alone: soon after it
+    /// was written (itself promptly after the dial), with no response to a
+    /// request yet and nothing of the client's written since (`H2Guard`).
     pub(crate) fn open_failed(&self) -> bool {
-        !self.responded && self.head_at.is_some_and(|t| t.elapsed() < H2_OPEN_WINDOW)
+        self.closed_on_head(std::time::Instant::now())
+    }
+
+    fn closed_on_head(&self, now: std::time::Instant) -> bool {
+        !self.responded
+            && !self.client_written
+            && self.head_prompt
+            && self.head_at.is_some_and(|t| now.saturating_duration_since(t) < H2_OPEN_WINDOW)
     }
 
     /// No request in flight: an expired deadline is the idle limit.
@@ -280,6 +294,7 @@ pub(crate) fn head_written(st: &mut Session) {
     let Some(h) = st.h2.as_mut() else { return };
     h.conn_end = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(h.cfg.max_lifetime_s));
     h.head_at = Some(std::time::Instant::now());
+    h.head_prompt = st.dialed_at.is_some_and(|t| t.elapsed() < H2_HEAD_PROMPT);
     st.deadline = Some(h.idle_deadline());
 }
 
@@ -557,6 +572,7 @@ async fn flush(
         }
         let rec = h.queue.pop_front().expect("front exists");
         h.held -= rec.bytes.len();
+        h.client_written = true;
         write_upstream(tcp_tx, &rec.bytes, deadline).await?;
         st.sent.update(&rec.bytes);
         if rec.req_idx == 0 {
@@ -1514,6 +1530,39 @@ mod tests {
     }
 
     /// An idle open connection (no request yet) on the shipped h2 offer.
+    /// §2.1: a close after the head is a failed open only when the provider
+    /// had nothing of the client's to object to.
+    #[test]
+    fn a_close_on_the_head_counts_only_when_no_client_can_have_caused_it() {
+        let app = app_state(false);
+        let now = std::time::Instant::now();
+        let head = |f: &dyn Fn(&mut H2)| {
+            let mut st = idle_session(&app);
+            let h = st.h2.as_mut().unwrap();
+            h.head_at = Some(now);
+            h.head_prompt = true;
+            h.responded = false;
+            h.client_written = false;
+            f(h);
+            st.h2.unwrap().closed_on_head(now + std::time::Duration::from_secs(1))
+        };
+        // The provider closed on N's head alone, promptly written: counted.
+        assert!(head(&|_| {}));
+        // The client stalled its release_head (a provider timer may have fired).
+        assert!(!head(&|h| h.head_prompt = false));
+        // A client record reached the provider (a control frame's payload and
+        // a request body are the client's bytes).
+        assert!(!head(&|h| h.client_written = true));
+        // A response began: the connection opened.
+        assert!(!head(&|h| h.responded = true));
+        // No head written, or long ago.
+        assert!(!head(&|h| h.head_at = None));
+        let mut st = idle_session(&app);
+        let h = st.h2.as_mut().unwrap();
+        (h.head_at, h.head_prompt, h.responded, h.client_written) = (Some(now), true, false, false);
+        assert!(!h.closed_on_head(now + H2_OPEN_WINDOW));
+    }
+
     fn idle_session(app: &AppState) -> Session {
         let mut st = open_session(300);
         let h = st.h2.as_mut().unwrap();
