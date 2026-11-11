@@ -261,11 +261,23 @@ statement `pi_win` (`zkbench`), the sidecar mode (`relay/src/{h2,h2_session,hpac
 `confidential-2pc`: the setup checks the credential and reserves nothing, each `request` is reserved and
 settled as a v2 session; `routstr/confidential_ws.py` `_run_h2_session`, tests
 `tests/unit/test_confidential_http2.py`; A.11 "Through a node" is the client-facing wire format). Not built:
-the SDK, routstrd, the web library. v2 is untouched and the default. Gates: `crypto/tools/v3-h2-check.sh`
+the web library. v2 is untouched and the default. Gates: `crypto/tools/v3-h2-check.sh`
 (starts its own sidecar; honest cases, five attacks, a v2 control) and `crypto/tools/v3-h2-node-check.sh`
 (starts a sidecar and a node on scratch state, needs routstr-core on `confidential-v3`; checks every case's
 money outcome in the node's database); offline: `node --experimental-strip-types src/h2-selfcheck.ts` in
 `crypto/client`.
+
+The clients (local branches `confidential-v3` in routstr-sdk, from `confidential-2pc`, and in routstrd, from
+`confidential-upstream`): the SDK runs chat on pooled `http: 2` connections when the verified offer lists
+`"2"` (`client/confidential/{h2,h2conn,h2pool}.ts`, `confidential.http2`, on by default; images, one-off Cashu
+bearers and other nodes keep the v2 flow), routstrd passes `confidentialUpstream.http2` through. Live checks:
+`bun scripts/confidential-h2-e2e.ts <node> <sk-key> <model>` in routstr-sdk (SDK level, against a node you
+started), and `crypto/tools/v3-h2-routstrd-check.sh`, which starts a sidecar, a node, a stub mint
+(`crypto/tools/v3-h2-routstrd/`) and a scratch routstrd (scratch HOME/ROUTSTRD_DIR/COCOD_DIR, dead proxy for
+non-loopback HTTP), sends curl requests with `x-routstr-verify: confidential` (5 sequential, a burst of 3,
+5 with http2 disabled), checks the routstrd log, the node log and the node's balance, and prints the time to
+first token and the bytes per request. It needs both client checkouts built (SDK `npm run build`, then
+routstrd `bun run build`).
 
 ## Browser client (separate repos)
 
