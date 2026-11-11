@@ -1,7 +1,9 @@
-//! Two-party TLS 1.3 key schedule for protocol v2 (`docs/TWOPC-DESIGN.md`),
-//! with **only N garbling**: authenticated garbling with garbler-held masks
-//! and an IT-MAC consistency check (the node garbles, the client evaluates
-//! and mostly downloads).
+//! Two-party TLS 1.3 key schedule, version `split-public-1` (protocol v3,
+//! `PROTOCOL-V3.md` §4; `docs/TWOPC-DESIGN.md`, `docs/TWOPC-NODE-GARBLING.md`).
+//! Only N garbles (authenticated garbling with garbler-held masks and an
+//! IT-MAC consistency check), and the garbled circuit holds only the part of
+//! the key schedule that needs a secret: the HMAC key-pad states and the outer
+//! compressions.
 //!
 //! C (the client) and N (the node) jointly run the client side of a TLS 1.3
 //! ECDHE(P-256) + SHA-256 key schedule so that neither learns the ECDHE secret
@@ -13,21 +15,24 @@
 //! | s_ap_0, c_ap_1 | yes | never |
 //! | K_0, IV_0 (of c_ap_0) | never | yes |
 //! | h1 = SHA256(c_ap_1), h2 = SHA256(s_ap_0), hk = SHA256(K_0‖IV_0) | yes | yes |
+//! | IS_HS, IS_dHS, IS_MS, IS_c0 (inner key-pad states) | yes | yes |
 //!
 //! # API
 //!
 //! ```ignore
-//! let mut p = Party::new(Role::C, io).await?;   // io: futures AsyncRead + AsyncWrite
+//! let mut p = Party::new(Role::C, io).await?;   // io: futures AsyncRead + AsyncWrite; exchanges VERSION_TAG
 //! p.preprocess().await?;                         // input independent (pre-warm)
 //! let joint: [u8; 65] = p.key_share().await?;    // commit-then-open joint P-256 share
-//! let hs: HsSecrets = p.handshake(&server_share, th_sh).await?;  // ECtF + phase A
-//! let ap: ApOut = p.application(th_sf).await?;   // phase B
+//! let hs: HsSecrets = p.handshake(&server_share, th_sh).await?;  // ECtF + stages A1–A3
+//! let ap: ApOut = p.application(th_sf).await?;   // stages B1, B2 (with the anchors)
 //! p.close().await;
 //! ```
 //!
 //! `Party::new` needs a running tokio runtime (it spawns the channel
-//! multiplexer); `close` flushes the transport; `take_timings` returns per-step
-//! wall time and transport bytes.
+//! multiplexer). It writes [`VERSION_TAG`] as the first bytes on the
+//! transport and reads the peer's; anything else is
+//! [`Error::VersionMismatch`] (`twopc_version_mismatch`). `close` flushes the
+//! transport; `take_timings` returns per-step wall time and transport bytes.
 //!
 //! The library sets no deadlines: a receive waits until the peer's data or
 //! EOF arrives, so a half-open transport stalls a step. Callers bound each
@@ -36,74 +41,55 @@
 //!
 //! # Protocol
 //!
-//! N garbles both phase circuits once ([`gc`]: three-halves garbling,
-//! Rosulek–Roy 2021, 1.5κ+5 bits per AND, global offset Δ_A). C is protected
-//! by **IT-MACs on N's wire masks** under C's key Δ_B and a batched
-//! consistency check of every AND gate:
+//! `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))` with `f` the SHA-256 compression
+//! function. Every HKDF message of the key schedule is public, so the garbled
+//! circuit ([`circuits::Split`], one circuit evaluated in five stages)
+//! computes only `IS_k`, `OS_k`, the outer compressions and the anchors.
+//! `IS_k` is a **public output** of its stage. Both parties compute the inner
+//! digests `d = f(IS_k, m)` in the clear; N sends the labels of the digest's
+//! input wires and C pins them with pointer checks against opened,
+//! authenticated masks. `OS_k` never leaves the circuit.
 //!
-//! * **Preprocess.** Random COTs with C as sender (Δ_B; Ferret over KOS)
-//!   authenticate, by `Fix` (N sends `d = λ ⊕ r`), N's mask λ_w of every
-//!   circuit input and AND output, and `t_k = λ_i·λ_j` of every AND gate.
-//!   N sends the garbled tables and the `d` bits, then C sends a random seed
-//!   (χ). N proves `t_k = λ_i·λ_j` for all gates (QuickSilver-style, two field
-//!   elements), opens the masks of C's input wires, the transcript-hash wires
-//!   and all output wires (values + one hash of MACs), and sends one 64-bit
-//!   check row per base wire and `Y_N` (`gc::check_material`). KOS random COT
-//!   with N as sender (Δ_A) for C's input bits, and the ECtF OLEs.
-//! * **Key share.** C commits to `SHA256(tag‖SEC1(P_C)‖nonce)`, N sends `P_N`,
-//!   C opens; both compute `P = P_C + P_N`.
-//! * **Handshake.** ECtF ([`ectf`]) turns `a_C·S`, `a_N·S` into additive shares
-//!   `x_C + x_N = x(ECDHE) mod p`; phase A computes `c_hs, s_hs` and
-//!   `MS ⊕ r_C ⊕ r_N` (C's MS share is `r_C`, N's is `MS ⊕ r_C`).
-//! * **Application.** Phase B takes the MS shares and computes
-//!   `(s_ap_0‖c_ap_1) ⊕ m_C`, `(K_0‖IV_0) ⊕ m_N`, h1, h2, hk.
-//! * **Online, per phase.** C sends `d = x ⊕ b` (Beaver derandomisation of its
-//!   COTs), N sends its own and the transcript-hash input labels, then the
-//!   corrections for C's labels. C checks the pointer bits of its own and of
-//!   the transcript-hash wires against the opened masks, evaluates, runs the
-//!   consistency check, decodes its outputs with the opened (authenticated)
-//!   masks and only then sends N the output pointer bits plus a hash of the
-//!   output labels, which N checks against its labels. About 1.5 round trips.
+//! Garbling, the IT-MACs on N's masks, the product check and the AND-gate
+//! consistency check are in [`gc`]; the check runs **per stage**, over exactly
+//! that stage's AND gates, before any output of the stage is decoded, reported
+//! or used.
 //!
-//! # Security (sketch; `docs/TWOPC-DESIGN.md` has the full argument)
+//! * **Preprocess.** N garbles the circuit and streams the tables. Random
+//!   COTs with C as sender (Δ_B; Ferret over KOS) authenticate N's masks and
+//!   the AND products (`Fix`). C sends its challenge seed only after the
+//!   tables and commitments arrived. N then sends the product check, the
+//!   opened masks (C's input wires, the digest input wires, every output that
+//!   C may decode) with one hash of their MACs, per stage the check rows and
+//!   `Y_N`, and the *label-check pairs*: for every output wire that C reports
+//!   to N, two salted 128-bit hashes of its two labels. KOS COTs with N as
+//!   sender (Δ_A) cover C's 256 input bits.
+//! * **Online, per stage.** C gets its input labels (stage A1: `d = x ⊕ b`,
+//!   then N's corrections; later stages: the digest labels), checks their
+//!   pointer bits, evaluates, runs the stage's consistency check, checks the
+//!   label-check pair of every output wire it is about to report, and only
+//!   then sends one message: the pointer bits of the outputs N may know and
+//!   one hash over their labels. N checks the hash (C cannot report a wrong
+//!   bit without an inactive label), decodes `IS_k`, computes the next
+//!   stage's inner digests and answers with their labels. One round trip per
+//!   stage.
 //!
-//! * **Malicious N.** Every base mask λ and product t is fixed under Δ_B
-//!   before χ; the products are checked over GF(2^128) (error ≤ 2n/2^128). An
-//!   AND gate evaluated inconsistently with the committed masks makes the
-//!   (GF(2^128)) combination E = Σχ^k e_k non-zero except with probability
-//!   n/2^128, and then C accepts only if the 64-bit projection of `Δ_B·E`
-//!   hits a value fixed before Δ_B is used: ≤ 2^-63 per phase (Δ_B has 127
-//!   uniform bits and N learns nothing about it). With all gates consistent,
-//!   C's outputs are the correct function of the inputs (C's inputs and the
-//!   transcript hash are pinned by the pointer checks against opened masks;
-//!   outputs decode with authenticated masks). What N can still do is a
-//!   *selective failure*: make C abort depending on any function of C's
-//!   private inputs and of internal wire values (N can corrupt the check row
-//!   of any wire, internal HKDF wires included, so a leaked bit can be a bit
-//!   of `s_ap_0` or `c_ap_1`). Per phase N observes one of {abort, labels
-//!   rejected, success}, the session ends at the first failure, and ECtF adds
-//!   two outcomes (C's degenerate-share abort, and the server Finished failing
-//!   between the phases): seven outcomes, ≤ log2 7 ≈ 2.8 bits per session,
-//!   provided ECtF leaks nothing beyond its outcome (below).
-//! * **Malicious C.** C is the evaluator; it sees the tables, active labels
-//!   and pointer bits, the opened masks (its inputs, the public transcript
-//!   hash, the outputs), check rows padded by hashes of inactive labels, and
-//!   `Y_N` (a value C can compute itself). It cannot report a wrong output to
-//!   N without an inactive output label (needs Δ_A).
-//! * **Fairness.** C decodes its outputs first and N gets its own only from
-//!   C's final message of each phase, so a malicious C can keep N's outputs
-//!   (`K_0, IV_0`) from it after learning its own. The protocol does not
-//!   prevent this; in the routstr flow it gains C nothing, since without the
-//!   credential record N writes under `K_0` there is no provider request.
-//! * **Inputs are never revealed** by either party (nothing is opened after
-//!   the evaluation). Private outputs are XOR-masked inside the circuit by
-//!   their owner's random mask; MS by both parties' masks.
-//! * **ECtF** uses mpz2's A2M/M2A, which are secure against semi-honest
-//!   parties only; the leakage bound above assumes a malicious N gains
-//!   nothing from them beyond the outcome. Under that assumption a deviation
-//!   only shifts the result (the TLS server Finished then fails) or trips the
-//!   degenerate-share check (a selective failure). All scalars, masks, labels
-//!   and Δ are fresh per session (ChaCha12 seeded from the OS).
+//! # Security (sketch; `docs/TWOPC-DESIGN.md` has the argument and its limits)
+//!
+//! * **Malicious N** is held stage by stage: an AND gate evaluated
+//!   inconsistently with the committed masks is caught by that stage's check
+//!   (≤ 2^-63 per stage). N's remaining power is selective failure: one
+//!   observable abort per stage. The label-check pairs make N commit to the
+//!   labels it expects *before* it sees anything derived from them, so the
+//!   report hash carries no information beyond that abort. A digest label for
+//!   another bit fails the pointer check, whatever C's secrets are.
+//! * **Malicious C** cannot report a wrong output bit (it needs an inactive
+//!   label, i.e. Δ_A) and has exactly one label per digest input wire, the one
+//!   N computed from the `IS_k` C reported under its labels.
+//! * **Both parties see `IS_k`.** Beyond "HMAC-SHA256 is a PRF" this needs the
+//!   two assumptions of Bellare's HMAC proof, used directly: `f` keyed by its
+//!   chaining input is a PRF, and `OS_k` is pseudorandom given `IS_k`.
+//! * **Inputs are never revealed.** ECtF is semi-honest A2M/M2A.
 
 pub mod circuits;
 
@@ -116,6 +102,7 @@ pub mod testutil;
 mod tests;
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use futures::{AsyncRead, AsyncWrite};
@@ -134,11 +121,11 @@ use sha2::{Digest, Sha256};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use zeroize::{Zeroize, Zeroizing};
 
-pub use mux::Counters;
-use mux::{FrameChan, Mux};
-use circuits::{Spec, from_bits, spec, to_bits};
+use circuits::{HS_STAGES, N_STAGES, OutKind, Split, from_bits, to_bits};
 use ectf::SecretFp;
 use gc::SecretBlocks;
+pub use mux::Counters;
+use mux::{FrameChan, Mux};
 
 /// Errors. `Abort` means a check failed (possible cheating); the session must
 /// be discarded.
@@ -154,7 +141,16 @@ pub enum Error {
     Input(String),
     #[error("wrong call order: {0}")]
     State(&'static str),
+    /// The peer's first bytes were not [`VERSION_TAG`]: it speaks another
+    /// version of the two-party key schedule (or another protocol). The
+    /// field is what was read up to the first differing byte, in hex. The
+    /// message starts with the error code `twopc_version_mismatch`.
+    #[error("twopc_version_mismatch: this side speaks routstr-2pc/split-public-1, the peer's first bytes were 0x{0}")]
+    VersionMismatch(String),
 }
+
+/// The error code of [`Error::VersionMismatch`], as callers report it.
+pub const VERSION_MISMATCH: &str = "twopc_version_mismatch";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -234,20 +230,29 @@ pub struct CircuitStats {
     pub compressions: usize,
     pub c_input_bits: usize,
     pub n_input_bits: usize,
+    /// Public inner-digest input bits (labels chosen by N, pinned by C).
+    pub digest_input_bits: usize,
     pub output_bits: usize,
 }
 
-pub fn circuit_stats() -> [CircuitStats; 2] {
-    let f = |name, s: &circuits::Spec| CircuitStats {
-        name,
-        and_gates: s.circ.and_count(),
-        xor_gates: s.circ.xor_count(),
-        compressions: s.compressions,
-        c_input_bits: s.c_bits,
-        n_input_bits: s.n_bits,
-        output_bits: s.out_bits,
-    };
-    [f("phase A", &circuits::PHASE_A), f("phase B", &circuits::PHASE_B)]
+/// The garbled circuit.
+pub fn circuit_stats() -> CircuitStats {
+    let sp = &*circuits::SPLIT;
+    CircuitStats {
+        name: "split-public-1",
+        and_gates: sp.circ.and_count(),
+        xor_gates: sp.circ.xor_count(),
+        compressions: sp.compressions,
+        c_input_bits: sp.xc.len(),
+        n_input_bits: sp.xn.len(),
+        digest_input_bits: sp.dig.iter().map(|d| d.len()).sum(),
+        output_bits: sp.circ.outputs().len(),
+    }
+}
+
+/// AND gates at the end of each stage of the circuit.
+pub fn stage_and_ends() -> [usize; N_STAGES] {
+    circuits::SPLIT.and_end
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,37 +265,56 @@ enum Stage {
     Failed,
 }
 
-/// Test-only deviations.
+/// Test-only deviations. `usize` arguments are stage indices (0..5).
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Cheat {
     #[default]
     None,
-    /// N: corrupt the half-ciphertexts of 64 AND gates of a phase.
+    /// N: corrupt the half-ciphertexts of 64 AND gates of a stage.
     CorruptGate(usize),
-    /// N: flip control (dicing) bits of 64 AND gates of a phase.
+    /// N: flip control (dicing) bits of 64 AND gates of a stage.
     CorruptControlBits(usize),
-    /// N: commit the mask of one AND output of a phase flipped (turns that
+    /// N: commit the mask of one AND output of a stage flipped (turns that
     /// AND into a NAND as far as the decoded values go, "logic change").
     FlipLambda(usize),
     /// N: wrong t_k for one AND gate (product check must fail).
     BadT,
-    /// N: lie about one opened output mask of a phase (flips C's output).
+    /// N: lie about one opened output mask of a stage (flips C's output).
     LieOpen(usize),
-    /// N: send a garbage label for its first own input of a phase.
+    /// N: lie about the opened mask of an input wire, by its position among
+    /// the opened inputs (0..256: C's x share; then the digest inputs).
+    LieOpenIn(usize),
+    /// N: send a garbage label (right pointer bit) for its first own input
+    /// (stage 0) or for the first digest input of a later stage.
     BadInputLabel(usize),
-    /// N: run the KOS for C's input labels with a different Δ than garbling.
+    /// N: the label of the flipped bit (shifted by Δ_A) for one digest input.
+    FlipDigestLabel(usize),
+    /// N: valid labels, but of another inner digest (the next block's of the
+    /// stage, or the digest of a modified block if the stage has one).
+    OtherDigest(usize),
+    /// N: run the COTs under Δ_A with a different Δ than garbling.
     KosDelta,
-    /// N: add random offsets to every check row of a phase.
+    /// N: add random offsets to every check row of a stage.
     BadRows(usize),
-    /// N: computes the check rows of a phase under a different salt.
+    /// N: computes the check rows of a stage under a different salt.
     WrongSalt(usize),
-    /// N: flip Y_N of a phase.
+    /// N: flip Y_N of a stage.
     BadYn(usize),
-    /// C: report one flipped output bit of a phase to N.
-    FlipOutput(usize),
+    /// N: the two halves of the label-check pair of one reported wire of a
+    /// stage swapped.
+    BadPair(usize),
+    /// N: the label-check pairs of a stage's first reported group are right
+    /// for the bit 0 and wrong for the bit 1 (an abort that depends on the
+    /// group's value).
+    BadPairHalf(usize),
+    /// C: report one flipped bit of the named output group to N.
+    FlipReported(&'static str),
     /// C: opens its key-share commitment to a different point.
     BadOpen,
+    /// C: uses another label than the one it got for a digest input of a
+    /// stage, ignores its own checks and reports what it computed.
+    FeedOther(usize),
 }
 
 type KosS = kos::Sender<chou_orlandi::Receiver>;
@@ -298,44 +322,51 @@ type KosR = kos::Receiver<chou_orlandi::Sender>;
 type FerS = ferret::Sender<KosS>;
 type FerR = ferret::Receiver<KosR>;
 
-
-/// N's per-phase state.
-struct NPhase {
-    /// Zero-label of every wire (with Δ_A, every label).
-    k: SecretBlocks,
-    /// Wire masks (each reveals a wire value to whoever sees the label).
-    lam: Zeroizing<Vec<bool>>,
+/// N's state after preprocessing.
+struct NState {
+    /// Zero-labels of the circuit inputs and outputs (with Δ_A, both labels).
+    k_in: SecretBlocks,
+    k_out: SecretBlocks,
+    /// Masks of the outputs.
+    lam_out: Zeroizing<Vec<bool>>,
+    /// COT keys under Δ_A for C's inputs.
+    cota: SecretBlocks,
+    /// Decoded values of the reported output groups.
+    vals: Vec<Option<Zeroizing<Vec<bool>>>>,
+    next: usize,
 }
 
-/// C's per-phase state.
-struct CPhase {
+/// C's state after preprocessing.
+struct CState {
     tables: Vec<gc::Gate3>,
-    ck: Option<gc::CheckKeys>,
-    rows: Vec<u64>,
-    y_n: u64,
+    /// Active label of every feed evaluated so far.
+    l: SecretBlocks,
+    ck: Vec<Option<gc::CheckKeys>>,
+    rows: Vec<Vec<u64>>,
+    y_n: Vec<u64>,
     /// Per-session salt of the check-row hash (from the challenge seed).
     salt: u128,
-    /// Opened masks: C's input wires, th wires, outputs.
-    lam_c: Vec<bool>,
-    lam_th: Vec<bool>,
+    /// Opened masks, by input wire / output index (false where not opened).
+    lam_in: Vec<bool>,
     lam_out: Vec<bool>,
+    /// Label-check pairs, by `Lay::e_idx`.
+    pairs: Vec<[[u8; 16]; 2]>,
+    /// COTs under Δ_A for C's inputs (`msg = key ⊕ choice·Δ_A`).
+    cot_choices: Zeroizing<Vec<bool>>,
+    cot_msgs: SecretBlocks,
+    /// Decoded values of the output groups (pointer bits for `ToN` groups).
+    vals: Vec<Option<Zeroizing<Vec<bool>>>>,
+    /// Inner digests C computed, waiting for N's labels.
+    dig: Vec<Option<Zeroizing<Vec<bool>>>>,
+    next: usize,
 }
 
 enum Pre {
-    N {
-        ph: Vec<NPhase>,
-        /// KOS keys for C's input bits (phase A then B).
-        cot_keys: SecretBlocks,
-    },
-    C {
-        ph: Vec<CPhase>,
-        /// KOS choice bits and messages (C's inputs are `d ⊕ choice`).
-        cot_choices: Zeroizing<Vec<bool>>,
-        cot_msgs: SecretBlocks,
-    },
+    N(Box<NState>),
+    C(Box<CState>),
 }
 
-const CH_COTA: usize = 0; // KOS for C's input labels (N sender, Δ_A)
+const CH_COTA: usize = 0; // COTs under Δ_A (N sender): C's inputs
 const CH_COTB: usize = 1; // MAC COTs (C sender, Δ_B)
 const CH_SC: usize = 2; // share conversion
 const CH_N2C: usize = 3; // all N→C protocol messages
@@ -343,42 +374,124 @@ const CH_C2N: usize = 4; // all C→N protocol messages
 const CH_TAB: usize = 5; // N→C garbled tables (bulk: lowest priority on the link)
 const N_CH: usize = 6;
 
-/// N streams phase A's tables once this many MAC-COT bytes from C arrived
-/// (C has N's OT bootstrap messages and is uploading the first part of the
-/// Ferret extension), and phase B's once C is past the first part (484 184
-/// bytes with mpz2 rev 8f89783 and this circuit size; measured with
-/// `TWOPC_TRACE=1`), i.e. past the last small N→C Ferret message. Either gate
-/// also opens when N's MAC COTs are complete, or after `TABLES_MAX_WAIT`.
+/// The version tag: the first bytes each party writes on the transport,
+/// before any multiplexer frame. A peer that reads anything else fails with
+/// [`Error::VersionMismatch`].
+pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-1\n";
+
+/// N streams the first part of the tables (stages A1–A3) once this many
+/// MAC-COT bytes from C arrived (C has N's OT bootstrap messages and is
+/// uploading the first part of the Ferret extension), and the rest once C is
+/// past the first part (484 184 bytes with mpz2 rev 8f89783, for this
+/// circuit's 960 988 COTs as for v2's 1.31 million; measured with
+/// `TWOPC_TRACE=1`), i.e. past the small N→C Ferret message between the two
+/// parts. Either gate also opens when N's MAC COTs are complete, or after
+/// `TABLES_MAX_WAIT`. Re-measured for this circuit (`BENCH.md`, "Table
+/// scheduling"): other thresholds were equal within noise or slower.
 const TABLES_GATE: [u64; 2] = [64 * 1024, 500_000];
 const TABLES_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 const TAG_KS: &[u8] = b"routstr-twopc-v2 key-share commit";
 const TAG_OPEN: &[u8] = b"routstr-twopc-ag open";
-const TAG_OUT: &[u8] = b"routstr-twopc-ag output labels";
+const TAG_OUT: &[u8] = b"routstr-twopc-split output labels";
 const TAG_CHI: &[u8] = b"routstr-twopc-ag chi";
+const TAG_PAIR: &[u8] = b"routstr-twopc-split label check";
 
+/// COTs under Δ_A: one per bit of C's x-coordinate share.
+const N_COTA: usize = 256;
 
-/// Number of MAC COTs per phase: inputs + AND outputs + AND products.
-fn macs_per_phase(s: &Spec) -> usize {
-    s.circ.inputs().len() + 2 * s.circ.and_count()
-}
-
-/// Circuit-derived index lists, computed once.
-struct Shape {
+/// Everything derived from the circuit, computed once.
+struct Lay {
+    sp: &'static Split,
+    shapes: Vec<gc::StageShape>,
     ands: Vec<(usize, usize, usize)>,
     base: Vec<usize>,
+    n_in: usize,
+    n_and: usize,
+    n_out: usize,
+    /// Feed id of output 0.
+    out0: usize,
+    /// Input wires whose mask is opened to C: its x share, the digest inputs.
+    open_in: Vec<usize>,
+    /// Per output: index of its label-check pair (the outputs C reports).
+    e_idx: Vec<Option<usize>>,
+    n_pairs: usize,
+    /// Δ_B pool: base masks and products (fixed), then 128 product-check
+    /// mask COTs.
+    mac_fixed: usize,
+    n_mac: usize,
 }
 
-static SHAPES: std::sync::LazyLock<[Shape; 2]> = std::sync::LazyLock::new(|| {
-    let f = |p| {
-        let s = spec(p);
-        Shape {
-            ands: gc::and_gates(&s.circ),
-            base: gc::base_wires(&s.circ),
+impl Lay {
+    fn new() -> Lay {
+        let sp: &'static Split = &circuits::SPLIT;
+        let circ = &sp.circ;
+        let shapes = gc::stage_shapes(circ, &sp.gate_end);
+        for (s, sh) in shapes.iter().enumerate() {
+            assert_eq!(sh.ands.end, sp.and_end[s]);
         }
-    };
-    [f(0), f(1)]
-});
+        let n_in = circ.inputs().len();
+        let n_and = circ.and_count();
+        let n_out = circ.outputs().len();
+        assert_eq!(sp.xc.len(), N_COTA);
+        let mut open_in: Vec<usize> = sp.xc.clone().collect();
+        for d in &sp.dig {
+            open_in.extend(d.clone());
+        }
+        let mut e_idx = vec![None; n_out];
+        let mut n_pairs = 0;
+        for g in &sp.outs {
+            if g.kind != OutKind::ToC {
+                for i in 0..g.len {
+                    e_idx[g.off + i] = Some(n_pairs);
+                    n_pairs += 1;
+                }
+            }
+        }
+        let mac_fixed = n_in + 2 * n_and;
+        Lay {
+            sp,
+            ands: gc::and_gates(circ),
+            base: gc::base_wires(circ),
+            shapes,
+            n_in,
+            n_and,
+            n_out,
+            out0: circ.outputs().start,
+            open_in,
+            e_idx,
+            n_pairs,
+            mac_fixed,
+            n_mac: mac_fixed + 128,
+        }
+    }
+
+    /// Output groups C opens (decodes).
+    fn opened(&self, gi: usize) -> bool {
+        self.sp.outs[gi].kind != OutKind::ToN
+    }
+
+    /// Output groups of `stage` that C reports to N (pointer bits).
+    fn reported(&self, stage: usize) -> Vec<usize> {
+        (0..self.sp.outs.len())
+            .filter(|&gi| {
+                let g = &self.sp.outs[gi];
+                g.stage == stage && g.kind != OutKind::ToC
+            })
+            .collect()
+    }
+}
+
+static LAY: LazyLock<Lay> = LazyLock::new(Lay::new);
+
+fn lay() -> &'static Lay {
+    &LAY
+}
+
+/// The inner state whose digests feed `stage` (1..=4).
+fn is_group(sp: &Split, stage: usize) -> usize {
+    sp.group(["IS_HS", "IS_dHS", "IS_MS", "IS_c0"][stage - 1])
+}
 
 pub struct Party {
     role: Role,
@@ -402,7 +515,6 @@ pub struct Party {
     stage: Stage,
     pre: Option<Pre>,
     scalar: Option<Scalar>,
-    ms_share: [u8; 32],
     timings: Vec<StepTiming>,
     #[cfg(test)]
     pub(crate) cheat: Cheat,
@@ -412,7 +524,6 @@ impl Drop for Party {
     fn drop(&mut self) {
         // Labels, masks, COT keys and MAC keys go with `pre` (their own
         // `Drop`s); copies inside mpz2's OT/OLE state are out of reach.
-        self.ms_share.zeroize();
         if let Some(a) = self.scalar.as_mut() {
             a.zeroize();
         }
@@ -482,6 +593,20 @@ fn first_nonzero(mut draw: impl FnMut(u32) -> Block) -> Block {
         .expect("a non-zero draw")
 }
 
+/// One half of a label-check pair: a salted hash of the value C holds for
+/// output `o` when its reported bit is `p`.
+fn pair_hash(salt: &[u8; 16], o: usize, p: bool, x: Block) -> [u8; 16] {
+    let h: [u8; 32] = Sha256::new()
+        .chain_update(TAG_PAIR)
+        .chain_update(salt)
+        .chain_update((o as u32).to_be_bytes())
+        .chain_update([p as u8])
+        .chain_update(x.as_bytes())
+        .finalize()
+        .into();
+    h[..16].try_into().unwrap()
+}
+
 fn parse_point(b: &[u8]) -> Result<ProjectivePoint> {
     if b.len() != 65 || b[0] != 0x04 {
         return Err(Error::Input("point must be 65-byte uncompressed SEC1".into()));
@@ -522,8 +647,45 @@ fn fp_from_be(be: &[u8]) -> Result<Fp> {
     r
 }
 
+/// Writes [`VERSION_TAG`] and reads the peer's, byte by byte, so that a peer
+/// speaking anything else (a v2 peer starts with a multiplexer frame header)
+/// is refused at its first differing byte and nothing past the tag is read.
+async fn exchange_version<IO>(io: IO) -> Result<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    use futures::{AsyncReadExt, AsyncWriteExt};
+    let (mut rd, mut wr) = io.split();
+    let send = async {
+        wr.write_all(VERSION_TAG).await?;
+        wr.flush().await?;
+        Ok::<_, Error>(())
+    };
+    let recv = async {
+        let mut got = Vec::with_capacity(VERSION_TAG.len());
+        let mut b = [0u8; 1];
+        while got.len() < VERSION_TAG.len() {
+            rd.read_exact(&mut b).await?;
+            got.push(b[0]);
+            if b[0] != VERSION_TAG[got.len() - 1] {
+                return Err(Error::VersionMismatch(hex::encode(&got)));
+            }
+        }
+        Ok(())
+    };
+    futures::try_join!(send, recv)?;
+    rd.reunite(wr).map_err(|_| Error::Protocol("transport halves".into()))
+}
+
 fn perr<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> Error {
     move |e| Error::Protocol(format!("{what}: {e}"))
+}
+
+fn fcfg() -> ferret::FerretConfig {
+    ferret::FerretConfig::builder()
+        .lpn_type(ferret::LpnType::Regular)
+        .build()
+        .expect("ferret config")
 }
 
 macro_rules! rcot_send {
@@ -553,27 +715,33 @@ impl Party {
     where
         IO: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        // The version tag, both ways, before anything else.
+        let io = exchange_version(io).await?;
         // What the peer may send per channel. N (the node) is the exposed
-        // party: C's honest upload is ~1.2 MB in all (Ferret on CH_COTB), a
-        // few KB of KOS/ECtF traffic and well under 4 KB of protocol messages;
-        // N→C-only channels accept nothing from C. C bounds N too, so a
-        // malicious node cannot grow the client's memory: an honest N sends
-        // 4 KB on CH_COTA, 451 KB on CH_COTB, 21 KB on CH_SC, 5.5 MB on
-        // CH_N2C and 16.2 MB of tables (the circuits are fixed).
+        // party: C's honest upload is about 1.1 MB in all (Ferret on CH_COTB;
+        // 12 KB of KOS on CH_COTA), a few KB of ECtF traffic and under 1 KB
+        // of protocol messages; N→C-only channels accept nothing from C. C
+        // bounds N too, so a malicious node cannot grow the client's memory:
+        // an honest N sends about 0.5 MB on CH_COTB, a few KB on CH_COTA,
+        // 21 KB on CH_SC, about 4.1 MB on CH_N2C and 11.8 MB of tables (the
+        // circuit is fixed).
         const MIB: u64 = 1 << 20;
         let caps: [u64; N_CH] = match role {
-            Role::N => [8 * MIB, 16 * MIB, 4 * MIB, 0, MIB, 0],
+            Role::N => [MIB, 16 * MIB, 4 * MIB, 0, MIB, 0],
             Role::C => [MIB, 4 * MIB, MIB, 16 * MIB, 0, 32 * MIB],
         };
         let (mux, mut chans) = Mux::start(io, N_CH, &[CH_TAB], &caps);
         let counters = mux.counters.clone();
+        let tag = VERSION_TAG.len() as u64;
+        counters.sent.fetch_add(tag, std::sync::atomic::Ordering::Relaxed);
+        counters.recv.fetch_add(tag, std::sync::atomic::Ordering::Relaxed);
         let mut take = |i: usize| std::mem::replace(&mut chans[i], tokio::io::duplex(1).0);
         let ctx_a = Context::new_single_threaded(take(CH_COTA).compat());
         let ctx_b = Context::new_single_threaded(take(CH_COTB).compat());
         let ctx_sc = Context::new_single_threaded(take(CH_SC).compat());
         let n2c = FrameChan::new(take(CH_N2C));
         let tab = FrameChan::new(take(CH_TAB));
-        // N never receives a protocol message over a few hundred bytes on C→N.
+        // N never receives a protocol message over a few KB on C→N.
         let c2n = match role {
             Role::N => FrameChan::with_max_msg(take(CH_C2N), 1 << 16),
             Role::C => FrameChan::new(take(CH_C2N)),
@@ -585,12 +753,6 @@ impl Party {
         let sc = match role {
             Role::C => ectf::Sc::new_sender(&mut rng),
             Role::N => ectf::Sc::new_receiver(&mut rng),
-        };
-        let fcfg = || {
-            ferret::FerretConfig::builder()
-                .lpn_type(ferret::LpnType::Regular)
-                .build()
-                .expect("ferret config")
         };
         let (mut kos_a_s, mut kos_a_r, mut mac_s, mut mac_r) = (None, None, None, None);
         match role {
@@ -639,7 +801,6 @@ impl Party {
             stage: Stage::New,
             pre: None,
             scalar: None,
-            ms_share: [0u8; 32],
             timings: Vec::new(),
             #[cfg(test)]
             cheat: Cheat::None,
@@ -701,6 +862,20 @@ impl Party {
     #[inline(always)]
     fn cheat(&self) {}
 
+    fn nst(&mut self) -> Result<&mut NState> {
+        match self.pre.as_mut() {
+            Some(Pre::N(s)) => Ok(s),
+            _ => Err(Error::State("not preprocessed")),
+        }
+    }
+
+    fn cst(&mut self) -> Result<&mut CState> {
+        match self.pre.as_mut() {
+            Some(Pre::C(s)) => Ok(s),
+            _ => Err(Error::State("not preprocessed")),
+        }
+    }
+
     /// Input-independent preprocessing.
     pub async fn preprocess(&mut self) -> Result<()> {
         self.check_stage(Stage::New, "preprocess must be first")?;
@@ -709,11 +884,17 @@ impl Party {
             let who = if self.role == Role::C { "C" } else { "N" };
             tokio::spawn(async move {
                 let t0 = Instant::now();
-                let mut last = (0, 0);
+                let mut last = (0, 0, 0);
                 for _ in 0..200 {
-                    let v = (c.ch_recv(CH_COTB), c.ch_recv(CH_TAB));
+                    let v = (c.ch_recv(CH_COTA), c.ch_recv(CH_COTB), c.ch_recv(CH_TAB));
                     if v != last {
-                        eprintln!("[{who} {:8.1} ms] recv cotb={} tab={}", t0.elapsed().as_secs_f64() * 1e3, v.0, v.1);
+                        eprintln!(
+                            "[{who} {:8.1} ms] recv cota={} cotb={} tab={}",
+                            t0.elapsed().as_secs_f64() * 1e3,
+                            v.0,
+                            v.1,
+                            v.2
+                        );
                         last = v;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -735,20 +916,15 @@ impl Party {
     async fn preprocess_n(&mut self) -> Result<()> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
+        let lay = lay();
+        let sp = lay.sp;
         let delta = self.delta;
         let mut grng = StdRng::from_seed(self.rng.random());
-        let c_bits = spec(0).c_bits + spec(1).c_bits;
-        let n_mac = macs_per_phase(spec(0)) + macs_per_phase(spec(1)) + 128;
 
         let garble = tokio::task::spawn_blocking(move || {
-            (0..2)
-                .map(|p| {
-                    let s = spec(p);
-                    let in_keys = SecretBlocks((0..s.circ.inputs().len()).map(|_| Block::random(&mut grng)).collect());
-                    let (k, tables) = gc::garble(&s.circ, delta, &in_keys, p, &mut grng);
-                    (SecretBlocks(k), tables)
-                })
-                .collect::<Vec<_>>()
+            let in_keys = SecretBlocks((0..lay.n_in).map(|_| Block::random(&mut grng)).collect());
+            let (k, tables) = gc::garble(&sp.circ, delta, &in_keys, 0, &mut grng);
+            (SecretBlocks(k), tables)
         });
 
         #[allow(unused_mut)]
@@ -766,6 +942,7 @@ impl Party {
                 chou_orlandi::Receiver::new_with_seed(self.rng.random()),
             ));
         }
+        let mut kos_a = self.kos_a_s.take().ok_or(Error::State("preprocess already ran"))?;
 
         let Party {
             ctx_a,
@@ -774,7 +951,6 @@ impl Party {
             n2c,
             c2n,
             tab,
-            kos_a_s,
             mac_r,
             sc,
             counters,
@@ -782,12 +958,12 @@ impl Party {
         } = self;
 
         // Garble and stream the tables while the OTs run, scheduled around C's
-        // MAC-COT upload (Ferret, ~1.16 MB C→N, in two parts separated by a
+        // MAC-COT upload (Ferret, about 1 MB C→N, in two parts separated by a
         // small N→C message). Any small N→C message sent after the tables sits
-        // behind them in the link buffers and stalls an OT round trip, so
-        // phase A's tables wait until C is uploading the first part (N's OT
-        // setup messages have arrived) and phase B's until the second part
-        // (`TABLES_GATE`). The download then overlaps C's upload.
+        // behind them in the link buffers and stalls an OT round trip, so the
+        // first part of the tables waits until C is uploading (N's OT setup
+        // messages have arrived) and the second until C is past the first
+        // part (`TABLES_GATE`). The download then overlaps C's upload.
         let mac_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let gate = |threshold: u64| {
             let counters = counters.clone();
@@ -804,141 +980,126 @@ impl Party {
         };
         let mut gates = vec![gate(TABLES_GATE[0]), gate(TABLES_GATE[1])].into_iter();
         let send_fut = async {
-            let g = garble.await.map_err(perr("garbling task"))?;
             #[allow(unused_mut)]
-            let mut keep = Vec::new();
-            #[allow(unused_mut)]
-            for (p, (k, mut tables)) in g.into_iter().enumerate() {
-                #[cfg(test)]
-                if cheat == Cheat::CorruptGate(p) {
-                    let n = tables.len();
-                    for g in 0..64 {
-                        let t = &mut tables[g * (n / 64)];
+            let (k, mut tables) = garble.await.map_err(perr("garbling task"))?;
+            #[cfg(test)]
+            if let Cheat::CorruptGate(s) | Cheat::CorruptControlBits(s) = cheat {
+                let r = lay.shapes[s].ands.clone();
+                for g in 0..64 {
+                    let t = &mut tables[r.start + g * (r.len() / 64)];
+                    if matches!(cheat, Cheat::CorruptGate(_)) {
                         t.g[0] ^= 1;
                         t.g[2] ^= 1 << 40;
+                    } else {
+                        t.z ^= 0b00011;
                     }
                 }
-                #[cfg(test)]
-                if cheat == Cheat::CorruptControlBits(p) {
-                    let n = tables.len();
-                    for g in 0..64 {
-                        tables[g * (n / 64)].z ^= 0b00011;
-                    }
-                }
+            }
+            let cut = sp.and_end[HS_STAGES - 1];
+            for part in [&tables[..cut], &tables[cut..]] {
                 if let Some(g) = gates.next() {
                     g.await;
                 }
-                tab.send(&gc::tables_to_bytes(&tables)).await?;
-                keep.push(k);
+                tab.send(&gc::tables_to_bytes(part)).await?;
             }
-            Ok::<_, Error>(keep)
+            Ok::<_, Error>(k)
         };
         let cot_a_fut = async {
-            let keys = rcot_send!(kos_a_s.as_mut().unwrap(), ctx_a, c_bits);
+            let keys = rcot_send!(&mut kos_a, ctx_a, N_COTA);
             Ok::<_, Error>(SecretBlocks(keys))
         };
         let cot_b_fut = async {
-            let (r, m) = rcot_recv!(mac_r.as_mut().unwrap().as_mut(), ctx_b, n_mac);
+            let (r, m) = rcot_recv!(mac_r.as_mut().unwrap().as_mut(), ctx_b, lay.n_mac);
             mac_done.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok::<_, Error>((Zeroizing::new(r), SecretBlocks(m)))
         };
         let sc_fut = sc.preprocess(ctx_sc);
-        let (keys, cot_keys, macs, scr) = futures::join!(send_fut, cot_a_fut, cot_b_fut, sc_fut);
-        let keys = keys?;
-        let cot_keys = cot_keys?;
+        let (k, cota, macs, scr) = futures::join!(send_fut, cot_a_fut, cot_b_fut, sc_fut);
+        let k = k?;
+        let cota = cota?;
         let (r_bits, r_macs) = macs?;
         scr?;
-        if cot_keys.len() != c_bits || r_bits.len() != n_mac {
+        if cota.len() != N_COTA || r_bits.len() != lay.n_mac {
             return Err(Error::Protocol("cot count".into()));
         }
 
         // Commit (Fix) λ for the base wires and t for every AND gate.
-        let mut d_bits = Vec::with_capacity(n_mac);
-        let mut st = Vec::new(); // (lam, mac, t_mac) per phase
-        let mut off = 0usize;
-        for (p, k) in keys.iter().enumerate() {
-            let shape = &SHAPES[p];
-            let s = spec(p);
-            let nb = shape.base.len();
-            #[allow(unused_mut)]
-            let mut base_lam: Vec<bool> = shape.base.iter().map(|&w| k[w].lsb()).collect();
-            #[cfg(test)]
-            if cheat == Cheat::FlipLambda(p) {
-                // An internal AND gate (half-way through the circuit).
-                let i = s.circ.inputs().len() + s.circ.and_count() / 2;
-                base_lam[i] = !base_lam[i];
-            }
-            let base_mac = SecretBlocks(r_macs[off..off + nb].to_vec());
-            for (i, l) in base_lam.iter().enumerate() {
-                d_bits.push(l ^ r_bits[off + i]);
-            }
-            off += nb;
-            let (lam, mac) = gc::propagate_n(&s.circ, &base_lam, &base_mac);
-            let na = shape.ands.len();
-            let mut t_mac = Vec::with_capacity(na);
-            for (a, &(i, j, _)) in shape.ands.iter().enumerate() {
-                #[allow(unused_mut)]
-                let mut t = lam[i] & lam[j];
-                #[cfg(test)]
-                if cheat == Cheat::BadT && p == 1 && a == 1000 {
-                    t = !t;
-                }
-                d_bits.push(t ^ r_bits[off + a]);
-                t_mac.push(r_macs[off + a]);
-            }
-            off += na;
-            st.push((Zeroizing::new(lam), SecretBlocks(mac), SecretBlocks(t_mac)));
+        let nb = lay.base.len();
+        #[allow(unused_mut)]
+        let mut base_lam: Vec<bool> = lay.base.iter().map(|&w| k[w].lsb()).collect();
+        #[cfg(test)]
+        if let Cheat::FlipLambda(s) = cheat {
+            // An AND gate half-way through the stage.
+            let r = &lay.shapes[s].ands;
+            let i = lay.n_in + (r.start + r.end) / 2;
+            base_lam[i] = !base_lam[i];
         }
-        let mask_bits = &r_bits[off..off + 128];
-        let mask_macs = &r_macs[off..off + 128];
+        let mut d_bits = Vec::with_capacity(lay.mac_fixed);
+        for (i, l) in base_lam.iter().enumerate() {
+            d_bits.push(l ^ r_bits[i]);
+        }
+        let (lam, mac) = gc::propagate_n(&sp.circ, &base_lam, &r_macs[..nb]);
+        let (lam, mac) = (Zeroizing::new(lam), SecretBlocks(mac));
+        for (a, &(i, j, _)) in lay.ands.iter().enumerate() {
+            #[allow(unused_mut)]
+            let mut t = lam[i] & lam[j];
+            #[cfg(test)]
+            if cheat == Cheat::BadT && a == lay.n_and - 1000 {
+                t = !t;
+            }
+            d_bits.push(t ^ r_bits[nb + a]);
+        }
+        let t_mac = SecretBlocks(r_macs[nb..nb + lay.n_and].to_vec());
+        let off = lay.mac_fixed;
+        let mask_bits = Zeroizing::new(r_bits[off..off + 128].to_vec());
+        let mask_macs = SecretBlocks(r_macs[off..off + 128].to_vec());
+        drop((r_bits, r_macs));
         n2c.send(&from_bits(&d_bits)).await?;
 
         // Challenge.
-        let seed = c2n.recv_exact(32).await?;
+        let seed: [u8; 32] = c2n.recv_exact(32).await?.try_into().expect("32 bytes");
         let t_seed = Instant::now();
         let chi_dv = chi(&seed, b"dvzk");
-        let chi_ck = [chi(&seed, b"check0"), chi(&seed, b"check1")];
-        let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
+        let chi_ck: Vec<Block> = (0..N_STAGES).map(|s| chi(&seed, format!("check{s}").as_bytes())).collect();
+        let salt_b = chi(&seed, b"check-salt").to_bytes();
+        let salt = u128::from_le_bytes(salt_b);
 
-        // Product check, openings, consistency-check material (CPU, blocking).
-        let mask_bits = Zeroizing::new(mask_bits.to_vec());
-        let mask_macs = SecretBlocks(mask_macs.to_vec());
-        drop((r_bits, r_macs));
-        let (st, keys, msgs) = tokio::task::spawn_blocking(move || {
-            // Check rows and Y_N per phase.
-            let rows_of = |p: usize| -> (Vec<u8>, Vec<u8>) {
-                let (lam, mac, t_mac) = &st[p];
-                let s = spec(p);
-                let pw = gc::powers(chi_ck[p], t_mac.len());
+        // Product check, openings, consistency-check material, label-check
+        // pairs (CPU, blocking).
+        let (st, msgs) = tokio::task::spawn_blocking(move || {
+            let rows_of = |s: usize| -> (Vec<u8>, Vec<u8>) {
+                let sh = &lay.shapes[s];
+                let pw = gc::powers(chi_ck[s], sh.ands.len());
                 #[allow(unused_mut)]
-                let mut salt_p = salt;
+                let mut salt_s = salt;
                 #[cfg(test)]
-                if cheat == Cheat::WrongSalt(p) {
-                    salt_p ^= 1 << 7;
+                if cheat == Cheat::WrongSalt(s) {
+                    salt_s ^= 1 << 7;
                 }
                 let cm = gc::check_material(
-                    &s.circ,
-                    salt_p,
-                    p,
-                    &SHAPES[p].ands,
-                    &SHAPES[p].base,
-                    &keys[p],
-                    lam,
-                    mac,
-                    t_mac,
+                    &sp.circ,
+                    sh.gates.clone(),
+                    salt_s,
+                    s,
+                    &lay.ands[sh.ands.clone()],
+                    &sh.rows,
+                    &k,
+                    &lam,
+                    &mac,
+                    &t_mac[sh.ands.clone()],
                     &pw,
                     delta,
                 );
                 #[allow(unused_mut)]
                 let mut y_n = cm.y_n;
                 #[cfg(test)]
-                if cheat == Cheat::BadYn(p) {
+                if cheat == Cheat::BadYn(s) {
                     y_n ^= 1;
                 }
                 #[allow(unused_mut)]
                 let mut rows = cm.rows;
                 #[cfg(test)]
-                if cheat == Cheat::BadRows(p) {
+                if cheat == Cheat::BadRows(s) {
                     let mut r = os_rng();
                     for x in rows.iter_mut() {
                         *x ^= r.random::<u64>();
@@ -948,13 +1109,10 @@ impl Party {
             };
             let mut msgs: Vec<Vec<u8>> = Vec::new();
             let rows = std::thread::scope(|sc| {
-                let r0 = sc.spawn(|| rows_of(0));
-                let r1 = sc.spawn(|| rows_of(1));
+                let hs: Vec<_> = (0..N_STAGES).map(|s| sc.spawn(move || rows_of(s))).collect();
+                let pw = gc::powers(chi_dv, lay.n_and);
                 let mut acc = (Block::ZERO, Block::ZERO);
-                for (p, (lam, mac, t_mac)) in st.iter().enumerate() {
-                    let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), t_mac.len());
-                    gc::dvzk_prover_acc(&SHAPES[p].ands, lam, mac, t_mac, &pw, &mut acc);
-                }
+                gc::dvzk_prover_acc(&lay.ands, &lam, &mac, &t_mac, &pw, &mut acc);
                 // Random mask a* = Σ r_i X^i.
                 let mut a_star = Block::ZERO;
                 let mut m_star = Block::ZERO;
@@ -962,31 +1120,34 @@ impl Party {
                     a_star ^= sel(mask_bits[i], Block::MONOMIAL[i]);
                     m_star ^= Block::MONOMIAL[i].gfmul(mask_macs[i]);
                 }
-                let u = acc.0 ^ m_star;
-                let v = acc.1 ^ a_star;
-                msgs.push(blocks_to_bytes(&[u, v]));
+                msgs.push(blocks_to_bytes(&[acc.0 ^ m_star, acc.1 ^ a_star]));
 
-                // Openings: C's inputs, th, outputs (both phases), one MAC hash.
+                // Openings: C's input wires, the digest input wires, every
+                // output C decodes; one MAC hash.
                 let mut bits = Vec::new();
                 let mut h = Sha256::new();
                 h.update(TAG_OPEN);
-                for (p, (lam, mac, _)) in st.iter().enumerate() {
-                    let s = spec(p);
-                    let n_feed = s.circ.feed_count();
-                    let wires = s
-                        .c_range()
-                        .chain(s.th_range())
-                        .chain(s.circ.outputs())
-                        .collect::<Vec<_>>();
-                    for (idx, &w) in wires.iter().enumerate() {
-                        #[allow(unused_mut)]
-                        let mut b = lam[w];
-                        #[cfg(test)]
-                        if cheat == Cheat::LieOpen(p) && w == n_feed - 1 && idx > 0 {
-                            b = !b;
-                        }
-                        let _ = (idx, n_feed);
-                        bits.push(b);
+                #[allow(unused_variables)]
+                for (j, &w) in lay.open_in.iter().enumerate() {
+                    #[cfg(test)]
+                    let lie = cheat == Cheat::LieOpenIn(j);
+                    #[cfg(not(test))]
+                    let lie = false;
+                    bits.push(lam[w] ^ lie);
+                    h.update(mac[w].as_bytes());
+                }
+                for (gi, g) in sp.outs.iter().enumerate() {
+                    if !lay.opened(gi) {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    let lie = cheat == Cheat::LieOpen(g.stage)
+                        && sp.outs.iter().position(|x| x.stage == g.stage && x.kind != OutKind::ToN) == Some(gi);
+                    #[cfg(not(test))]
+                    let lie = false;
+                    for i in 0..g.len {
+                        let w = lay.out0 + g.off + i;
+                        bits.push(lam[w] ^ (lie && i == 1));
                         h.update(mac[w].as_bytes());
                     }
                 }
@@ -994,14 +1155,52 @@ impl Party {
                 let mut open = from_bits(&bits);
                 open.extend_from_slice(&hd);
                 msgs.push(open);
-                [r0.join().expect("rows thread"), r1.join().expect("rows thread")]
+                hs.into_iter().map(|h| h.join().expect("rows thread")).collect::<Vec<_>>()
             });
             for (r, y) in rows {
                 msgs.push(r);
                 msgs.push(y);
             }
 
-            (st, keys, msgs)
+            // Label-check pairs: for each output wire C reports, the salted
+            // hashes of its two labels, by pointer bit.
+            let mut pairs = Vec::with_capacity(32 * lay.n_pairs);
+            #[allow(unused_variables)]
+            for (gi, g) in sp.outs.iter().enumerate() {
+                for i in 0..g.len {
+                    let o = g.off + i;
+                    if lay.e_idx[o].is_none() {
+                        continue;
+                    }
+                    // The label with pointer bit 0: k ⊕ λ·Δ_A.
+                    let x0 = k[lay.out0 + o] ^ sel(lam[lay.out0 + o], delta);
+                    #[allow(unused_mut)]
+                    let mut pair = [pair_hash(&salt_b, o, false, x0), pair_hash(&salt_b, o, true, x0 ^ delta)];
+                    #[cfg(test)]
+                    if lay.reported(g.stage)[0] == gi {
+                        if cheat == Cheat::BadPair(g.stage) && i == 3 {
+                            pair.swap(0, 1);
+                        }
+                        if cheat == Cheat::BadPairHalf(g.stage) {
+                            pair[1][0] ^= 1;
+                        }
+                    }
+                    pairs.extend_from_slice(&pair[0]);
+                    pairs.extend_from_slice(&pair[1]);
+                }
+            }
+            msgs.push(pairs);
+
+            let outs = sp.circ.outputs();
+            let st = NState {
+                k_in: SecretBlocks(k[..lay.n_in].to_vec()),
+                k_out: SecretBlocks(k[outs.clone()].to_vec()),
+                lam_out: Zeroizing::new(lam[outs].to_vec()),
+                cota,
+                vals: (0..sp.outs.len()).map(|_| None).collect(),
+                next: 0,
+            };
+            (st, msgs)
         })
         .await
         .map_err(perr("preprocess task"))?;
@@ -1009,21 +1208,16 @@ impl Party {
         for msg in msgs {
             n2c.send(&msg).await?;
         }
-
-        let ph = st
-            .into_iter()
-            .zip(keys)
-            .map(|((lam, _mac, _t_mac), k)| NPhase { k, lam })
-            .collect();
-        self.pre = Some(Pre::N { ph, cot_keys });
+        self.pre = Some(Pre::N(Box::new(st)));
         Ok(())
     }
 
     async fn preprocess_c(&mut self) -> Result<()> {
+        let lay = lay();
+        let sp = lay.sp;
         let delta_b = self.delta;
-        let own_bits = spec(0).c_bits + spec(1).c_bits;
-        let n_mac = macs_per_phase(spec(0)) + macs_per_phase(spec(1)) + 128;
         let seed: [u8; 32] = self.rng.random();
+        let mut kos_a = self.kos_a_r.take().ok_or(Error::State("preprocess already ran"))?;
         let Party {
             ctx_a,
             ctx_b,
@@ -1031,7 +1225,6 @@ impl Party {
             n2c,
             c2n,
             tab,
-            kos_a_r,
             mac_s,
             sc,
             ..
@@ -1039,25 +1232,24 @@ impl Party {
 
         let t0 = Instant::now();
         let recv_fut = async {
-            let mut t = Vec::new();
-            for p in 0..2 {
-                let s = spec(p);
-                let n = s.circ.and_count();
+            let mut t = Vec::with_capacity(lay.n_and);
+            let cut = sp.and_end[HS_STAGES - 1];
+            for n in [cut, lay.n_and - cut] {
                 let b = tab.recv_exact(gc::tables_len(n)).await?;
-                tr(t0, "C", "tables phase recv");
-                t.push(gc::tables_from_bytes(&b, n).ok_or_else(|| Error::Protocol("tables".into()))?);
+                tr(t0, "C", "tables part recv");
+                t.extend(gc::tables_from_bytes(&b, n).ok_or_else(|| Error::Protocol("tables".into()))?);
             }
-            let d = n2c.recv_exact((n_mac - 128).div_ceil(8)).await?;
+            let d = n2c.recv_exact(lay.mac_fixed.div_ceil(8)).await?;
             tr(t0, "C", "d recv");
-            Ok::<_, Error>((t, unpack(&d, n_mac - 128)))
+            Ok::<_, Error>((t, unpack(&d, lay.mac_fixed)))
         };
         let cot_a_fut = async {
-            let (c, m) = rcot_recv!(kos_a_r.as_mut().unwrap(), ctx_a, own_bits);
-            tr(t0, "C", "kos (input) done");
+            let (c, m) = rcot_recv!(&mut kos_a, ctx_a, N_COTA);
+            tr(t0, "C", "cot (delta_A) done");
             Ok::<_, Error>((c, m))
         };
         let cot_b_fut = async {
-            let keys = rcot_send!(mac_s.as_mut().unwrap().as_mut(), ctx_b, n_mac);
+            let keys = rcot_send!(mac_s.as_mut().unwrap().as_mut(), ctx_b, lay.n_mac);
             tr(t0, "C", "mac cot done");
             Ok::<_, Error>(keys)
         };
@@ -1072,11 +1264,11 @@ impl Party {
         let kb = SecretBlocks(kb?);
         scr?;
         let (cot_choices, cot_msgs) = (Zeroizing::new(cot_choices), SecretBlocks(cot_msgs));
-        if kb.len() != n_mac || cot_choices.len() != own_bits {
+        if kb.len() != lay.n_mac || cot_choices.len() != N_COTA {
             return Err(Error::Protocol("cot count".into()));
         }
-        // Keys of the committed values: K[x] = K[r] ⊕ d·Δ_B.
-        // (The last 128 COTs stay random: they mask the product check.)
+        // Keys of the committed values: K[x] = K[r] ⊕ d·Δ_B. The 128 COTs
+        // after them stay random: the product-check mask.
         let kfix = SecretBlocks(
             kb.iter()
                 .enumerate()
@@ -1089,56 +1281,49 @@ impl Party {
         tr(t0, "C", "seed sent");
 
         // Receive the rest while computing the keys.
+        let n_open: usize = lay.open_in.len()
+            + sp.outs.iter().enumerate().filter(|(gi, _)| lay.opened(*gi)).map(|(_, g)| g.len).sum::<usize>();
         let recv2 = async {
             let dv = n2c.recv_exact(32).await?;
-            let n_open: usize = (0..2)
-                .map(|p| {
-                    let s = spec(p);
-                    s.c_bits + s.th_bits + s.out_bits
-                })
-                .sum();
             let open = n2c.recv_exact(n_open.div_ceil(8) + 32).await?;
             let mut rows = Vec::new();
-            for p in 0..2 {
-                let r = n2c.recv_exact(8 * SHAPES[p].base.len()).await?;
+            for s in 0..N_STAGES {
+                let r = n2c.recv_exact(8 * lay.shapes[s].rows.len()).await?;
                 let y = n2c.recv_exact(8).await?;
                 let r: Vec<u64> = r.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
                 rows.push((r, u64::from_le_bytes(y[..].try_into().unwrap())));
             }
-            Ok::<_, Error>((dv, open, rows))
+            let pairs = n2c.recv_exact(32 * lay.n_pairs).await?;
+            Ok::<_, Error>((dv, open, rows, pairs))
         };
         let chi_dv = chi(&seed, b"dvzk");
-        let chi_ck = [chi(&seed, b"check0"), chi(&seed, b"check1")];
+        let chi_ck: Vec<Block> = (0..N_STAGES).map(|s| chi(&seed, format!("check{s}").as_bytes())).collect();
         let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
         let compute = tokio::task::spawn_blocking(move || {
-            let mut off = 0;
-            let mut per = Vec::new();
+            let nb = lay.base.len();
+            let key = SecretBlocks(gc::propagate_c(&sp.circ, &kfix[..nb], delta_b));
+            let t_key = &kfix[nb..nb + lay.n_and];
             let mut acc = Block::ZERO;
-            for p in 0..2 {
-                let s = spec(p);
-                let shape = &SHAPES[p];
-                let nb = shape.base.len();
-                let key = SecretBlocks(gc::propagate_c(&s.circ, &kfix[off..off + nb], delta_b));
-                off += nb;
-                let na = shape.ands.len();
-                let t_key = &kfix[off..off + na];
-                off += na;
-                let pw = gc::powers(chi_dv.gfmul(Block::new(((p as u128) + 1).to_le_bytes())), na);
-                gc::dvzk_verifier_acc(&shape.ands, &key, t_key, delta_b, &pw, &mut acc);
-                let pw = gc::powers(chi_ck[p], na);
-                let ck = gc::check_keys(&shape.ands, &key, t_key, &pw);
-                per.push((key, ck));
-            }
+            let pw = gc::powers(chi_dv, lay.n_and);
+            gc::dvzk_verifier_acc(&lay.ands, &key, t_key, delta_b, &pw, &mut acc);
+            let cks: Vec<gc::CheckKeys> = (0..N_STAGES)
+                .map(|s| {
+                    let sh = &lay.shapes[s];
+                    let pw = gc::powers(chi_ck[s], sh.ands.len());
+                    gc::check_keys(&lay.ands[sh.ands.clone()], &key, &t_key[sh.ands.clone()], &pw)
+                })
+                .collect();
+            let off = lay.mac_fixed;
             let mut k_star = Block::ZERO;
             for i in 0..128 {
                 k_star ^= Block::MONOMIAL[i].gfmul(kfix[off + i]);
             }
-            (per, acc ^ k_star)
+            (key, cks, acc ^ k_star)
         });
         let (r2, comp) = futures::join!(recv2, compute);
         tr(t0, "C", "rows recv + keys computed");
-        let (dv, open, rows) = r2?;
-        let (per, w) = comp.map_err(perr("preprocess task"))?;
+        let (dv, open, rows, pairs) = r2?;
+        let (key, cks, w) = comp.map_err(perr("preprocess task"))?;
 
         // Product check: Σχ B ⊕ K* = U ⊕ V·Δ_B.
         let uv = bytes_to_blocks(&dv);
@@ -1147,48 +1332,52 @@ impl Party {
         }
 
         // Openings.
-        let n_open = open.len() - 32;
-        let mut bits = to_bits(&open[..n_open]).into_iter();
+        let mut bits = unpack(&open[..open.len() - 32], n_open).into_iter();
         let mut h = Sha256::new();
         h.update(TAG_OPEN);
-        let mut ph = Vec::new();
-        for (p, ((key, ck), (rws, y_n))) in per.into_iter().zip(rows).enumerate() {
-            let s = spec(p);
-            let mut take = |r: std::ops::Range<usize>| -> Vec<bool> {
-                r.map(|w| {
-                    let b = bits.next().unwrap_or(false);
-                    h.update((key[w] ^ sel(b, delta_b)).as_bytes());
-                    b
-                })
-                .collect()
-            };
-            let lam_c = take(s.c_range());
-            let lam_th = take(s.th_range());
-            let lam_out = take(s.circ.outputs());
-            ph.push(CPhase {
-                tables: Vec::new(),
-                ck: Some(ck),
-                rows: rws,
-                y_n,
-                salt,
-                lam_c,
-                lam_th,
-                lam_out,
-            });
-            let _ = p;
+        let mut take = |w: usize| -> bool {
+            let b = bits.next().unwrap_or(false);
+            h.update((key[w] ^ sel(b, delta_b)).as_bytes());
+            b
+        };
+        let mut lam_in = vec![false; lay.n_in];
+        for &w in &lay.open_in {
+            lam_in[w] = take(w);
+        }
+        let mut lam_out = vec![false; lay.n_out];
+        for (gi, g) in sp.outs.iter().enumerate() {
+            if lay.opened(gi) {
+                for o in g.off..g.off + g.len {
+                    lam_out[o] = take(lay.out0 + o);
+                }
+            }
         }
         let hd: [u8; 32] = h.finalize().into();
-        if hd[..] != open[n_open..] {
+        if hd[..] != open[open.len() - 32..] {
             return Err(Error::Abort("opened masks do not match their MACs".into()));
         }
-        for (cp, t) in ph.iter_mut().zip(tables) {
-            cp.tables = t;
-        }
-        self.pre = Some(Pre::C {
-            ph,
+        let (rows, y_n): (Vec<Vec<u64>>, Vec<u64>) = rows.into_iter().unzip();
+        let pairs = pairs
+            .chunks_exact(32)
+            .map(|c| [c[..16].try_into().unwrap(), c[16..].try_into().unwrap()])
+            .collect();
+        let st = CState {
+            tables,
+            l: SecretBlocks(vec![Block::ZERO; sp.circ.feed_count()]),
+            ck: cks.into_iter().map(Some).collect(),
+            rows,
+            y_n,
+            salt,
+            lam_in,
+            lam_out,
+            pairs,
             cot_choices,
             cot_msgs,
-        });
+            vals: (0..sp.outs.len()).map(|_| None).collect(),
+            dig: (0..sp.dig.len()).map(|_| None).collect(),
+            next: 0,
+        };
+        self.pre = Some(Pre::C(Box::new(st)));
         Ok(())
     }
 
@@ -1256,7 +1445,7 @@ impl Party {
         Ok(encode_point(&joint))
     }
 
-    /// ECtF + phase A.
+    /// ECtF + stages A1–A3.
     pub async fn handshake(&mut self, server_share: &[u8], th_sh: [u8; 32]) -> Result<HsSecrets> {
         self.check_stage(Stage::KeyShared, "handshake after key_share")?;
         let r = self.handshake_inner(server_share, th_sh).await;
@@ -1283,307 +1472,514 @@ impl Party {
         let share = SecretFp(self.sc.point_add_x(&mut self.ctx_sc, x.0, y.0).await?);
         drop((x, y));
         self.record("ectf", m);
-        let mut x_le: [u8; 32] = share.0.into();
+        let x_le: [u8; 32] = share.0.into();
         drop(share);
-
-        let mut r_mask: [u8; 32] = self.rng.random();
-        let mut own = Zeroizing::new(Vec::with_capacity(64));
-        own.extend_from_slice(&x_le);
-        own.extend_from_slice(&r_mask);
+        let x_bits = Zeroizing::new(to_bits(&x_le));
+        let mut x_le = x_le;
         x_le.zeroize();
-        let out = self.run_phase(0, own, th_sh).await;
-        let out = match out {
-            Ok(o) => o,
-            Err(e) => {
-                r_mask.zeroize();
-                return Err(e);
-            }
+
+        let m = self.mark();
+        let r = match self.role {
+            Role::N => self.handshake_n(&x_bits, th_sh).await,
+            Role::C => self.handshake_c(&x_bits, th_sh).await,
         };
-        let mut hs = HsSecrets {
-            c_hs: [0; 32],
-            s_hs: [0; 32],
-        };
-        hs.c_hs.copy_from_slice(&out[0..32]);
-        hs.s_hs.copy_from_slice(&out[32..64]);
-        match self.role {
-            Role::C => self.ms_share = r_mask,
-            Role::N => {
-                for i in 0..32 {
-                    self.ms_share[i] = out[64 + i] ^ r_mask[i];
-                }
-            }
-        }
-        r_mask.zeroize();
-        Ok(hs)
+        self.record("phase_a", m);
+        r
     }
 
-    /// Phase B.
+    /// Stages B1, B2 and the anchors.
     pub async fn application(&mut self, th_sf: [u8; 32]) -> Result<ApOut> {
         self.check_stage(Stage::Handshaken, "application after handshake")?;
-        let r = self.application_inner(th_sf).await;
+        let m = self.mark();
+        let r = match self.role {
+            Role::N => self.application_n(th_sf).await,
+            Role::C => self.application_c(th_sf).await,
+        };
+        self.record("phase_b", m);
         let r = self.fail(r);
         let o = r?;
         self.stage = Stage::Done;
         Ok(o)
     }
 
-    async fn application_inner(&mut self, th_sf: [u8; 32]) -> Result<ApOut> {
-        let mask_len = match self.role {
-            Role::C => 64,
-            Role::N => 28,
-        };
-        let mut mask = Zeroizing::new(vec![0u8; mask_len]);
-        self.rng.fill(&mut mask[..]);
-        let mut own = Zeroizing::new(Vec::with_capacity(32 + mask_len));
-        own.extend_from_slice(&self.ms_share);
-        own.extend_from_slice(&mask);
-        self.ms_share.zeroize();
-        let out = self.run_phase(1, own, th_sf).await;
-        let out = match out {
-            Ok(o) => o,
-            Err(e) => {
-                mask.zeroize();
-                return Err(e);
-            }
-        };
-        let arr = |s: &[u8]| -> [u8; 32] { s.try_into().unwrap() };
-        let h1 = arr(&out[92..124]);
-        let h2 = arr(&out[124..156]);
-        let hk = arr(&out[156..188]);
-        let res = match self.role {
-            Role::C => {
-                let mut s_ap_0 = [0u8; 32];
-                let mut c_ap_1 = [0u8; 32];
-                for i in 0..32 {
-                    s_ap_0[i] = out[i] ^ mask[i];
-                    c_ap_1[i] = out[32 + i] ^ mask[32 + i];
-                }
-                if Sha256::digest(c_ap_1)[..] != h1 || Sha256::digest(s_ap_0)[..] != h2 {
-                    return Err(Error::Abort("anchor mismatch".into()));
-                }
-                ApOut::C {
-                    s_ap_0,
-                    c_ap_1,
-                    h1,
-                    h2,
-                    hk,
-                }
-            }
-            Role::N => {
-                let mut kiv = [0u8; 28];
-                for i in 0..28 {
-                    kiv[i] = out[64 + i] ^ mask[i];
-                }
-                if Sha256::digest(kiv)[..] != hk {
-                    return Err(Error::Abort("anchor mismatch".into()));
-                }
-                let o = ApOut::N {
-                    k0: kiv[..16].try_into().unwrap(),
-                    iv0: kiv[16..].try_into().unwrap(),
-                    h1,
-                    h2,
-                    hk,
-                };
-                kiv.zeroize();
-                o
-            }
-        };
-        mask.zeroize();
-        Ok(res)
-    }
+    // ----------------------------------------------------------------- N --
 
-    /// One phase. Returns the decoded output bytes (only after the checks).
-    async fn run_phase(&mut self, phase: usize, own: Zeroizing<Vec<u8>>, th: [u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
-        let name = ["phase_a", "phase_b"][phase];
-        let m = self.mark();
-        let r = match self.role {
-            Role::N => self.phase_n(phase, own, th).await,
-            Role::C => self.phase_c(phase, own, th).await,
-        };
-        self.record(name, m);
+    /// N found the peer cheating (or malformed): tell C, so that it does not
+    /// wait for an answer, and pass the error on.
+    async fn n_rej<T>(&mut self, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            let _ = self.n2c.send(&[0u8]).await;
+        }
         r
     }
 
-    async fn phase_n(&mut self, phase: usize, own: Zeroizing<Vec<u8>>, th: [u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
+    async fn handshake_n(&mut self, x_bits: &[bool], th: [u8; 32]) -> Result<HsSecrets> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
-        let s = spec(phase);
-        let own_bits = Zeroizing::new(to_bits(&own));
-        if own_bits.len() != s.n_bits {
-            return Err(Error::Input("input length".into()));
-        }
-        let th_bits = to_bits(&th);
+        let lay = lay();
+        let sp = lay.sp;
         let delta = self.delta;
-        let c_off = if phase == 0 { 0 } else { spec(0).c_bits };
-        let Some(Pre::N { ph, cot_keys }) = self.pre.as_mut() else {
-            return Err(Error::State("not preprocessed"));
+        // Own input labels, sent at once.
+        #[allow(unused_mut)]
+        let mut labels: Vec<Block> = {
+            let st = self.nst()?;
+            if st.next != 0 {
+                return Err(Error::State("handshake already ran"));
+            }
+            sp.xn.clone().zip(x_bits).map(|(w, b)| st.k_in[w] ^ sel(*b, delta)).collect()
         };
-        let st = std::mem::replace(
-            &mut ph[phase],
-            NPhase {
-                k: SecretBlocks::default(),
-                lam: Zeroizing::new(Vec::new()),
-            },
-        );
-        if st.k.is_empty() {
-            return Err(Error::State("phase already used"));
-        }
-        let cot = SecretBlocks(cot_keys[c_off..c_off + s.c_bits].to_vec());
-
-        // Own and transcript-hash labels, sent at once.
-        let mut labels = Vec::with_capacity(s.n_bits + s.th_bits);
-        for (w, b) in s.n_range().zip(own_bits.iter()) {
-            labels.push(st.k[w] ^ sel(*b, delta));
-        }
-        for (w, b) in s.th_range().zip(&th_bits) {
-            labels.push(st.k[w] ^ sel(*b, delta));
-        }
         #[cfg(test)]
-        if cheat == Cheat::BadInputLabel(phase) {
+        if cheat == Cheat::BadInputLabel(0) {
             labels[0] = labels[0] ^ Block::new([0x5a; 16]);
         }
         self.n2c.send(&blocks_to_bytes(&labels)).await?;
-        let d = self.c2n.recv_exact(s.c_bits.div_ceil(8)).await?;
-        let d = unpack(&d, s.c_bits);
-        let adj: Vec<Block> = s
-            .c_range()
-            .enumerate()
-            .map(|(j, w)| st.k[w] ^ cot[j] ^ sel(d[j], delta))
-            .collect();
+        gc::wipe_blocks(&mut labels);
+        let d = unpack(&self.c2n.recv_exact(32).await?, 256);
+        let mut adj: Vec<Block> = {
+            let st = self.nst()?;
+            sp.xc.clone().enumerate().map(|(j, w)| st.k_in[w] ^ st.cota[j] ^ sel(d[j], delta)).collect()
+        };
         self.n2c.send(&blocks_to_bytes(&adj)).await?;
+        gc::wipe_blocks(&mut adj);
 
-        // C's verdict and output pointer bits.
+        for s in 0..HS_STAGES {
+            let r = self.n_report(s).await;
+            self.n_rej(r).await?;
+            if s + 1 < HS_STAGES {
+                let lab = self.n_digest_labels(s + 1, &th)?;
+                self.n2c.send(&lab).await?;
+            }
+        }
+        let st = self.nst()?;
+        let get = |name: &str| -> Result<[u8; 32]> {
+            let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
+            Ok(from_bits(v).try_into().expect("32 bytes"))
+        };
+        Ok(HsSecrets {
+            c_hs: get("c_hs")?,
+            s_hs: get("s_hs")?,
+        })
+    }
+
+    async fn application_n(&mut self, th: [u8; 32]) -> Result<ApOut> {
+        let lay = lay();
+        let sp = lay.sp;
+        // Stage B1's digests need th_SF; `IS_MS` came with the A3 report.
+        let lab = self.n_digest_labels(HS_STAGES, &th)?;
+        self.n2c.send(&lab).await?;
+        for s in HS_STAGES..N_STAGES {
+            let r = self.n_report(s).await;
+            self.n_rej(r).await?;
+            if s + 1 < N_STAGES {
+                let lab = self.n_digest_labels(s + 1, &th)?;
+                self.n2c.send(&lab).await?;
+            }
+        }
+        let st = self.nst()?;
+        let get = |name: &str| -> Result<[u8; 32]> {
+            let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
+            Ok(from_bits(v).try_into().expect("32 bytes"))
+        };
+        let (h1, h2, hk) = (get("h1")?, get("h2")?, get("hk")?);
+        let mut kiv: [u8; 28] = from_bits(st.vals[sp.group("kiv")].as_ref().ok_or(Error::State("output missing"))?)
+            .try_into()
+            .expect("28 bytes");
+        // The circuit computed hk over the same wires; a difference means C's
+        // report went through although the labels were not N's (not reachable
+        // without Δ_A), so this is a self-check.
+        if Sha256::digest(kiv)[..] != hk {
+            kiv.zeroize();
+            return Err(Error::Abort("anchor mismatch".into()));
+        }
+        let o = ApOut::N {
+            k0: kiv[..16].try_into().unwrap(),
+            iv0: kiv[16..].try_into().unwrap(),
+            h1,
+            h2,
+            hk,
+        };
+        kiv.zeroize();
+        Ok(o)
+    }
+
+    /// Receives C's report of stage `s` and checks it against N's labels: for
+    /// every reported pointer bit N recomputes the label C must hold and
+    /// compares one hash, so C cannot report a bit it has no label for.
+    async fn n_report(&mut self, s: usize) -> Result<()> {
+        let lay = lay();
+        let sp = lay.sp;
+        let delta = self.delta;
         let msg = self.c2n.recv().await?;
         if msg.first() != Some(&1) {
-            return Err(Error::Abort("peer aborted (consistency check failed on C)".into()));
+            return Err(Error::Abort("peer aborted (a check failed on C)".into()));
         }
-        if msg.len() != 1 + s.out_bits.div_ceil(8) + 32 {
-            return Err(Error::Protocol("output message length".into()));
+        let groups = lay.reported(s);
+        let body: usize = groups.iter().map(|&gi| sp.outs[gi].len / 8).sum();
+        if msg.len() != 1 + body + 32 {
+            return Err(Error::Protocol("report length".into()));
         }
-        let pbits = unpack(&msg[1..1 + s.out_bits.div_ceil(8)], s.out_bits);
+        let st = self.nst()?;
+        if st.next != s {
+            return Err(Error::State("stage order"));
+        }
         let mut h = Sha256::new();
         h.update(TAG_OUT);
-        h.update([phase as u8]);
-        let mut v = Vec::with_capacity(s.out_bits);
-        for (w, pb) in s.circ.outputs().zip(&pbits) {
-            let lab = st.k[w] ^ sel(*pb ^ st.lam[w], delta);
-            h.update(lab.as_bytes());
-            v.push(*pb ^ st.lam[w]);
+        h.update([s as u8]);
+        let mut off = 1;
+        let mut parsed = Vec::new();
+        for &gi in &groups {
+            let g = &sp.outs[gi];
+            let bits = unpack(&msg[off..off + g.len / 8], g.len);
+            off += g.len / 8;
+            for (i, p) in bits.iter().enumerate() {
+                let o = g.off + i;
+                // The label with pointer bit p: k ⊕ (p ⊕ λ)·Δ_A.
+                let x = st.k_out[o] ^ sel(*p ^ st.lam_out[o], delta);
+                h.update(x.as_bytes());
+            }
+            parsed.push((gi, bits));
         }
         let hd: [u8; 32] = h.finalize().into();
-        if hd[..] != msg[msg.len() - 32..] {
+        if hd[..] != msg[off..] {
             return Err(Error::Abort("output labels do not authenticate".into()));
         }
-        let out = Zeroizing::new(from_bits(&v));
-        v.zeroize();
+        for (gi, bits) in parsed {
+            let g = &sp.outs[gi];
+            let v: Vec<bool> = bits.iter().enumerate().map(|(i, p)| p ^ st.lam_out[g.off + i]).collect();
+            st.vals[gi] = Some(Zeroizing::new(v));
+        }
+        st.next = s + 1;
+        Ok(())
+    }
+
+    /// The labels of stage `s`'s digest inputs: N computes the inner digests
+    /// from the public `IS` (which C reported under its labels in the stage
+    /// before) and its own transcript hash, and sends the label of every
+    /// digest bit. C gets one label per wire and nothing to choose from.
+    fn n_digest_labels(&mut self, s: usize, th: &[u8; 32]) -> Result<Vec<u8>> {
+        #[allow(unused_variables)]
+        let cheat = self.cheat();
+        let lay = lay();
+        let sp = lay.sp;
+        let delta = self.delta;
+        let st = self.nst()?;
+        if st.next != s {
+            return Err(Error::State("stage order"));
+        }
+        #[allow(unused_mut)]
+        let mut blocks = circuits::digest_blocks(s, th);
+        #[cfg(test)]
+        if cheat == Cheat::OtherDigest(s) {
+            if blocks.len() > 1 {
+                blocks.rotate_left(1);
+            } else {
+                blocks[0][0] ^= 1;
+            }
+        }
+        let digs = sp.digs_of(s);
+        let is = st.vals[is_group(sp, s)].as_ref().ok_or(Error::State("no inner state"))?;
+        let mut labels: Vec<Block> = Vec::with_capacity(256 * digs.len());
+        for (n, blk) in blocks.iter().enumerate() {
+            let d = Zeroizing::new(circuits::inner_digest(is, blk));
+            for (i, w) in sp.dig[digs[n]].clone().enumerate() {
+                labels.push(st.k_in[w] ^ sel(d[i], delta));
+            }
+        }
+        #[cfg(test)]
+        if cheat == Cheat::BadInputLabel(s) {
+            labels[0] = labels[0] ^ Block::new([0x5a; 16]);
+        }
+        #[cfg(test)]
+        if cheat == Cheat::FlipDigestLabel(s) {
+            labels[0] = labels[0] ^ delta;
+        }
+        let out = blocks_to_bytes(&labels);
+        gc::wipe_blocks(&mut labels);
         Ok(out)
     }
 
-    async fn phase_c(&mut self, phase: usize, own: Zeroizing<Vec<u8>>, th: [u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
+    // ----------------------------------------------------------------- C --
+
+    /// A message from N of exactly `n` bytes; a single zero byte instead
+    /// means N rejected C's last message.
+    async fn c_recv(&mut self, n: usize) -> Result<Vec<u8>> {
+        let m = self.n2c.recv().await?;
+        if m.len() == 1 && m[0] == 0 && n != 1 {
+            return Err(Error::Abort("peer aborted (N rejected a report)".into()));
+        }
+        if m.len() != n {
+            return Err(Error::Protocol(format!("unexpected message length {} (expected {n})", m.len())));
+        }
+        Ok(m)
+    }
+
+    async fn handshake_c(&mut self, x_bits: &[bool], th: [u8; 32]) -> Result<HsSecrets> {
+        let lay = lay();
+        let sp = lay.sp;
+        let d: Vec<bool> = {
+            let st = self.cst()?;
+            if st.next != 0 {
+                return Err(Error::State("handshake already ran"));
+            }
+            x_bits.iter().zip(st.cot_choices.iter()).map(|(x, r)| x ^ r).collect()
+        };
+        self.c2n.send(&from_bits(&d)).await?;
+        let gl = SecretBlocks(bytes_to_blocks(&self.c_recv(16 * 256).await?));
+        let el = SecretBlocks(bytes_to_blocks(&self.c_recv(16 * 256).await?));
+        // Active labels: with N's zero-labels and Δ_A they give C's inputs.
+        let mut ok_in = true;
+        {
+            let st = self.cst()?;
+            for (j, w) in sp.xc.clone().enumerate() {
+                st.l[w] = el[j] ^ st.cot_msgs[j];
+                ok_in &= st.l[w].lsb() == x_bits[j] ^ st.lam_in[w];
+            }
+            for (j, w) in sp.xn.clone().enumerate() {
+                st.l[w] = gl[j];
+            }
+        }
+        for s in 0..HS_STAGES {
+            let msg = self.c_stage(s, ok_in).await?;
+            self.c2n.send(&msg).await?;
+            if s + 1 < HS_STAGES {
+                ok_in = self.c_next_digests(s + 1, &th).await?;
+            }
+        }
+        let st = self.cst()?;
+        let get = |name: &str| -> Result<[u8; 32]> {
+            let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
+            Ok(from_bits(v).try_into().expect("32 bytes"))
+        };
+        Ok(HsSecrets {
+            c_hs: get("c_hs")?,
+            s_hs: get("s_hs")?,
+        })
+    }
+
+    async fn application_c(&mut self, th: [u8; 32]) -> Result<ApOut> {
+        let lay = lay();
+        let sp = lay.sp;
+        let mut ok_in = self.c_next_digests(HS_STAGES, &th).await?;
+        for s in HS_STAGES..N_STAGES {
+            let msg = self.c_stage(s, ok_in).await?;
+            if s + 1 < N_STAGES {
+                self.c2n.send(&msg).await?;
+                ok_in = self.c_next_digests(s + 1, &th).await?;
+                continue;
+            }
+            // Last stage: C compares the anchors with its own outputs before
+            // it reports anything of the stage (N gets K_0 with that report).
+            let st = self.cst()?;
+            let get = |name: &str| -> Result<[u8; 32]> {
+                let v = st.vals[sp.group(name)].as_ref().ok_or(Error::State("output missing"))?;
+                Ok(from_bits(v).try_into().expect("32 bytes"))
+            };
+            let (h1, h2, hk) = (get("h1")?, get("h2")?, get("hk")?);
+            let (mut s_ap_0, mut c_ap_1) = (get("s_ap_0")?, get("c_ap_1")?);
+            if Sha256::digest(c_ap_1)[..] != h1 || Sha256::digest(s_ap_0)[..] != h2 {
+                s_ap_0.zeroize();
+                c_ap_1.zeroize();
+                let _ = self.c2n.send(&[0u8]).await;
+                return Err(Error::Abort("anchor mismatch".into()));
+            }
+            let o = ApOut::C {
+                s_ap_0,
+                c_ap_1,
+                h1,
+                h2,
+                hk,
+            };
+            s_ap_0.zeroize();
+            c_ap_1.zeroize();
+            self.c2n.send(&msg).await?;
+            return Ok(o);
+        }
+        unreachable!("the last stage returns")
+    }
+
+    /// Evaluates stage `s` and runs its checks; only if all pass does it
+    /// decode the stage's outputs and return the report for N (`1 ‖ bits ‖
+    /// hash`). On a failure it tells N (one zero byte) and aborts.
+    ///
+    /// The checks, in this order: the pointer bits of the stage's input
+    /// labels (`ok_in`, done by the caller against opened masks), the
+    /// consistency check of every AND gate of the stage, and the label check
+    /// of every output wire that is reported: the label C holds must hash to
+    /// the half of N's pair that belongs to the pointer bit C is about to
+    /// send. N fixed the pairs in preprocessing, so the hash C then sends
+    /// tells N nothing it did not commit to. Whatever fails, C evaluates the
+    /// whole stage first and sends the same single byte.
+    async fn c_stage(&mut self, s: usize, ok_in: bool) -> Result<Vec<u8>> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
-        let s = spec(phase);
-        let own_bits = Zeroizing::new(to_bits(&own));
-        if own_bits.len() != s.c_bits {
-            return Err(Error::Input("input length".into()));
-        }
-        let th_bits = to_bits(&th);
+        let lay = lay();
+        let sp = lay.sp;
         let delta_b = self.delta;
-        let c_off = if phase == 0 { 0 } else { spec(0).c_bits };
-        let Some(Pre::C {
-            ph,
-            cot_choices,
-            cot_msgs,
-        }) = self.pre.as_mut()
-        else {
-            return Err(Error::State("not preprocessed"));
-        };
-        let st = ph[phase].ck.take().ok_or(Error::State("phase already used"))?;
-        let tables = std::mem::take(&mut ph[phase].tables);
-        let rows = std::mem::take(&mut ph[phase].rows);
-        let y_n = ph[phase].y_n;
-        let salt = ph[phase].salt;
-        let lam_c = ph[phase].lam_c.clone();
-        let lam_th = ph[phase].lam_th.clone();
-        let lam_out = ph[phase].lam_out.clone();
-        let b = Zeroizing::new(cot_choices[c_off..c_off + s.c_bits].to_vec());
-        let msgs = SecretBlocks(cot_msgs[c_off..c_off + s.c_bits].to_vec());
-
-        let d: Vec<bool> = own_bits.iter().zip(b.iter()).map(|(x, r)| x ^ r).collect();
-        self.c2n.send(&from_bits(&d)).await?;
-        let gl = bytes_to_blocks(&self.n2c.recv_exact(16 * (s.n_bits + s.th_bits)).await?);
-        let el = bytes_to_blocks(&self.n2c.recv_exact(16 * s.c_bits).await?);
-        // Active labels: with N's zero-labels and Δ_A they give C's inputs.
-        let mut inl = SecretBlocks(vec![Block::ZERO; s.circ.inputs().len()]);
-        for (j, w) in s.c_range().enumerate() {
-            inl[w] = el[j] ^ msgs[j];
+        let st = self.cst()?;
+        if st.next != s {
+            return Err(Error::State("stage order"));
         }
-        for (j, w) in s.n_range().chain(s.th_range()).enumerate() {
-            inl[w] = gl[j];
-        }
-
-        let ok_in = s.c_range().enumerate().all(|(j, w)| inl[w].lsb() == own_bits[j] ^ lam_c[j])
-            && s.th_range().enumerate().all(|(j, w)| inl[w].lsb() == th_bits[j] ^ lam_th[j]);
-
-        let circ = s.circ.clone();
-        let (ok_check, out_labels) = tokio::task::spawn_blocking(move || {
-            let l = SecretBlocks(gc::evaluate(&circ, &inl, &tables, phase));
-            drop(inl);
-            let ok = gc::run_check(salt, phase, &SHAPES[phase].ands, &SHAPES[phase].base, &l, &st, &rows, y_n, delta_b);
-            let out = SecretBlocks(circ.outputs().map(|w| l[w]).collect());
-            (ok, out)
+        let ck = st.ck[s].take().ok_or(Error::State("stage already used"))?;
+        let rows = std::mem::take(&mut st.rows[s]);
+        let (y_n, salt) = (st.y_n[s], st.salt);
+        let tables = std::mem::take(&mut st.tables);
+        let mut l = std::mem::take(&mut st.l);
+        let (ok_check, tables, l) = tokio::task::spawn_blocking(move || {
+            let sh = &lay.shapes[s];
+            gc::evaluate_range(&sp.circ, &mut l, &tables, sh.gates.clone(), sh.ands.start, 0);
+            let ok = gc::run_check(salt, s, &lay.ands[sh.ands.clone()], &sh.rows, &l, &ck, &rows, y_n, delta_b);
+            (ok, tables, l)
         })
         .await
         .map_err(perr("eval task"))?;
-
-        if !ok_in || !ok_check {
-            let _ = self.c2n.send(&[0u8]).await;
-            return Err(Error::Abort(if !ok_in {
-                "input label pointer bits do not match the opened masks".into()
-            } else {
-                "garbled-circuit consistency check failed".into()
-            }));
+        let st = self.cst()?;
+        st.tables = tables;
+        st.l = l;
+        if s + 1 == N_STAGES {
+            st.tables = Vec::new();
         }
-        // Decode with the authenticated masks; then report to N.
-        let mut v: Vec<bool> = out_labels.iter().zip(&lam_out).map(|(l, m)| l.lsb() ^ m).collect();
-        #[allow(unused_mut)]
-        let mut pbits: Vec<bool> = out_labels.iter().map(|l| l.lsb()).collect();
+
+        let salt_b = salt.to_le_bytes();
+        let mut ok_pair = true;
+        let mut body = vec![1u8];
         let mut h = Sha256::new();
         h.update(TAG_OUT);
-        h.update([phase as u8]);
-        for l in out_labels.iter() {
-            h.update(l.as_bytes());
+        h.update([s as u8]);
+        let mut decoded = Vec::new();
+        #[allow(unused_mut, unused_variables)]
+        let mut flip_at: Option<usize> = None;
+        for (gi, g) in sp.outs.iter().enumerate().filter(|(_, g)| g.stage == s) {
+            let mut vals = Vec::with_capacity(g.len);
+            let mut bits = Vec::with_capacity(g.len);
+            for i in 0..g.len {
+                let o = g.off + i;
+                let lab = st.l[lay.out0 + o];
+                // N's own outputs: their masks are not opened (`lam_out` is
+                // false there), so C keeps only the pointer bit.
+                vals.push(lab.lsb() ^ st.lam_out[o]);
+                if let Some(e) = lay.e_idx[o] {
+                    let p = lab.lsb();
+                    ok_pair &= pair_hash(&salt_b, o, p, lab) == st.pairs[e][p as usize];
+                    h.update(lab.as_bytes());
+                    bits.push(p);
+                }
+            }
+            if !bits.is_empty() {
+                #[cfg(test)]
+                if cheat == Cheat::FlipReported(g.name) {
+                    flip_at = Some(body.len() + 1);
+                }
+                body.extend_from_slice(&from_bits(&bits));
+            }
+            decoded.push((gi, Zeroizing::new(vals)));
         }
         let hd: [u8; 32] = h.finalize().into();
+        body.extend_from_slice(&hd);
+
+        #[allow(unused_mut)]
+        let mut ignore = false;
         #[cfg(test)]
-        if cheat == Cheat::FlipOutput(phase) {
-            pbits[100] = !pbits[100];
+        if cheat == Cheat::FeedOther(s) {
+            ignore = true;
         }
-        let mut msg = vec![1u8];
-        msg.extend_from_slice(&from_bits(&pbits));
-        msg.extend_from_slice(&hd);
-        self.c2n.send(&msg).await?;
-        let out = Zeroizing::new(from_bits(&v));
-        v.zeroize();
-        Ok(out)
+        if !(ok_in && ok_check && ok_pair) && !ignore {
+            let _ = self.c2n.send(&[0u8]).await;
+            return Err(Error::Abort(
+                if !ok_in {
+                    "input label pointer bits do not match the opened masks"
+                } else if !ok_check {
+                    "garbled-circuit consistency check failed"
+                } else {
+                    "output label check failed"
+                }
+                .into(),
+            ));
+        }
+        #[cfg(test)]
+        if let Some(at) = flip_at {
+            body[at] ^= 0x10;
+        }
+        // Only now are the outputs used.
+        for (gi, v) in decoded {
+            st.vals[gi] = Some(v);
+        }
+        st.next = s + 1;
+        Ok(body)
+    }
+
+    /// Computes the inner digests of stage `s`'s inputs from the public `IS`
+    /// and C's own transcript hash, receives N's labels for them and checks
+    /// every label's pointer bit against the opened, authenticated mask of
+    /// its wire and C's own digest bit. Returns whether all matched (the
+    /// caller aborts in `c_stage`, after evaluating, like for any other
+    /// failed check of the stage).
+    async fn c_next_digests(&mut self, s: usize, th: &[u8; 32]) -> Result<bool> {
+        #[allow(unused_variables)]
+        let cheat = self.cheat();
+        let lay = lay();
+        let sp = lay.sp;
+        let digs = sp.digs_of(s);
+        {
+            let st = self.cst()?;
+            let is = st.vals[is_group(sp, s)].clone().ok_or(Error::State("no inner state"))?;
+            for (n, blk) in circuits::digest_blocks(s, th).iter().enumerate() {
+                st.dig[digs[n]] = Some(Zeroizing::new(circuits::inner_digest(&is, blk)));
+            }
+        }
+        let msg = self.c_recv(16 * 256 * digs.len()).await?;
+        let blocks = SecretBlocks(bytes_to_blocks(&msg));
+        let st = self.cst()?;
+        let mut ok = true;
+        for (n, &j) in digs.iter().enumerate() {
+            let bits = st.dig[j].take().ok_or(Error::State("digest missing"))?;
+            for (i, w) in sp.dig[j].clone().enumerate() {
+                let lab = blocks[256 * n + i];
+                st.l[w] = lab;
+                ok &= lab.lsb() == bits[i] ^ st.lam_in[w];
+            }
+        }
+        #[cfg(test)]
+        if cheat == Cheat::FeedOther(s) {
+            // "Another digest": C has no other label, the best it can do is
+            // to guess one (here: a random offset with the pointer flipped).
+            let w = sp.dig[digs[0]].start + 5;
+            let mut x = Block::random(&mut self.rng);
+            x.set_lsb(true);
+            let st = self.cst()?;
+            st.l[w] = st.l[w] ^ x;
+        }
+        Ok(ok)
     }
 }
 
-/// Bytes of the protocol messages per session, by direction, as computed
-/// from the circuit sizes (for reports). Excludes OT extension traffic.
+/// Bytes of the protocol messages per session, by direction (C→N, N→C), as
+/// computed from the circuit sizes (for reports). Excludes OT traffic and
+/// the version tag.
 pub fn message_sizes() -> (usize, usize) {
-    let mut n2c = 0;
-    let mut c2n = 0;
-    for p in 0..2 {
-        let s = spec(p);
-        n2c += gc::tables_len(s.circ.and_count()); // three-halves tables
-        n2c += macs_per_phase(s).div_ceil(8); // d bits (approx; one message)
-        n2c += 8 * SHAPES[p].base.len() + 8; // check rows + Y_N (64-bit)
-        n2c += (s.c_bits + s.th_bits + s.out_bits).div_ceil(8);
-        n2c += 16 * (s.n_bits + s.th_bits + s.c_bits); // online labels
-        c2n += s.c_bits.div_ceil(8) + 1 + s.out_bits.div_ceil(8) + 32;
+    let l = lay();
+    let sp = l.sp;
+    let mut n2c = gc::tables_len(l.n_and) + l.mac_fixed.div_ceil(8) + 32 + 32 * l.n_pairs;
+    let n_open: usize = l.open_in.len()
+        + sp.outs.iter().enumerate().filter(|(gi, _)| l.opened(*gi)).map(|(_, g)| g.len).sum::<usize>();
+    n2c += n_open.div_ceil(8) + 32;
+    n2c += l.shapes.iter().map(|s| 8 * s.rows.len() + 8).sum::<usize>();
+    n2c += 16 * l.n_in + 65; // online labels and corrections, N's key share
+    let mut c2n = 32 + 32 + 32 + 97; // seed, d, key-share commitment and opening
+    for s in 0..N_STAGES {
+        c2n += 1 + 32 + l.reported(s).iter().map(|&g| sp.outs[g].len / 8).sum::<usize>();
     }
-    n2c += 32 + 32;
-    c2n += 32;
     (c2n, n2c)
+}
+
+/// Bytes N→C by kind (tables, check rows and Y_N, mask commitment bits,
+/// label-check pairs, online labels), for reports.
+pub fn download_breakdown() -> [(&'static str, usize); 5] {
+    let l = lay();
+    [
+        ("three-halves tables", gc::tables_len(l.n_and)),
+        ("check rows and Y_N", l.shapes.iter().map(|s| 8 * s.rows.len() + 8).sum()),
+        ("mask commitment bits", l.mac_fixed.div_ceil(8)),
+        ("label-check pairs", 32 * l.n_pairs),
+        ("online labels and corrections", 16 * l.n_in),
+    ]
 }

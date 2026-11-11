@@ -2,7 +2,7 @@
 name = "twopc"
 version = "0.1.0"
 edition = "2024"
-description = "Two-party TLS 1.3 key schedule (protocol v2): joint P-256 key share, ECtF, node-only authenticated garbling (three-halves tables, IT-MAC consistency check)"
+description = "Two-party TLS 1.3 key schedule (protocol v3, split-public-1): joint P-256 key share, ECtF, split key schedule under node-only authenticated garbling (three-halves tables, IT-MAC consistency check per stage)"
 license = "MIT"
 
 [lib]
@@ -15,6 +15,10 @@ path = "src/bin/cu-2pc.rs"
 [[example]]
 name = "bench"
 path = "examples/bench.rs"
+
+[[example]]
+name = "procbench"
+path = "examples/procbench.rs"
 
 [dependencies]
 mpz-circuits = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141", features = ["sha2"] }
@@ -42,4 +46,5 @@ zeroize = { version = "1", features = ["derive"] }
 cu-crypto = { path = "../cu-crypto" }
 # WAN emulation for the benchmark (`zkbench::transport::emulated_link`).
 zkbench = { path = "../zkbench" }
-
+# getrusage in the `procbench` example.
+libc = "0.2"
