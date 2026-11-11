@@ -25,6 +25,9 @@
 #   CU_UPSTREAM      provider host:port (default api.venice.ai:443)
 #   CU_UPSTREAM_BASE the provider's API base for the node (default https://api.venice.ai/api/v1)
 #   CU_MODEL         chat model (default mistral-small-3-2-24b-instruct)
+#   CU_IMAGE_MODEL   image model (default z-image-turbo, the cheapest; its first
+#                    offered variant, one image: the two honest image cases
+#                    cost about $0.01 each at the provider)
 #   CU_CASES         optional space-separated subset of case ids (v2 always runs:
 #                    the other cases compare their reservation with it)
 #   CU_H2_PAUSE      seconds of idle time in the `idle` case (default 0 = skip;
@@ -50,6 +53,14 @@
 #   replay-usage    request 2 is released and "settled" with request 1's usage: the
 #                   sidecar refuses, and the node charges request 2's reservation
 #                   (what v2 charges for a released request with no disclosure)
+#   image           (A.13) one image request on a connection: reserved at the
+#                   signed price per image plus the larger fee, its body proven by
+#                   π_WIN, the response accepted, charged exactly the signed price
+#   chat-image      a chat request, then an image request on the same connection:
+#                   each reserved and settled by its own rule, one handshake
+#   image-suffix    request 2 is an image request whose body ends in a suffix that
+#                   orders one image more than the request names: π_WIN fails, the
+#                   provider never has the request, its reservation is released
 #   no-funds        a setup with an unfunded key: refused (402) before the sidecar
 #                   is dialed, so it gets no garbled circuit
 #   low-balance     a setup with a key that holds less than the connection deposit:
@@ -72,6 +83,7 @@ CRYPTO="$(cd "$HERE/.." && pwd)"
 CORE="${CU_CORE:-$CRYPTO/../routstr-core}"
 OUT="${CU_H2_NODE_OUT:-$CRYPTO/runs/v3-h2-node-check}"
 MODEL="${CU_MODEL:-mistral-small-3-2-24b-instruct}"
+IMAGE_MODEL="${CU_IMAGE_MODEL:-z-image-turbo}"
 CASE_TIMEOUT="${CU_CASE_TIMEOUT:-180}"
 PAUSE="${CU_H2_PAUSE:-0}"
 KEY_ENV="${CU_KEY_ENV:-VENICE_API_KEY}"
@@ -181,11 +193,13 @@ for _ in $(seq 1 150); do
     && "$PY" -I -c 'import json,sys; o=json.load(open(sys.argv[1])); sys.exit(0 if sys.argv[2] in o.get("price_list", {}) else 1)' "$OUT/offer.json" "$MODEL" && break
   sleep 0.4
 done
-"$PY" -I - "$OUT/offer.json" "$MODEL" "$DEPOSIT" "$IDLE" <<'PYEOF' || { echo "the node's offer is not usable; see $OUT/offer.json and $OUT/node.out" >&2; exit 2; }
+"$PY" -I - "$OUT/offer.json" "$MODEL" "$DEPOSIT" "$IDLE" "$IMAGE_MODEL" <<'PYEOF' || { echo "the node's offer is not usable; see $OUT/offer.json and $OUT/node.out" >&2; exit 2; }
 import json, sys
 o = json.load(open(sys.argv[1]))
 ok = sys.argv[2] in o.get("price_list", {}) and "2" in (o.get("http") or []) and isinstance(o.get("h2"), dict) and o.get("sig")
 ok = ok and o["h2"].get("connection_deposit_msat") == int(sys.argv[3]) and o["h2"].get("idle_timeout_s") == int(sys.argv[4])
+# Image requests over http 2: the sidecar's kinds and the node's priced variants.
+ok = ok and o["h2"].get("kinds") == ["chat", "images"] and sys.argv[5] in (o.get("images") or {}).get("price_list", {})
 sys.exit(0 if ok else 1)
 PYEOF
 
@@ -251,6 +265,10 @@ run_case provider-error "error:2:400" "$START_BALANCE" -- --http2 --requests 3 -
 run_case unknown-model  "node-refused:2:not served confidentially" "$START_BALANCE" -- --http2 --requests 3 --h2-models "$MODEL,no-such-model-xyz"
 run_case wrong-suffix   "released:2:pi_win failed" "$START_BALANCE" -- --http2 --requests 2 --adv-h2 suffix --adv-at 2
 run_case replay-usage   "charged:2:interval" "$START_BALANCE" -- --http2 --requests 2 --adv-h2 replay-usage
+IMG=(--image-model "$IMAGE_MODEL" --prompt "a red circle on a white background")
+run_case image          "kinds:images" "$START_BALANCE" -- --http2 --requests 1 --h2-kinds images "${IMG[@]}"
+run_case chat-image     "kinds:chat,images" "$START_BALANCE" -- --http2 --requests 2 --h2-kinds chat,images --image-model "$IMAGE_MODEL"
+run_case image-suffix   "released:2:pi_win failed" "$START_BALANCE" -- --http2 --requests 2 --h2-kinds chat,images --image-model "$IMAGE_MODEL" --adv-h2 suffix --adv-at 2
 run_case no-funds       "no-funds:402" 0 -- --http2
 run_case low-balance    "no-deposit:402" "$((DEPOSIT - 1))" -- --http2
 run_case open-drop      "unused:unused" "$START_BALANCE" -- --http2 --requests 0

@@ -8,7 +8,8 @@
 # The script starts its own cu-sidecar on loopback (with relay/offer.venice.h2.json,
 # no node: the sidecar signs stub receipts) and stops it when done. No routstr
 # node is involved. Every request is small (max_tokens 20); the flow-control
-# case sends one ~200 kB prompt.
+# case sends one ~200 kB prompt. The image case generates one image of the
+# cheapest model (real money: about $0.01); the image attack costs nothing.
 #
 # Environment:
 #   CU_SIDECAR      use this running sidecar instead of starting one (it must
@@ -19,6 +20,7 @@
 #   CU_KEY_ENV      variable holding the provider key (default VENICE_API_KEY)
 #   CU_UPSTREAM     provider host:port (default api.venice.ai:443)
 #   CU_MODEL        chat model (default mistral-small-3-2-24b-instruct)
+#   CU_IMAGE_MODEL  image model (default z-image-turbo; one image, the default variant)
 #   CU_CASES        optional space-separated subset of case ids
 #   CU_H2_PAUSE     seconds of idle time in the `idle` case (default 0 = skip;
 #                   150 for the long check)
@@ -39,8 +41,13 @@
 #   e-path            a HEADERS block with another :path of the same length
 #   e-path-long       the same with a longer path (refused on the record length)
 #   d-replay-usage    request 1's usage tail presented as request 2's disclosure
+#   h2-image          an image request on a connection (A.13): its body is proven
+#                     like a chat body, the response (one JSON body over DATA
+#                     frames) is accepted and settled flat
+#   f-image-suffix    an image request whose body ends in a suffix ordering one
+#                     image more than the request names
 #   v2                an unchanged protocol v2 (HTTP/1.1) session on the same sidecar
-# For a, b, c, e the sidecar must refuse (a failed π_WIN, or the record shape)
+# For a, b, c, e, f the sidecar must refuse (a failed π_WIN, or the record shape)
 # and its own log must show that no record of the attacked request was written
 # to the provider. For d the request itself is honest and reaches the provider;
 # what must be refused is its settlement on the earlier request's usage.
@@ -52,6 +59,7 @@ OUT="${CU_H2_OUT:-$CRYPTO/runs/v3-h2-check}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 MODEL="${CU_MODEL:-mistral-small-3-2-24b-instruct}"
+IMAGE_MODEL="${CU_IMAGE_MODEL:-z-image-turbo}"
 PAUSE="${CU_H2_PAUSE:-0}"
 CASE_TIMEOUT="${CU_CASE_TIMEOUT:-180}"
 KEY_ENV="${CU_KEY_ENV:-VENICE_API_KEY}"
@@ -130,6 +138,8 @@ run_case c-suffix         "refused:2:pi_win failed" 0 -- --http2 --requests 2 --
 run_case e-path           "refused:2:pi_win failed" 0 -- --http2 --requests 2 --adv-h2 path --adv-at 2
 run_case e-path-long      "refused:1:not its HEADERS frame" 0 -- --http2 --adv-h2 path --adv-h2-path /api/v1/api_keys/rate_limits
 run_case d-replay-usage   "replay:2:interval" 0 -- --http2 --requests 2 --adv-h2 replay-usage
+run_case h2-image         "image:1" 120 -- --http2 --image --image-model "$IMAGE_MODEL" --prompt "a red circle on a white background"
+run_case f-image-suffix   "refused:1:pi_win failed" 0 -- --http2 --image --image-model "$IMAGE_MODEL" --prompt "a red circle" --adv-h2 suffix --adv-at 1
 run_case v2 "v2" 0 --
 
 echo

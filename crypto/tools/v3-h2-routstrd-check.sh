@@ -21,7 +21,8 @@
 # a throwaway one whose default mint is a local stub (helpers in
 # v3-h2-routstrd/); the node credential is credited in the node's scratch
 # database and seeded into routstrd's store, so no mint is involved. The
-# provider key is passed by environment only. 13 small requests (max_tokens 20).
+# provider key is passed by environment only. 13 small requests (max_tokens 20)
+# and one image.
 #
 # Environment:
 #   CU_SCRATCH       scratch and evidence directory (default: a fresh mktemp -d,
@@ -37,6 +38,7 @@
 #   CU_UPSTREAM      provider host:port (default api.venice.ai:443)
 #   CU_UPSTREAM_BASE the provider's API base for the node (default https://api.venice.ai/api/v1)
 #   CU_MODEL         chat model (default mistral-small-3-2-24b-instruct)
+#   CU_IMAGE_MODEL   image model of the h2-image case (default z-image-turbo; empty: skip)
 #   CU_PAUSE         seconds between sequential requests (default 3: the v2
 #                    run's pre-warm pool arms the next session meanwhile)
 #
@@ -47,6 +49,11 @@
 #                  "request reserved"/"settled" pairs with n in the node log, no
 #                  plain chat/completions request at the node
 #   h2-burst       http2 on: 3 parallel requests: all 200, 3 reserved + 3 settled
+#   h2-image       http2 on: one image request (POST /v1/images/generations, the
+#                  cheapest model, one image: about $0.01 at the provider) on a
+#                  connection the chat requests left: 200 with a WebP image, a
+#                  reused connection, one image reservation settled flat at the
+#                  node (CU_IMAGE_MODEL= skips the case)
 #   v2-sequential  http2 disabled in the routstrd config (routstrd restarted):
 #                  5 sequential requests settle through the v2 flow
 #   money          the credential's balance in the node's database is the start
@@ -63,6 +70,7 @@ CORE="${CU_CORE:-$CRYPTO/../routstr-core}"
 SDK="${CU_SDK:-$CRYPTO/../routstr-sdk}"
 RD="${CU_ROUTSTRD:-$CRYPTO/../routstrd}"
 MODEL="${CU_MODEL:-mistral-small-3-2-24b-instruct}"
+IMAGE_MODEL="${CU_IMAGE_MODEL-z-image-turbo}"
 KEY_ENV="${CU_KEY_ENV:-VENICE_API_KEY}"
 SPORT="${CU_H2_PORT:-7480}"
 NPORT="${CU_NODE_PORT:-8421}"
@@ -280,6 +288,21 @@ run_case() {
 start_rd
 run_case h2seq seq 5
 run_case h2burst burst 3
+if [ -n "$IMAGE_MODEL" ]; then
+  # One image request on a connection the chat requests left open.
+  echo "== h2image: 1 image request =="
+  nskip="$(node_lines)"; rskip="$(rd_lines)"
+  t0="$(bun -e 'console.log(Date.now())')"
+  curl -sS -m 300 -D "$EV/h2image-1.headers" -o "$EV/h2image-1.body" "http://127.0.0.1:$RPORT/v1/images/generations" \
+    -H 'content-type: application/json' -H 'x-routstr-verify: confidential' \
+    -d "{\"model\":\"$IMAGE_MODEL\",\"prompt\":\"a red circle on a white background\",\"n\":1,\"output_format\":\"webp\"}" 2>> "$EV/curl.err" || true
+  bun "$HELP/image.ts" "$t0" h2image-1 "$EV/h2image-1.headers" "$EV/h2image-1.body" | tee "$EV/results-h2image.jsonl"
+  # The image itself is not evidence: keep its summary only.
+  : > "$EV/h2image-1.body"
+  sleep 2
+  node_log | tail -n +"$((nskip + 1))" > "$EV/node-h2image.log"
+  rd_log | tail -n +"$((rskip + 1))" > "$EV/rd-h2image.log"
+fi
 
 # The same daemon with http2 disabled: the v2 flow and its pre-warming.
 stop "$RD_PID"; RD_PID=""

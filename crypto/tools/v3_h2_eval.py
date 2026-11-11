@@ -5,6 +5,8 @@ Arguments: case expect driver_rc driver_out driver_err sidecar_runs_dir
   settled:<n>            n requests on one connection, each a 200 with a verified receipt
   error:<n>:<status>     n requests; the last one a disclosed error head with that status
   big:<records>          one 200 whose request went in at least that many records
+  image:<n>              n image requests on one connection, each a 200 whose body
+                         holds the images asked for, accepted and settled flat
   refused:<n>:<regex>    the attack on request n is refused by the sidecar for that
                          reason; request n never reaches the provider
   replay:<n>:<regex>     the stale disclosure for request n is refused for that reason;
@@ -60,7 +62,7 @@ elif kind == "v2":
     evidence += f" sig={e2e and e2e.get('receipt_sig_ok')} usage_match={e2e and e2e.get('usage_match')}"
     if not ok:
         dev.append("the v2 session did not settle with a verified receipt")
-elif kind in ("settled", "error", "big"):
+elif kind in ("settled", "error", "big", "image"):
     reqs = (e2e or {}).get("requests") or []
     evidence += " " + " ".join(
         f"[{r.get('n')}:{r.get('status')} rel={r.get('released_ms')}ms ttft={r.get('ttft_ms')}ms rec={r.get('records')}]" for r in reqs
@@ -75,6 +77,20 @@ elif kind in ("settled", "error", "big"):
             dev.append(f"expected {n} settled 200 requests on one connection")
         if [r.get("stream") for r in reqs] != [2 * i + 3 for i in range(len(reqs))]:
             dev.append("requests did not use streams 3, 5, ...")
+    elif kind == "image":
+        n = int(rest)
+        evs = sidecar_events() or []
+        evidence += " " + " ".join(
+            f"[images={r.get('images')}/{r.get('count')} bytes={r.get('response_bytes')} frames={r.get('response_frames')} total={r.get('total_ms')}ms]" for r in reqs
+        )
+        if len(reqs) != n or any(r.get("status") != 200 or r.get("kind") != "images" for r in reqs):
+            dev.append(f"expected {n} image request(s) with status 200")
+        elif any(r.get("images") != r.get("count") or not r.get("response_bytes") or r.get("warnings") for r in reqs):
+            dev.append("a response does not hold the images asked for")
+        elif any(p.get("proof") == "pi_c3s" for r in reqs for p in r.get("proofs", [])):
+            dev.append("an image request ran a usage proof")
+        elif not all(any(e.startswith(f"request n={r['n']} accepted: flat charge") for e in evs) for r in reqs):
+            dev.append("the sidecar did not settle the image request flat on accept")
     elif kind == "error":
         n, status = (int(x) for x in rest.split(":"))
         if len(reqs) != n or reqs[-1].get("status") != status or any(r.get("status") != 200 for r in reqs[:-1]):

@@ -278,17 +278,28 @@ own failures with `fault` in its `error` frame), and the connection's last frame
 The node closes a connection with no request in flight for `idle_timeout_s` (`closed`, reason `idle`). The
 driver: `--requests 0`, `--linger-ms`, `--max-deposit`.
 
+Images over `http: 2` (A.13): the sidecar offer's `h2.kinds` (`["chat", "images"]` in
+`relay/offer.venice.h2.json`; absent = chat only) lets an image request run as one more request on a
+connection. The path is the route of the images endpoint's head template, the node renders the suffix
+(`reserve_image`) and the sidecar checks it (`check_suffix` in `on_request`), π_WIN proves it like a chat
+suffix, a 2xx is settled by `accept {n, server_records}` (`on_accept`; flat usage, `settle_flat`), an error
+by its head. The response is one JSON body over DATA frames, ended by END_STREAM; the connection head's
+2^31-1 windows cover it without WINDOW_UPDATEs, and a connection is retired after 1 GiB received
+(`closed`, reason `max_bytes`). Driver: `--http2 --image`, or `--h2-kinds chat,images --image-model <id>`.
+The gates' image cases generate real images (z-image-turbo, about $0.01 each: one in `v3-h2-check.sh`, two
+in `v3-h2-node-check.sh`, one in `v3-h2-routstrd-check.sh` and one in the SDK script's `image` case).
+
 The clients (local branches `confidential-v3` in routstr-sdk, from `confidential-2pc`, and in routstrd, from
 `confidential-upstream`): the SDK runs chat on pooled `http: 2` connections when the verified offer lists
-`"2"` (`client/confidential/{h2,h2conn,h2pool}.ts`, `confidential.http2`, on by default; images, one-off Cashu
-bearers and other nodes keep the v2 flow; a node whose deposit exceeds `http2.maxConnectionDepositMsat`,
+`"2"` (`client/confidential/{h2,h2conn,h2pool}.ts`, `confidential.http2`, on by default; one-off Cashu
+bearers and other nodes keep the v2 flow, and so do images unless the offer's `h2.kinds` lists them; a node whose deposit exceeds `http2.maxConnectionDepositMsat`,
 default 100 000 msat, also gets the v2 flow; the pool's idle time stays below the node's `idle_timeout_s`),
 routstrd passes `confidentialUpstream.http2` through. Live checks:
 `bun scripts/confidential-h2-e2e.ts <node> <sk-key> <model>` in routstr-sdk (SDK level, against a node you
 started), and `crypto/tools/v3-h2-routstrd-check.sh`, which starts a sidecar, a node, a stub mint
 (`crypto/tools/v3-h2-routstrd/`) and a scratch routstrd (scratch HOME/ROUTSTRD_DIR/COCOD_DIR, dead proxy for
 non-loopback HTTP), sends curl requests with `x-routstr-verify: confidential` (5 sequential, a burst of 3,
-5 with http2 disabled), checks the routstrd log, the node log and the node's balance, and prints the time to
+one image request, 5 with http2 disabled), checks the routstrd log, the node log and the node's balance, and prints the time to
 first token and the bytes per request. It needs both client checkouts built (SDK `npm run build`, then
 routstrd `bun run build`).
 

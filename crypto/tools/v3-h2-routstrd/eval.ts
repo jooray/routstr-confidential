@@ -74,6 +74,24 @@ const okResult = (r: any) => r.status === 200 && r.verify === "confidential" && 
   verdict("h2-burst", p, `3 × 200 on ${new Set(rs.map((r) => r.sid)).size} connection(s) (${rs.map((r) => r.connection).join(" | ")}); node: 3 reserved + 3 settled`);
 }
 
+// (2b) http2 on: an image request on a connection the chat requests left.
+const imageRan = existsSync(`${dir}/results-h2image.jsonl`);
+if (imageRan) {
+  const p: string[] = [];
+  const r = results("h2image")[0] ?? {};
+  const log = nodeLog("h2image");
+  const st = stats("h2image");
+  if (r.status !== 200 || r.verify !== "confidential") p.push(`status ${r.status}`);
+  if (r.http !== "2" || !/^reused; request=\d+$/.test(String(r.connection))) p.push(`not on a reused http 2 connection (${r.http}, ${r.connection})`);
+  if (r.images !== 1 || r.webp !== 1 || r.warnings) p.push(`${r.webp} WebP image(s) of ${r.images} returned${r.warnings ? `, warnings: ${r.warnings}` : ""}`);
+  const reserved = msg(log, "confidential ws: request reserved");
+  const settled = msg(log, "confidential ws: settled");
+  if (reserved.length !== 1 || reserved[0].kind !== "images") p.push(`node log: ${reserved.length} reservation(s) of kind ${reserved[0]?.kind}`);
+  if (settled.length !== 1 || settled[0].cost_msats !== r.cost_msats || !(r.cost_msats > 0)) p.push(`node log: settled ${settled[0]?.cost_msats}, the response names ${r.cost_msats}`);
+  if (st.length !== 1 || st[0].kind !== "images" || st[0].reused !== true) p.push("routstrd log: no image request line on a reused connection");
+  verdict("h2-image", p, `200, 1 WebP image (${r.image_bytes} bytes) in ${r.total_ms} ms on connection ${r.sid} (${r.connection}), variant ${r.variant}; node: reserved as images, settled flat at ${r.cost_msats} msat; routstrd↔node: ${st[0]?.bytesRecv} bytes down, ${st[0]?.bytesSent} up`);
+}
+
 // (3) http2 off: the v2 flow (one session per request, pre-warmed after the first).
 {
   const p: string[] = [];
@@ -96,7 +114,8 @@ const okResult = (r: any) => r.status === 200 && r.verify === "confidential" && 
   const m = JSON.parse(readFileSync(`${dir}/money.json`, "utf8"));
   const settled = msg(jsonl("node-all.log"), "confidential ws: settled");
   const charges = settled.reduce((n, l) => n + (Number(l.cost_msats) || 0), 0);
-  if (settled.length !== 13) p.push(`${settled.length} settlements in the node log, expected 13`);
+  const expected = 13 + (imageRan ? 1 : 0);
+  if (settled.length !== expected) p.push(`${settled.length} settlements in the node log, expected ${expected}`);
   if (m.reserved !== 0) p.push(`reserved_balance ${m.reserved}`);
   if (m.balance !== m.start - charges) p.push(`balance ${m.balance} != start ${m.start} - charges ${charges}`);
   if (charges <= 0) p.push("no charge in the node log");

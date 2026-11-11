@@ -11,6 +11,11 @@ sidecar ran during the case, and what the v2 control session reserved.
                            the usage the provider reported, with a verified receipt;
                            with `:idle` the client then stays idle and the node closes
                            the connection (`closed`, reason `idle`), holding nothing
+  kinds:<k1>,<k2>,…        one connection whose requests are of these kinds (`chat`,
+                           `images`), in this order: a chat request as for `settled`;
+                           an image request reserved at the signed price per image ×
+                           count plus the larger fee, accepted, and charged exactly
+                           that price × count plus the session fee
   unused:<reason>          a connection is opened and ends without a request: the
                            deposit is charged for that reason (`unused`: the client
                            left; `idle`: the node closed it after its idle timeout
@@ -154,6 +159,7 @@ def receipt(n):
 
 reqs = (e2e or {}).get("requests") or []
 reserved = {e.get("n"): e.get("reserved_msats") for e in msg(evs, "request reserved")}
+reserved_kind = {e.get("n"): e.get("kind") for e in msg(evs, "request reserved")}
 settled = {e.get("n"): e.get("cost_msats") for e in msg(evs, "confidential ws: settled")}
 aborted = [e.get("outcome") for e in msg(evs, "session aborted")]
 ended = msg(evs, "http 2 connection ended")
@@ -184,9 +190,42 @@ def check_deposit_returned():
 evidence = f"rc={rc}"
 
 
+def check_image(r):
+    """An image request: reserved and charged at the signed flat price, accepted (no usage proof)."""
+    n = r.get("n")
+    rec = receipt(n) or {}
+    images = offer.get("images") or {}
+    variant = next((v for v in (images.get("price_list") or {}).get(r.get("model"), []) if v.get("id") == r.get("variant")), None)
+    fee = int(offer.get("session_fee_msat") or 0)
+    hold = max(fee, int(offer.get("abandon_fee_msat") or 0))
+    if not variant:
+        dev.append(f"request {n}: the signed offer has no variant {r.get('variant')} of {r.get('model')}")
+        return
+    price = variant["msat_per_image"] * r.get("count", 0)
+    if r.get("status") != 200 or r.get("receipt_sig_ok") is not True:
+        dev.append(f"request {n}: not a 200 with a verified receipt")
+    elif r.get("images") != r.get("count") or not r.get("response_bytes") or r.get("warnings"):
+        dev.append(f"request {n}: the response does not hold the {r.get('count')} image(s) asked for")
+    elif (rec.get("kind"), rec.get("variant"), rec.get("count"), rec.get("msat_per_image")) != ("images", r.get("variant"), r.get("count"), variant["msat_per_image"]):
+        dev.append(f"request {n}: the receipt does not name the variant, the count and the signed price")
+    elif (rec.get("usage") or {}).get("flat") is not True or rec.get("http") != 2 or rec.get("n") != n:
+        dev.append(f"request {n}: the receipt is not a flat http 2 receipt for the request")
+    elif not (r.get("cost_msats") == rec.get("cost_msats") == settled.get(n) == price + fee):
+        dev.append(f"request {n}: charged {r.get('cost_msats')} (node log {settled.get(n)}), the signed price is {price} + fee {fee}")
+    elif reserved.get(n) != price + hold or rec.get("reserved_msats") != price + hold or reserved_kind.get(n) != "images":
+        dev.append(f"request {n}: reserved {reserved.get(n)} as {reserved_kind.get(n)}, expected {price + hold} as images")
+    elif any(p.get("proof") == "pi_c3s" for p in r.get("proofs", [])):
+        dev.append(f"request {n}: an image request ran a usage proof")
+    charges.append(r.get("cost_msats") or 0)
+
+
 def check_settled(count):
-    """Requests 1..count: 200, reserved, settled at the reported usage, receipt verified."""
+    """Requests 1..count: 200, reserved, settled at the reported usage, receipt verified
+    (an image request: at its flat price, `check_image`)."""
     for r in reqs[:count]:
+        if r.get("kind") == "images":
+            check_image(r)
+            continue
         n = r.get("n")
         rec = receipt(n) or {}
         want = usage_cost(rec, (rec.get("usage") or {}).get("usage")) if (rec.get("usage") or {}).get("usage") else None
@@ -215,7 +254,9 @@ def check_settled(count):
 
 def trace():
     return " ".join(
-        f"[{r.get('n')}:{r.get('status')} reserved={reserved.get(r.get('n'))} cost={r.get('cost_msats')} balance={r.get('balance_msats')}]"
+        f"[{r.get('n')}:{r.get('kind', 'chat')}:{r.get('status')} reserved={reserved.get(r.get('n'))} cost={r.get('cost_msats')} balance={r.get('balance_msats')}"
+        + (f" images={r.get('images')}/{r.get('count')} bytes={r.get('response_bytes')}" if r.get("kind") == "images" else "")
+        + "]"
         for r in reqs
     )
 
@@ -272,9 +313,15 @@ elif kind == "unused":
         if not limit or not limit * 1000 - 3000 <= (closed.get("idle_ms") or 0) <= limit * 1000 + 8000:
             dev.append(f"closed after {closed.get('idle_ms')} ms, the offer's idle_timeout_s is {limit}")
     charges.append(DEPOSIT)
-elif kind == "settled":
-    n, _, then = rest.partition(":")
-    n = int(n)
+elif kind in ("settled", "kinds"):
+    if kind == "kinds":
+        want_kinds = rest.split(",")
+        n, then = len(want_kinds), ""
+        if [r.get("kind", "chat") for r in reqs] != want_kinds:
+            dev.append(f"expected requests of kinds {want_kinds}, the driver reports {[r.get('kind', 'chat') for r in reqs]}")
+    else:
+        n, _, then = rest.partition(":")
+        n = int(n)
     evidence += " " + trace()
     if rc != 0 or not e2e or e2e.get("http") != 2:
         dev.append("no http: 2 result")
