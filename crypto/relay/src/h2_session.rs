@@ -298,7 +298,7 @@ pub(crate) fn head_written(st: &mut Session) {
     st.deadline = Some(h.idle_deadline());
 }
 
-/// `request`: the terms of the next request (what a v2 setup carries).
+/// `request`: the terms of the next request (kind, model, cap or count, body length).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_request(
     app: &Arc<AppState>,
@@ -344,7 +344,7 @@ pub(crate) fn on_request(
     // image count (an image request) and the response cap.
     let (canonical, path, image_count, cap) = if images {
         // An image request (A.13): the node rendered the suffix from its
-        // signed offer; it is checked here as for a v2 image setup.
+        // signed offer; it is checked here byte for byte.
         let (Some(path), Some(ep)) = (h.images_path.as_ref(), app.offer.endpoints.images.as_ref()) else {
             refuse!("this connection serves no image requests");
         };
@@ -401,7 +401,7 @@ pub(crate) fn on_request(
         settle_on: None,
         attestation: None,
     });
-    // The per-request limit, as for a v2 session: up to the release, then
+    // The per-request limit: up to the release, then
     // again from it.
     st.deadline = Some(tokio::time::Instant::now() + SESSION_TIMEOUT);
     side(st, format!("request n={n} stream={stream} model={model} body_len={body_len} max_tokens={max_tokens} images={image_count:?}"));

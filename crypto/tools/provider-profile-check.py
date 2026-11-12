@@ -3,8 +3,25 @@
 
 Run against the real provider with a real key (costs a fraction of a cent):
 
-    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py
+    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py            # A1-A13
+    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --images   # I1-I9 (paid)
+    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8
     python3 -I crypto/tools/provider-profile-check.py --self-test   # offline, mocked
+
+The provider is the one a sidecar offer file names: ``--offer FILE`` (default
+``crypto/relay/offer.venice.json``) gives the host, the chat route, the fixed
+pins and the ``h2`` block; ``--key-env NAME`` (default ``VENICE_API_KEY``) the
+variable that holds the key; ``--model ID`` a cheap chat model of that provider.
+The key is sent only to the offer's ``upstream_host``.
+
+``--h2`` checks what framing "2" of protocol v3 needs from a provider
+(PROTOCOL-V3.md section 5.6) and ends with a verdict line, ``offer "2": yes``
+or ``no, because ...``. Run it before adding ``"2"`` to the offer's ``http``
+list. It idles one connection for ``--h2-idle SECS`` (default: the offer's
+``h2.idle_secs``, 300), sends one body of ``--h2-body-bytes N`` (default
+8388608, the sidecar's ``--max-body``), and, when the offer serves images over
+HTTP/2, generates one image (``--h2-no-images`` skips that path and leaves H7
+open for images).
 
 Each check prints one line, PASS / FAIL / INCONCLUSIVE, with short evidence. The
 header records the provider host, the provider build (``x-venice-version``), the
@@ -22,10 +39,12 @@ Rules:
 * 429, 5xx, timeouts and connection errors are *inconclusive*: retried with
   backoff (``RETRIES``), and if still inconclusive the check is reported
   INCONCLUSIVE and the gate fails. Inconclusive is never PASS.
-* A9 and A11 use ``openssl s_client`` (OpenSSL >= 1.1.1, not LibreSSL), because
-  Python's ``ssl`` cannot restrict the TLS 1.3 suites. The client's profile is
-  reproduced exactly: TLS 1.3 only, ``TLS_AES_128_GCM_SHA256`` as the *only*
-  offered suite, X25519, ALPN ``http/1.1``. Set ``CU_OPENSSL`` to pick a binary.
+* A9, A11 and every ``--h2`` item use ``openssl s_client`` (OpenSSL >= 1.1.1,
+  not LibreSSL), because Python's ``ssl`` cannot restrict the TLS 1.3 suites
+  or send a KeyUpdate. The client's profile is reproduced: TLS 1.3 only,
+  ``TLS_AES_128_GCM_SHA256`` as the *only* offered suite, P-256 as the only
+  group (the joint key share), ALPN ``http/1.1`` (framing "1.1") or ``h2``
+  (framing "2"). Set ``CU_OPENSSL`` to pick a binary.
 
 Assumptions (paper section 3.1):
 
@@ -48,11 +67,12 @@ Assumptions (paper section 3.1):
       tokens x rate is not visible in the API; it was measured on Venice
       against the account balance (crypto/PROGRESS-CONFIDENTIAL.md)
   A9  TLS 1.3 handshake succeeds when the client offers only
-      TLS_AES_128_GCM_SHA256 + X25519 + ALPN http/1.1, and negotiates exactly that
+      TLS_AES_128_GCM_SHA256 + P-256 + ALPN http/1.1, and negotiates exactly that
   A10 price-changing request fields outside the pinned suffix are rejected
       (400, unrecognized key)
-  A11 a client KeyUpdate sent in the middle of the request body (s_client's
-      ``k`` command) is accepted: the provider answers the request correctly
+  A11 a client KeyUpdate sent between the request head and the body
+      (s_client's ``k`` command; where the node's KeyUpdate sits in framing
+      "1.1") is accepted: the provider answers the request correctly
       (200, usage event for the pinned model, [DONE], terminal chunk) and then
       closes the connection itself (``Connection: close`` honoured; our side of
       the pipe stays open, so the close is the server's)
@@ -63,10 +83,36 @@ Assumptions (paper section 3.1):
       locate the usage event by a raw ``\ndata: `` and end each chunk's data
       at the first CRLF, so CRLF events or multi-line JSON would break them
 
-A real session sends two client KeyUpdates (KU0 after the handshake, KU1
-before the credential record); A11 sends one, mid-body, which is the same
-mechanism. Every end-to-end session (``crypto/client/src/driver.ts``) also
-exercises both.
+A real framing-"1.1" connection has exactly this KeyUpdate: the node writes
+the request head with the credential under the epoch-0 key and a KeyUpdate in
+one write, and the client's body follows under the next key. Every end-to-end
+connection (``crypto/client/src/driver.ts``) exercises it as well.
+
+Framing "2" (``--h2``, PROTOCOL-V3.md section 5.6):
+
+  H1  TLS 1.3 with ALPN h2 on the API host, for the client's exact offer
+      (the one suite, P-256 only)
+  H2  a TLS KeyUpdate right after the first flight of an HTTP/2 connection
+      (the connection head) is accepted: the next request is answered.
+      Control: the same connection without the KeyUpdate
+  H3  the provider keeps the request dynamic table: its SETTINGS leave
+      HEADER_TABLE_SIZE at the default or at least at the size of the
+      credential entry, and a request that names the credential by index
+      (``be``) is authenticated
+  H4  HEADER_TABLE_SIZE = 0 is honoured for response headers: every response
+      header block decodes with an empty dynamic table
+  H5  a request naming ``authorization`` by index only is authenticated right
+      after the head and again after the idle time; control: the same request
+      with no authorization field is refused (401, 402 or 403)
+  H6  a request body of the node's body limit passes the provider's flow
+      control and is answered
+  H7  no response reflects the credential: headers (Huffman decoded),
+      trailers and bodies of the probe GET, a chat 200, chat errors (unknown
+      model, unknown field, no authorization) and, for image offers, the image
+      error and the image success (the paths of item 8 / I4)
+  H8  the event stream of a 200 ends the way the usage disclosure parses it:
+      ``data: <usage JSON>\n\ndata: [DONE]\n\n`` up to END_STREAM, LF only,
+      only the frames section 5.4 allows in between, within 16 KiB
 """
 
 from __future__ import annotations
@@ -83,14 +129,38 @@ import subprocess
 import sys
 import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python3 -I leaves it out
+import cu_h2 as h2  # noqa: E402
 from dataclasses import dataclass, field
 from typing import Callable
 
-HOST = os.environ.get("CU_PROVIDER_HOST", "api.venice.ai")
-PATH = os.environ.get("CU_PROVIDER_PATH", "/api/v1/chat/completions")
-KEY = os.environ.get("VENICE_API_KEY", "")
-CHEAP = os.environ.get("CU_CHEAP_MODEL", "mercury-2")
-REASONING = os.environ.get("CU_REASONING_MODEL", "mercury-2")
+
+
+def _flag(name: str, default: str | None = None) -> str | None:
+    a = sys.argv[1:]
+    return a[a.index(name) + 1] if name in a and a.index(name) + 1 < len(a) else default
+
+
+def _route(head_template: str) -> str:
+    m = re.match(r"POST (\S+) HTTP/1\.1\r\n", head_template or "")
+    return m.group(1) if m else ""
+
+
+# The provider is the one the sidecar offer file names.
+_OFFER_FILE = _flag("--offer") or os.environ.get(
+    "CU_OFFER", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relay", "offer.venice.json")
+)
+with open(_OFFER_FILE) as _f:
+    OFFER = json.load(_f)
+_CHAT = OFFER["chat"]
+_IMAGES = (OFFER.get("endpoints") or {}).get("images") or {}
+HOST = os.environ.get("CU_PROVIDER_HOST") or OFFER.get("upstream_host") or "api.venice.ai"
+PATH = os.environ.get("CU_PROVIDER_PATH") or _route(OFFER.get("head_template", "")) or "/api/v1/chat/completions"
+KEY_ENV = _flag("--key-env") or os.environ.get("CU_KEY_ENV", "VENICE_API_KEY")
+KEY = os.environ.get(KEY_ENV, "")
+CHEAP = _flag("--model") or os.environ.get("CU_CHEAP_MODEL", "mistral-small-3-2-24b-instruct")
+REASONING = os.environ.get("CU_REASONING_MODEL", "openai-gpt-oss-120b")
 TEXT_ONLY = os.environ.get("CU_TEXT_ONLY_MODEL", "deepseek-v4-flash")
 VISION = os.environ.get("CU_VISION_MODEL", "mistral-small-3-2-24b-instruct")
 # The completion margin the node reserves beyond max_tokens (routstr-core
@@ -113,15 +183,10 @@ EXPECT_BAD_CHARACTER = (404, r"character")
 EXPECT_IMAGE_REJECTED = (400, r"Image content is not supported")
 
 MSG = '"messages":[{"role":"user","content":"Say hi."}]'
-# Every request carries the fixed pins of the shipped offer's chat block
+# Every request carries the fixed pins of the offer's chat block
 # (docs/CHAT-SUFFIX.md), rendered as the sidecar renders them, as real
-# sessions do (without venice_parameters Venice injects a ~1.6k-token system
-# prompt). CU_OFFER names another sidecar offer file.
-_OFFER_FILE = os.environ.get(
-    "CU_OFFER", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relay", "offer.venice.json")
-)
-with open(_OFFER_FILE) as _f:
-    _CHAT = json.load(_f)["chat"]
+# connections do (without venice_parameters Venice injects a ~1.6k-token
+# system prompt).
 STREAM = ",".join(
     json.dumps(k) + ":" + json.dumps(v, sort_keys=True, separators=(",", ":")) for k, v in _CHAT["fixed_pins"]
 )
@@ -282,7 +347,7 @@ def find_openssl() -> str | None:
     return None
 
 
-def _s_client_real(brief: bool, steps: list, keep_open: bool, timeout_s: float, groups: str = "X25519") -> SClient:
+def _s_client_real(brief: bool, steps: list, keep_open: bool, timeout_s: float, groups: str = "P-256", alpn: str = "http/1.1") -> SClient:
     """Run s_client with the client's exact TLS profile.
 
     ``steps`` is a list of bytes (written to stdin) or floats (sleep seconds),
@@ -295,7 +360,7 @@ def _s_client_real(brief: bool, steps: list, keep_open: bool, timeout_s: float, 
         raise Inconclusive("no OpenSSL >= 1.1.1 found (set CU_OPENSSL); LibreSSL cannot pin TLS 1.3 suites")
     args = [
         exe, "s_client", "-connect", f"{HOST}:443", "-servername", HOST,
-        "-tls1_3", "-ciphersuites", SUITE, "-groups", groups, "-alpn", "http/1.1",
+        "-tls1_3", "-ciphersuites", SUITE, "-groups", groups, "-alpn", alpn,
         "-verify_return_error",
     ]
     if brief:
@@ -345,7 +410,100 @@ def _s_client_real(brief: bool, steps: list, keep_open: bool, timeout_s: float, 
     return SClient(p.returncode, bufs["o"].decode("latin1"), bufs["e"].decode("latin1"), exited)
 
 
-TRANSPORT: dict[str, Callable] = {"http": _http_real, "partial": _partial_real, "s_client": _s_client_real}
+class SClientH2:
+    """A TLS connection with the client's exact offer and ALPN h2, through
+    ``openssl s_client`` (for its KeyUpdate), as a ``cu_h2`` transport.
+
+    s_client reads stdin in chunks of 8 kB and takes a chunk that starts with
+    a command letter (``k`` = KeyUpdate, ``Q`` = quit) as a command. So every
+    write here is at most one chunk and starts with a frame header (a zero
+    byte) or the preface, the writes are spaced, and the checks keep letters
+    out of the bulk of a large body.
+    """
+
+    def __init__(self) -> None:
+        exe = find_openssl()
+        if not exe:
+            raise Inconclusive("no OpenSSL >= 1.1.1 found (set CU_OPENSSL); LibreSSL cannot pin TLS 1.3 suites")
+        self.p = subprocess.Popen(
+            [exe, "s_client", "-connect", f"{HOST}:443", "-servername", HOST, "-tls1_3", "-ciphersuites", SUITE,
+             "-groups", "P-256", "-alpn", "h2", "-verify_return_error", "-brief"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.out, self.err, self.eof = bytearray(), b"", False
+        self.cv = threading.Condition()
+        threading.Thread(target=self._rd_out, daemon=True).start()
+        threading.Thread(target=self._rd_err, daemon=True).start()
+        t0 = time.time()
+        while b"CONNECTION ESTABLISHED" not in self.err and self.p.poll() is None and time.time() - t0 < 20:
+            time.sleep(0.05)
+        time.sleep(0.2)  # the rest of the brief summary
+        if b"CONNECTION ESTABLISHED" not in self.err:
+            err = self.err.decode("latin1").strip()
+            self.close()
+            raise TransportError(f"no TLS connection: {snip(err[-80:])}")
+
+    def _rd_out(self) -> None:
+        for c in iter(lambda: self.p.stdout.read1(65536), b""):
+            with self.cv:
+                self.out += c
+                self.cv.notify_all()
+        with self.cv:
+            self.eof = True
+            self.cv.notify_all()
+
+    def _rd_err(self) -> None:
+        for c in iter(lambda: self.p.stderr.read1(65536), b""):
+            self.err += c
+
+    def now(self) -> float:
+        return time.monotonic()
+
+    def settle(self) -> None:
+        time.sleep(0.3)
+
+    def _write(self, data: bytes) -> None:
+        try:
+            self.p.stdin.write(data)
+            self.p.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise h2.TransportClosed(f"s_client is gone ({type(exc).__name__})") from exc
+
+    def send(self, data: bytes) -> None:
+        assert len(data) <= 8192 and data[:1] in (b"\x00", b"P")
+        self._write(data)
+        time.sleep(0.004)
+
+    def key_update(self) -> None:
+        time.sleep(0.4)
+        self._write(b"k\n")
+        time.sleep(0.4)
+
+    def recv(self, timeout: float) -> bytes:
+        with self.cv:
+            if not self.out and not self.eof and timeout > 0:
+                self.cv.wait(timeout)
+            if self.out:
+                data = bytes(self.out)
+                self.out.clear()
+                return data
+            if self.eof:
+                raise h2.TransportClosed("the provider closed the connection")
+            return b""
+
+    def info(self) -> dict:
+        err = self.err.decode("latin1")
+        f = _handshake_fields(err)
+        return {"protocol": f["protocol"], "cipher": f["cipher"], "key_updates": err.count("KEYUPDATE")}
+
+    def close(self) -> None:
+        try:
+            self.p.kill()
+            self.p.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+TRANSPORT: dict[str, Callable] = {"http": _http_real, "partial": _partial_real, "s_client": _s_client_real, "h2": SClientH2}
 
 
 def transient(status: int) -> bool:
@@ -596,6 +754,10 @@ def _handshake_fields(text: str) -> dict:
     }
 
 
+def _is_p256(text: str, f: dict) -> bool:
+    return "prime256v1" in text or "P-256" in text or f["group"] in ("P-256", "prime256v1")
+
+
 _HS_FAIL = re.compile(r"handshake failure|no shared cipher|no suitable|wrong version|protocol version|alert", re.I)
 
 
@@ -610,32 +772,29 @@ def a9_transport() -> None:
             break
         if sc.rc not in (0, None) and _HS_FAIL.search(sc.err):
             # The server refused the client's offer: a real FAIL, not an outage.
-            check("A9 TLS 1.3 / AES-128-GCM only / X25519 / ALPN http/1.1", False,
+            check("A9 TLS 1.3 / AES-128-GCM only / P-256 only / ALPN http/1.1", False,
                   f"handshake refused: {snip(sc.err.strip().splitlines()[-1] if sc.err.strip() else '', 80)}")
             return
         last = f"rc={sc.rc} {snip(sc.err.strip()[-80:])}"
     else:
         raise Inconclusive(f"A9: no handshake after {RETRIES + 1} attempts (last: {last})")
-    ok = (
-        f["protocol"] == "TLSv1.3"
-        and f["cipher"] == SUITE
-        and f["alpn"] == "http/1.1"
-        and f["verify"] == "0"
-        and f["group"] == "X25519"
-    )
+    p256 = _is_p256(sc.out, f)
+    ok = f["protocol"] == "TLSv1.3" and f["cipher"] == SUITE and f["alpn"] == "http/1.1" and f["verify"] == "0" and p256
     check(
-        "A9 TLS 1.3 / AES-128-GCM only / X25519 / ALPN http/1.1",
+        "A9 TLS 1.3 / AES-128-GCM only / P-256 only / ALPN http/1.1",
         ok,
-        f"offered only {SUITE}+X25519+http/1.1 -> {f['protocol']} {f['cipher']} group={f['group']} "
+        f"offered only {SUITE}+P-256+http/1.1 -> {f['protocol']} {f['cipher']} group={f['group']} p256={p256} "
         f"alpn={f['alpn']} verify={f['verify']}",
     )
 
 
 def a11_keyupdate_mid_request() -> None:
     body = BASE.encode()
-    # The resumed chunk must not start with an s_client command letter.
-    assert body[30:31] not in (b"k", b"K", b"Q", b"R", b"C")
-    steps = [head(len(body)) + body[:30], 0.5, b"k\n", 0.5, body[30:]]
+    # The KeyUpdate sits where the node's does in framing "1.1": after the
+    # request head, before the body. (The body must not start with an
+    # s_client command letter.)
+    assert body[:1] not in (b"k", b"K", b"Q", b"R", b"C")
+    steps = [head(len(body)), 0.5, b"k\n", 0.5, body]
     last = ""
     for attempt in range(RETRIES + 1):
         if attempt:
@@ -643,7 +802,7 @@ def a11_keyupdate_mid_request() -> None:
         sc = TRANSPORT["s_client"](True, steps, True, 45.0)
         f = _handshake_fields(sc.err)
         if "HTTP/1." not in sc.out and sc.rc not in (0, None) and _HS_FAIL.search(sc.err):
-            check("A11 client KeyUpdate mid-body; complete answer; server closes", False,
+            check("A11 client KeyUpdate between head and body; complete answer; server closes", False,
                   f"handshake refused: {snip(sc.err.strip().splitlines()[-1] if sc.err.strip() else '', 80)}")
             return
         if "HTTP/1." not in sc.out:
@@ -671,7 +830,7 @@ def a11_keyupdate_mid_request() -> None:
         and sc.exited_by_itself
     )
     check(
-        "A11 client KeyUpdate mid-body; complete answer; server closes",
+        "A11 client KeyUpdate between head and body; complete answer; server closes",
         ok,
         f"keyupdate_sent={ku} {f['protocol']} {f['cipher']} -> {r.status} complete_stream={stream_ok(r, CHEAP) and complete} "
         f"server_closed={sc.exited_by_itself} conn_hdr={r.headers.get('connection')}",
@@ -786,17 +945,18 @@ def run_all(pause: float = 0.3, quiet: bool = False, checks: list | None = None)
 # price, so the route must keep the last duplicate (arrays replaced, not
 # merged), reject unknown keys and unknown models (no silent fallback), never
 # reflect the request head (success or error), wait for the whole body before
-# it starts, and speak the v2 transport: TLS 1.3, the one suite, P-256 only,
-# and a client KeyUpdate in the middle of the body.
+# it starts, and speak the protocol's transport: TLS 1.3, the one suite, P-256
+# only, and a KeyUpdate between the request head and the body (framing "1.1").
+# Framing "2" image requests are covered by --h2 (H7 reads the image paths).
 #   I1 last duplicate wins (count, model)        I6 paid extras and arrays pinned
 #   I2 unknown keys rejected                     I7 waits for the full body
 #   I3 unknown model refused, no fallback        I8 TLS 1.3 / suite / P-256 / ALPN
-#   I4 no head reflection (success and error)    I9 KeyUpdate mid-body
+#   I4 no head reflection (success and error)    I9 KeyUpdate after the head
 #   I5 an open string cannot swallow the suffix
 # ---------------------------------------------------------------------------
 
-IMAGE_PATH = os.environ.get("CU_IMAGE_PATH", "/api/v1/image/generate")
-IMAGE_MODEL = os.environ.get("CU_IMAGE_MODEL", "z-image-turbo")
+IMAGE_PATH = os.environ.get("CU_IMAGE_PATH") or _route(_IMAGES.get("head_template", "")) or "/api/v1/image/generate"
+IMAGE_MODEL = _flag("--image-model") or os.environ.get("CU_IMAGE_MODEL", "z-image-turbo")
 IMAGE_PINS = ('"return_binary":false,"enhance_prompt":false,"enable_web_search":false,'
               '"style_references":[],"format":"webp"')
 
@@ -863,12 +1023,12 @@ def i7_image_waits_for_body() -> None:
 
 
 def i8_image_tls_p256() -> None:
-    # The v2 client offers only P-256 (the joint key share), with the one suite.
+    # The client offers only P-256 (the joint key share), with the one suite.
     sc = TRANSPORT["s_client"](False, [], False, 30.0, "P-256")
     f = _handshake_fields(sc.out)
     if not (f["protocol"] and f["cipher"]) and not (sc.rc not in (0, None) and _HS_FAIL.search(sc.err)):
         raise Inconclusive(f"I8: no handshake (rc={sc.rc} {snip(sc.err.strip()[-60:])})")
-    p256 = "prime256v1" in sc.out or "P-256" in sc.out or f["group"] in ("P-256", "prime256v1")
+    p256 = _is_p256(sc.out, f)
     check("I8 TLS 1.3 / AES-128-GCM / P-256 only / ALPN http/1.1 (free)",
           f["protocol"] == "TLSv1.3" and f["cipher"] == SUITE and f["alpn"] == "http/1.1" and f["verify"] == "0" and p256,
           f"offered only {SUITE}+P-256+http/1.1 -> {f['protocol']} {f['cipher']} group={f['group']} p256={p256} "
@@ -877,15 +1037,15 @@ def i8_image_tls_p256() -> None:
 
 def i9_image_keyupdate_mid_body() -> None:
     body = f'{{"prompt":"a small green leaf","model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}'.encode()
-    assert body[30:31] not in (b"k", b"K", b"Q", b"R", b"C")
-    steps = [head(len(body), IMAGE_PATH) + body[:30], 0.5, b"k\n", 0.5, body[30:]]
+    assert body[:1] not in (b"k", b"K", b"Q", b"R", b"C")
+    steps = [head(len(body), IMAGE_PATH), 0.5, b"k\n", 0.5, body]
     sc = TRANSPORT["s_client"](True, steps, True, 90.0, "P-256")
     if "HTTP/1." not in sc.out:
         raise Inconclusive(f"I9: no response (rc={sc.rc} {snip(sc.err.strip()[-60:])})")
     r = parse_http(sc.out.encode("latin1"))
     ku = "KEYUPDATE" in sc.err or "KEYUPDATE" in sc.out
     n = len(_image_json(r).get("images") or [])
-    check("I9 image route: client KeyUpdate mid-body; image returned; server closes (paid)",
+    check("I9 image route: client KeyUpdate between head and body; image returned; server closes (paid)",
           ku and r.status == 200 and n == 1 and sc.exited_by_itself,
           f"keyupdate_sent={ku} -> {r.status}, {n} image(s), server_closed={sc.exited_by_itself}")
 
@@ -904,6 +1064,396 @@ def i5_image_malformed() -> None:
 
 IMAGE_CHECKS = [i8_image_tls_p256, i2_image_unknown_rejected, i3_image_unknown_model, i5_image_malformed,
                 i1_image_last_wins, i7_image_waits_for_body, i9_image_keyupdate_mid_body]
+
+
+# ---------------------------------------------------------------------------
+# Framing "2" (--h2): PROTOCOL-V3.md section 5.6, H1-H8. Every connection is
+# what a framing-"2" connection puts on the wire: the client's TLS offer with
+# ALPN h2, the connection head of section 5.2 (the probe GET stores the
+# credential at index 62 of the provider's request table), a TLS KeyUpdate,
+# then requests whose header block names the credential by index only.
+# ---------------------------------------------------------------------------
+
+_H2 = OFFER.get("h2") or {}
+H2_PROBE = _H2.get("probe_path", "")
+H2_OFFER_IDLE = int(_H2.get("idle_secs", 300))
+H2_IDLE = float(_flag("--h2-idle") or H2_OFFER_IDLE)
+H2_BODY_BYTES = int(_flag("--h2-body-bytes") or 8 << 20)
+H2_IMAGES = "images" in (_H2.get("kinds") or []) and bool(_IMAGES)
+H2_NAMES = {
+    "H1": "H1 TLS 1.3 with ALPN h2 (the one suite, P-256 only)",
+    "H2": "H2 KeyUpdate right after the connection head is accepted",
+    "H3": "H3 the request dynamic table is kept (credential entry fits; SETTINGS do not shrink it)",
+    "H4": "H4 HEADER_TABLE_SIZE = 0 honoured for response headers",
+    "H5": "H5 authorization by index only is authenticated, also after the idle time",
+    "H6": "H6 a body of the node's limit passes flow control",
+    "H7": "H7 no response reflects the credential",
+    "H8": "H8 the usage event and [DONE] end the stream as the disclosure parses it",
+}
+
+
+# What a request without a credential gets (402: a provider that then asks for payment).
+H2_UNAUTH = (401, 402, 403)
+
+
+class ConnLost(Exception):
+    """The provider ended the HTTP/2 connection."""
+
+
+def h2_body(filler: int = 0, model: str | None = None, extra: str = "") -> str:
+    """A small chat request; ``filler`` bytes of JSON whitespace make it large
+    without prompt tokens (and without s_client command letters)."""
+    return "{" + MSG + "," + " " * filler + extra + f'"model":"{model or CHEAP}","max_tokens":4,' + STREAM + "}"
+
+
+def h2_open(reset_probe: bool = True, key_update: bool = True) -> h2.H2Client:
+    """A connection up to where the first request may go."""
+    c = h2.H2Client(TRANSPORT["h2"](), HOST, KEY)
+    c.open(H2_PROBE, reset_probe)
+    if key_update:
+        c.key_update()
+    # The provider's SETTINGS and its answer to ours; then what it still has
+    # to say about the probe (section 5.4: C waits for it, or 2 s).
+    c.pump(lambda: bool(c.peer_settings) and c.settings_acked, 10.0)
+    c.pump(lambda: c.streams[1].ended, 2.0)
+    if c.closed or c.goaway:
+        raise ConnLost(f"the provider closed the connection after the head{_goaway(c)}")
+    if not c.peer_settings:
+        raise TransportError("no SETTINGS from the provider in 10 s")
+    return c
+
+
+def _goaway(c: h2.H2Client) -> str:
+    return f" (GOAWAY error {c.goaway[0]} {snip(c.goaway[1].decode('latin1'), 40)})" if c.goaway else ""
+
+
+def h2_request(c: h2.H2Client, path: str, body: str, label: str, by_index: bool = True, timeout: float = 120.0) -> h2.StreamResp:
+    """One request; transient outcomes are retried on the same connection."""
+    last = ""
+    for attempt in range(RETRIES + 1):
+        if attempt:
+            time.sleep(BACKOFF[min(attempt - 1, len(BACKOFF) - 1)])
+        try:
+            r = c.request(path, body.encode(), by_index, timeout)
+        except h2.TransportClosed as exc:
+            raise ConnLost(f"{label}: {exc}{_goaway(c)}") from exc
+        H2_SEEN.append((label, r))
+        if not r.ended and r.reset is None:
+            if c.closed or c.goaway:
+                raise ConnLost(f"{label}: the provider closed the connection{_goaway(c)}")
+            last = f"no answer in {timeout:.0f} s"
+            continue
+        if r.reset is not None and not r.headers:
+            last = f"RST_STREAM {r.reset}"
+            continue
+        if r.status and transient(r.status):
+            last = f"HTTP {r.status} {snip(r.text, 60)}"
+            continue
+        return r
+    raise Inconclusive(f"{label}: still transient after {RETRIES + 1} attempts (last: {last})")
+
+
+H2_SEEN: list[tuple[str, "h2.StreamResp"]] = []
+
+
+def h2_stream_ok(r: h2.StreamResp, model: str) -> bool:
+    u = usage_of(r.text)
+    return r.status == 200 and r.ended and u.get("model") == model and bool(u.get("usage"))
+
+
+def _key_forms() -> list[bytes]:
+    k = KEY.encode()
+    return [k, base64.b64encode(k), base64.b64encode(b"Bearer " + k)]
+
+
+def h2_reflection(r: h2.StreamResp) -> str | None:
+    """Where a response carries the credential, or None."""
+    for part, data in (
+        ("headers", "\n".join(f"{n}: {v}" for n, v in r.headers).encode("latin1", "replace")),
+        ("trailers", "\n".join(f"{n}: {v}" for n, v in r.trailers).encode("latin1", "replace")),
+        ("body", r.body),
+    ):
+        if KEY and any(k in data for k in _key_forms()):
+            return part
+    return None
+
+
+def run_h2() -> int:
+    """H1-H8. Returns the exit status and prints the verdict line."""
+    RESULTS.clear()
+    H2_SEEN.clear()
+    res: dict[str, tuple[str, str]] = {}
+    entry = h2.credential_entry_size(len(KEY))
+
+    def put(item: str, verdict: str, evidence: str) -> None:
+        if item not in res:
+            res[item] = (verdict, redact(evidence))
+            if not QUIET:
+                print(f"{verdict:12s} {H2_NAMES[item]}: {res[item][1]}", flush=True)
+
+    def guarded(items: list[str], fn: Callable) -> None:
+        """Run a phase; what it leaves open is inconclusive (or failed, when
+        the provider ended the connection)."""
+        try:
+            fn()
+        except Inconclusive as exc:
+            for it in items:
+                put(it, "INCONCLUSIVE", str(exc))
+        except TransportError as exc:
+            for it in items:
+                put(it, "INCONCLUSIVE", f"transport: {exc}")
+        except ConnLost as exc:
+            for it in items:
+                put(it, "FAIL", str(exc))
+        except (h2.H2Error, h2.FlowStall) as exc:
+            for it in items:
+                put(it, "FAIL", f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            for it in items:
+                put(it, "FAIL", f"error: {type(exc).__name__}: {exc}")
+
+    conns: list[h2.H2Client] = []
+    state: dict = {}
+
+    # ---- H1: the handshake, for the client's exact offer.
+    def p_h1() -> None:
+        last = ""
+        for attempt in range(RETRIES + 1):
+            if attempt:
+                time.sleep(BACKOFF[min(attempt - 1, len(BACKOFF) - 1)])
+            sc = TRANSPORT["s_client"](False, [], False, 30.0, "P-256", "h2")
+            f = _handshake_fields(sc.out)
+            if f["protocol"] and f["cipher"]:
+                p256 = _is_p256(sc.out, f)
+                ok = f["protocol"] == "TLSv1.3" and f["cipher"] == SUITE and f["alpn"] == "h2" and f["verify"] == "0" and p256
+                put("H1", "PASS" if ok else "FAIL",
+                    f"offered only {SUITE}+P-256+h2 -> {f['protocol']} {f['cipher']} p256={p256} alpn={f['alpn']} verify={f['verify']}")
+                return
+            if sc.rc not in (0, None) and _HS_FAIL.search(sc.err):
+                put("H1", "FAIL", f"handshake refused: {snip(sc.err.strip().splitlines()[-1] if sc.err.strip() else '', 80)}")
+                return
+            last = f"rc={sc.rc} {snip(sc.err.strip()[-80:])}"
+        raise Inconclusive(f"H1: no handshake after {RETRIES + 1} attempts (last: {last})")
+
+    guarded(["H1"], p_h1)
+    if res.get("H1", ("", ""))[0] == "FAIL":
+        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8"):
+            put(it, "FAIL", "not checked: no HTTP/2 connection (H1)")
+        return _h2_verdict(res)
+
+    # ---- The probe, left open: is the key accepted, and what does it answer?
+    def p_probe() -> None:
+        c = h2_open(reset_probe=False, key_update=False)
+        conns.append(c)
+        c.pump(lambda: c.streams[1].ended or c.streams[1].reset is not None, 30.0)
+        r = c.streams[1]
+        H2_SEEN.append(("probe GET", r))
+        state["probe"] = r
+        if transient(r.status) or not r.ended:
+            raise Inconclusive(f"probe GET {H2_PROBE}: {r.status or 'no answer'}")
+        # Control for H2: the same connection without a KeyUpdate answers a request.
+        state["control"] = h2_request(c, PATH, h2_body(), "control (no KeyUpdate)")
+
+    guarded([], p_probe)  # what it leaves open, connection A settles
+    probe = state.get("probe")
+    ctl = state.get("control")
+    if probe is not None and probe.status in H2_UNAUTH:
+        for it in ("H2", "H3", "H5", "H6", "H8"):
+            put(it, "FAIL", f"the key is refused: probe GET {H2_PROBE} with the literal credential -> {probe.status}")
+    elif ctl is not None and 400 <= ctl.status < 500 and ctl.status not in H2_UNAUTH:
+        # Not the provider's HTTP/2: the plain request itself is refused (the
+        # model, the body). Nothing can be concluded from such a run.
+        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8"):
+            put(it, "INCONCLUSIVE", f"the check's own chat request is refused: {ctl.status} {snip(ctl.text, 70)} (name a chat model of this provider with --model)")
+        for c in conns:
+            c.tr.close()
+        return _h2_verdict(res)
+
+    # ---- Connection A: head, KeyUpdate, requests by index; later the idle time.
+    def p_main() -> None:
+        try:
+            a = h2_open()
+        except ConnLost as exc:
+            if ctl is not None and h2_stream_ok(ctl, CHEAP):
+                put("H2", "FAIL", f"{exc}; control without KeyUpdate -> {ctl.status}")
+            raise
+        conns.append(a)
+        state["a"] = a
+        try:
+            r1 = h2_request(a, PATH, h2_body(), "chat by index")
+        except ConnLost as exc:
+            if ctl is not None and h2_stream_ok(ctl, CHEAP):
+                put("H2", "FAIL", f"{exc}; control without KeyUpdate -> {ctl.status}")
+            raise
+        state["r1"] = r1
+        ku = a.tr.info()["key_updates"]
+        ok1 = h2_stream_ok(r1, CHEAP)
+        ctl_ok = ctl is not None and h2_stream_ok(ctl, CHEAP)
+        if ok1 and ku >= 1:
+            put("H2", "PASS", f"head, KeyUpdate (sent={ku}), then a request -> {r1.status}, complete stream; control without KeyUpdate -> {ctl.status if ctl else '?'}")
+        elif ku < 1:
+            put("H2", "INCONCLUSIVE", "s_client did not send the KeyUpdate")
+        elif not ctl_ok:
+            put("H2", "INCONCLUSIVE" if ctl is None or transient(ctl.status) else "FAIL",
+                f"request after the KeyUpdate -> {r1.status} {snip(r1.text, 50)}; the control without KeyUpdate fails too ({ctl.status if ctl else 'none'})")
+        else:
+            put("H2", "FAIL", f"request after the KeyUpdate -> {r1.status} {snip(r1.text, 50)}; control without KeyUpdate -> {ctl.status}")
+        # H3: the table size the provider announced, and the index worked.
+        hts = a.header_table_size
+        sizes = [s[h2.S_HEADER_TABLE_SIZE] for c in conns for s in c.peer_settings if h2.S_HEADER_TABLE_SIZE in s]
+        size_ok = all(v >= entry for v in sizes)
+        put("H3", "PASS" if size_ok and r1.status == 200 else "FAIL",
+            f"SETTINGS HEADER_TABLE_SIZE={'default 4096' if hts is None else hts} (credential entry {entry} bytes, "
+            f"{len(a.peer_settings)} SETTINGS frame(s)); request naming index 62 -> {r1.status}")
+        # H5, first half and its control.
+        r_no = h2_request(a, PATH, h2_body(), "chat without authorization", by_index=False)
+        state["noauth"] = r_no
+        # Error paths (H7, and more header blocks for H4).
+        state["e_model"] = h2_request(a, PATH, h2_body(model="no-such-model-xyz"), "chat, unknown model")
+        state["e_field"] = h2_request(a, PATH, h2_body(extra='"bogus_field_xyz":1,'), "chat, unknown field")
+        state["idle_from"] = a.tr.now()
+
+    guarded(["H2", "H3", "H5"], p_main)
+    a = state.get("a")
+
+    # The idle time runs on connection A (answering PINGs) while the others work.
+    idler = None
+    if a is not None and "idle_from" in state:
+        idler = threading.Thread(target=lambda: a.idle(H2_IDLE), daemon=True)
+        idler.start()
+
+    # ---- H6: one large body on a connection of its own.
+    def p_big() -> None:
+        b = h2_open()
+        conns.append(b)
+        body = h2_body(filler=max(0, H2_BODY_BYTES - len(h2_body())))
+        try:
+            r = h2_request(b, PATH, body, f"chat, {len(body)} byte body", timeout=300.0)
+        except h2.FlowStall as exc:
+            put("H6", "FAIL", f"{exc}; provider window {b.peer_initial_window}, {b.window_updates} WINDOW_UPDATE frames")
+            return
+        ok = h2_stream_ok(r, CHEAP)
+        put("H6", "PASS" if ok else "FAIL",
+            f"{len(body)} byte body in {-(-len(body) // h2.DATA_CHUNK)} DATA frames, provider window {b.peer_initial_window}, "
+            f"{b.window_updates} WINDOW_UPDATE frames -> {r.status}{'' if ok else ' ' + snip(r.text, 60)}"
+            + ("" if ok or r.status != 413 else f" (the provider refuses a body this large: run the sidecar with a smaller --max-body and check that size with --h2-body-bytes)"))
+
+    guarded(["H6"], p_big)
+
+    # ---- The image paths of H7 (item 8 / I4): error (free), success (paid).
+    def p_images() -> None:
+        c = h2_open()
+        conns.append(c)
+        state["i_err"] = h2_request(c, IMAGE_PATH, f'{{"prompt":"x","bogus_field_xyz":1,"model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "image, unknown field")
+        state["i_ok"] = h2_request(c, IMAGE_PATH, f'{{"prompt":"a red dot","model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "image", timeout=180.0)
+
+    if H2_IMAGES and not NO_H2_IMAGES:
+        guarded(["H7"], p_images)
+
+    # ---- H5, second half: the same connection after the idle time.
+    def p_idle() -> None:
+        if idler is None:
+            return
+        idler.join()
+        idle_s = a.tr.now() - state["idle_from"]
+        r1, r_no = state["r1"], state["noauth"]
+        if a.closed or a.goaway:
+            put("H5", "FAIL", f"indexed -> {r1.status}; the provider closed the idle connection within {idle_s:.0f} s{_goaway(a)}")
+            return
+        r2 = h2_request(a, PATH, h2_body(), f"chat by index after {idle_s:.0f} s idle")
+        state["r2"] = r2
+        ok = r1.status == 200 and r2.status == 200 and h2_stream_ok(r2, CHEAP) and r_no.status in H2_UNAUTH
+        ev = (f"indexed -> {r1.status}; no authorization field -> {r_no.status} (control); idle {idle_s:.0f} s "
+              f"({a.pings} PING answered), then indexed -> {r2.status}")
+        if ok and H2_IDLE < H2_OFFER_IDLE:
+            put("H5", "INCONCLUSIVE", ev + f"; but the offer's h2.idle_secs is {H2_OFFER_IDLE}: run with --h2-idle {H2_OFFER_IDLE} or lower h2.idle_secs to {H2_IDLE:.0f}")
+        else:
+            put("H5", "PASS" if ok else "FAIL", ev + ("" if r_no.status in H2_UNAUTH else "; the control was not refused, so the index proves nothing"))
+
+    guarded(["H5"], p_idle)
+
+    # ---- H4: every response header block, with an empty dynamic table.
+    blocks = sum(c.blocks for c in conns)
+    errs = [c.hpack_error for c in conns if c.hpack_error]
+    updates = sorted({u for c in conns for u in c.dec.size_updates})
+    ok200 = sum(1 for _, r in H2_SEEN if r.status == 200)
+    if errs:
+        put("H4", "FAIL", f"{errs[0]} ({blocks} header blocks)")
+    elif blocks >= 4 and ok200 >= 2:
+        put("H4", "PASS", f"{blocks} response header blocks on {len(conns)} connections decode with an empty dynamic table"
+            + (f"; table size updates: {updates}" if updates else "; no table size update") )
+    else:
+        put("H4", "INCONCLUSIVE", f"only {blocks} response header blocks and {ok200} answered requests seen")
+
+    # ---- H7: every response read.
+    want = ["probe GET", "chat by index", "chat without authorization", "chat, unknown model", "chat, unknown field"]
+    if H2_IMAGES and not NO_H2_IMAGES:
+        want += ["image, unknown field", "image"]
+    seen = {}
+    for label, r in H2_SEEN:
+        if r.headers or r.body:
+            seen.setdefault(label.split(" after ")[0] if label.startswith("chat by index") else label, []).append(r)
+    leaks = [f"{label} ({r.status}): {h2_reflection(r)}" for label, rs in seen.items() for r in rs if h2_reflection(r)]
+    missing = [w for w in want if w not in seen]
+    classes = {
+        "chat by index": lambda r: r.status == 200, "probe GET": lambda r: r.status == 200,
+        "chat without authorization": lambda r: 400 <= r.status < 500, "chat, unknown model": lambda r: 400 <= r.status < 500,
+        "chat, unknown field": lambda r: 400 <= r.status < 500, "image, unknown field": lambda r: 400 <= r.status < 500,
+        "image": lambda r: r.status == 200,
+    }
+    off = [f"{w} -> {seen[w][-1].status}" for w in want if w in seen and not any(classes[w](r) for r in seen[w])]
+    paths = "; ".join(f"{w} {seen[w][-1].status}" for w in want if w in seen)
+    if leaks:
+        put("H7", "FAIL", "the credential comes back in: " + "; ".join(leaks))
+    elif missing or off:
+        put("H7", "INCONCLUSIVE", f"not every response path was read (missing: {missing or '-'}; unexpected status: {off or '-'}); clean so far: {paths}")
+    elif H2_IMAGES and NO_H2_IMAGES:
+        put("H7", "INCONCLUSIVE", f"the image paths were skipped (--h2-no-images) though the offer serves images over HTTP/2; clean: {paths}")
+    else:
+        put("H7", "PASS", f"headers, trailers and bodies carry no credential: {paths}")
+
+    # ---- H8: the tail of every 200 stream.
+    tails = [(label, r) for label, r in H2_SEEN if r.status == 200 and label.startswith("chat")]
+    probs = [f"{label}: {h2.tail_problem(r)}" for label, r in tails if h2.tail_problem(r)]
+    if probs:
+        put("H8", "FAIL", probs[0])
+    elif len(tails) >= 2:
+        r = tails[0][1]
+        tail = r.body[r.body.rfind(b"\ndata: ", 0, len(r.body) - 16) + 1 :]
+        put("H8", "PASS", f"{len(tails)} streams end in the usage event and [DONE] ({len(tail)} byte tail, LF only), END_STREAM "
+            + ("on trailers" if r.trailers else "on the last DATA frame"))
+    else:
+        put("H8", "INCONCLUSIVE", f"only {len(tails)} complete 200 stream(s) seen")
+
+    for c in conns:
+        c.tr.close()
+    return _h2_verdict(res)
+
+
+QUIET = False
+NO_H2_IMAGES = "--h2-no-images" in sys.argv[1:]
+
+
+def _h2_verdict(res: dict) -> int:
+    for item in H2_NAMES:
+        v, ev = res.get(item, ("INCONCLUSIVE", "not reached"))
+        RESULTS.append((H2_NAMES[item], v, ev))
+    fails = [n.split()[0] for n, v, _ in RESULTS if v == "FAIL"]
+    inc = [n.split()[0] for n, v, _ in RESULTS if v == "INCONCLUSIVE"]
+    if not QUIET:
+        print(f"summary: {len(RESULTS) - len(fails) - len(inc)} PASS, {len(fails)} FAIL, {len(inc)} INCONCLUSIVE of {len(RESULTS)}")
+        why = lambda items: "; ".join(f"{n.split()[0]}: {ev}" for n, v, ev in RESULTS if n.split()[0] in items)  # noqa: E731
+        if fails:
+            print(f'offer "2": no, because {why(fails)}')
+            print(f'  keep "http": ["1.1"] in the offer file for {HOST}.')
+        elif inc:
+            print(f'offer "2": not yet, because the check is incomplete ({why(inc)})')
+            print('  run it again; add "2" only after a run in which H1-H8 all pass.')
+        else:
+            print(f'offer "2": yes. {HOST} does what framing "2" needs (H1-H8).')
+            print(f'  "http": ["2", "1.1"] with "h2": {{"probe_path": {json.dumps(H2_PROBE)}, "idle_secs": at most {H2_IDLE:.0f}}}; '
+                  f"the sidecar's --max-body at most {H2_BODY_BYTES}.")
+    return 1 if fails else (2 if inc else 0)
 
 
 def provider_build() -> str:
@@ -929,7 +1479,9 @@ class MockProvider:
     def __init__(self, status: int | None = None, lenient: bool = False, cipher: str = SUITE,
                  hs_refuse: bool = False, timeout: bool = False, early: bool = False,
                  no_close: bool = False, no_ku: bool = False, crlf: bool = False,
-                 pretty: bool = False, image_free: bool = False, image_fee: bool = False) -> None:
+                 pretty: bool = False, image_free: bool = False, image_fee: bool = False,
+                 h2_alpn: bool = True, open_auth: bool = False, reflect_body: bool = False, h2: dict | None = None) -> None:
+        self.h2_alpn, self.open_auth, self.reflect_body, self.h2_faults = h2_alpn, open_auth, reflect_body, h2 or {}
         self.status, self.lenient, self.cipher = status, lenient, cipher
         self.hs_refuse, self.timeout, self.early = hs_refuse, timeout, early
         self.no_close, self.no_ku = no_close, no_ku
@@ -972,17 +1524,42 @@ class MockProvider:
     def http(self, body: str) -> Resp:
         return self._answer(body)
 
+    def h2_app(self, path: str, body: str, authorized: bool) -> tuple[int, str, str]:
+        """One request on a mock HTTP/2 connection."""
+        if self.status is not None:
+            return self.status, "application/json", '{"error":"mock"}'
+        if not authorized and not self.open_auth:
+            return 401, "application/json", '{"error":"Authentication failed"}'
+        if path == H2_PROBE:
+            return 200, "application/json", '{"data":[]}'
+        if path == IMAGE_PATH:
+            try:
+                d = json.loads(body)
+            except json.JSONDecodeError:
+                return 400, "application/json", '{"error":"Invalid JSON request"}'
+            if "bogus_field_xyz" in d:
+                note = f" (request by Bearer {KEY})" if self.reflect_body else ""
+                return 400, "application/json", json.dumps({"error": "Unrecognized key(s) in object: 'bogus_field_xyz'" + note})
+            return 200, "application/json", '{"images":["AAAA"],"request":{"data":{"model":"m","variants":1}}}'
+        r = self._answer(body)
+        return r.status, ("text/event-stream" if r.status == 200 else "application/json"), r.text
+
+    def h2(self):
+        if self.timeout:
+            raise TransportError("timeout")
+        return h2.MockH2(KEY, self.h2_app, **self.h2_faults)
+
     def partial(self, body: str, hold_s: float, cut: int, path: str = "") -> tuple[bytes, Resp]:
         r = self._answer(body)
         return (b"HTTP/1.1 400" if self.early else b""), r
 
-    def s_client(self, brief: bool, steps: list, keep_open: bool, timeout_s: float, groups: str = "X25519") -> SClient:
+    def s_client(self, brief: bool, steps: list, keep_open: bool, timeout_s: float, groups: str = "P-256", alpn: str = "http/1.1") -> SClient:
         if self.timeout:
             return SClient(None, "", "connect: Operation timed out", False)
         if self.hs_refuse:
             return SClient(1, "", "error:0A000410:SSL routines::ssl/tls alert handshake failure", False)
         if brief:
-            err = f"CONNECTION ESTABLISHED\nProtocol version: TLSv1.3\nCiphersuite: {self.cipher}\nPeer Temp Key: X25519, 253 bits\n"
+            err = f"CONNECTION ESTABLISHED\nProtocol version: TLSv1.3\nCiphersuite: {self.cipher}\nPeer Temp Key: ECDH, prime256v1, 256 bits\n"
             if not self.no_ku:
                 err += "KEYUPDATE\n"
             raw = b"".join(s for s in steps if isinstance(s, bytes) and s != b"k\n")
@@ -994,8 +1571,9 @@ class MockProvider:
             if self.no_close:
                 return SClient(None, out.decode("latin1"), err, False)
             return SClient(0, out.decode("latin1"), err, True)
-        out = (f"New, TLSv1.3, Cipher is {self.cipher}\nPeer Temp Key: X25519, 253 bits\nProtocol: TLSv1.3\n"
-               "ALPN protocol: http/1.1\nVerify return code: 0 (ok)\n")
+        got = alpn if alpn != "h2" or self.h2_alpn else None
+        out = (f"New, TLSv1.3, Cipher is {self.cipher}\nPeer Temp Key: ECDH, prime256v1, 256 bits\nProtocol: TLSv1.3\n"
+               + (f"ALPN protocol: {got}\n" if got else "No ALPN negotiated\n") + "Verify return code: 0 (ok)\n")
         return SClient(0, out, "", False)
 
 
@@ -1041,8 +1619,62 @@ def self_test() -> int:
         ("image billed outside the token counts fails A13", MockProvider(image_fee=True),
          lambda v, rc: rc == 1 and v.get("A13") == "FAIL"),
     ]
+    # Framing "2" (--h2): the same rules. A healthy provider passes H1-H8; each
+    # fault fails its item; an outage or a timeout is never PASS.
+    global QUIET, H2_IMAGES, H2_IDLE, H2_BODY_BYTES, H2_PROBE
+    QUIET, H2_IMAGES, H2_BODY_BYTES, H2_PROBE = True, True, 300_000, H2_PROBE or "/v1/models"
+    H2_IDLE = float(H2_OFFER_IDLE)
+    hs = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8"]
+    h2_scenarios = [
+        ("h2: healthy provider passes H1-H8", MockProvider(),
+         lambda v, rc: rc == 0 and all(v.get(k) == "PASS" for k in hs)),
+        ("h2: ALPN h2 not selected fails H1, nothing passes", MockProvider(h2_alpn=False),
+         lambda v, rc: rc == 1 and v.get("H1") == "FAIL" and not any(x == "PASS" for x in v.values())),
+        ("h2: wrong cipher fails H1", MockProvider(cipher="TLS_CHACHA20_POLY1305_SHA256"),
+         lambda v, rc: rc == 1 and v.get("H1") == "FAIL"),
+        ("h2: connection closed on the KeyUpdate fails H2", MockProvider(h2={"close_on_ku": True}),
+         lambda v, rc: rc == 1 and v.get("H2") == "FAIL" and v.get("H5") != "PASS"),
+        ("h2: SETTINGS HEADER_TABLE_SIZE 0 fails H3", MockProvider(h2={"table_size": 0}),
+         lambda v, rc: rc == 1 and v.get("H3") == "FAIL" and v.get("H5") != "PASS"),
+        ("h2: a table too small for the credential fails H3", MockProvider(h2={"table_size": 40}),
+         lambda v, rc: rc == 1 and v.get("H3") == "FAIL"),
+        ("h2: response headers through the dynamic table fail H4", MockProvider(h2={"dynamic_responses": True}),
+         lambda v, rc: rc == 1 and v.get("H4") == "FAIL"),
+        ("h2: credential forgotten while idle fails H5", MockProvider(h2={"forget_after_idle": True}),
+         lambda v, rc: rc == 1 and v.get("H5") == "FAIL" and v.get("H2") == "PASS"),
+        ("h2: an endpoint that needs no credential fails H5 (control)", MockProvider(open_auth=True),
+         lambda v, rc: rc == 1 and v.get("H5") == "FAIL"),
+        ("h2: no WINDOW_UPDATE for a large body fails H6", MockProvider(h2={"stall": True}),
+         lambda v, rc: rc == 1 and v.get("H6") == "FAIL" and v.get("H2") == "PASS"),
+        ("h2: credential in a (Huffman-coded) response header fails H7", MockProvider(h2={"reflect_header": True}),
+         lambda v, rc: rc == 1 and v.get("H7") == "FAIL"),
+        ("h2: credential in an error body fails H7", MockProvider(reflect_body=True),
+         lambda v, rc: rc == 1 and v.get("H7") == "FAIL"),
+        ("h2: CRLF event stream fails H8", MockProvider(crlf=True),
+         lambda v, rc: rc == 1 and v.get("H8") == "FAIL"),
+        ("h2: multi-line usage event fails H8", MockProvider(pretty=True),
+         lambda v, rc: rc == 1 and v.get("H8") == "FAIL"),
+        ("h2: outage (503 everywhere) passes nothing beyond the handshake", MockProvider(status=503),
+         lambda v, rc: rc == 2 and not any(v.get(k) == "PASS" for k in hs[1:])),
+        ("h2: rate limit (429 everywhere) passes nothing beyond the handshake", MockProvider(status=429),
+         lambda v, rc: rc == 2 and not any(v.get(k) == "PASS" for k in hs[1:])),
+        ("h2: timeouts are inconclusive, gate closed", MockProvider(timeout=True),
+         lambda v, rc: rc == 2 and all(x == "INCONCLUSIVE" for x in v.values())),
+        ("h2: a silent connection is inconclusive, gate closed", MockProvider(h2={"dead": True}),
+         lambda v, rc: rc == 2 and not any(v.get(k) == "PASS" for k in hs[1:])),
+        ("h2: bad key (401 everywhere) passes nothing beyond the handshake", MockProvider(status=401),
+         lambda v, rc: rc == 1 and not any(v.get(k) == "PASS" for k in hs[1:])),
+    ]
     bad = 0
     try:
+        for label, mock, pred in h2_scenarios:
+            TRANSPORT.update(http=mock.http, partial=mock.partial, s_client=mock.s_client, h2=mock.h2)
+            rc = run_h2()
+            v = verdicts()
+            ok = pred(v, rc)
+            bad += not ok
+            summary = " ".join(f"{k}={x[0]}" for k, x in v.items())
+            print(f"{'ok  ' if ok else 'BAD '} {label}: exit={rc} [{summary}]")
         for label, mock, pred in scenarios:
             TRANSPORT.update(http=mock.http, partial=mock.partial, s_client=mock.s_client)
             rc = run_all(pause=0.0, quiet=True)
@@ -1053,7 +1685,8 @@ def self_test() -> int:
             print(f"{'ok  ' if ok else 'BAD '} {label}: exit={rc} [{summary}]")
     finally:
         TRANSPORT.update(saved)
-    print(f"self-test: {len(scenarios) - bad}/{len(scenarios)} scenarios behave as required")
+    total = len(scenarios) + len(h2_scenarios)
+    print(f"self-test: {total - bad}/{total} scenarios behave as required")
     return 1 if bad else 0
 
 
@@ -1061,13 +1694,22 @@ def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return self_test()
     if not KEY:
-        print("VENICE_API_KEY is not set", file=sys.stderr)
+        print(f"{KEY_ENV} is not set", file=sys.stderr)
         return 2
     now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"provider profile check  {now}")
     print(f"  provider: https://{HOST}{PATH}  build: {provider_build()}")
     print(f"  models: cheap={CHEAP} reasoning={REASONING} text_only={TEXT_ONLY} vision={VISION}")
+    print(f"  offer file: {os.path.relpath(_OFFER_FILE)}  key: ${KEY_ENV}")
     print(f"  openssl: {find_openssl() or 'NOT FOUND'}  retries={RETRIES}")
+    if "--h2" in sys.argv[1:]:
+        if not H2_PROBE:
+            print('the offer file has no "h2" block: add one with a probe_path (a cheap authenticated GET, '
+                  'e.g. the models list) to check framing "2"', file=sys.stderr)
+            return 2
+        print(f"  framing \"2\": probe {H2_PROBE}, idle {H2_IDLE:.0f} s (offer h2.idle_secs {H2_OFFER_IDLE}), "
+              f"body {H2_BODY_BYTES} bytes, images {'yes: one paid image of ' + IMAGE_MODEL if H2_IMAGES and not NO_H2_IMAGES else 'no'}")
+        return run_h2()
     if "--images" in sys.argv[1:]:
         print(f"  image route: {IMAGE_PATH} model={IMAGE_MODEL} (three paid images)")
         return run_all(checks=IMAGE_CHECKS)

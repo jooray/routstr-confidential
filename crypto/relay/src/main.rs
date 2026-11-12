@@ -8,7 +8,8 @@
 //! One lifecycle, two framings of the inner connection to the provider:
 //!   SETUP (no request terms) → 2PC preprocessing → joint key share (armed;
 //!   no provider connection) → [framing "1.1": REQUEST 1] → ClientHello
-//!   (exactly the joint P-256 share; the upstream is dialed now) → joint key
+//!   (canonical, with exactly the joint P-256 share; the upstream is dialed
+//!   now) → joint key
 //!   schedule → HS_VERIFIED → head record assembled under K_0, π_NK params →
 //!   π_NK (the client verifies it; N, the prover, learns no verdict) →
 //!   RELEASE_HEAD (the client's acceptance) → [head record ‖ KeyUpdate]
@@ -1153,11 +1154,16 @@ Options:
   --max-body BYTES        request body cap (default 8388608)
   --runs-dir DIR          session evidence directory (default crypto/runs)
   --runs-keep-hours N     keep run files N hours (default 24; 0 = remove at the end)
+  -h, --help              this text
+
+Framing 2 (HTTP/2) is offered only when the offer file lists it; check the
+provider first: crypto/tools/provider-profile-check.py --h2 --offer FILE. After
+5 consecutive HTTP/2 connections that failed to open through no client's doing
+the sidecar withdraws framing 2 from GET /offer for 600 s (it logs both).
 
 Test hooks (loopback only): CU_TEST_H2_FAIL_FILE=<path> fails every framing-2
 open while the file exists; CU_TEST_H2_RETRY_SECS=<n> shortens the 600 s after
 which a withdrawn framing 2 is offered again.
-  -h, --help              this text
 ";
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
