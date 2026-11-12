@@ -1,4 +1,4 @@
-// Summarizes one image response of v3-h2-routstrd-check.sh as a JSON line:
+// Summarizes one image response of v3-routstrd-check.sh as a JSON line:
 // its status and confidential headers, and whether the body holds WebP images.
 //   bun image.ts <t0 ms> <label> <header file> <body file>
 import { readFileSync } from "node:fs";
@@ -24,7 +24,7 @@ console.log(
     label,
     status: Number(/^HTTP\/\S+ (\d+)/m.exec(headers)?.[1] ?? 0),
     total_ms: total,
-    http: h("x-routstr-confidential-http") ?? "1.1",
+    http: h("x-routstr-confidential-http"),
     connection: h("x-routstr-confidential-connection"),
     sid: h("x-routstr-confidential-sid")?.slice(0, 8),
     verify: h("x-routstr-verify"),

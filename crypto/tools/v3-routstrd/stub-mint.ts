@@ -1,5 +1,5 @@
 // A stand-in Cashu mint for the scratch routstrd wallet of
-// v3-h2-routstrd-check.sh: it serves mint info and one keyset, so the wallet
+// v3-routstrd-check.sh: it serves mint info and one keyset, so the wallet
 // starts with a reachable default mint. It mints nothing (the test credential
 // is credited in the node's database).
 //   CU_SDK=<routstr-sdk checkout> bun stub-mint.ts <port>
