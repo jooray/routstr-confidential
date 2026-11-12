@@ -524,7 +524,7 @@ offer. Fields: `v: 3`; `http`, `h2` (the sidecar's; `kinds` lists `images` only 
 `images` block; `h2` only when `http` lists `"2"`); `twopc`; `connection_deposit_msat` (integer ≥ 0);
 `idle_timeout_s` (integer ≥ 10, at most `h2.idle_secs` when `"2"` is offered; node setting
 `CONFIDENTIAL_IDLE_TIMEOUT_S`, default 120; the deposit's default is max(abandon fee, session fee,
-1000 msat), 0 settable); and everything the v2 offer had
+1000 msat), 0 settable, a value above 0 at least the node's minimum request); and everything the v2 offer had
 (`upstream_host`, `head_template`, `chat`, `images`, `capabilities`, `price_list`, `session_fee_msat`,
 `abandon_fee_msat`, `max_tokens_cap`, `node_pubkey`, `sig`, …), unchanged in meaning.
 
@@ -533,6 +533,10 @@ values, the chosen framing listed; for `"2"` the `h2` block in range and `probe_
 plus `/models`; `connection_deposit_msat` at most the client's maximum (reference driver: 100 000 msat);
 the v2 checks (signature, host, chat block, head template, images block). An offer with `v < 3`:
 `node_protocol_outdated`.
+
+**N** The node's Nostr listing (kind 38421) carries the tag `["confidential","3"]` while a sidecar is
+configured (§11), and each confidential model in `GET /v1/models` has
+`confidential_upstream: {"v":3,"offer_url"[,"session_fee_msat","abandon_fee_msat","rate_surcharge_pct"][,"kind":"images"]}`.
 
 **Connection-level fields** of an offer: `v`, `twopc`, `upstream_host`, `head_template`, `chat`, `h2`,
 `connection_deposit_msat`, `idle_timeout_s`, and the `images` block without its `price_list`. A `request`
@@ -746,15 +750,42 @@ on its own. After it:
 | `"2"` | `sid`, `http:"2"`, `n`, `stream`, `s_k`, `server_records`, `sha256_recv` (the type-23 server records of the request's interval, header ‖ payload), `client_records`, `sha256_sent` (the request's HEADERS and DATA records), `cert_chain_hash`, `th_sh`, `th_sf`, `c_commit`, `time` |
 | `"1.1"` | `sid`, `http:"1.1"`, `n:1`, `server_records` (all records), `sha256_recv` (every byte received), `client_records` (body records), `sha256_sent` (every byte written), `cert_chain_hash`, `th_sh`, `th_sf`, `c_commit`, `time` |
 
-**N** re-signs it: `a_json`, `sig` (the node's), `sig_scheme`, `sidecar_sig`.
+**N** re-signs it and sends
+`{"type":"attestation","n","a":{…},"a_json","sig","sig_scheme":"schnorr-secp256k1","sidecar_sig"}`: `a` is the
+sidecar's object unchanged; `a_json` is its canonical JSON (keys sorted, no whitespace, UTF-8), the text the
+node signed; `sig` is the node's BIP-340 signature over SHA-256 of `a_json`; `sidecar_sig` is the sidecar's
+signature (the `sig` of the S frame). The node signs only an attestation whose `a.sid` is the connection's
+and whose `n` is the request in flight; any other is dropped. A receipt's `attestation_hash` is SHA-256 of
+`a_json`.
 
 **Settlement.** S with `--node-settles`:
 `{"type":"usage","sid","http","n","model":<pinned>,"usage":<the usage event | {"error_status","choices":[]} | {"flat":true,"kind":"images","count"}>[,"reported_model"]}`;
 without it a stub `{"type":"receipt","n","receipt":{"sid","http","n",…},"receipt_json","sig"}`.
-**N** consumes `usage` and sends `{"type":"receipt","receipt":{…},"receipt_json","sig","sig_scheme"}`; the
-receipt has v2's fields plus `http`, `n`, and, on the connection's first settled request,
-`deposit_released_msat`. `session_fee_msat` in a receipt is the fee this request was charged (0 after the
-connection's first settlement).
+**N** consumes `usage` (it is not relayed) and sends
+`{"type":"receipt","receipt":{…},"receipt_json","sig","sig_scheme":"schnorr-secp256k1"}`. `receipt_json` is the
+receipt's canonical JSON, the text the node signed (`sig`: BIP-340 over its SHA-256). The receipt:
+
+| Field | Present | Meaning |
+|---|---|---|
+| `v` | always | `1`, the receipt format |
+| `sid`, `http`, `n` | always | the connection, its framing, the request |
+| `model` | always | the pinned model |
+| `usage` | always | the `usage` of the S frame: the provider's usage event, `{"error_status","choices":[]}`, or `{"flat":true,"kind":"images","count"}` |
+| `cost_msats` | always | what the request was charged |
+| `reserved_msats` | always | what was reserved for it |
+| `balance_msats` | always | the credential's balance after the charge (`null` if the key is gone) |
+| `rates` | chat | the frozen rates `{"in","cached_in","cache_write","out"}`, msat per 1000 tokens |
+| `kind:"images"`, `variant`, `count`, `msat_per_image` | images | the frozen variant and price (no `rates`) |
+| `session_fee_msat` | when this request owed it | the offer's session fee; absent (0) after the connection's first settlement, and when the offer has none |
+| `abandon_fee_msat` | when the offer has one | the offer's abandon fee (never below the session fee) |
+| `rate_surcharge_pct` | when the offer has one | the offer's surcharge |
+| `deposit_released_msat` | on the connection's first settled request, when a deposit was held | the deposit this settlement released |
+| `notary_pubkey` | always | the node's key (x-only, hex) |
+| `attestation_hash` | always | SHA-256 of the request's `a_json`, hex |
+| `time` | always | Unix seconds |
+
+A `usage` with no attestation before it, or a settlement the node cannot write, gives no receipt: the node
+ends the connection with `error` (`fault: "node"`, 12.9).
 
 After a settled 2xx a framing-`"2"` connection is READY again. Otherwise the connection ends (12.9).
 
@@ -776,10 +807,20 @@ violation and failed proof. `fault` is `"upstream"` (the provider could not be r
 the framing needs) or `"node"` (the sidecar failed). `code`, when present: `upgrade_required`,
 `twopc_version_mismatch`, `upstream_unreachable`, `h2_not_selected`, `h2_withdrawn`, `h2_table_size`.
 `{"type":"upstream_closed_early","n","response_bytes"}` precedes the `error` when the provider closed before
-the request was fully written.
+the request was fully written (N relays it).
 
-**N** adds to the connection's last frame (`closed` or `error`) the signed deposit outcome when the deposit
-was not released by a settlement (12.10).
+**N** sends its own `error` frames as `{"type":"error","status","reason","detail"[,"fault":"node"]}`: a
+refused setup (12.3; the socket then closes), a protocol error in a `request` (12.4), a time limit (408),
+and its own failures, which carry `fault: "node"`: the sidecar's socket ending without a last frame (502),
+a `usage` without an attestation (502), a settlement that could not be written (500; `detail.error` is
+`{"type":"settlement_failed","outcome"}`). The sidecar's `closed` or `error` is held back until the node
+has finalized what the connection still holds, and is then sent as the connection's last frame.
+
+**N** adds to the connection's last frame (`closed` or `error`) the signed deposit outcome when a deposit
+was reserved and not released by a settlement (12.10). That includes the `error` of a setup the node
+refused after it reserved the deposit (no session slot, the sidecar unreachable: row 2); a setup refused
+earlier (row 1) reserved nothing and carries none. When neither side had a last word (the client left),
+the frame would be `{"type":"closed","reason":"ended"}`.
 
 | Limit | Value |
 |---|---|
@@ -804,6 +845,7 @@ was not released by a settlement (12.10).
 |---|---|
 | refused (`request_refused`) | never made, or released in full |
 | accepted, the connection ends before `body_released` (a failed π_WIN, the client leaves, the time limit) | released; the abandon fee is kept, except when the deposit is charged for it (below) |
+| accepted, the connection ends before `body_released` with the sidecar's `fault` (`"upstream"`, `"node"`) or with its socket lost | released in full: not the client's doing |
 | before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes) | released; the session fee is kept if still due |
 | after `body_released` with no settlement | charged in full |
 | settled 2xx | usage at the frozen rates (chat) or `msat_per_image × count` (images), plus the session fee if still due |
@@ -839,6 +881,24 @@ connection ends.
  "deposit_json":<the signed bytes>,"deposit_sig":<hex>,"sig_scheme":"schnorr-secp256k1"}
 ```
 
+| `deposit` field | Meaning |
+|---|---|
+| `sid` | the connection (`null` when the sidecar never sent `ready`: rows 2 and 3 before it) |
+| `msat` | the deposit that was reserved (`ready.deposit_msat`) |
+| `outcome` | `"released"` or `"charged"` |
+| `reason` | the row's `reason` above |
+| `cost_msats` | what the credential paid for it: `msat` when charged, `0` when released |
+| `balance_msats` | the credential's balance afterwards (`null` if the key is gone) |
+| `time` | Unix seconds |
+
+`deposit_json` is the canonical JSON of `deposit` (keys sorted, no whitespace), `deposit_sig` the node's
+BIP-340 signature over its SHA-256, as for a receipt. Before `ready` the client verifies it with the key of
+the signed offer. An offer with `connection_deposit_msat: 0` reserves nothing and reports nothing.
+
+**Order at a connection's end.** The node first decides the deposit, then finalizes a request still in
+flight, then sends the last frame; a client that is already gone changes none of it. A client that leaves
+is never row 4: that row needs the sidecar's socket to end while the client's is still open.
+
 ## 13. Conformance: what "done" means
 
 1. Gates, all against a real provider with a real key, nothing announced: sidecar + reference client
@@ -870,3 +930,8 @@ connection ends.
 | default deposit max(abandon fee, session fee, 1000 msat); a provider closing during the handshake is charged | §8.1 |
 | session fee due once per connection at the first settlement; reservation formula; deposit instead of abandon fee before the first settlement | §8.3 |
 | the paper's §2, not §3 | §1 |
+| the node's exact `receipt`, `attestation` and `deposit` fields; the node's own `error` frames and `fault: "node"`; the order at a connection's end | §12.8, §12.9, §12.10 |
+| the deposit outcome is also on the `error` of a setup refused after the deposit was reserved (row 2) | §12.9 |
+| a request in flight when the sidecar reports a `fault` (or its socket is lost) before `body_released` is released in full, no abandon fee | §12.10 |
+| N relays `upstream_closed_early`; a framing-`"2"` `request` before `head_written` is refused by the node itself | §12.9, §12.4 |
+| the Nostr listing's tag is `["confidential","3"]`; the `confidential_upstream` field of `/v1/models` | §12.1 |
