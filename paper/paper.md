@@ -1457,8 +1457,12 @@ per direction, 40 ms one way; reference client to the relay directly, no node), 
 At 2 Mbit/s up the cold time is the 2.63 MB upload (about 10.5 s): the proof channel's 1.5 MB shares the
 uplink with the 2PC, so the 2PC-only figure of section 6.4 (7.0 s) is not the time to first token.
 
-**Against a deployed node.** v3 has not been measured from a remote client to a deployed node:
-`[TO MEASURE]`. For v2, with the 22 MB download, a cold request from a home connection reached its first
+**Against a deployed node.** One run on 2026-11-12, right after the deployment, from a home
+connection to routstr.cypherpunk.today (reference client, `deepseek-v4-flash`, 30 output tokens; one
+sample, not a benchmark): framing "2", the request that opened the connection reached its first token
+after 6.0 s (5.0 s of it the connection: 2PC preprocessing 2.9 s, handshake, $\pi_{NK}$), the two later
+requests on the same connection after 1.3 s and 1.0 s, with 14-15 kB from the node on the request
+path and one 610 kB top-up between them; framing "1.1", a cold request after 4.7 s. For v2, with the 22 MB download, a cold request from a home connection reached its first
 token after 6.7 to 21 s and a pre-warmed one after 1.1 to 1.5 s (2026-10-19, `deployed-cold.jsonl`,
 `deployed-arm.jsonl` in the evidence directory).
 
@@ -1742,8 +1746,10 @@ msat on 2026-10-19 (signed v2 receipts in `docs/evidence/deployed-receipts/`). S
 exactly the inference, and only waste is priced. Each chat request reserves the model's worst-case
 prompt for its duration (on 2026-10-19, 119 to 160 sats for models with a context of about 1M tokens)
 and releases what it does not use, so a credential needs that much balance to send a request even
-though it is not spent. Under v3 that reservation exists only while a request is in flight. Receipts
-of a deployed v3 node: `[TO MEASURE]`.
+though it is not spent. Under v3 that reservation exists only while a request is in flight. On the deployed v3 node
+(2026-11-12, session fee 0, deposit 2000 msat) the same model's requests of 15 prompt and 30 output tokens
+were charged 10 msat each against a reservation of 133 410 msat, and the deposit came back with the
+connection's first receipt.
 
 **What remains.** The deposit and the limits bound the cost per connection and per address, not the
 total: many addresses can still open connections, each risking a deposit, which is a priced service
