@@ -97,7 +97,10 @@ IMAGE_MODEL="${CU_IMAGE_MODEL:-z-image-turbo}"
 PAUSE="${CU_PAUSE:-0}"
 CASE_TIMEOUT="${CU_CASE_TIMEOUT:-180}"
 KEY_ENV="${CU_KEY_ENV:-VENICE_API_KEY}"
-RETRY_SECS=8
+# How long the started sidecar keeps framing "2" withdrawn (its test hook). The
+# cases that must run inside the withdrawal (the end of fb-5, fb-offer-11,
+# fb-auto-11, fb-http2-refused) take about 10 s, more on a busy machine.
+RETRY_SECS=45
 export CU_PROVER="${CU_PROVER:-$CRYPTO/zkbench/target/release/cu-prover}"
 export CU_2PC="${CU_2PC:-$CRYPTO/zkbench/target/release/cu-2pc}"
 read -r -a DRIVER <<< "${CU_DRIVER:-node --experimental-strip-types src/driver.ts}"
@@ -260,7 +263,8 @@ if [ "$OWN_SIDECAR" = 1 ] && { [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" 
   run_case fb-auto-11 "auto:1.1:no" 0 none -- --http auto
   run_case fb-http2-refused "nohttp2" 0 none -- --http 2
   rm -f "$FAIL_FILE"
-  sleep "$((RETRY_SECS + 2))"
+  # The withdrawal ends by itself, RETRY_SECS after the fifth failure.
+  for _ in $(seq 1 "$((RETRY_SECS + 5))"); do [ "$(offer_http)" = "2,1.1" ] && break; sleep 1; done
   check fb-offer-back "2,1.1" offer_http
   run_case fb-auto-2 "auto:2:no" 0 none -- --http auto
 fi

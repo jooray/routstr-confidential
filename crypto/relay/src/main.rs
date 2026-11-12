@@ -1631,6 +1631,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
             }
             send_budget.add_permits(n);
         }
+        // The last frame is out: say goodbye in order.
+        let _ = ws_tx.send(Message::Close(None)).await;
     });
 
     let mut st = Session { twopc_tx: Some(twopc_tx), ..Session::default() };
@@ -2096,8 +2098,28 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     // frame (e.g. the explicit {type:"error"} abort) before the socket goes.
     drop(to_client);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), send_task).await;
+    // A session that ends in an error often ends while the client is still
+    // sending (its body records, when the first one was refused). Closing the
+    // socket over unread data resets the connection, and a reset can destroy
+    // the `error` frame before the client has read it: the client would then
+    // see a socket error instead of the reason. So read what the client still
+    // sends, and drop it, until it closes or a moment has passed.
+    if result.is_err() {
+        let _ = tokio::time::timeout(ERROR_LINGER, async {
+            while let Some(Ok(m)) = ws_rx.next().await {
+                if matches!(m, Message::Close(_)) {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
     result
 }
+
+/// How long a session that ended in an error keeps reading (and dropping)
+/// what the client sends, so that its `error` frame arrives.
+const ERROR_LINGER: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The reason of a session that ended in a panic.
 const INTERNAL_ERROR: &str = "internal error in the session";
