@@ -1,0 +1,33 @@
+== h2-one (expect: settled:2:chat:nofallback) ==
+   DEVIATION: request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own
+   rc=0 [1:2:chat:404:cold reserved=68411 cost=5000] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] aborted=[] | db: start=200000000 charges=[5000] balance=199995000 reserved=0
+== h11-one (expect: settled:1.1:chat) ==
+   DEVIATION: request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own; a framing-1.1 connection did not close with `done`
+   rc=0 [1:1.1:chat:404:cold reserved=68411 cost=5000] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] aborted=[] | db: start=200000000 charges=[5000] balance=199995000 reserved=0
+== h2-three (expect: settled:2:chat,chat,chat) ==
+   DEVIATION: expected requests of kinds ['chat', 'chat', 'chat'], the driver reports ['chat']; request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own
+   rc=0 [1:2:chat:404:cold reserved=68411 cost=5000] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] aborted=[] | db: start=200000000 charges=[5000] balance=199995000 reserved=0
+== h2-decoy (expect: settled:2:chat:decoy) ==
+   DEVIATION: request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own; the provider did not run the pinned model (reported [None])
+   rc=0 [1:2:chat:404:cold reserved=68411 cost=5000] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] aborted=[] reported_model=[None] | db: start=200000000 charges=[5000] balance=199995000 reserved=0
+== h11-decoy (expect: settled:1.1:chat:decoy) ==
+   DEVIATION: request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own; a framing-1.1 connection did not close with `done`; the provider did not run the pinned model (reported [None])
+   rc=0 [1:1.1:chat:404:cold reserved=68411 cost=5000] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] aborted=[] reported_model=[None] | db: start=200000000 charges=[5000] balance=199995000 reserved=0
+== h2-c-model-swap (expect: attack:2:2:abandoned:pi_win failed) ==
+   DEVIATION: CRASH or attack not refused (driver exit != 0 or no ADV line); request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own; request 2 was never reserved (the attack did not reach the node's billing); the abandoned request did not keep the abandon fee (node: []); balance 199995000 (spent 5000), expected 199990000
+   rc=5 [1:2:chat:404:cold reserved=68411 cost=5000] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] aborted=[] adv=None | db: start=200000000 charges=[5000, 5000] balance=199995000 reserved=0
+== h11-c-model-swap (expect: attack:1.1:1:abandoned:.) ==
+   PASS
+   rc=0  F=3000 A=5000 D=7000 deposit=[('charged', 'request_abandoned')] aborted=['released'] adv={"mode": "suffix", "http": "1.1", "refused": true, "reason": "the final body record must be the pinned suffix alone (134 bytes), it carries 132", "local": "side | db: start=200000000 charges=[7000] balance=199993000 reserved=0
+
+case              expected                            verdict                                                                                                                                                                                             
+h2-one            settled:2:chat:nofallback           DEVIATION: request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own                                                                                     
+h11-one           settled:1.1:chat                    DEVIATION: request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own; a framing-1.1 connection did not close with `done`                                 
+h2-three          settled:2:chat,chat,chat            DEVIATION: expected requests of kinds ['chat', 'chat', 'chat'], the driver reports ['chat']; request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own   
+h2-decoy          settled:2:chat:decoy                DEVIATION: request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own; the provider did not run the pinned model (reported [None])                        
+h11-decoy         settled:1.1:chat:decoy              DEVIATION: request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own; a framing-1.1 connection did not close with `done`; the provider did not run the pi
+h2-c-model-swap   attack:2:2:abandoned:pi_win failed  DEVIATION: CRASH or attack not refused (driver exit != 0 or no ADV line); request 1: not a 200 with a verified receipt; request 1: the receipt's usage is not the client's own; request 2 was never 
+h11-c-model-swap  attack:1.1:1:abandoned:.            PASS                                                                                                                                                                                                
+
+FAILED: 6 of 7 cases deviated (evidence in /private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/runs/node-openrouter)
+exit 1

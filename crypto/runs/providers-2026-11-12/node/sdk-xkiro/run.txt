@@ -1,0 +1,119 @@
+node http://127.0.0.1:8464 v=3 http=["2","1.1"] deposit=7000 fee=3000 idle=120s balance=200000000
+
+# seq: three sequential requests on one framing-2 connection
+  1: status=200 http=2 conn="new; request=1" ttft=2244ms settled=ok cost=3007
+  2: status=200 http=2 conn="reused; request=2" ttft=877ms settled=ok cost=7
+  3: status=200 http=2 conn="reused; request=3" ttft=661ms settled=ok cost=7
+ok   three requests settled
+ok   all on framing "2"
+ok   one connection, requests 1, 2, 3
+ok   one connection id
+ok   the first receipt returns the deposit (7000 msat), later ones do not
+ok   the session fee (3000 msat) is charged once per connection
+
+# burst: three overlapping requests
+  1: status=200 http=2 conn="reused; request=4" ttft=947ms settled=ok cost=7
+  2: status=200 http=2 conn="new; request=1" ttft=2367ms settled=ok cost=3007
+  3: status=200 http=2 conn="new; request=1" ttft=2442ms settled=ok cost=3007
+ok   three overlapping requests settled
+ok   on three connections
+ok   the pool holds 3 connections
+
+# h11: framing "1.1" forced
+  1: status=200 http=1.1 conn="new; request=1" ttft=1580ms settled=ok cost=3007
+  2: status=200 http=1.1 conn="new; request=1" ttft=1549ms settled=ok cost=3007
+ok   two requests settled
+ok   each on its own framing-"1.1" connection
+ok   two connection ids
+ok   each connection pays the session fee
+ok   each receipt returns its connection's deposit
+
+# armed: requests served by armed connections (pre-warm)
+  1.1 first: status=200 http=1.1 conn="new; request=1" ttft=1616ms settled=ok cost=3007
+ok   framing 1.1: the first request settled (cold)
+ok   framing 1.1: an armed connection is waiting
+  1.1 second: status=200 http=1.1 conn="armed; request=1" ttft=1105ms settled=ok cost=3007
+ok   framing 1.1: the second request ran on the armed connection
+  1.1: closed 1 unused armed connection(s): 7000 msat of deposits charged
+  2 first: status=200 http=2 conn="new; request=1" ttft=1937ms settled=ok cost=3007
+ok   framing 2: the first request settled (cold)
+ok   framing 2: an armed connection is waiting
+  2 second: status=200 http=2 conn="armed; request=1" ttft=1287ms settled=ok cost=3007
+ok   framing 2: the second request ran on the armed connection
+  2: closed 1 unused armed connection(s): 7000 msat of deposits charged
+
+# fallback: framing "2" fails to open, the request is served on "1.1"
+  1: status=200 http=1.1 conn="new; request=1" ttft=2320ms settled=ok cost=3008
+ok   served on framing "1.1" on the same node
+ok   framing "2" is marked bad for the node
+  2: status=200 http=1.1 conn="new; request=1" ttft=1532ms settled=ok cost=3007
+ok   the next request goes straight to "1.1" (the mark holds)
+  3: status=200 http=2 conn="new; request=1" ttft=2014ms settled=ok cost=3007
+ok   framing "2" is used again after the failure was lifted
+
+# scopes: two local clients get separate connections
+  a1: status=200 http=2 conn="new; request=1" ttft=1909ms settled=ok cost=3007 sid=08ff9203
+  b1: status=200 http=2 conn="new; request=1" ttft=1951ms settled=ok cost=3007 sid=d2f1f62b
+  a2: status=200 http=2 conn="reused; request=2" ttft=756ms settled=ok cost=7 sid=08ff9203
+  b2: status=200 http=2 conn="reused; request=2" ttft=721ms settled=ok cost=7 sid=d2f1f62b
+ok   four requests settled
+ok   the two scopes use different connections
+ok   each scope reuses its own connection
+ok   request 2 of each scope
+
+# refused: a refused request (402), then a good one on the same connection
+  1: status=402 body={"detail":{"error":{"type":"insufficient_quota","code":"insufficient_balance","message":"Insufficient balance: 60630 mSats required. 13000 available. (reserved:
+ok   the node refused the request with 402 (the balance covers the deposit, not the reservation)
+ok   the connection is kept (idle, no request accepted)
+ok   the refusal cost nothing: only the deposit is held (available 13000, reserved 7000)
+  2: status=200 http=2 conn="reused; request=1" ttft=843ms settled=ok cost=3007
+ok   the good request ran on the same connection with the same number
+ok   its receipt returns the deposit
+  poor key: before=20000 after_topup_and_request=100016993 cost=3007
+
+# upgrade: a fake v2 node, and a fake node that is newer than this client
+  v2 node: node_protocol_outdated: the node offers routstr-confidential v2, this client speaks v3; the node must be updated before it can serve confidential requests
+ok   a v2 node is node_protocol_outdated
+ok   the offer was asked for with ?v=3
+  newer node: upgrade_required: the node speaks a newer routstr-confidential protocol (v4 or later) than this client (v3); update the client
+ok   a 426 is upgrade_required, with the node's minimum version
+
+# money
+  balance 200000000 -> 199943866 (fell by 56134); receipts 42134; deposits of unused connections 14000; reserved 0
+ok   nothing is reserved at the end
+ok   the balance fell by exactly the receipts' costs plus the unused deposits (42134 + 14000)
+
+# requests (time to first token from the request's arrival; bytes between client and node)
+case      http found  n  status ttft_ms  total_ms connect_ms sent     recv      arm_sent  arm_recv  cost_msat 
+seq       2    cold   1  200    2211     2317     1068       73729    10095     2549443   17883165  3007      
+seq       2    open   2  200    875      976      -          75193    618066    -         -         7         
+seq       2    open   3  200    660      742      -          72800    9927      -         -         7         
+burst     2    open   4  200    945      1146     -          75123    618029    -         -         7         
+burst     2    cold   1  200    2366     2444     1314       73689    10100     2549428   17883165  3007      
+burst     2    cold   1  200    2441     2518     1313       73694    10088     2549322   17883165  3007      
+h11       1.1  cold   1  200    1579     1658     886        68502    91248     2549430   17883051  3007      
+h11       1.1  cold   1  200    1548     1618     872        68507    91236     2549455   17883051  3007      
+armed-1.1 1.1  cold   1  200    1613     1736     937        68502    91256     2549460   17883051  3007      
+armed-1.1 1.1  armed  1  200    1104     1188     958        68507    91257     2549459   17883050  3007      
+armed-2   2    cold   1  200    1937     2010     870        73724    10100     2549448   17883170  3007      
+armed-2   2    armed  1  200    1286     1379     979        73704    10116     2549457   17883164  3007      
+fallback  1.1  cold   1  200    2319     2432     880        68447    91501     2549460   17883051  3008      
+fallback  1.1  cold   1  200    1530     1624     896        68509    91255     2549445   17883051  3007      
+fallback  2    cold   1  200    2000     2090     891        74584    10136     2549438   17883165  3007      
+scopes    2    cold   1  200    1908     1997     851        73724    10107     2549458   17883165  3007      
+scopes    2    cold   1  200    1950     2097     859        73724    10101     2549453   17883165  3007      
+scopes    2    open   2  200    755      844      -          72765    9936      -         -         7         
+scopes    2    open   2  200    720      807      -          72795    9928      -         -         7         
+refused   2    open   1  200    842      938      -          73704    10106     -         -         3007      
+
+# summary: chat requests by framing and what they found (medians)
+http found  count ttft_ms  sent     recv      arm_sent  arm_recv  
+2    cold   7     2000     73724    10100     2549443   17883165  
+2    armed  1     1286     73704    10116     2549457   17883164  
+2    open   6     842      73704    10106     0         0         
+1.1  cold   5     1579     68502    91255     2549455   17883051  
+1.1  armed  1     1104     68507    91257     2549459   17883050  
+
+PASS
+gate exit 0
+exit 0

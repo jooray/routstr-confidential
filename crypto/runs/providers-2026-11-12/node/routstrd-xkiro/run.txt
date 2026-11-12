@@ -1,0 +1,75 @@
+== seq: 5 seq request(s) ==
+{"label":"seq-1","status":200,"first_byte_ms":2306,"ttft_ms":2306,"total_ms":2386,"http":"2","connection":"new; request=1","sid":"cd11a60f","verify":"confidential","text":"1"}
+{"label":"seq-2","status":200,"first_byte_ms":1431,"ttft_ms":1431,"total_ms":1500,"http":"2","connection":"reused; request=2","sid":"cd11a60f","verify":"confidential","text":"2"}
+{"label":"seq-3","status":200,"first_byte_ms":752,"ttft_ms":752,"total_ms":829,"http":"2","connection":"reused; request=3","sid":"cd11a60f","verify":"confidential","text":"3"}
+{"label":"seq-4","status":200,"first_byte_ms":827,"ttft_ms":827,"total_ms":906,"http":"2","connection":"reused; request=4","sid":"cd11a60f","verify":"confidential","text":"4"}
+{"label":"seq-5","status":200,"first_byte_ms":708,"ttft_ms":708,"total_ms":788,"http":"2","connection":"reused; request=5","sid":"cd11a60f","verify":"confidential","text":"5"}
+== burst: 3 burst request(s) ==
+{"label":"burst-1","status":200,"first_byte_ms":708,"ttft_ms":708,"total_ms":779,"http":"2","connection":"reused; request=6","sid":"cd11a60f","verify":"confidential","text":"1"}
+{"label":"burst-3","status":200,"first_byte_ms":2362,"ttft_ms":2362,"total_ms":2439,"http":"2","connection":"new; request=1","sid":"0a808976","verify":"confidential","text":"3"}
+{"label":"burst-2","status":200,"first_byte_ms":2757,"ttft_ms":2757,"total_ms":2831,"http":"2","connection":"new; request=1","sid":"6647d708","verify":"confidential","text":"2"}
+== clients: A and B ==
+{"label":"clients-1","status":200,"first_byte_ms":2072,"ttft_ms":2072,"total_ms":2164,"http":"2","connection":"new; request=1","sid":"d297be77","verify":"confidential","text":"1"}
+{"label":"clients-2","status":200,"first_byte_ms":681,"ttft_ms":681,"total_ms":761,"http":"2","connection":"reused; request=7","sid":"cd11a60f","verify":"confidential","text":"2"}
+{"label":"clients-3","status":200,"first_byte_ms":826,"ttft_ms":826,"total_ms":906,"http":"2","connection":"reused; request=2","sid":"d297be77","verify":"confidential","text":"3"}
+== refused: a 402 and then a good request ==
+{"label":"refused-1","status":402,"error_type":"insufficient_balance","error":"Insufficient balance: need 73 sats, have 0 sats available. ","first_byte_ms":32,"total_ms":33,"text":""}
+{"label":"refused-2","status":200,"first_byte_ms":818,"ttft_ms":818,"total_ms":901,"http":"2","connection":"reused; request=3","sid":"d297be77","verify":"confidential","text":"2"}
+== fallback: framing 2 fails to open ==
+{"label":"fallback-1","status":200,"first_byte_ms":2817,"ttft_ms":2817,"total_ms":2890,"http":"1.1","connection":"new; request=1","sid":"9b5a4c97","verify":"confidential","text":"1"}
+{"label":"fallback-2","status":200,"first_byte_ms":1509,"ttft_ms":1509,"total_ms":1607,"http":"1.1","connection":"new; request=1","sid":"953f9d99","verify":"confidential","text":"2"}
+== forced11: 2 seq request(s) ==
+{"label":"forced11-1","status":200,"first_byte_ms":1928,"ttft_ms":1928,"total_ms":2003,"http":"1.1","connection":"new; request=1","sid":"eccceea0","verify":"confidential","text":"1"}
+{"label":"forced11-2","status":200,"first_byte_ms":1665,"ttft_ms":1665,"total_ms":1753,"http":"1.1","connection":"new; request=1","sid":"06c5c15d","verify":"confidential","text":"2"}
+== armed11: 3 seq request(s) ==
+{"label":"armed11-1","status":200,"first_byte_ms":1759,"ttft_ms":1760,"total_ms":1846,"http":"1.1","connection":"new; request=1","prewarmed":"0","sid":"c1fe6d2c","verify":"confidential","text":"1"}
+{"label":"armed11-2","status":200,"first_byte_ms":1050,"ttft_ms":1050,"total_ms":1120,"http":"1.1","connection":"armed; request=1","prewarmed":"1","sid":"ae11cbf2","verify":"confidential","text":"2"}
+{"label":"armed11-3","status":200,"first_byte_ms":1277,"ttft_ms":1277,"total_ms":1362,"http":"1.1","connection":"armed; request=1","prewarmed":"1","sid":"2477aa96","verify":"confidential","text":"3"}
+== armed2: 3 seq request(s) ==
+{"label":"armed2-1","status":200,"first_byte_ms":2068,"ttft_ms":2068,"total_ms":2145,"http":"2","connection":"new; request=1","prewarmed":"0","sid":"d115b493","verify":"confidential","text":"1"}
+{"label":"armed2-2","status":200,"first_byte_ms":1339,"ttft_ms":1339,"total_ms":1424,"http":"2","connection":"armed; request=1","prewarmed":"1","sid":"b7abc791","verify":"confidential","text":"2"}
+{"label":"armed2-3","status":200,"first_byte_ms":1268,"ttft_ms":1268,"total_ms":1351,"http":"2","connection":"armed; request=1","prewarmed":"1","sid":"15171cd4","verify":"confidential","text":"3"}
+== upgrade: 2 seq request(s) ==
+{"label":"upgrade-1","status":502,"error_type":"node_protocol_outdated","error":"node_protocol_outdated: the node offers routstr-confidential v2, this client speaks v3; the node must be updated before it can serve confidential requests","first_byte_ms":32,"total_ms":33,"text":""}
+{"label":"upgrade-2","status":502,"error_type":"node_protocol_outdated","error":"node_protocol_outdated: the node offers routstr-confidential v2, this client speaks v3; the node must be updated before it can serve confidential requests","first_byte_ms":14,"total_ms":14,"text":""}
+
+run       #  http  found  ttft ms  total ms  node→client  client→node  arming: node→client  client→node
+seq       1  2     cold   2306     2386      10.2 kB      74.6 kB      17.88 MB             2.55 MB    
+seq       2  2     open   1431     1500      224.9 kB     73.7 kB      -                    -          
+seq       3  2     open   752      829       10.0 kB      73.6 kB      -                    -          
+seq       4  2     open   827      906       421.5 kB     73.7 kB      -                    -          
+seq       5  2     open   708      788       10.0 kB      73.7 kB      -                    -          
+burst     1  2     open   708      779       10.0 kB      73.7 kB      -                    -          
+burst     2  2     cold   2757     2831      10.1 kB      74.6 kB      17.88 MB             2.55 MB    
+burst     3  2     cold   2362     2439      10.2 kB      74.6 kB      17.88 MB             2.55 MB    
+clients   1  2     cold   2072     2164      10.2 kB      74.6 kB      17.88 MB             2.55 MB    
+clients   2  2     open   681      761       10.0 kB      73.7 kB      -                    -          
+clients   3  2     open   826      906       10.0 kB      73.7 kB      -                    -          
+refused   1  -     -      -        33        -            -            -                    -          
+refused   2  2     open   818      901       10.0 kB      73.7 kB      -                    -          
+fallback  1  1.1   cold   2817     2890      91.2 kB      68.5 kB      17.88 MB             2.55 MB    
+fallback  2  1.1   cold   1509     1607      91.3 kB      68.5 kB      17.88 MB             2.55 MB    
+forced11  1  1.1   cold   1928     2003      91.3 kB      68.5 kB      17.88 MB             2.55 MB    
+forced11  2  1.1   cold   1665     1753      91.3 kB      68.5 kB      17.88 MB             2.55 MB    
+armed11   1  1.1   cold   1760     1846      91.3 kB      68.5 kB      17.88 MB             2.55 MB    
+armed11   2  1.1   armed  1050     1120      91.3 kB      68.5 kB      17.88 MB             2.55 MB    
+armed11   3  1.1   armed  1277     1362      91.2 kB      68.5 kB      17.88 MB             2.55 MB    
+armed2    1  2     cold   2068     2145      10.2 kB      74.6 kB      17.88 MB             2.55 MB    
+armed2    2  2     armed  1339     1424      10.2 kB      74.6 kB      17.88 MB             2.55 MB    
+armed2    3  2     armed  1268     1351      10.2 kB      74.6 kB      17.88 MB             2.55 MB    
+(found: cold = a connection opened for the request, armed = a pre-warmed one, open = an open framing-2 connection; bytes: 2PC, proofs, relayed records and control frames between routstrd and the node; arming = the 2PC preprocessing and key share, paid before the request when armed)
+
+PASS  sequential   5 × 200 on connection cd11a60f (new; request=1 | reused; request=2 | reused; request=3 | reused; request=4 | reused; request=5); node costs 3007,7,7,7,7 msat (fee once)
+PASS  burst        3 × 200 on 3 connections (reused; request=6 | new; request=1 | new; request=1)
+PASS  clients      B: d297be77 (new; request=1, then reused; request=2); A: cd11a60f (reused; request=7)
+PASS  refused      402 (Insufficient balance: need 73 sats, have 0 sats available. ), cost 0; then 200 on the same connection as request 3 (the node's request_refused reached routstrd as its 402)
+PASS  fallback     2 × 200 on "1.1" (new; request=1 | new; request=1); "2" marked bad once; the failed open's deposit released
+PASS  forced-1.1   2 × 200, 2 connections, fee on each (3007,3007 msat)
+PASS  armed-1.1    new; request=1 | armed; request=1 | armed; request=1; ttft 1760, 1050, 1277 ms
+PASS  armed-2      new; request=1 | armed; request=1 | armed; request=1; ttft 2068, 1339, 1268 ms
+PASS  upgrade      2 × 502 node_protocol_outdated ("node_protocol_outdated: the node offers routstr-confidential v2, this client speaks v3; the node mus"); offers asked as offer /v1/confidential/offer?v=3; logged once
+PASS  money        balance 199943846 = 200000000 - 42154 (22 settlements) - 14000 (2 unused armed connection(s)); 17 deposits: 15 released, 2 charged; reserved 0
+
+OK: all cases as expected
+evidence (no secrets) in /private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/runs/rd-xkiro
+exit 0

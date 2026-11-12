@@ -1,0 +1,2 @@
+case	expected	verdict	evidence
+h2-three	settled:2:chat,chat,chat	PASS	rc=0 [1:2:chat:200:cold reserved=357732 cost=3282] [2:2:chat:200:open reserved=357732 cost=282] [3:2:chat:200:open reserved=357732 cost=282] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] aborted=[] | db: start=200000000 charges=[3282, 282, 282] balance=199996154 reserved=0

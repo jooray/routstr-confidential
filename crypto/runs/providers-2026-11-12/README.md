@@ -12,6 +12,9 @@ keys only as `***`.
 | `keepalive/` | `<provider>.none` (silent connection, up to 1200 s), `.ping` (PING every 120 s for 900 s), `.request` (a chat request every 150-200 s) |
 | `e2e/` | `crypto/tools/v3-check.sh` through our sidecar: `v3.<provider>.txt` (the run), `<provider>/` (summary, driver output per case, the sidecar's offer and log) |
 | `node-attempt/` | `v3-node-check.sh` with Numes as a `generic` provider: the node priced 11 models, the confidential `price_list` stayed empty (`offer.json`, `models-raw.json`) |
+| `node/` | after the two fixes (org/ ids, usage event rule): `v3-node-check.sh` through a scratch node per provider (`<provider>.txt` the run, `<provider>/` its `summary.tsv`, the node's signed `offer.json` with `upstream_models`, the keys' final balances); `routstrd-xkiro/` (`v3-routstrd-check.sh`) and `sdk-xkiro/` (routstr-sdk's `confidential-v3-e2e.ts`) |
+| `e2e/v3.openrouter.free-after-fix.txt` | `v3-check.sh` with OpenRouter's `liquid/lfm-2.5-2.6b:free` after the usage event fix (the decoy cases twice: the first run hit an evaluator bug with `:` in model ids) |
+| `profile/a7rule.*` | A7 and A12 again for OpenRouter and Cloudflare under the §5.4 rule; `a.opencodezen.txt`, `opencodezen.notes.txt` (OpenCode Zen) |
 | `tools/` | the scripts (below) |
 
 Scripts (`tools/`, run from that directory; Python stdlib, Node 24 for the decryption):

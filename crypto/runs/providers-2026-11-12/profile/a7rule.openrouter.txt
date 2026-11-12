@@ -1,0 +1,10 @@
+  items: A7,A12
+provider profile check  2026-11-12T20:53:31Z
+  provider: https://openrouter.ai/api/v1/chat/completions  build: ? (probe 200)
+  models: cheap=liquid/lfm-2.5-2.6b:free reasoning=liquid/lfm-2.5-2.6b:free text_only=liquid/lfm-2.5-2.6b:free vision=liquid/lfm-2.5-2.6b:free
+  offer file: ../offers/offer.openrouter.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+PASS         A7 last event carries usage + model (choices without content, §5.4), then [DONE]: -> 200 model=liquid/lfm-2.5-2.6b:free usage=13+4 (body 160 bytes) choices=[{'index': 0, 'delta': {'content': '', 'role': 'assistant'}, 'finish_reason': 'length', 'native_finish_reason': 'length'}] done=True
+PASS         A12 SSE framing: LF-only, one data: line per event: -> 200, 5 events, LF-only
+summary: 2 PASS, 0 FAIL, 0 INCONCLUSIVE of 2
+exit status 0

@@ -28,36 +28,47 @@ length, the `chat` block with the generic pins `n`, `stream`,
    file and the reference driver: framing "2", framing "1.1", three requests
    on one HTTP/2 connection, a second request after 60 s idle, a 200 kB body,
    the decoy model in the private part, the model-swap attack).
-5. Through a scratch routstr-core node (`v3-node-check.sh` with the provider
-   row's `provider_type` changed): see "The node" below; it offered no model
-   for any provider tested here.
+5. Through a scratch routstr-core node (2026-11-12, after the two fixes below):
+   `crypto/tools/v3-node-check.sh` with `CU_PROVIDER_TYPE`/`CU_HOST_MATCH` and the
+   cases `h2-one h11-one h2-three h2-decoy h11-decoy h2-c-model-swap
+   h11-c-model-swap`: chat on both framings, three requests on one HTTP/2
+   connection, the decoy model in the private part (the provider must report the
+   pinned model), the model-swap attack on both framings, every receipt verified
+   (signature, sid, framing, request, the public id as `model`, the provider's id
+   as `upstream_model`) and the money of every case exact in the node's database.
+   For xKiro also `v3-routstrd-check.sh` (routstrd, 10 cases) and the SDK gate
+   (`scripts/confidential-v3-e2e.ts`). The node runs on scratch state in a 0700
+   directory and its database (which holds the provider key) is deleted at the end.
 
 ## Table
 
 ✓ works, ✗ does not (reason), ? not tested or not available (reason).
 "E2E" = through our sidecar with the reference driver (stub receipts, no node).
+"Node" = through a scratch routstr-core node: the node's signed offer, its
+receipts and its database (step 5).
 
-| Provider | Endpoint | HTTP/1.1 (profile) | HTTP/2 (H items) | Idle close (silent) | Keepalive holds 15 min | Recommended `idle_secs` | Chat | Images | E2E chat (2 / 1.1) | Follow-up on kept connection | E2E image | Chat + image on one connection | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Venice (reference) | `api.venice.ai/api/v1` | ✓ A1-A13 | ✓ H1-H8 | 400 s, GOAWAY | ✓ PING or empty SETTINGS every 2-5 min: 16+ min | 390 (production) | ✓ | ✓ native `/api/v1/image/generate` | ✓ / ✓ (v3 gates, production) | ✓ | ✓ | ✓ | the deployed provider |
-| Numes | `api.numes.ai/api/v1` | ✓ A1, A2, A5, A6, A7, A9, A11, A12; A4: an unknown field gets 502 (passed on, refused upstream, not ignored); A10: `service_tier`, `web_search_options` 400, `prediction` accepted | ✓ H1-H8 at 590 s (the error-path probe uses a bad `service_tier`, since an unknown field is a 502) | 600 s, GOAWAY | ✗ PINGs do not reset it; a request every 200 s keeps it (idle limit, not age) | 590 | ✓ | ? no image models | ✓ / ✓ | ✓ (3 on one connection; after 60 s idle) | ? | ? | free: `moonshotai/kimi-k3.1-pro` and others priced 0. E2E 9/9: decoy neutralised, model swap refused. Node: 0 models (prefixed ids) |
-| xKiro (FreeLLMAPI key) | `api.xkiro.com/v1` | ✓ A1, A2, A5, A6, A7, A9, A11, A12; ✗ A4, A10: unknown and price fields accepted silently | ✓ H1-H6, H8 at 390 s; H7 ?: the 401 and 404 responses carry no key, but no request field gets a 4xx (even `"temperature":"hot"` is a 200) | 400 s, GOAWAY | ✓ PING every 120 s | 390 | ✓ (caveat A4/A10) | ? no image models | ✓ / ✓ | ✓ (3 on one connection; after 60 s idle) | ? | ? | the catalogue's `:free` ids are not in xKiro's `/models`; used `mistralai/ministral-3b` (catalogue: free, 500K tokens/day). E2E 9/9. Node: 0 models (prefixed ids) |
-| OpenRouter (FreeLLMAPI key) | `openrouter.ai/api/v1` | ✗ A7: the usage event carries a non-empty `choices`; A12: `: OPENROUTER PROCESSING` comment lines; A4: unknown fields accepted. ✓ A1, A2, A9, A11 | ✓ H1-H6, H8 at 390 s (H7 incomplete: unknown field accepted) | 400 s, GOAWAY | ✓ PING every 120 s | 390 | ✗ settlement: the client and sidecar refuse a usage event with non-empty `choices` | ✗ images come through chat (`modalities`); the protocol cannot serve them as it stands (below) | ✗ / ✗ "the last event before data: [DONE] is not a usage event" | ✗ | ✗ | ✗ | free tier: 50 requests/day per account |
-| NVIDIA NIM (FreeLLMAPI key) | `integrate.api.nvidia.com/v1` | ✗ A2: the **first** `model` key wins (routing), `max_tokens` the last; ✓ A1, A4 (400), A5, A6, A7, A9, A11, A12; A10 accepted | ✓ H1-H8 at 330 s | 340 s, TCP close **without** GOAWAY | ✓ PING every 120 s | 330 | ✗ the pinned model can be overridden by a `model` in the private part | ? image models are on `ai.api.nvidia.com/v1/genai/...`, another host and route | ✓ / ✓, but ✗ decoy (both framings: the request went to the decoy model and did not finish in 180 s) | ✓ (3 on one connection) | ? | ? | blocked by model binding |
-| Google AI Studio (FreeLLMAPI key) | `generativelanguage.googleapis.com/v1beta/openai` | ✗ A7: usage merged into the last content chunk; A6: `max_tokens` with `max_completion_tokens` is a 400 (one cap key only); completion tokens 0 at `finish_reason: length` (thinking not reported). ✓ A1, A2, A4 (400), A5, A9, A11, A12 | ✗ H5 (no key gives 400, not 401), H8 (usage is not its own event); ✓ H1-H4, H6 | 240 s, GOAWAY `session_timed_out` | ✗ PINGs do not reset it; a request every 150 s keeps it | 230 | ✗ | ? no free image model | not run (blocked) | ? | ? | ? | this key has a `.` (the sidecar accepts only `[A-Za-z0-9_-]`: π_NK alphabet); classic `AIza…` keys fit |
-| Cloudflare Workers AI (FreeLLMAPI key) | `api.cloudflare.com/client/v4/accounts/<account>/ai/v1` | ✗ A7: usage on every chunk, the last one with a non-empty `choices`; A4, A10 accepted. ✓ A1, A2, A5, A6, A9, A11, A12 | ✓ H1-H6, H8 at 390 s (`/ai/v1/models` is 405: probe `/client/v4/user/tokens/verify`) | 400 s, GOAWAY | ✓ PING every 120 s | 390 | ✗ | ? image models only on `/ai/run/@cf/...`; `/ai/v1/images/generations`: "No route for that URI" | not run (blocked) | ? | ? | ? | the account id sits in the path, so the signed offer publishes it |
-| UnoRouter (FreeLLMAPI key) | `api.unorouter.com/v1` | ✗ A6: 64 completion tokens at cap 20; A2: refused in both orders; A11: incomplete answer; intermittent 403 `consent_required`; `: PING` comments; model reported without `:free` | ✗ H8: after 173 s idle the last event before `[DONE]` was not the usage event (H5 fails with it); ✓ H1-H4, H6 | ? not measured (1 request/min) | ? | ? | ✗ | ? free FLUX models on `/v1/images/generations`, but the account's image budget answered 429 | not run (blocked) | ? | ? | ? | free models: 1 request/min per model |
-| OpenCode Go | `opencode.ai/zen/go/v1` | ✗ every request needs an `x-opencode-session` header (400 `MissingSessionID`); the head template allows only Host, Authorization, Content-Type, Accept-Encoding, Connection, Content-Length. With the header added: ✓ A1, A2, A6, A7, A9, A11, A12; A4, A10 accepted | ✗ H1: no `h2` in ALPN | – | – | – | ✗ | ? | not run (blocked) | ? | ? | ? | flat-rate subscription; tested with `glm-5.3-flash` |
+| Provider | Endpoint | HTTP/1.1 (profile) | HTTP/2 (H items) | Idle close (silent) | Keepalive holds 15 min | Recommended `idle_secs` | Chat | Images | E2E chat (2 / 1.1) | Follow-up on kept connection | E2E image | Chat + image on one connection | Node chat (2 / 1.1) | Node follow-up | Node receipts and money | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Venice (reference) | `api.venice.ai/api/v1` | ✓ A1-A13 | ✓ H1-H8 | 400 s, GOAWAY | ✓ PING or empty SETTINGS every 2-5 min: 16+ min | 390 (production) | ✓ | ✓ native `/api/v1/image/generate` | ✓ / ✓ (v3 gates, production) | ✓ | ✓ | ✓ | ✓ / ✓ (`v3-node-check.sh`: 63/63, with the new decoy cases; routstrd 11/11) | ✓ | ✓ exact | the deployed provider; ids carry no prefix, so its offer has no `upstream_models` and is unchanged |
+| Numes | `api.numes.ai/api/v1` | ✓ A1, A2, A5, A6, A7, A9, A11, A12; A4: an unknown field gets 502 (passed on, refused upstream, not ignored); A10: `service_tier`, `web_search_options` 400, `prediction` accepted | ✓ H1-H8 at 590 s (the error-path probe uses a bad `service_tier`, since an unknown field is a 502) | 600 s, GOAWAY | ✗ PINGs do not reset it; a request every 200 s keeps it (idle limit, not age) | 590 | ✓ | ? no image models | ✓ / ✓ | ✓ (3 on one connection; after 60 s idle) | ? | ? | ✓ / ✓ | ✓ (3 on one connection) | ✓ exact; decoy ran the pinned model, model swap refused on both framings | free: `moonshotai/kimi-k3.1-pro`, offered as `kimi-k3.1-pro` (15 models in the node's offer, all via `upstream_models`). Slow at times (time to first token up to 69 s): one `h2-three` run hit the 180 s case limit and passed with 600 s |
+| xKiro (FreeLLMAPI key) | `api.xkiro.com/v1` | ✓ A1, A2, A5, A6, A7, A9, A11, A12; ✗ A4, A10: unknown and price fields accepted silently | ✓ H1-H6, H8 at 390 s; H7 ?: the 401 and 404 responses carry no key, but no request field gets a 4xx (even `"temperature":"hot"` is a 200) | 400 s, GOAWAY | ✓ PING every 120 s | 390 | ✓ (caveat A4/A10) | ? no image models | ✓ / ✓ | ✓ (3 on one connection; after 60 s idle) | ? | ? | ✓ / ✓ | ✓ (3 on one connection; routstrd: 5 on one) | ✓ exact; decoy and model swap as Numes; routstrd gate 10/10 and SDK gate (20 requests, all cases) | node: `mistral-small-2603` → `mistralai/mistral-small-2603` (the node prices 44 of xKiro's 69 models; `ministral-3b` is not among them, so the sidecar-level model could not be used) |
+| OpenRouter (FreeLLMAPI key, account with credit) | `openrouter.ai/api/v1` | ✓ A7 under the §5.4 rule (one choice with an empty delta, `finish_reason`, `native_finish_reason`; it failed before the fix); A12 ✓ on the re-run (the `: OPENROUTER PROCESSING` comment lines come first and are no part of the usage tail); A4: unknown fields accepted. ✓ A1, A2, A9, A11 | ✓ H1-H6, H8 at 390 s (H7 incomplete: unknown field accepted) | 400 s, GOAWAY | ✓ PING every 120 s | 390 | ✓ | ✗ images come through chat (`modalities`); not supported (below) | ✓ / ✓ (sidecar, `liquid/lfm-2.5-2.6b:free`: one, three on a connection, decoy, model swap) | ✓ | ✗ | ✗ | ✓ / ✓ | ✓ (3 on one connection) | ✓ exact; decoy and model swap as Numes | node: routstr's OpenRouter catalogue drops `:free` ids, so a node offers paid models only: tested with `mistral-nemo` → `mistralai/mistral-nemo` ($0.00000024 a request). This account's data policy allows no endpoint of `liquid/lfm-2.5-2.6b` (404: settled as an error head, the abandon fee, exactly). Paid accounts: pin `plugins`, `models`, `provider` off |
+| NVIDIA NIM (FreeLLMAPI key) | `integrate.api.nvidia.com/v1` | ✗ A2: the **first** `model` key wins (routing), `max_tokens` the last; ✓ A1, A4 (400), A5, A6, A7, A9, A11, A12; A10 accepted | ✓ H1-H8 at 330 s | 340 s, TCP close **without** GOAWAY | ✓ PING every 120 s | 330 | ✗ the pinned model can be overridden by a `model` in the private part | ? image models are on `ai.api.nvidia.com/v1/genai/...`, another host and route | ✓ / ✓, but ✗ decoy (both framings: the request went to the decoy model and did not finish in 180 s) | ✓ (3 on one connection) | ? | ? | not run | ? | ? | blocked by model binding  |
+| Google AI Studio (FreeLLMAPI key) | `generativelanguage.googleapis.com/v1beta/openai` | ✗ A7: usage merged into the last content chunk; A6: `max_tokens` with `max_completion_tokens` is a 400 (one cap key only); completion tokens 0 at `finish_reason: length` (thinking not reported). ✓ A1, A2, A4 (400), A5, A9, A11, A12 | ✗ H5 (no key gives 400, not 401), H8 (usage is not its own event); ✓ H1-H4, H6 | 240 s, GOAWAY `session_timed_out` | ✗ PINGs do not reset it; a request every 150 s keeps it | 230 | ✗ | ? no free image model | not run (blocked) | ? | ? | ? | not run | ? | ? | this key has a `.` (the sidecar accepts only `[A-Za-z0-9_-]`: π_NK alphabet); classic `AIza…` keys fit  |
+| Cloudflare Workers AI (FreeLLMAPI key) | `api.cloudflare.com/client/v4/accounts/<account>/ai/v1` | ✓ A7 under the §5.4 rule (usage on every chunk; the last one has an empty `delta` and `finish_reason`; it failed before the fix); A4, A10 accepted. ✓ A1, A2, A5, A6, A9, A11, A12 | ✓ H1-H6, H8 at 390 s (`/ai/v1/models` is 405: probe `/client/v4/user/tokens/verify`) | 400 s, GOAWAY | ✓ PING every 120 s | 390 | ? the usage shape is accepted now; not run end to end | ? image models only on `/ai/run/@cf/...`; `/ai/v1/images/generations`: "No route for that URI" | not run | ? | ? | ? | not run | ? | ? | the account id sits in the path, so the signed offer publishes it; the node would need a provider type that lists Workers AI models |
+| UnoRouter (FreeLLMAPI key) | `api.unorouter.com/v1` | ✗ A6: 64 completion tokens at cap 20; A2: refused in both orders; A11: incomplete answer; intermittent 403 `consent_required`; `: PING` comments; model reported without `:free` | ✗ H8: after 173 s idle the last event before `[DONE]` was not the usage event (H5 fails with it); ✓ H1-H4, H6 | ? not measured (1 request/min) | ? | ? | ✗ | ? free FLUX models on `/v1/images/generations`, but the account's image budget answered 429 | not run (blocked) | ? | ? | ? | not run | ? | ? | free models: 1 request/min per model  |
+| OpenCode Go | `opencode.ai/zen/go/v1` | ✗ every request needs an `x-opencode-session` header (400 `MissingSessionID`); the head template allows only Host, Authorization, Content-Type, Accept-Encoding, Connection, Content-Length. With the header added: ✓ A1, A2, A6, A7, A9, A11, A12; A4, A10 accepted | ✗ H1: no `h2` in ALPN | – | – | – | ✗ | ? | not run (blocked) | ? | ? | ? | not run | ? | ? | flat-rate subscription; tested with `glm-5.3-flash`  |
+| OpenCode Zen (OpenCode Go key) | `opencode.ai/zen/v1` | ✓ A9 (TLS profile); A1-A12 ? not run: every chat request is a 429 `FreeUsageLimitError` ("Free models work in OpenCode"; `retry-after` 12 655 s), for `deepseek-v4.1-flash-free` and `glm-5.3-flash-free`, with or without `x-opencode-session`; paid models need a balance (402) | ✗ H1: no `h2` in ALPN | – | – | – | ? | ? | not run | ? | ? | ? | not run | ? | ? | 47 models, 11 free (`/zen/v1/models`). Unlike Go, Zen does not demand `x-opencode-session` (an unknown model without it is a 400 "Model is unavailable", not `MissingSessionID`). HTTP/1.1 only, once the free quota allows a profile run |
 
 ## What blocks whom
 
-- **Usage event shape (OpenRouter, Google, Cloudflare).** The sidecar
-  (`validate_r`, `h2.rs`) and the clients take the last event before
-  `[DONE]` as the usage event and require `choices: []`. These providers put
-  `usage` into a chunk that still carries a choice (an empty delta with the
-  finish reason on OpenRouter and Cloudflare, the last content on Google). A
-  relaxed rule (a choice whose delta has no content) would accept OpenRouter and
-  Cloudflare; Google's merged chunk would disclose the last output text.
+- **Usage event shape (Google only now).** The usage event is the last event
+  before `[DONE]`; since 2026-11-12 its `choices` may be `[]` or one choice with
+  no content (an allow-list of empty fields, PROTOCOL-V3.md §5.4; vectors in
+  `crypto/relay/usage-event-vectors.json`), which accepts OpenRouter's and
+  Cloudflare's shape (Cloudflare's usage on every chunk: only the last event
+  is disclosed). Google merges the usage into the last content chunk: disclosing
+  it would disclose output, so it stays refused.
 - **First-wins model routing (NVIDIA).** The suffix pins `model` as the last
   key; NVIDIA routes by the first. A client can name another model in the
   private part and be billed at the pinned model's rates. Not fixable by
@@ -68,18 +79,39 @@ length, the `chat` block with the generic pins `n`, `stream`,
   the provider knows (OpenRouter: `plugins`, `models`, `provider`;
   `service_tier`) would have to be pinned off in the `chat` block.
 - **Extra request header (OpenCode Go).** Needs a template header the sidecar
-  and clients do not allow.
+  and clients do not allow. OpenCode Zen (`opencode.ai/zen/v1`, same key) does
+  not ask for it. What carrying it would take (not built):
+  - *A fixed value per node* (e.g. a UUID in the sidecar's offer file, written
+    into `head_template` and, for framing "2", into the connection head and the
+    pinned request HEADERS block). It is then public template bytes: π_NK and
+    π_WIN are unchanged, the client checks it like every other template byte.
+    The clients' head-template policy would have to allow that one header name
+    with a strict value alphabet (`[A-Za-z0-9-]`, fixed length) so a node cannot
+    smuggle CR/LF or another header through it. Every client of the node shares
+    the value, which links nothing the shared provider key does not already
+    link. This is the safe and simple option, if OpenCode accepts a constant.
+  - *A value per connection* chosen by the node: a second slot in the template
+    that the node fills and discloses to the client before π_NK (the client
+    rebuilds the head with it and checks the alphabet and length). Safe under the
+    same alphabet rule, but it changes the template format, `c_commit` and the
+    clients' rebuild.
+  - *A value per request*: the client would write it in each request's HEADERS
+    record, and π_WIN would have to pin its format instead of its bytes. Most
+    work, and nothing gained unless the provider demands a fresh value.
 - **Key alphabet (this Google key).** π_NK proves the key over `[A-Za-z0-9_-]`.
-- **The node (all prefixed-id providers).** routstr-core offers a model
-  confidentially only when its public id equals the id the provider is sent
-  (`offered_models` in `routstr/confidential.py`). The public id drops the
-  `org/` prefix (`algorithm.py`, `get_base_model_id`) and a forwarded id equal
-  to the model id is ignored, so with provider types `custom` and `generic`
-  Numes listed 11 priced models and the confidential `price_list` was empty.
-  This affects every provider whose ids carry an `org/` prefix (Numes, xKiro,
-  OpenRouter, NVIDIA). The node-level end-to-end runs (receipts and money in
-  the node's database) therefore could not run for any provider here; the
-  sidecar-level runs above cover the protocol.
+- **The node (fixed 2026-11-12).** routstr-core offered a model confidentially
+  only when its public id equalled the id the provider is sent; the public id
+  drops the `org/` prefix, so Numes, xKiro, OpenRouter and NVIDIA got no model
+  into the offer. The node now offers such a model under its public id and pins
+  the provider's own id in the suffix; the signed offer lists the pairs in
+  `upstream_models` (PROTOCOL-V3.md §12.1), the receipt names both (`model`,
+  `upstream_model`). Venice's ids have no prefix: its offer is unchanged.
+- **OpenRouter's `:free` models through a node.** routstr-core's OpenRouter
+  catalogue drops `:free` ids (`routstr/upstream/base.py`), so a node offers
+  paid OpenRouter models only. The sidecar-level runs use a `:free` model.
+- **xKiro's catalogue at the node.** The node prices 44 of xKiro's 69 models
+  (`mistralai/ministral-3b` is not among them); the node runs used
+  `mistralai/mistral-small-2603`.
 
 ## Images through OpenRouter chat
 
@@ -91,7 +123,9 @@ of them `completion_tokens_details.image_tokens`, billed by OpenRouter at the
 `image_output` rate ($0.00003/token), twenty times the `completion` rate.
 The protocol cannot serve this as it stands:
 
-1. the usage event has a non-empty `choices` (as for chat);
+1. (no longer a blocker) the usage event's choice is an empty delta with the
+   finish reason, which §5.4 accepts since 2026-11-12; the image itself comes in
+   an earlier delta;
 2. the node prices `completion_tokens` at the model's completion rate, so it
    would charge about 1/20 of the cost; it would need `image_tokens` priced at
    `image_output` (or settle on the reported `cost`, which π_C3S proves came

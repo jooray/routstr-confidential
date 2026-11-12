@@ -1,0 +1,8 @@
+== h2-three (expect: settled:2:chat,chat,chat) ==
+   PASS
+   rc=0 [1:2:chat:200:cold reserved=357732 cost=3282] [2:2:chat:200:open reserved=357732 cost=282] [3:2:chat:200:open reserved=357732 cost=282] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] aborted=[] | db: start=200000000 charges=[3282, 282, 282] balance=199996154 reserved=0
+
+case      expected                  verdict  evidence
+h2-three  settled:2:chat,chat,chat  PASS     rc=0 [1:2:chat:200:cold reserved=357732 cost=3282] [2:2:chat:200:open reserved=357732 cost=282] [3:2:chat:200:open reserved=357732 cost=282] F=3000 A=5000 D=7000 deposit=[('released', 'request_settled')] a
+
+OK: all 1 cases as expected; sidecar and node stopped (evidence in /private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/runs/node-numes)

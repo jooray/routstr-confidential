@@ -1,0 +1,45 @@
+h2-selfcheck: 162 checks passed
+h2-conn-test: 7 checks passed
+== h2-one (expect: settled:2:1) ==
+   PASS
+   rc=0 [2/1:200 cold rel=60ms ttft=689ms rec=2]
+== h11-one (expect: settled:1.1:1) ==
+   PASS
+   rc=0 [1.1/1:200 cold rel=720ms ttft=1144ms rec=2]
+== h2-three (expect: settled:2:3) ==
+   PASS
+   rc=0 [2/1:200 cold rel=60ms ttft=1123ms rec=2] [2/2:200 open rel=217ms ttft=626ms rec=2] [2/3:200 open rel=214ms ttft=1058ms rec=2]
+== h2-decoy (expect: decoy:2:liquid/lfm-2.5-2.6b:free) ==
+   DEVIATION: the provider did not run the pinned model
+   rc=0 [2/1:200 cold rel=61ms ttft=322ms rec=2] reported_model=liquid/lfm-2.5-2.6b:free
+== h11-decoy (expect: decoy:1.1:liquid/lfm-2.5-2.6b:free) ==
+   DEVIATION: the provider did not run the pinned model
+   rc=0 [1.1/1:200 cold rel=774ms ttft=1013ms rec=2] reported_model=liquid/lfm-2.5-2.6b:free
+== h2-c-model-swap (expect: refused:2:1:pi_win failed) ==
+   PASS
+   rc=0 adv={"mode": "suffix", "http": "2", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [CheckResult { label: \\\"anchor\\\", ok: true, got: \\\"c4be900ca7b5604d853bb8679658ea7baf00c1dc3afbe7a77e9cf2dc0bb10646\\\", first_diff: None }, CheckResult { label: \\\"windows\\\", ok: fa
+
+case             expected                            verdict                                               evidence
+h2-one           settled:2:1                         PASS                                                  rc=0 [2/1:200 cold rel=60ms ttft=689ms rec=2]
+h11-one          settled:1.1:1                       PASS                                                  rc=0 [1.1/1:200 cold rel=720ms ttft=1144ms rec=2]
+h2-three         settled:2:3                         PASS                                                  rc=0 [2/1:200 cold rel=60ms ttft=1123ms rec=2] [2/2:200 open rel=217ms ttft=626ms rec=2] [2/3:200 open rel=214ms ttft=1058m
+h2-decoy         decoy:2:liquid/lfm-2.5-2.6b:free    DEVIATION: the provider did not run the pinned model  rc=0 [2/1:200 cold rel=61ms ttft=322ms rec=2] reported_model=liquid/lfm-2.5-2.6b:free
+h11-decoy        decoy:1.1:liquid/lfm-2.5-2.6b:free  DEVIATION: the provider did not run the pinned model  rc=0 [1.1/1:200 cold rel=774ms ttft=1013ms rec=2] reported_model=liquid/lfm-2.5-2.6b:free
+h2-c-model-swap  refused:2:1:pi_win failed           PASS                                                  rc=0 adv={"mode": "suffix", "http": "2", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [Chec
+
+FAILED: 2 of 6 cases deviated (evidence in /Users/juraj/projects/routstr-confidential/crypto/runs/v3-check)
+exit 1
+h2-selfcheck: 162 checks passed
+h2-conn-test: 7 checks passed
+== h2-decoy (expect: decoy:2:liquid/lfm-2.5-2.6b:free) ==
+   PASS
+   rc=0 [2/1:200 cold rel=61ms ttft=591ms rec=2] reported_model=liquid/lfm-2.5-2.6b:free
+== h11-decoy (expect: decoy:1.1:liquid/lfm-2.5-2.6b:free) ==
+   PASS
+   rc=0 [1.1/1:200 cold rel=863ms ttft=1102ms rec=2] reported_model=liquid/lfm-2.5-2.6b:free
+
+case       expected                            verdict  evidence
+h2-decoy   decoy:2:liquid/lfm-2.5-2.6b:free    PASS     rc=0 [2/1:200 cold rel=61ms ttft=591ms rec=2] reported_model=liquid/lfm-2.5-2.6b:free
+h11-decoy  decoy:1.1:liquid/lfm-2.5-2.6b:free  PASS     rc=0 [1.1/1:200 cold rel=863ms ttft=1102ms rec=2] reported_model=liquid/lfm-2.5-2.6b:free
+
+OK: all 2 cases as expected (evidence in /Users/juraj/projects/routstr-confidential/crypto/runs/v3-check)
