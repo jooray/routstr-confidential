@@ -126,7 +126,12 @@ or `"1.1"` (one request). An application never sees the framing.
    the credential by index only, DATA carries the body, the canonical suffix
    ends the last one. **The sidecar writes no client record before a π_WIN
    that covers it has verified** (frame headers, the last byte, the whole
-   HEADERS record, the suffix), and none beyond the client's `release`.
+   HEADERS record, the suffix), none of a request before all of its records
+   are proven (a long body takes several disjoint batches), and none beyond
+   the client's `release`. Control records: SETTINGS ACK, PING ACK,
+   RST_STREAM only (no WINDOW_UPDATE). A record outside an accepted `request`
+   is refused before it is queued (§5.3.1: a cancelled request cannot lend
+   its credential reference).
    Framing "1.1": body records are relayed, the suffix alone in the final
    record is held until a one-window π_WIN verifies. Then `body_released`.
 9. *Response and end of a request.* The client decrypts and verifies the
@@ -138,7 +143,10 @@ or `"1.1"` (one request). An application never sees the framing.
    it, settles, and returns a signed receipt bound to sid, n and the
    attestation. The proofs compare inside the circuit (the node learns one
    bit), and the client checks every proof parameter against its own records
-   (`params.ts`, `checkPiWinParams`).
+   (`params.ts`, `checkPiWinParams`). The usage-tail grammar skips late
+   frames of the probe stream 1; an error head is disclosed from byte 0 of
+   its record, after only stream-0, own-stream WINDOW_UPDATE and probe-stream
+   frames (`errorHeadPrefixProblem` in both clients).
 10. *Money.* Usage at the frozen rates (or the flat image price); the session
     fee once per connection, at its first settlement; 429/503 and 401/402/403
     cost the session fee if still due, any other 4xx the abandon fee. The
@@ -283,7 +291,10 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 - `crypto/tools/v3-node-check.sh` + `v3_node_eval.py` (**the node gate, owned
   by the node work in routstr-core `confidential-v3`**): starts a sidecar and
   a node on scratch state and checks every case's money outcome (deposit,
-  reservation, fees) in the node's database.
+  reservation, fees) in the node's database. Includes the cancel-and-reuse
+  attacks (`h2-k-rst-reuse`, `-rst-reuse-same`, `-rst-before-final`,
+  `-rst-after-release`, `-ctl-headers`, `h11-k-extra-record`,
+  `h11-k-pipelined`; driver `--adv rst-*|ctl-headers|extra-record`).
 - `crypto/tools/v3-h2-routstrd-check.sh`: sidecar, node, stub mint and a
   scratch routstrd; curl through the local API (sequential, burst, forced
   "1.1"). Needs the SDK and routstrd checkouts built.
@@ -323,7 +334,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 | Part | State |
 |---|---|
 | `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-1` with the version tag |
-| `crypto/relay` (sidecar) | done; 97 unit tests; `v3-check.sh` clean in one run (49 cases, 2026-11-12). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause |
+| `crypto/relay` (sidecar) | done; 103 unit tests; `v3-check.sh` clean in one run (49 cases, 2026-11-12). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause |
 | `crypto/client` (reference driver) | done for both framings; run live against the sidecar by `v3-check.sh` and against a node by the node gate |
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
 | measurements | loopback and shaped links (2/50, 2/10 Mbit/s, 40 ms one way) with `bench.sh` + `shape-proxy.py`: `crypto/PROGRESS-CONFIDENTIAL.md` |
@@ -400,6 +411,17 @@ Both still speak protocol v2 (branch `twopc-v2` crates); the v3 port is open.
   must end in `offer "2": yes` for the offer file you deploy, with the idle
   time you put in `h2.idle_secs`. Never rely on a Venice-specific behaviour:
   everything provider-specific lives in the offer file.
+- **Node limits added by the v3 review (2026-11-12).** `CONFIDENTIAL_MAX_ACTIVE_PER_IP`
+  (16 connections per address in all; a full node or address closes its
+  longest-idle *used* connection, `closed` reason `evicted`, before it
+  refuses a setup); 8 refused requests in a row end a connection; a request
+  may name an offer only while it is served or 10 min after (old prices end);
+  a security-relevant offer change retires live connections for further
+  requests; `closed upstream_closed` carries `after_client_frames` when the
+  client had control frames written on a connection without a request (then
+  not row 5). Clients: optional body padding (`confidential.padBucket`,
+  `--pad-bucket`, off by default); routstrd `x-routstr-reuse-scope` narrows the
+  reuse scope.
 - **Ports.** `v3-check.sh` defaults to 7462 and the node gate to 7461/8431;
   pick others (`CU_V3_PORT`) when several agents work at once, and stop every
   process you start.
