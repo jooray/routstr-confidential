@@ -150,7 +150,8 @@ export class H11 {
         throw new Error('receipt usage does not match our own plaintext')
       }
       if (receipt.model !== b.model) throw new Error('receipt names another model than the request pinned')
-      if (ownUsage.model !== b.model) console.log(`[client ${s.label}] note: the provider reported model ${ctx.shown(ownUsage.model)} for the pinned ${b.model}`)
+      const pinned = b.pinned ?? b.model
+      if (ownUsage.model !== pinned) console.log(`[client ${s.label}] note: the provider reported model ${ctx.shown(ownUsage.model)} for the pinned ${pinned}`)
       text = Buffer.from(resp).toString('utf8')
     } else if (status >= 400) {
       // No usage event: disclose only the head (status line and headers); the body stays private.

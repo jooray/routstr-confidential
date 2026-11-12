@@ -2,7 +2,7 @@
 // (`src/offer.ts`): the receipt's upper bound and the image count key.
 //   node --experimental-strip-types test/offer-check.ts
 import assert from 'node:assert/strict'
-import { MAX_BODY_LEN, checkImagesBlock, imageCountKeyForRoute, maxUsageCharge, padBody, paddedBodyLength } from '../src/offer.ts'
+import { MAX_BODY_LEN, checkImagesBlock, imageCountKeyForRoute, maxUsageCharge, padBody, paddedBodyLength, pinnedModel, renderChatSuffix, upstreamModelsProblem } from '../src/offer.ts'
 
 // The bound is the node's own formula: a usage with cached reads is bounded
 // at the cached price, never at the uncached one.
@@ -54,5 +54,22 @@ assert.throws(() => paddedBodyLength(10, 3), /bucket/)
   assert.equal(body.length, 64)
   assert.deepEqual(JSON.parse(new TextDecoder().decode(body)), { messages: [], model: 'm' })
   assert.ok(new TextDecoder().decode(body).endsWith(' ,"model":"m"}'))
+}
+
+// upstream_models: the suffix pins the provider's own id for a public id.
+{
+  const offer = { price_list: { 'kimi-k3.1-pro': rates, same: rates }, upstream_models: { 'kimi-k3.1-pro': 'moonshotai/kimi-k3.1-pro' } }
+  assert.equal(upstreamModelsProblem(offer), null)
+  assert.equal(upstreamModelsProblem({ price_list: {} }), null)
+  assert.equal(pinnedModel(offer, 'kimi-k3.1-pro'), 'moonshotai/kimi-k3.1-pro')
+  assert.equal(pinnedModel(offer, 'same'), 'same')
+  assert.equal(pinnedModel({}, 'x'), 'x')
+  const chat = { cap_keys: ['max_tokens'], fixed_pins: [['stream', true]] }
+  assert.equal(renderChatSuffix(chat, pinnedModel(offer, 'kimi-k3.1-pro'), 9), ',"model":"moonshotai/kimi-k3.1-pro","max_tokens":9,"stream":true}')
+  for (const bad of [[], 'x', { other: 'a/b' }, { same: 'same' }, { same: 'a"b' }, { same: 'a\\b' }, { same: '' }, { same: 'a b' }, { same: 7 }]) {
+    assert.notEqual(upstreamModelsProblem({ price_list: offer.price_list, upstream_models: bad }), null, JSON.stringify(bad))
+  }
+  assert.equal(upstreamModelsProblem({ price_list: { a: rates }, upstream_models: { a: '@cf/meta/llama-3.2-1b-instruct' } }), null)
+  assert.equal(upstreamModelsProblem({ price_list: { a: rates }, upstream_models: { a: 'liquid/lfm-2.5-2.6b:free' } }), null)
 }
 console.log('offer-check: ok')

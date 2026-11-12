@@ -77,7 +77,7 @@ import { RequestRefused, advOutcome, type Ctx, type Framing, type ImageTerms, ty
 import { H11 } from './driver-h11.ts'
 import { H2Conn, runHttp2 } from './driver-h2.ts'
 import { MAX_DATA_IN_RECORD, chatPath, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
-import { chatBlockProblem, checkImagesBlock, maxUsageCharge, padBody, renderChatSuffix, renderImagesSuffix } from './offer.ts'
+import { chatBlockProblem, checkImagesBlock, maxUsageCharge, padBody, pinnedModel, renderChatSuffix, renderImagesSuffix, upstreamModelsProblem } from './offer.ts'
 import { checkHeadTemplate, checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
 import { errText, shown, termSafe } from './term.ts'
@@ -284,6 +284,8 @@ function checkOffer(offer: any): void {
   }
   const problem = chatBlockProblem(offer)
   if (problem) offerRefused(`the offer's chat block is refused: ${termSafe(problem)}`)
+  const upstream = upstreamModelsProblem(offer)
+  if (upstream) offerRefused(`offer_malformed: ${termSafe(upstream)}`)
   try {
     // The head template is held to its syntax before any setup (π_NK checks it again in framing "1.1").
     checkHeadTemplate(offer.head_template ?? '', offer.upstream_host ?? '', 'chat')
@@ -428,16 +430,17 @@ function buildBody(g: number): ReqBody {
     return { kind: 'images', model, maxTokens: 0, body: padBody(enc.encode(p), enc.encode(sfx), PAD_BUCKET), suffix: enc.encode(sfx), canonicalSuffix, image: terms }
   }
   const model = MODELS[g - 1] ?? MODEL
-  const canonicalSuffix = renderChatSuffix(OFFER.chat, model, MAX_TOKENS)
+  // The request names the public id; the suffix pins the provider's (upstream_models).
+  const canonicalSuffix = renderChatSuffix(OFFER.chat, pinnedModel(OFFER, model), MAX_TOKENS)
   const sfx = wrong
-    ? renderChatSuffix(OFFER.chat, ADV_SUFFIX_MODEL ?? (ADV_BODY_MAX_TOKENS === undefined ? otherModel(model) : model), ADV_BODY_MAX_TOKENS ?? MAX_TOKENS)
+    ? renderChatSuffix(OFFER.chat, ADV_SUFFIX_MODEL ?? (ADV_BODY_MAX_TOKENS === undefined ? otherModel(pinnedModel(OFFER, model)) : pinnedModel(OFFER, model)), ADV_BODY_MAX_TOKENS ?? MAX_TOKENS)
     : canonicalSuffix
   let content = REQUESTS > 1 ? `${PROMPT} (request ${g})` : PROMPT
   if (BODY_BYTES > content.length) content += ` Ignore this filler: ${'lorem ipsum '.repeat(Math.ceil((BODY_BYTES - content.length) / 12))}`
   let p = `{"messages":[{"role":"user","content":${JSON.stringify(userContent(content))}}]`
   if (DECOY) p += `,"model":${JSON.stringify(DECOY)}`
   p += extra
-  return { kind: 'chat', model, maxTokens: MAX_TOKENS, body: padBody(enc.encode(p), enc.encode(sfx), PAD_BUCKET), suffix: enc.encode(sfx), canonicalSuffix }
+  return { kind: 'chat', model, pinned: pinnedModel(OFFER, model), maxTokens: MAX_TOKENS, body: padBody(enc.encode(p), enc.encode(sfx), PAD_BUCKET), suffix: enc.encode(sfx), canonicalSuffix }
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +939,11 @@ function countKeyUpdates(content: Uint8Array): number {
 function checkReceipt(label: string): NonNullable<Ctx['checkReceipt']> {
   return (receipt, q) => {
     const feeDue = q.first ? SESSION_FEE : 0
+    // A chat receipt names the public id (`model`) and, where it differs, the
+    // provider's id the suffix pinned (`upstream_model`).
+    if (!q.image && q.model !== undefined && (receipt.upstream_model ?? receipt.model) !== pinnedModel(OFFER, q.model)) {
+      throw new Error(`receipt ${q.n} names the pinned model ${shown(receipt.upstream_model ?? receipt.model)}, not ${pinnedModel(OFFER, q.model)}`)
+    }
     if ((receipt.session_fee_msat ?? 0) > feeDue || (receipt.abandon_fee_msat ?? 0) > ABANDON_FEE) {
       throw new Error(`receipt ${q.n} names larger fees than the signed offer allows for this request`)
     }

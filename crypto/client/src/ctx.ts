@@ -22,6 +22,8 @@ export interface ImageTerms {
 export interface ReqBody {
   kind: 'chat' | 'images'
   model: string
+  /** The id the suffix pins (the offer's `upstream_models`; the public id when absent). */
+  pinned?: string
   maxTokens: number
   body: Uint8Array
   /** The suffix the body ends in (an attack: not the canonical one). */

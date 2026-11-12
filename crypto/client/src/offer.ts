@@ -20,6 +20,31 @@ export function renderChatSuffix(chat: any, model: string, maxTokens: number): s
   return `,${parts.join(',')}}`
 }
 
+/**
+ * The id the chat suffix pins for `model` (a public id of `price_list`): the
+ * offer's `upstream_models` entry where the provider's own id differs (an
+ * `org/` prefix), else the id itself (PROTOCOL-V3.md §12.1).
+ */
+export function pinnedModel(offer: any, model: string): string {
+  const m = offer?.upstream_models
+  return m && Object.hasOwn(m, model) ? m[model] : model
+}
+
+/** Why the offer's `upstream_models` is refused, or null (absent is fine). */
+export function upstreamModelsProblem(offer: any): string | null {
+  const m = offer?.upstream_models
+  if (m === undefined) return null
+  if (m === null || typeof m !== 'object' || Array.isArray(m)) return 'upstream_models is not an object'
+  for (const [pub, id] of Object.entries(m)) {
+    if (!Object.hasOwn(offer.price_list ?? {}, pub)) return `upstream_models names ${JSON.stringify(pub)}, which price_list does not`
+    // Rendered into the suffix as a JSON string: printable ASCII, no quote or backslash.
+    if (typeof id !== 'string' || !/^[\x21-\x7e]{1,256}$/.test(id) || /["\\]/.test(id) || id === pub) {
+      return `upstream_models[${JSON.stringify(pub)}] is not a provider model id`
+    }
+  }
+  return null
+}
+
 const CAP_KEYS = ['max_tokens', 'max_completion_tokens', 'max_output_tokens']
 const PIN_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
 const pinValueOk = (v: unknown): boolean =>
