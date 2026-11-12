@@ -29,6 +29,9 @@
 //   --abandon                  arm a connection and close it unused
 //   --refuse-first             before request 1, send a request the peer must refuse (request_refused),
 //                              then the good one on the same connection with the same n
+//   --retry-refused-ms N       (node) a request refused with 402 is sent again after N ms, same n
+//   --offer-at K               (node) request K names the offer as refetched just before it; on
+//                              `offer_changed` it is sent again naming the connection's own offer
 //   --pause-ms N  --linger-ms N  --h2-chunk N  --max-deposit MSAT [100000]  --no-zkchan
 //   --auth CREDENTIAL  --node-pubkey HEX|npub  --trusted-host H  --runs-dir DIR  --no-accept-fee
 //   --legacy-v2-socket [--legacy-no-v]   open a protocol-v2 socket and print the peer's answer (LEGACY_JSON)
@@ -133,6 +136,16 @@ const MAX_DEPOSIT = Number(arg('--max-deposit', '100000'))
 const ARM = argv.includes('--arm')
 const ABANDON = argv.includes('--abandon')
 const REFUSE_FIRST = argv.includes('--refuse-first')
+// Node mode, test hooks for a refused request on a connection that stays (§12.4):
+// --retry-refused-ms N: a request refused with 402 is sent again after N ms (a
+// test tops the balance up meanwhile; `REFUSED_WAIT` is printed first).
+// --offer-at K: request K names the offer as fetched just before it; when the
+// node answers `offer_changed`, the request is sent again naming the offer the
+// connection was opened on.
+const RETRY_REFUSED_MS = Number(arg('--retry-refused-ms', '0'))
+const OFFER_AT = Number(arg('--offer-at', '0'))
+/** Every `request_refused` the hooks above saw. */
+const REFUSALS: any[] = []
 // Behave like a client that does not echo the offer's fees.
 const NO_ACCEPT_FEE = argv.includes('--no-accept-fee')
 // Proofs run over the connection's pre-warmed proof channel; `--no-zkchan`
@@ -594,7 +607,8 @@ class Session {
     let d: any
     try {
       d = JSON.parse(json)
-      signed = verifySig(json, m.deposit_sig, this.ready?.pubkey, m.sig_scheme) && (d.sid === this.sid || d.sid === null)
+      // Before `ready` (a setup the node could not serve) the key is the signed offer's.
+      signed = verifySig(json, m.deposit_sig, this.ready?.pubkey ?? OFFER_PUBKEY, m.sig_scheme) && (d.sid === this.sid || d.sid === null)
     } catch {
       d = {}
     }
@@ -982,6 +996,30 @@ function makeCtx(label: string): Ctx {
     chunk: H2_CHUNK,
     buildBody,
     refuseFirst: REFUSE_FIRST,
+    beforeRequest: NODE_MODE && OFFER_AT > 0 ? async (n) => {
+      if (n !== OFFER_AT) return
+      const raw: any = await (await fetch(`${NODE!.replace(/\/$/, '')}/v1/confidential/offer?v=${PROTO}`)).json()
+      const payload: string = raw.sig_payload ?? JSON.stringify(raw)
+      if (!verifySig(payload, raw.sig, OFFER_PUBKEY ?? JSON.parse(payload).notary_pubkey, 'schnorr-secp256k1')) throw new Error('the refetched offer is not signed by the node')
+      console.log(`[client ${label}] request ${n} names the offer as refetched now (${raw.sig === OFFER_SIG ? 'the same offer' : 'another offer'})`)
+      requestExtras.offer_sig = raw.sig
+    } : undefined,
+    onRefused: NODE_MODE && (OFFER_AT > 0 || RETRY_REFUSED_MS > 0) ? async (n, m, attempt) => {
+      const type = m?.detail?.error?.type
+      REFUSALS.push({ n, status: m.status, type, reason: typeof m.reason === 'string' ? m.reason.slice(0, 200) : undefined })
+      if (attempt > 1) return false
+      if (OFFER_AT === n && type === 'offer_changed' && requestExtras.offer_sig !== OFFER_SIG) {
+        console.log(`OFFER_CHANGED n=${n} status=${shown(m.status)}: refused; sending it again naming the offer the connection was opened on`)
+        requestExtras.offer_sig = OFFER_SIG
+        return true
+      }
+      if (RETRY_REFUSED_MS > 0 && m.status === 402) {
+        console.log(`REFUSED_WAIT n=${n} status=402 type=${shown(type)}: sending it again in ${RETRY_REFUSED_MS} ms`)
+        await sleep(RETRY_REFUSED_MS)
+        return true
+      }
+      return false
+    } : undefined,
     adv: ADV_MODE ? { mode: ADV_MODE, at: ADV_AT, path: ADV_PATH } : undefined,
     acceptAny: ADV_ACCEPT_ANY,
     verifySig,
@@ -1219,6 +1257,7 @@ async function main() {
     requests: results,
     adv,
     fallback,
+    refusals: REFUSALS.length ? REFUSALS : undefined,
     deposit: last?.deposit,
     closed: lastClosed,
     phases: last?.phases,

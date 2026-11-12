@@ -52,6 +52,10 @@ export interface Ctx {
   buildBody: (g: number) => ReqBody
   /** Send a request the peer must refuse before request 1, then the good one with the same `n`. */
   refuseFirst: boolean
+  /** Test hook: runs before `request` n is sent (e.g. to name a newer offer in it). */
+  beforeRequest?: (n: number) => Promise<void>
+  /** Test hook: `request` n was refused; true = send it again with the same `n` (the connection is still usable). */
+  onRefused?: (n: number, m: any, attempt: number) => Promise<boolean>
   /** Adversarial mode and the request it applies to. */
   adv?: { mode: string; at: number; path?: string }
   /** A dishonest client: `accept` an image response whatever its status. */
@@ -120,9 +124,15 @@ export async function openRequest(
     refused = { status: m.status, reason: typeof m.reason === 'string' ? m.reason.slice(0, 200) : JSON.stringify(m.reason ?? null).slice(0, 200) }
     console.log(`[client ${s.label}] request ${n} refused as expected: status=${m.status} reason=${ctx.shown(m.reason, 200)}; sending the good request with the same n`)
   }
-  send(requestMessage(ctx, n, b, bodyLen))
-  const m = await wait(['request_ok', 'request_refused'], 30000)
-  if (m.type === 'request_refused') throw new RequestRefused(m)
+  await ctx.beforeRequest?.(n)
+  let m: any
+  for (let attempt = 1; ; attempt++) {
+    send(requestMessage(ctx, n, b, bodyLen))
+    m = await wait(['request_ok', 'request_refused'], 30000)
+    if (m.type !== 'request_refused') break
+    if (m.n !== n) throw new Error('request_refused names another request')
+    if (!(ctx.onRefused && (await ctx.onRefused(n, m, attempt)))) throw new RequestRefused(m)
+  }
   if (m.n !== n || (m.sid !== undefined && m.sid !== s.sid)) throw new Error('request_ok names another connection or request')
   if (typeof m.suffix !== 'string') throw new Error('request_ok names no pinned suffix')
   return { ok: m, refused }
