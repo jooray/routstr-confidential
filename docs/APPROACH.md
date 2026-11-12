@@ -159,18 +159,22 @@ Requests on one connection are linkable for the provider: same TCP connection, s
 - Framing `"2"`: a kept connection replaces pre-warming for a client that is already talking to a node. The client may keep one armed connection per pool key while there is traffic and every open connection is busy, so a burst does not wait for a 2PC.
 - The pre-warmed proof channel holds correlations for π_NK and the first π_WIN and π_C3S; on a kept connection it is topped up while idle.
 
-Measured (loopback, Apple M2 Max, provider Venice). The HTTP/2 figures were taken with the v2-size key schedule, before `split-public-1` was merged:
+Measured on the final build (Apple M2 Max, provider Venice, `mistral-small-3-2-24b-instruct`, medians,
+2026-11-12; time to first token from the connection's start, the claim of an armed connection, or the
+request on an open one):
 
-| | Data | Time |
-|---|---|---|
-| Opening an HTTP/2 connection | 23.7 MB down, 2.6 MB up (with `split-public-1` about 6 MB less down: `[TO MEASURE]`) | 1.0–1.1 s |
-| A later chat request on it | 0.5–1.0 MB down, about 85 kB up | |
-| An image request on an open connection | image + about 9 kB down, 36 kB up | |
-| Time to first token through routstrd, opening request | | 2.0 s |
-| Time to first token through routstrd, reused connection | | 0.46–1.26 s |
-| v2, pre-warmed session, for comparison | about 28 MB per request | 0.9–1.5 s |
+| | Data (up / down) | Loopback, through the node | 2/50 Mbit/s, 40 ms | 2/10 Mbit/s, 40 ms |
+|---|---|---|---|---|
+| Cold request, framing "2" | 2.63 MB / 17.97 MB | 1.38 s | 12.1 s | 18.9 s |
+| Cold request, framing "1.1" | about the same | 1.52 s | 11.8 s | 19.2 s |
+| Armed connection, "2" / "1.1" | 83 kB / 87 kB; 77 kB / 93 kB | 0.81 / 0.76 s | 1.43 / 1.38 s | 1.59 / 1.85 s |
+| Request on an open HTTP/2 connection | 86 kB / 1.01 MB (the proof channel's top-up) | 0.57 s | 0.92 s | 1.23 s |
+| v2, pre-warmed session, for comparison | about 28 MB per request | 0.9–1.5 s | | |
 
-Not measured yet: an HTTP/2 open with `split-public-1` end to end `[TO MEASURE]`; a framing `"1.1"` request under v3 `[TO MEASURE]`; any of this against a remote node over a home link `[TO MEASURE]`.
+(The shaped rows are the reference client against the sidecar through `shape-proxy.py`; the loopback row
+goes through the node.) An image request on an open connection moved 36 kB up and the image plus about 9 kB
+down (prototype). At 2 Mbit/s up the cold time is the 2.63 MB upload. Not measured yet: any of this from a
+remote client against a deployed node `[TO MEASURE]`.
 
 ## Upgrade
 

@@ -697,7 +697,8 @@ each is there:
 | TLS padding to shift where the frame ends, so a later "payload" starts a new frame | π_WIN proves the record's last plaintext byte is the content type `0x17`: no padding, the frame fills the record |
 | A HEADERS record with another path, method or an extra header | the whole HEADERS record is proven equal to the public block built from the offer |
 | A second stream while one is open; a request without `request_ok` | the node expects exactly the frames of request `n` on stream `2n + 1`; anything else ends the connection |
-| Control frames as a vehicle (CONTINUATION, PRIORITY, a SETTINGS with values, a PUSH_PROMISE) | only SETTINGS ACK, PING ACK, WINDOW_UPDATE on stream 0 and RST_STREAM on the current stream are allowed, each announced and proven |
+| Control frames as a vehicle (CONTINUATION, PRIORITY, a SETTINGS with values, a PUSH_PROMISE, a "PING ACK" whose payload is a HEADERS frame) | only SETTINGS ACK, PING ACK and RST_STREAM on the current stream are allowed, each announced, of fixed length and proven against its own frame header; no WINDOW_UPDATE (its increment was client-chosen, and zero or an overflow makes the provider close) |
+| Force-stopping a request (RST_STREAM) and reusing the stored credential for an unbilled one | a record outside an accepted `request` is refused before it is queued; RST_STREAM is accepted only after all of the request's records and queues behind them; after `body_released` an unsettled request is charged its full reservation; a new TCP/TLS connection has no index 62 (`PROTOCOL-V3.md` §5.3.1) |
 | A header block that adds or resizes table entries | refused; the block is public and fixed |
 | A KeyUpdate from the client, to move to keys the proof does not anchor | not allowed; π_WIN is anchored on `SHA256(c_ap_1)` with a public update count |
 | Sending the body beyond what was proven | the node holds every record until a π_WIN that covers it verifies, and never writes beyond the client's `release` mark |
@@ -707,9 +708,10 @@ each is there:
 A failed proof or an unexpected frame ends the connection. Before
 `body_released` the request's reservation is released; if the connection
 had no settled request yet, the deposit is charged (Q4.4), otherwise the
-abandon fee is kept. The gates `v3-h2-check.sh` and
-`v3-h2-node-check.sh` run attack cases of this kind and check the node's
-balance afterwards. The frame rules are new and **not externally
+abandon fee is kept. The gates `v3-check.sh` and
+`v3-node-check.sh` run attack cases of this kind (including the
+cancel-and-reuse cases `h2-k-*`, `h11-k-*`) and check the node's balance
+afterwards. The frame rules are new and **not externally
 reviewed**; that is the main open item of v3.
 
 In framing `"1.1"` the question does not arise: `Connection: close` and
@@ -733,6 +735,29 @@ carries one request.
   (`confidentialUpstream.http2.reuse: "per-client" | "shared" | "none"`).
   `none`, or framing `"1.1"`, gives v2's behaviour at v2's cost (a
   two-party handshake per request).
+- **The default links more than a conversation.** `per-client` means
+  every request made with one local API key shares the pool key, across
+  conversations and applications that use the key. A request header
+  `x-routstr-reuse-scope` narrows it (one conversation, one task); it never
+  widens it. A passive observer of the node's link to the provider sees one
+  long-lived flow per connection; a global observer can correlate the
+  client–node and node–provider legs by timing and size.
+- This linkage is accepted for v3 by design, on the condition that the user
+  can turn it off: `http2.reuse: "none"` or `http: "1.1"` in routstrd,
+  `confidential.http` / `http2.reuse` in the SDK.
+- **Receipts and attestations** of one connection repeat its id,
+  transcript hashes, `c_commit`, certificate-chain hash, request numbers and
+  intervals. Anyone shown several of them can link them and see their order
+  and gaps: treat them as private documents.
+- **Compromise scope.** One pair of traffic secrets protects every request
+  of the connection (up to `h2.max_requests`; the client may not KeyUpdate).
+  A compromise of the client's process exposes the connection's current and
+  later traffic; secrets retained after the close would expose all of it.
+  The clients drop them at the close.
+- **Body size.** The body length is exact unless the client pads to a bucket
+  (SDK `confidential.padBucket`, off by default: the node learns the prompt's
+  token count at settlement anyway, so padding helps only against
+  observers of the connections).
 - The node learns the same grouping (which requests share a connection).
   It already knows the credential that pays for each request, so for the
   node this is new only when one-off Cashu tokens pay for requests on one
@@ -754,6 +779,8 @@ abandon fee for an unused session. v3:
 | The provider unreachable, `h2` not selected, framing `"2"` withdrawn | released (`provider_unreachable`) | the node |
 | The sidecar failed | released (`sidecar_failure`) | the node |
 | The provider closed the open, idle connection before any request | released (`provider_closed`) | the node |
+| The same, but the client had control frames written on it first (`after_client_frames`) | **charged** (`unused`): the close may be the client's doing | the client |
+| The connection was evicted (a newer setup needed its slot; only idle connections that already settled a request) | already released by that settlement | nobody |
 | The node refused a request with a 5xx, or a billing write failed | released (`node_failure`) | the node |
 | A request was written in full and never settled | released; that request's reservation is charged | the client, through the reservation |
 | The provider answered a request and closed before its body was complete | released; the request keeps the session fee | the client, through the session fee |
@@ -775,10 +802,16 @@ reservation after a failed request. That is the business-honesty trust
 the model leaves with the node, now bounded per connection by a small
 amount instead of a full-context reservation. On the node's side, a
 deposit below the real cost of a handshake leaves a cheap way to make it
-work; the per-address limit on unused connections and the session slots
-bound that. Whether the default covers an operator's cost is the
-operator's calculation: `[TO MEASURE]` (node CPU seconds per handshake
-under load).
+work; the per-address limits (12 unused, 16 in all), the session slots
+(a full node or address evicts its longest-idle used connection before it
+refuses) and the cap of 8 refused requests in a row bound that. One
+handshake costs the node about 0.40 s of CPU, 457 MiB peak memory and
+16.4 MB of upload in a single run (`crypto/twopc/BENCH.md`); a request on
+an open connection about 1 MB of proof-channel download and two proof
+verifications, which usage at the frozen rates covers except for the
+smallest requests (`PROTOCOL-V3.md` §8.5). Whether the default deposit
+covers an operator's handshake cost under load is the operator's
+calculation: `[TO MEASURE]` (node CPU per handshake with 32 concurrent).
 
 ### 4.5 What if my provider's HTTP/2 misbehaves?
 
@@ -799,7 +832,13 @@ after idle), and ends streams the way the usage proof parses them.
   serves the request on `"1.1"` on the same node, when the offer lists it.
   A failure that shows only in the response (a 401 because the index no
   longer authenticates) comes after the body was released: that request
-  is settled as an error and is not retried.
+  is settled as an error (the session fee at most) and is not retried, and
+  neither the sidecar nor the client counts it as a failed open. A
+  provider that systematically forgets the entry therefore costs each
+  connection one handshake and one session fee until the operator acts;
+  the guard is H5 of the profile check, run with the idle time the node
+  offers. (Telling such a 401 from a revoked node key would need a
+  comparison on framing "1.1" or an independent probe; not built.)
 - **A provider that shrinks the table.** The node ends the connection when
   the provider's SETTINGS put `HEADER_TABLE_SIZE` below the credential
   entry's size. (`h2_table_size`). The client reports the SETTINGS it saw; a client that lies

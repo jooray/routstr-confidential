@@ -43,8 +43,9 @@ Epochs, as far as the key schedule is concerned (the framings are in `PROTOCOL-V
 ## Idea: split HMAC at the compression function
 
 `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))`, with f the SHA-256 compression function,
-`IS_k = f(IV, k ⊕ ipad)` and `OS_k = f(IV, k ⊕ opad)`. Every HMAC message of the TLS 1.3 key schedule is public
-(a label and a transcript hash). So the garbled circuit computes only
+`IS_k = f(IV, k ⊕ ipad)` and `OS_k = f(IV, k ⊕ opad)`. Every inner digest that moves out of the circuit has a
+public message (a fixed label and a transcript hash). The one HMAC of the key schedule with a secret message,
+the extraction `HS = HMAC(salt, Z)`, stays whole inside the circuit (stage A1). So the garbled circuit computes only
 
 - the key-pad states `IS_k`, `OS_k` of the four secret HMAC keys (HS, the derived secret, MS, c_ap_0),
 - the outer compressions `f(OS_k, pad(d))`,
@@ -161,10 +162,16 @@ authenticated by a hash of its labels.
   | 6–7 | C aborts in B1 or B2 |
   | 8 | success |
 
-  **Eight outcomes, at most log2 8 = 3 bits per connection** about fresh, single-use values (the ECDHE
-  share, the session's secrets), provided ECtF gives a malicious N nothing beyond its outcome (below). N may
+  **Eight outcomes, so at most log2 8 = 3 bits per connection of additional selective-failure leakage**
+  about fresh, single-use values (the ECDHE share, the session's secrets), **in the idealized abort model
+  stated here**: every deviation of N ends in one of these eight outcomes, which N observes and nothing else.
+  It is conditional on ECtF giving a malicious N nothing beyond its outcome (below) and on the garbling
+  argument (`TWOPC-NODE-GARBLING.md`, no published proof). It is not a bound on everything N learns: N also
+  receives the outputs it is meant to have (the public `IS_k`, c_hs, s_hs, the anchors, `K_0 ‖ IV_0`). N may
   choose its predicate for a later stage after seeing the earlier stages' public outputs; that does not add
-  outcomes.
+  outcomes. What a full proof must still enumerate: every externally distinguishable result of a malicious
+  ECtF, OT and preprocessing, of every stage, of N's own report checks, of the TLS verification, timeouts and
+  error messages; the tests compare selected cheats at two stages (`abort_looks_the_same_whatever_failed`).
 - *Why an abort is one outcome per stage.* C's three checks of a stage (input pointer bits, consistency
   check, label-check pairs) end in the same single byte, sent after C evaluated the whole stage
   (`abort_looks_the_same_whatever_failed`). There is no "N rejected C's labels" outcome: the label-check
@@ -203,9 +210,28 @@ needs:
 
 These are the two assumptions of Bellare's proof that HMAC is a PRF (CRYPTO 2006). Nothing is assumed that
 the usual justification of HMAC does not assume, but here they are used directly, and a party sees a value no
-HMAC user ever sees. The inner hash also loses its secret key: with `IS_k` known, distinct messages must have
-distinct inner digests by plain collision resistance of f. The messages are fixed labels with the handshake's
-transcript hashes, which each party computes itself, so nobody chooses them.
+HMAC user ever sees. Bellare's theorem is about one key and an adversary who sees neither pad state; it is
+not by itself a proof of this system, where both parties see `IS_k` of a chain of derived keys
+(HS → derived → MS → c_ap_0), several outer outputs per key go to different parties, the anchors are
+public and selective failure is possible. That proof is a chain of hybrids over both adversary directions
+and all values revealed together, and it is **not written yet**.
+
+3. **Distinct inner digests under one key (cross-label collision resistance).** The inner hash loses its
+   secret key. Under one `OS_k` the circuit computes several outputs, and two equal inner digests give
+   equal outputs: in B1 `c_ap_0 = f(OS_MS, pad(d_c0))` and `s_ap_0 = f(OS_MS, pad(d_s0))`, so
+   `d_c0 = d_s0` would hand C (who holds `s_ap_0`) `c_ap_0`, hence `K_0, IV_0`, and break P1; in A2
+   `c_hs`, `s_hs` and the derived secret come from `OS_HS`, and a collision of the `"derived"` digest with
+   `d_c` or `d_s` would make the derived secret one a party holds, and with it MS. So the requirement is
+   that the inner digests of one key are pairwise distinct: for the exact HKDF message blocks of the
+   schedule, `f(IS_k, m) ≠ f(IS_k, m')` for `m ≠ m'`. **Justification:** the messages of one key differ in
+   their fixed HKDF labels (`c hs traffic`, `s hs traffic`, `derived`; `c ap traffic`, `s ap traffic`),
+   which sit at fixed positions of the message block, so `m ≠ m'` always; `IS_k` is known to both
+   parties, so an equal pair is a collision of the SHA-256 compression function under a known (random,
+   not chosen) chaining value. Neither party chooses the labels; the transcript hashes it can influence
+   (C picks its random, N relays) sit in both messages alike. Finding such a collision costs about 2^128
+   compressions by the generic attack, and it is a property SHA-256 is relied on for everywhere. In v2 the
+   inner key was secret and the PRF assumption covered this; in `split-public-1` it is an explicit
+   assumption of its own. (A reviewed domain-separation construction could remove it; none is used.)
 
 | who relies on 1 and 2 | to protect | against |
 |---|---|---|
@@ -258,7 +284,10 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 | the check run per stage, crossing wires as row wires | argued (`TWOPC-NODE-GARBLING.md` §2, §4); new in v3 |
 | label-check pairs | argued (`TWOPC-NODE-GARBLING.md` §7); new in v3 |
 | public `IS_k`, digest labels from N pinned by pointer checks | argued above; assumptions 1 and 2; new in v3 |
-| leakage bound (≤ 3 bits per connection) | counting argument above, conditional on ECtF |
+| leakage bound (≤ 3 bits per connection) | counting argument in the idealized abort model above, conditional on ECtF and the garbling argument; not a full enumeration of a malicious N's observations |
+| distinct inner digests under one key (assumption 3) | assumed: compression-function collision resistance under a known chaining value |
+| the chained multi-output composition with public `IS_k` | **not written** (hybrids over both directions and every value revealed together) |
+| soundness of online digest labels N chooses after the salt is known | argued heuristically (`TWOPC-NODE-GARBLING.md` §5), not for arbitrary online labels |
 | Ferret/KOS against a malicious receiver (N for the MAC COTs under Δ_B; C for the 256 COTs under Δ_A), KOS consistency-check leakage of a few Δ bits with negligible probability | assumed from mpz2 |
 | ECtF | semi-honest only; no argument for a malicious N |
 | external review | **none yet** |

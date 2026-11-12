@@ -20,11 +20,19 @@ RFC 2119.
 | Pre-warm object | a session bound to model, `max_tokens`, body length | a connection bound to the credential only |
 | Version | `v = 2` | `v = 3`; a v3 node refuses v2, a v3 client refuses a v2-only node, both with an explicit upgrade error (§11) |
 
-What does **not** change: the trust model and every guarantee of the paper's §2; the roles (C is the TLS
+What does **not** change: the trust model and the confidentiality guarantees of the paper's §2 (P1, the key
+stays from C; P2, prompt and response stay from N; the binding of model, caps and usage), under the extra
+assumptions and with the residual risks of §4 and §10; the roles (C is the TLS
 client of U, N relays records and writes the credential in epoch 0); ECtF and the joint P-256 share; the
 node-only authenticated garbling construction; π_NK and π_C3S; the chat suffix and its offer block
 (`docs/CHAT-SUFFIX.md`); image rules (`docs/CONFIDENTIAL-IMAGES.md`); the attestation and receipt signatures;
 the usage-based settlement and the abort rules, read per request.
+
+What **does** change for privacy beyond confidentiality (§9.1, §10): requests on one framing-`"2"`
+connection are linkable for the provider, its CDN and network observers; the connection's traffic secrets
+protect up to `h2.max_requests` requests; receipts and attestations of one connection are linkable to each
+other; and the body length is exact unless the client pads (§9.3). A user who does not want connection
+linkage turns reuse or HTTP/2 off (§9.1).
 
 The three legs, to avoid confusion about "HTTP versions":
 
@@ -168,9 +176,18 @@ hostname, CertificateVerify and both Finished messages), with:
   ended the connection; a 402 then cost a handshake.) In framing `"1.1"` a refused request 1 may be
   followed by another `request` 1 while the connection is still ARMED.
 - The node remembers a signed offer for 10 minutes after it last served it **or while a connection opened
-  on it is alive**, so a client that keeps a connection does not have to refetch the offer for it. Rates
-  are frozen per request from the offer the request names; C SHOULD refetch the offer every 10 minutes and
-  name the newest.
+  on it is alive** (for the comparison of connection-level fields). Rates are frozen per request from the
+  offer the request names, and a request may name an offer only **while the node serves it or for 10
+  minutes after it stopped** (else `offer_expired`): old prices never outlive a price change by more than
+  that, whatever the connection's lifetime. C refetches the offer on `offer_expired` (and SHOULD every 10
+  minutes) and names the newest; a price-only change keeps the connection.
+- **Security-relevant changes retire live connections.** Once the node serves an offer whose `v`, `twopc`,
+  `upstream_host`, `head_template`, `chat`, `h2` or `images` block (prices aside) differs from the offer a
+  connection was opened on, that connection takes no further request (`offer_changed`, whichever offer the
+  request names): a changed suffix or head is in force for every request from then on. A changed
+  `connection_deposit_msat` or `idle_timeout_s` applies to new connections only; framing `"2"` withdrawn
+  (§2.1) does not end live connections. Rotating the provider credential means restarting the sidecar,
+  which ends every live connection (`fault`, deposits released, §12.10 row 4).
 
 ### 3.4 Records, proof, release
 
@@ -202,8 +219,9 @@ Base: v2's node-only authenticated garbling (`docs/TWOPC-NODE-GARBLING.md`): N g
 tables, its wire masks are authenticated to C by IT-MACs over Ferret COTs, C checks every AND gate with a
 salted 64-bit row before it uses an output. ECtF is unchanged.
 
-Change: `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))`, `f` the SHA-256 compression function. Every HMAC message of
-the TLS 1.3 key schedule is public. The circuit computes only the pad states `IS_k`, `OS_k` of the four
+Change: `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))`, `f` the SHA-256 compression function. Every inner digest
+moved out of the circuit has a public message (a fixed HKDF label and a transcript hash); the extraction
+`HS = HMAC(salt, Z)`, whose message is the secret `Z`, stays whole in the circuit. The circuit computes only the pad states `IS_k`, `OS_k` of the four
 secret keys (HS, the derived secret, MS, `c_ap_0`), the outer compressions, and the three anchors.
 `IS_k` is a **public output** of its stage; both parties compute the inner digest `f(IS_k, m)` in the
 clear; N sends the labels of the digest's input wires; C pins them by pointer checks against opened,
@@ -222,8 +240,9 @@ One circuit, five stages, a consistency check per stage before C uses any output
 - 22 garbled compressions, 479 022 AND gates. Measured: 16.38 MB node → client, 1.13 MB client → node.
 - **Label-check pairs** (new, mandatory): for every output wire C reports to N, N sends in preprocessing
   the salted hashes of both candidate labels. C checks its label against the pair before it reveals
-  anything and aborts on a mismatch. This replaces v2's bare report hash, which N could test offline
-  against candidates.
+  anything and aborts on a mismatch. The pairs **augment** the report hash (C still sends one hash over
+  its reported labels, so it cannot report a bit it has no label for); what they remove is v2's weakness
+  that the bare hash was a value N could test offline against candidate labels.
 - The variant with zero-knowledge proofs of the inner digests (`Proven` in the prototype) is not part of
   v3 and is removed from the code.
 - **Version tag.** The first message of the 2PC channel in each direction is the ASCII tag
@@ -231,12 +250,25 @@ One circuit, five stages, a consistency check per stage before C uses any output
 
 Security statement (informal; no proof, external review outstanding, as for v2):
 
-- A cheating node learns at most log2 8 = 3 bits per **connection** about fresh, single-use values (eight
-  observable outcomes: the ECtF abort, an abort in each of the five stages, the server Finished failing,
-  success), under v2's conditions.
+- A cheating node learns at most log2 8 = 3 bits per **connection** of additional selective-failure leakage
+  about fresh, single-use values, **in the idealized abort model** (eight observable outcomes: the ECtF
+  abort, an abort in each of the five stages, the server Finished failing, success), conditional on ECtF
+  leaking nothing beyond its outcome and on the garbling argument. It is not a bound on all N learns: N
+  also gets its intended outputs (`IS_k`, `c_hs`, `s_hs`, the anchors, `K_0 ‖ IV_0`). A full proof must
+  enumerate every distinguishable result of malicious ECtF, OT, preprocessing, report checks, TLS
+  verification, timeouts and errors; that is not done.
 - Assumptions beyond "HMAC-SHA256 is a PRF", for both parties, because both see `IS_k`: (1) `f` keyed by
-  its chaining input is a PRF; (2) `OS_k` is pseudorandom given `IS_k`. These are the two assumptions of
-  Bellare's HMAC proof (CRYPTO 2006), used directly.
+  its chaining input is a PRF; (2) `OS_k` is pseudorandom given `IS_k` (the two assumptions of Bellare's
+  HMAC proof, CRYPTO 2006, used directly; his theorem is for one key with hidden pad states and does not
+  by itself prove this chain of keys with public `IS_k`, several outputs per key for different parties
+  and public anchors: that hybrid argument is not written); (3) **the inner digests of one key are
+  pairwise distinct**: under one `OS_k` the circuit derives several outputs, and two equal inner digests
+  give equal outputs (`d_c0 = d_s0` would make `c_ap_0 = s_ap_0`, which C holds, and give C `K_0`; a
+  `"derived"` digest equal to `d_c` or `d_s` would expose the derived secret and MS). The messages of
+  one key always differ in their fixed HKDF labels at fixed positions of the block, and `IS_k` is known,
+  so an equal pair is a collision of the SHA-256 compression function under a known, unchosen chaining
+  value (generic cost about 2^128). In v2 the secret inner key covered this; here it is an explicit
+  assumption (`docs/TWOPC-DESIGN.md`, "Assumptions").
 - Round trips compared with v2, measured: +2 in the handshake call (A1, A2, A3: each stage's public output
   must reach N before it sends the next stage's digest labels) and +0.5 in the application call (N sends
   the B1 labels without waiting for C; B2 needs C's B1 report).
@@ -254,8 +286,10 @@ Security statement (informal; no proof, external review outstanding, as for v2):
 3. For each record π_WIN shows bytes `[0, 9)` equal the frame header N expects and the **last byte is
    `0x17`**; the header's length field equals `inner_len − 10`. (Without the last-byte check, TLS padding
    would move the frame boundary and hide a HEADERS frame in a later payload.)
-4. Allowed frames: SETTINGS ACK, PING ACK, WINDOW_UPDATE on stream 0, RST_STREAM on the current request's
-   stream (announced by a `ctl` message each); for a request, one HEADERS (END_HEADERS; the whole record
+4. Allowed frames: SETTINGS ACK, PING ACK, RST_STREAM on the current request's stream (announced by a `ctl`
+   message each); no WINDOW_UPDATE (the head opens both windows to 2^31-1 and a connection is retired after
+   1 GiB, so C never needs one, and its increment would be a client-chosen payload: zero is a connection
+   error and any positive increment on stream 0 overflows the window); for a request, one HEADERS (END_HEADERS; the whole record
    is proven equal to the public block) and DATA frames (END_STREAM only on the last, whose tail is proven
    equal to the suffix). Anything else ends the connection.
 5. C never sends a KeyUpdate, a header block that adds a dynamic-table entry, a table size update, or a
@@ -288,7 +322,54 @@ Stream `2k + 1`. HEADERS block, public, built by both from the offer:
 `be` = indexed field 62, the credential. `<path>` is the chat or images path of the offer. DATA frames
 carry the JSON body; the canonical suffix is the tail of the last one. π_WIN: the HEADERS record in full;
 each DATA record's header and last byte; the last record's tail = suffix ‖ `0x17`. C follows U's flow
-control with `release {n, upto}`; N never writes an unproven record nor beyond `upto`.
+control with `release {n, upto}`; N never writes an unproven record nor beyond `upto`. **No record of a
+request is written before every record of the request is proven**: a body whose windows exceed one π_WIN
+(§7.1 limits) is proven in several consecutive, disjoint batches while N buffers, and the first record goes
+out only after the last batch verified. So every body the record rules allow (up to `3 + body_len/4096`
+records, 8 MiB) is provable, and no inference starts on a request that fails a proof.
+
+### 5.3.1 A cancelled request cannot lend its credential reference
+
+The attack: C force-stops request k (RST_STREAM) and starts another HTTP request that names the stored
+`authorization` entry (index 62), so that the provider serves it and N bills nothing for it. It fails, in
+every form, because a request record exists for N only inside an accepted `request` and every record is
+classified and proven before it is written:
+
+- *A HEADERS record with no `request`* (for the next stream, or the same stream again, after RST_STREAM):
+  once request k is complete, any record that is not a declared control frame is refused before it is
+  queued (`a client record outside a request`): it never reaches the provider, and the connection ends.
+  Request k, released and not settled, is charged its full reservation.
+- *RST_STREAM before the last DATA record is released*: RST_STREAM is accepted only once all of the
+  request's records are in, and it is queued behind them, so it cannot overtake the unreleased last record;
+  the provider holds a body without END_STREAM (no inference, provider item 1) and the next `request` is
+  refused while k is in flight. k ends before `body_released`: released less the abandon fee (the deposit,
+  on a connection with no settlement yet).
+- *RST_STREAM after `body_released`, no disclosure*: k can only end by its own disclosure (a usage event
+  the provider produced, i.e. the work done) or an error head of the provider's; otherwise it is charged its
+  full reservation, the bound C accepted. A cancelled request is never cheaper than its bound, and no next
+  `request` is accepted while it is in flight.
+- *A control record carrying a HEADERS frame*: a control record's frame header (and its last byte) are
+  proven against the declared kind, its length is fixed (PING ACK 8, RST_STREAM 4, SETTINGS ACK 0), and
+  WINDOW_UPDATE is not allowed at all, so its payload cannot hold a frame: the proof fails, nothing is
+  written.
+- *Framing "1.1"*: the head pins `Content-Length` and `Connection: close`; content bytes beyond `body_len`
+  are refused (`client body exceeds declared length`), so a record after the final one cannot carry a
+  second request; a second request inside the body is body bytes (one JSON body, refused by the provider
+  as malformed); TLS padding can only make the delivered body shorter than `Content-Length`, which stalls
+  C's own request and gives the provider nothing more.
+- *A new connection*: the HPACK table belongs to one HTTP/2 connection (RFC 7541 §2.3.2); on a new TCP/TLS
+  connection index 62 is out of range, and C never holds `K_0` to write a credential of its own.
+
+**Can request k still be generating while k+1 runs, and can k+1's disclosure absorb k's?** Requests are
+sequential: N accepts `request` k+1 only after k's settlement, and only a usage settlement leaves the
+connection open (an error head closes it; anything else charges k and ends it). The usage event comes at
+the end of k's stream, so when k+1 runs, k's generation is over. Frames of stream k that a misbehaving
+provider still sent later would lie in k+1's interval, and the tail grammar (§5.4) refuses a frame on any
+stream but 0, the probe stream 1 and the request's own: k+1's disclosure would fail and k+1 be charged in
+full. A usage event of stream k is not
+the usage event of k+1 (the stream id is in the frame headers N parses). So k's usage can neither be hidden
+in nor counted as k+1's; the frames of a misbehaving provider can only cost C, never N. The node gate runs
+every case above with exact money (`h2-k-*`, `h11-k-extra-record`, `h11-k-pipelined`).
 
 ### 5.4 Usage disclosure, error head
 
@@ -298,15 +379,23 @@ control with `release {n, upto}`; N never writes an unproven record nor beyond `
   such a frame. N parses text and frames alternately; the DATA payload bytes on the request's stream from
   `R`'s start to END_STREAM must be exactly `data: <usage JSON>\n\ndata: [DONE]\n\n`, and the stream must
   end inside `R`. π_C3S, unchanged circuit.
-- A tail that contains a frame on any stream other than 0 and the request's is refused. The only other
-  stream is the probe (stream 1, reset by N in the connection head); the provider may still answer it.
-  Those frames arrive right after the head, long before a usage tail, so in practice they are outside
-  every disclosed tail; C SHOULD wait for the probe's response (or 2 s) before its first request so that
-  they also lie before `S_1`. If one does land in a tail, C has no usage disclosure for that request and
-  it falls under the abort rule (charged in full after `body_released`).
-- `disclose_head`: one complete HEADERS frame of the request's stream at byte 0 of a server record in the
-  interval, π_WIN under `s_ap_0`, decoded with an empty dynamic table, `:status` 400..599. The connection
-  closes after an error head is settled.
+- **The probe stream.** The provider may still answer the probe (stream 1, reset by N in the connection
+  head), late. Complete frames of stream 1 of the kinds a GET response consists of (HEADERS, CONTINUATION,
+  DATA, RST_STREAM, WINDOW_UPDATE) are **skipped** by the tail grammar: their payloads are no part of the
+  request's event stream, and the usage, END_STREAM and stream rules are unchanged. A frame on any stream
+  other than 0, 1 and the request's is refused. So billing does not depend on when the probe's answer
+  arrives (before or after `S_k`).
+- `disclose_head`: `R` runs from **byte 0 of a server record** in the interval to the end of one complete
+  HEADERS frame of the request's stream; the frames before it in that record are disclosed with it and may
+  only be SETTINGS, PING, GOAWAY on stream 0, WINDOW_UPDATE on stream 0 or the request's stream, and frames
+  of the probe stream. π_WIN under `s_ap_0` over those bytes; the block decoded with an empty dynamic
+  table, `:status` 400..599. The connection closes after an error head is settled. Why this widens nothing
+  N can be made to accept: the claim is still anchored at a record's byte 0, as before, and walking the
+  disclosed frames from there lands on the HEADERS frame exactly where the provider's framing puts it; a
+  fabricated head still needs a frame header (with its zero bytes) at byte 0 of a record, which JSON text
+  never has (risk 5). The prefix frames carry nothing of C's: the request's stream has nothing before its
+  response head. What remains a provider requirement (§5.6, H9): a response head lies in a record that
+  starts at a frame boundary.
 - Images: the response is one JSON body in DATA frames; C sends `accept` after END_STREAM on the request's
   stream (never by a length). N's connection head opens the windows to 2^31-1, so C sends no flow-control
   frame for a response; the connection is retired after 1 GiB received (`closed`, `max_bytes`).
@@ -334,6 +423,12 @@ Checked by `provider-profile-check.py --h2`; an operator offers `"2"` only when 
 | H6 | request bodies up to the node's body limit pass flow control |
 | H7 | no response path reflects the `authorization` value (same list as item 8) |
 | H8 | the streamed usage event and `[DONE]` end the stream as §5.4 parses them |
+| H9 | an error response's HEADERS frame lies in a record that starts at a frame boundary (the frames before it in the record being of the kinds §5.4 allows) |
+
+H9 is not checked by the profile tool (it sees no record boundaries); the clients check it on every error
+head and the gates exercise it. A provider that splits a frame across records right before an error head
+makes that error undisclosable, and after `body_released` an undisclosed request is charged in full: the
+money consequence of H9 failing.
 
 N MUST end the connection if U's SETTINGS set `HEADER_TABLE_SIZE` below the size of the credential entry
 (H3 at run time; C reports the value in `settings_seen`, §12.6, and a lying C only harms itself: its
@@ -396,7 +491,7 @@ correlations + 6.4 k per block).
 - A connection that ends with no settled request: the deposit is **charged**, except when the end was the
   node's, the sidecar's or the provider's failure and not something C can cause: the provider unreachable,
   `h2` not selected, framing `"2"` withdrawn, a sidecar or node failure, the provider closing an open idle
-  connection. Then it is released. A provider that closes **during the handshake** is charged: a client
+  connection (not after control frames of C on it, `after_client_frames`). Then it is released. A provider that closes **during the handshake** is charged: a client
   can cause that (a bad Finished). §12.10 has every row.
 - The outcome is reported in `closed.deposit = {"msat", "outcome": "released"|"charged", "reason"}` and,
   when it is released by a settlement, in that request's receipt (`deposit_released_msat`).
@@ -423,20 +518,40 @@ settlement (`closed`, reason `idle`). The client's pool uses a shorter idle time
 ### 8.4 Limits
 
 A connection takes one of the node's session slots for its life and counts against its address's
-unused-connection limit until its first `body_released`.
+unused-connection limit until its first `body_released`, and against its address's total
+(`CONFIDENTIAL_MAX_ACTIVE_PER_IP`, 16) for its life. A setup that finds the node or its address full first
+closes the longest-idle **used** connection there (one that settled a request and has none in flight, so it
+holds no deposit; `closed`, reason `evicted`) and is refused only when there is none. At most 8 requests in a
+row may be refused on one connection; the ninth refusal ends it (`error` 429).
+
+### 8.5 Recurring cost
+
+A request on an open connection moves about 86 kB up and 1.0 MB down (mostly the proof channel's top-up for
+π_WIN and π_C3S) and costs the node two proof verifications. At commodity prices that is well under a
+millisatoshi of traffic and CPU per request; usage at the frozen rates (plus `rate_surcharge_pct`, if the
+operator sets one) covers it except for the very smallest requests, and every request first needs a
+reservation of a full-context prompt plus `max_tokens`, so requests cannot be sent unfunded. Refused requests
+hold nothing and are bounded by §8.4. No per-request fee is defined; an operator who wants one sets
+`rate_surcharge_pct`.
 
 ## 9. Client behaviour
 
 ### 9.1 Pool (framing `"2"`)
 
-- Key: (node, credential, `reuseScope`). Requests on one connection are linkable for the provider (same
-  TCP connection, same TLS session), as requests under one API key already are for a non-confidential
-  client. `reuseScope` is the caller's tool to separate what must not be linked; a scope never shares a
-  connection with another.
+- Key: (node, credential, `reuseScope`). Requests on one connection are linkable for the provider and its
+  CDN or gateway (same TCP connection, same TLS session, in order), for a passive observer of the node's
+  link to the provider (one long-lived flow), and for a global observer who correlates the client–node and
+  node–provider timing and sizes. Under v2 the shared node key gave account-level linkage only. This is a
+  deliberate trade (accepted for v3) as long as the user can turn it off: `reuseScope` separates what must
+  not be linked; a scope never shares a connection with another; `reuse: none` gives every request its
+  own connection; framing `"1.1"` (`confidential.http: "1.1"`, routstrd `confidentialUpstream.http:
+  "1.1"`) turns HTTP/2 off.
 - A request takes an idle connection of its key, else opens one (up to `maxConnections` per key,
   `maxTotal`). Parallel requests use separate connections.
 - routstrd derives `reuseScope` from its local client (the local API key), default on
-  (`confidentialUpstream.http2.reuse: "per-client" | "shared" | "none"`).
+  (`confidentialUpstream.http2.reuse: "per-client" | "shared" | "none"`). So by default **every request made
+  with one local API key is connection-linkable**, across conversations and applications sharing the key.
+  A request header `x-routstr-reuse-scope` narrows it (one conversation, one task); it never widens it.
 - One-off Cashu bearers: framing `"1.1"` (a connection per token), or `"2"` with `reuse: none`.
 
 ### 9.2 Pre-warm
@@ -451,7 +566,16 @@ connection), bound to the credential only.
 - The pre-warmed proof channel holds correlations for π_NK and the first π_WIN and π_C3S; on a kept
   connection it is topped up while idle.
 
-### 9.3 Checks C makes
+### 9.3 Body size
+
+The body length (`body_len`, the record sizes, the ciphertext) is exact unless C pads. A client MAY pad with
+JSON whitespace between the private part and the canonical suffix to a bucket (SDK `confidential.padBucket`,
+reference driver `--pad-bucket`: a multiple of N bytes or the next power of two, at most 8 MiB). **Off by
+default**: the node learns the prompt's token count at settlement anyway, so padding hides the size only
+from observers of the connections (and from the provider), and it costs upload, the scarce direction on the
+links measured. A client that cares about passive observers turns it on.
+
+### 9.4 Checks C makes
 
 Everything v2 checks (`params.ts`), with: π_WIN parameters (§7.1); the receipt's and attestation's `n`,
 `stream`, `s_k`; the connection head template per framing; U's certificate chain, hostname and handshake
@@ -465,8 +589,12 @@ by its own TLS stack.
 | 2 | π_WIN, the frame rules and the interval rule of §5.4 are new | no external review |
 | 3 | `split-public-1`: staged check, label-check pairs, both parties see `IS_k` | no external review; assumptions in §4 |
 | 4 | A provider that changes HTTP/2 behaviour (table size, KeyUpdate) breaks framing `"2"` | detected, §2.1 auto-disable, §2.3 fallback |
-| 5 | A fabricated error head would need a binary frame header at byte 0 of a server record in the interval | smaller than v2's equivalent |
-| 6 | 3 bits per connection instead of 2.8 per request | fewer connections than requests |
+| 5 | A fabricated error head would need a binary frame header at byte 0 of a server record in the interval (with only stream-0, own-stream WINDOW_UPDATE and probe-stream frames before the head, §5.4) | smaller than v2's equivalent |
+| 6 | 3 bits per connection instead of 2.8 per request (idealized abort model, §4) | fewer connections than requests; with one request per connection it is slightly more |
+| 7 | A malicious N can write more epoch-0 records than the proven head (π_NK binds the head's content only): HEADERS frames that change the provider's request table, so that index 62 no longer names the proven credential entry, or that change the connection's state | C's own header blocks stay proven; it cannot reveal the prompt or the key, but it can change how C's requests authenticate or make them fail. Inherited from risk 1 of v2, with a new effect |
+| 8 | Receipts and attestations of one connection repeat `sid`, the transcript hashes, `c_commit`, the certificate-chain hash and the request numbers and intervals | anyone shown several of them can link them and see their order and gaps: they are **private documents** of the client. Showing them to third parties unlinkably would need a new signed presentation format; redacting fields of the signed ones breaks their signatures |
+| 9 | Compromise scope: one `c_ap_1`/`s_ap_0` pair protects up to `h2.max_requests` requests (C may not KeyUpdate under π_WIN's rules). A live compromise of C exposes the connection's current and later traffic; a later forensic compromise of retained secrets exposes the whole recorded connection, not one request | clients erase traffic secrets when a connection closes (and keep them out of logs and swap where they can); operators keep `h2.max_requests` and `h2.max_lifetime_s` in proportion. A per-request ratchet needs a new anchor protocol |
+| 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
 
 v2's residual risks carry over unchanged (π_NK does not bind other epoch-0 records; provider reflection;
 ECtF semi-honest; no proof of the garbler-only construction).
@@ -666,17 +794,19 @@ HTTP/2 frame per record (§5.1), a DATA payload at most 16 375 bytes.
   provider never sent the parameter, i.e. the default 4096). Required before the first `request`; sent again
   whenever a later SETTINGS frame carries the parameter. A value below `32 + 13 + 7 + key_length` (the size
   of the credential entry): `error` with `code: "h2_table_size"`.
-- `C → N  {"type":"ctl","frame":"settings_ack"|"ping_ack"|"window_update"|"rst_stream"}`: the next record is
-  that control frame (inner lengths 10, 18, 14, 14). `window_update` on stream 0; `rst_stream` on the
-  current request's stream, once its records are all received. At most 16 unproven control records.
+- `C → N  {"type":"ctl","frame":"settings_ack"|"ping_ack"|"rst_stream"}`: the next record is that control
+  frame (inner lengths 10, 18, 14). `rst_stream` on the current request's stream, once its records are all
+  received. At most 16 unproven control records. (`window_update` is refused: §5.1 rule 4.)
 - Any other record belongs to the open request: first the HEADERS record (flags `04`, stream `2k+1`, block
   `83 87 01 <len> <host> 04 <len> <path> 0f 10 10 "application/json" be`, `<path>` the route of
   `head_template` or `images.head_template`), then DATA records (flags `00`, the last `01`) until the
   payloads sum to `body_len`. Refused: an empty DATA frame, a last DATA frame shorter than the suffix, more
   than `3 + body_len/4096` records, a record with no request open.
 - `N → C  {"type":"zk_params","proof":"pi_win","purpose":"records","first_seq":s,"count":c,"params":{"PiWin":…}}`:
-  all unproven queued records, sequence numbers `s … s+c-1`. Sent when the request is complete (control
-  records sent meanwhile join it) or, with no request open, per control record.
+  the next unproven queued records, sequence numbers `s … s+c-1`, as many as one π_WIN holds (§7.1
+  limits). Sent when the request is complete (control records sent meanwhile join it) or, with no request
+  open, per control record; one at a time, and the next batch after the previous one verified. A long body
+  takes several batches; none of its records is written before the last one verified.
 - `C → N  {"type":"release","n":k,"upto":u}`: the first `u` records of request `k` may be written once
   proven; `u` only grows. C follows the provider's flow control (stream credit = the provider's
   `INITIAL_WINDOW_SIZE` + WINDOW_UPDATEs on the stream; connection credit = 65 535 + WINDOW_UPDATEs on
@@ -724,9 +854,10 @@ connection began (handshake flight included).
   `{"type":"zk_params","proof":"pi_c3s","n","params":{"PiC3S":…}}`, C proves with `s_ap_0`.
 - Images 2xx: `C → N  {"type":"accept","n","server_records":m}` after END_STREAM
   (`{"type":"accept_retry","n","server_records"}` when N holds more); `attestation`; settlement.
-- Status ≥ 400: `C → N  {"type":"disclose_head","n","record":i,"r":<hex>[,"key_updates","epoch_start"]}`: one
-  HEADERS frame of the stream with END_HEADERS at byte 0 of server record `i ≥ S_k`, at most 16 KiB and 8
-  records, decodable with an empty dynamic table, `:status` first, 400..599. Allowed once the request's first
+- Status ≥ 400: `C → N  {"type":"disclose_head","n","record":i,"r":<hex>[,"key_updates","epoch_start"]}`: `r`
+  is the plaintext from byte 0 of server record `i ≥ S_k` to the end of one HEADERS frame of the stream with
+  END_HEADERS; before it only the frames §5.4 allows; at most 16 KiB and 8 records, the block decodable with
+  an empty dynamic table, `:status` first, 400..599. Allowed once the request's first
   record was written and no client record is unproven. `attestation`, then
   `{"type":"zk_params","proof":"pi_win","purpose":"error_head","n","record","params"}` (`anchor = h2`; per
   record the frame's bytes from offset 0 and the last byte = `17`).
@@ -799,7 +930,8 @@ After a settled 2xx a framing-`"2"` connection is READY again. Otherwise the con
 | `error_settled` | an error head was settled (both framings) |
 | `idle` | no request in flight for the idle limit (the node's `idle_timeout_s`; the sidecar's `h2.idle_secs` behind it) |
 | `max_requests`, `max_lifetime`, `max_bytes` | framing `"2"`: at the settlement that reached `h2.max_requests`, `h2.max_lifetime_s`, or 1 GiB received |
-| `upstream_closed` | the provider closed an open connection with no request in flight |
+| `upstream_closed` | the provider closed an open connection with no request in flight; `"after_client_frames": true` when C had control frames written on a connection that carried no request (the close may be C's doing: not row 5 of 12.10) |
+| `evicted` | node only: a newer setup took the slot of this idle, used connection (§8.4) |
 | `ended` | node only: neither side had a last word |
 
 `N → C  {"type":"error","reason"[,"status"][,"code"][,"fault"]}` and the socket closes: every protocol
@@ -834,7 +966,8 @@ the frame would be `{"type":"closed","reason":"ended"}`.
 | π_WIN | 2 200 windows, 64 KiB ciphertext |
 | π_C3S | `r` ≤ 16 KiB; the limits of `zkbench::statements` |
 | control message | 256 KiB |
-| sessions | 32 per process (S and N); unused connections per address: `CONFIDENTIAL_MAX_UNUSED_PER_IP` (12), counted until the first `body_released` |
+| sessions | 32 per process (S and N); per address: `CONFIDENTIAL_MAX_UNUSED_PER_IP` (12) unused, counted until the first `body_released`, and `CONFIDENTIAL_MAX_ACTIVE_PER_IP` (16) in all; a full node or address evicts its longest-idle used connection first (§8.4) |
+| refused requests | 8 in a row per connection; the ninth ends it (`error` 429) |
 | `/zk` sockets per connection | 6 |
 
 ### 12.10 Money (N)
@@ -863,14 +996,14 @@ settled request, first matching row:
 | 2 | no session slot, the sidecar unreachable, or it refused the setup | released | `not_started` |
 | 3 | the sidecar reported `fault: "upstream"` (the provider unreachable, `h2` not selected, framing `"2"` withdrawn) | released | `provider_unreachable` |
 | 4 | the sidecar reported `fault: "node"`, or its socket ended without `error` or `closed` | released | `sidecar_failure` |
-| 5 | the provider closed the open, idle connection before any request (`closed`, `upstream_closed`) | released | `provider_closed` |
+| 5 | the provider closed the open, idle connection before any request (`closed`, `upstream_closed`, without `after_client_frames`) | released | `provider_closed` |
 | 6 | the node refused a request of this connection with a 5xx, or a settlement's billing write failed | released | `node_failure` |
 | 7 | a request was written in full (`body_released`) and never settled | released (the reservation is charged) | `request_received` |
 | 8 | the provider answered a request and closed before its body was complete | released (the request keeps the session fee) | `provider_refused` |
 | 9 | a request was accepted and the connection ended before its `body_released` for any other reason | **charged**; the reservation is released in full | `request_abandoned` |
 | 10 | no request in flight for `idle_timeout_s` | **charged** | `idle` |
 | 11 | `head_written` not reached within 600 s | **charged** | `setup_timeout` |
-| 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake, only refused requests | **charged** | `unused` |
+| 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake or after the client's control frames (`after_client_frames`), only refused requests | **charged** | `unused` |
 
 A refused request (4xx) by itself costs nothing; the connection stays, and the deposit follows how the
 connection ends.
@@ -935,3 +1068,11 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | a request in flight when the sidecar reports a `fault` (or its socket is lost) before `body_released` is released in full, no abandon fee | §12.10 |
 | N relays `upstream_closed_early`; a framing-`"2"` `request` before `head_written` is refused by the node itself | §12.9, §12.4 |
 | the Nostr listing's tag is `["confidential","3"]`; the `confidential_upstream` field of `/v1/models` | §12.1 |
+| a long body is proven in several disjoint π_WIN batches, none of its records written before the last verified | §5.3, §12.6 |
+| no client WINDOW_UPDATE | §5.1, §12.6 |
+| late probe-stream frames are skipped by the tail grammar; an error head may follow stream-0, own-stream WINDOW_UPDATE and probe frames in its record; H9 | §5.4, §5.6, §12.8 |
+| request-offer age (prices end 10 min after the offer stops being served); security-relevant offer changes retire live connections | §3.3 |
+| `after_client_frames`; `evicted`; the per-address total and the eviction of idle used connections; 8 refused requests in a row; recurring cost | §8, §12.9, §12.10 |
+| the `split-public-1` statement: the inner-digest message rule, assumption (3), the idealized 3-bit model, label-check pairs augment the report hash | §4 |
+| privacy: linkability and its off switches, body padding (off by default), residual risks 7-10 | §1, §9.1, §9.3, §10 |
+| a cancelled request cannot lend its credential reference (the attack and why each form fails) | §5.3.1 |

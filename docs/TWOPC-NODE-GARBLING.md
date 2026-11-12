@@ -143,7 +143,10 @@ Online bytes: 24.6 kB of labels N→C in `handshake` and 20.5 kB in `application
 
 **Labels N chooses online.** The check rows are committed in preprocessing, so the salt argument of §4
 covers the tables and everything derived from them. The labels N sends online (its own input, the
-corrections, the digest labels) are chosen when N already knows the salt. This is not a gap:
+corrections, the digest labels) are chosen when N already knows the salt. We argue below that this is not a gap; the argument is about
+this circuit and is heuristic (it reasons about where a shifted label leads, not about arbitrary online
+labels in general), so the `2^-60`-style soundness figure of §4 covers the committed parts only, and the
+online labels are part of what an external review has to settle:
 
 - a digest label of the other bit value (shift Δ_A) has the wrong pointer bit, and C aborts whatever its
   secrets are (C computed the digest itself);

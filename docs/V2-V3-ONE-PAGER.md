@@ -29,17 +29,15 @@ request per connection, inside the same lifecycle.
 | Reservation; session fee | per session; per request | per request; once per connection |
 | Pre-warm | a session bound to model, token cap and body length | a connection bound to the credential only; on HTTP/2 a kept connection replaces it |
 | Images | always the cold cost, about 26 MB | one more request on an open HTTP/2 connection: 36 kB up, image + 9 kB down |
-| A cheating node learns at most | 2.8 bits per request | 3 bits per connection |
+| A cheating node learns at most (selective failure, idealized abort model) | 2.8 bits per request | 3 bits per connection |
 
-**Data and speed.** The HTTP/2 rows were measured with the v2-size 2PC, before the smaller key schedule
-was merged; with it an opening is about 6 MB smaller (`[TO MEASURE]`). Not measured yet: a framing `"1.1"`
-request, and any of this over a remote link end to end (`[TO MEASURE]`).
+**Data and speed** (final build, through a node on loopback, 2026-11-12; shaped: 2 Mbit/s up, 40 ms one way).
 
 | | v2 | v3 |
 |----------------------------------------------|--------------------|------------------------------------------------|
-| First chat request | about 28 MB | opening an HTTP/2 connection: 23.7 MB down, 2.6 MB up, 1.0–1.1 s |
-| Each later chat request | about 28 MB again | 0.5–1.0 MB down, about 85 kB up |
-| Time to first token through routstrd | pre-warmed 0.9–1.5 s | 2.0 s on the opening request, 0.46–1.26 s on a reused connection |
+| First chat request (cold) | about 28 MB | 17.97 MB down, 2.63 MB up; first token 1.38 s ("2"), 1.52 s ("1.1"); 12.1 s at 2/50 Mbit/s |
+| Each later chat request | about 28 MB again | on an open connection 1.01 MB down, 86 kB up; first token 0.57 s (0.92 s at 2/50) |
+| Armed (pre-warmed) | pre-warmed 0.9–1.5 s | 0.81 s ("2"), 0.76 s ("1.1"); 1.43 s at 2/50 |
 | Cold 2PC: local; 2 Mbit/s up, 50 down; 2 up, 10 down (simulated) | 0.67 s; 7.42 s; 20.12 s | 0.45 s; 7.02 s; 15.61 s |
 | 2PC online round trips; node peak memory | 1 + 1; 517 MiB | 3 + 1.5; 457 MiB |
 

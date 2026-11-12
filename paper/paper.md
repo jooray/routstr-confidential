@@ -83,13 +83,16 @@ an instruction to the provider's HTTP/2 stack and the node cannot read it.
    responses run under keys only the client holds. The handshake key schedule runs as a two-party
    computation secure against a malicious peer, in which only the node garbles and the client checks
    every gate against masks the node has authenticated to it. Neither party ever reveals its inputs;
-   a cheating node can learn at most 3 bits per connection about values used only in that connection,
-   provided the semi-honest share conversion at its start gives it nothing beyond its outcome.
+   a cheating node can learn at most 3 bits per connection of additional selective-failure leakage
+   about values used only in that connection, in an idealized abort model, provided the semi-honest
+   share conversion at its start gives it nothing beyond its outcome and the garbling argument holds.
 2. A split of the key schedule at the SHA-256 compression function (section 4.4): only the pad states
    of four secret keys and the outer compressions are garbled, the inner states are public and both
    parties compute the inner digests in the clear. This cuts the circuit from 656,179 to 479,022 AND
    gates and the client's download from 22.1 to 16.4 MB, and rests on the two compression-function
-   assumptions of Bellare's HMAC proof, used directly.
+   assumptions of Bellare's HMAC proof, used directly, plus collision resistance of the compression
+   function under a known chaining value for the distinct labels of one key (section 4.4); the composed
+   argument has not been written as a proof.
 3. A way to use a credential many times after writing it once: the node stores it in the provider's
    HPACK dynamic table in its own epoch, and the client's later HTTP/2 requests name it by index
    (sections 4.2, 4.5), with an argument that the stored value cannot be read back (section 5).
@@ -555,7 +558,12 @@ values, which include C's own secrets $s_{ap,0}$ and $c_{ap,1}$. N observes one 
 connection: an abort in ECtF (C's degenerate-share check, which a deviating N may be able to make
 depend on C's input), an abort in one of the five stages, the server Finished failing after a shifted
 Z, or success. The connection ends at the first failure. So N learns at most $\log_2 8 = 3$ bits per
-connection, provided ECtF reveals nothing beyond its outcome (below). A cheating C, the evaluator, sees
+connection of additional selective-failure leakage, in this idealized abort model (every deviation ends in
+one of these outcomes and N observes nothing else), provided ECtF reveals nothing beyond its outcome
+(below) and the garbling argument holds. N also receives the outputs it is meant to have; the bound is
+about the rest. A proof would have to enumerate every distinguishable result of a malicious ECtF, OT and
+preprocessing, of N's own report checks, of the TLS verification, of timeouts and errors; that has not
+been done. A cheating C, the evaluator, sees
 the tables, its active labels, uniformly random pointer bits, the opened masks of values it already
 knows or decodes, check rows and label-check pairs padded by hashes of labels it does not hold, the
 public states $IS_k$, and $Y_N$, which it can compute itself. It learns nothing beyond its outputs and
@@ -570,7 +578,21 @@ and (2) $OS_k$ is pseudorandom given $IS_k$, that is, $f$ keyed through its mess
 $k \oplus \mathrm{ipad}$ and $k \oplus \mathrm{opad}$ gives unrelated outputs. These are the two
 assumptions of Bellare's proof that HMAC is a PRF (CRYPTO 2006); we use them directly instead of
 through the theorem, and for both parties, since both see $IS_k$. No output secret is derivable from an
-$IS_k$ without $OS_k$: every derived value passes through an outer compression keyed by $OS_k$.
+$IS_k$ without $OS_k$: every derived value passes through an outer compression keyed by $OS_k$. Every
+inner digest moved out of the circuit has a public message (a fixed label and a transcript hash); the
+one HMAC with a secret message, $HS = \mathrm{HMAC}(salt, Z)$, stays inside.
+
+A third requirement comes from the exposed inner state: (3) **the inner digests of one key are pairwise
+distinct.** Several outputs are derived under one $OS_k$, and equal inner digests would give equal
+outputs: $c_{ap,0} = f(OS_{MS}, \mathrm{pad}(d_{c0}))$ and $s_{ap,0} = f(OS_{MS}, \mathrm{pad}(d_{s0}))$, so
+$d_{c0} = d_{s0}$ would hand C, who holds $s_{ap,0}$, the key $c_{ap,0}$ and with it $K_0$; a "derived"
+digest equal to $d_c$ or $d_s$ under $OS_{HS}$ would expose the derived secret and MS. The messages of one
+key differ in their fixed HKDF labels at fixed positions of the block, and $IS_k$ is known, so an equal
+pair is a collision of the SHA-256 compression function under a known, unchosen chaining value (generic
+cost about $2^{128}$). With the inner key secret this was covered by the PRF assumption; here it is an
+assumption of its own. Bellare's theorem is about one key with hidden pad states; the chained,
+multi-output system with public $IS_k$, outputs for different parties, public anchors and selective
+failure needs its own hybrid argument, which has not been written.
 
 **Why the leakage cannot accumulate.** The bits N can learn are about that connection's values: C's
 ECDHE scalar share and the key schedule's internal wires, including C's traffic secrets $s_{ap,0}$ and
@@ -732,7 +754,10 @@ N takes every ciphertext from its own relay buffer, never from C. In framing "1.
 the whole final record equals the suffix followed by `0x17`. In framing "2" a request's batch has the
 HEADERS record in full, the first nine bytes and the last byte of every DATA record, and the tail of
 the last DATA record (suffix $\Vert$ `0x17`). A proof holds at most 2,200 windows and 64 KiB of
-ciphertext, so a long body is proven in several batches as it is released. The statement costs 7
+ciphertext, so a long body is proven in several consecutive, disjoint batches while N buffers it, and
+none of its records is written before the last batch verified: every body the record rules allow
+(8 MiB in up to $3 + \lceil$body$/4096\rceil$ records) is provable, and the statement "no inference ran on
+a failed proof" holds for long bodies too. The statement costs 7
 SHA-256 compressions plus one AES block per distinct 16-byte block a window touches, since the anchor
 is a hash of a secret that the 2PC itself output and the key schedule is not recomputed.
 
@@ -802,8 +827,10 @@ must lie in the request's **interval**, the server records with index at least $
 the last server byte N has received. N parses R as alternating text and frames: the DATA payloads on
 the request's stream must be exactly `data: <usage JSON>`, a blank line, `data: [DONE]` and a blank
 line, and the stream must end (END_STREAM) inside R. A usage event from request $k - 1$ lies before
-$S_k$ and is refused; frames of other streams and connection-level frames inside R are visible to N as
-frames and carry no content.
+$S_k$ and is refused; connection-level frames inside R are visible to N as frames and carry no content.
+Frames of the probe stream (stream 1, reset in the head), which U may still answer late, are skipped
+whole, their payloads kept out of the event text, so billing does not depend on when that answer
+arrives; a frame of any other stream is refused.
 
 U may rotate its keys mid-response (a KeyUpdate inside the encrypted stream, which only C can see). C
 then reports $k$ and the record where that epoch starts, whose sequence numbers restart at 0; a wrong
@@ -825,8 +852,12 @@ it parses, and model output is confined to JSON strings inside DATA payloads.
 carries no usage event. C then discloses only the response head and the error body stays private,
 since it can quote the request. In framing "1.1" this is the status line and header lines, proven by
 $\pi_{C3S}$ with `skip` set to the length of the rest of the response. In framing "2" it is one
-complete HEADERS frame of the request's stream that starts at byte 0 of a server record in the
-request's interval, proven by $\pi_{WIN}$ under $s_{ap,0}$ (anchor $h_2$). N decodes the block with an
+complete HEADERS frame of the request's stream in a server record of the request's interval, disclosed
+from byte 0 of that record: the frames before it in the record, which may only be stream-0 control
+frames, WINDOW_UPDATEs and frames of the probe stream (none carries C's bytes), are disclosed with it.
+Walking them from byte 0 lands on the HEADERS frame where U's stack put it, so the claim is anchored at
+the record start exactly as before; this only lets a head that U coalesced with such frames be
+disclosed. It is proven by $\pi_{WIN}$ under $s_{ap,0}$ (anchor $h_2$). N decodes the block with an
 empty dynamic table, which is sound because the head set `HEADER_TABLE_SIZE = 0` (a block that
 references a dynamic entry is refused), and requires a `:status` from 400 to 599. A connection closes
 after an error head is settled.
@@ -887,8 +918,9 @@ rejected) less the abandon fee $f_a$; other 5xx are charged like a missing discl
 header lines cannot come from model output or chunk framing; the relay holds it to the start of a TLS
 record, not provably to the start of the response, so this rests on the provider's response format
 (residual risk 13). In framing "2" a fabricated head would need a valid HEADERS frame header for the
-request's stream at byte 0 of a server record, where the provider's own stack places frame headers; a
-DATA payload cannot start a record without its own frame header before it. An error body larger than
+request's stream reachable from byte 0 of a server record through the allowed frames, where the
+provider's own stack places frame headers; a DATA payload cannot start a record without its own frame
+header before it, and JSON text has none of the zero bytes every frame header starts with. An error body larger than
 the disclosure limit cannot be disclosed at all in framing "1.1" and is charged like a missing
 disclosure; in framing "2" the head is its own frame and the body's size does not matter.
 
@@ -1098,7 +1130,30 @@ proven header fixes the frame's type, flags and stream. So C cannot place a fram
 at byte 0 of a record, where it is proven. The gates include both evasions we know: a HEADERS frame
 hidden in a DATA payload, and TLS padding that shifts the boundary (section 6.5). The DATA payload
 before the suffix is C's private content, as the body prefix is on HTTP/1.1, and the provider's JSON
-parser resolves it against the suffix by the same profile items 5 and 6.
+parser resolves it against the suffix by the same profile items 5 and 6. A control record's header is
+proven against its declared kind and its payload length is fixed (8 bytes for a PING ACK, 4 for a
+RST_STREAM, none for a SETTINGS ACK), so it cannot hold a frame; C sends no WINDOW_UPDATE at all, whose
+increment would be a payload of C's choosing that makes the provider close the connection.
+
+**Cancelling a request does not free its credential reference.** Suppose C force-stops request $k$ with
+RST_STREAM and starts another HTTP request that names the stored credential, hoping that U serves it while
+N bills nothing. N accepts a record as part of a request only inside an accepted `request` (which it
+reserved), and classifies and proves every record before writing it. So (a) a HEADERS record with no
+`request`, for the next stream or the same one, is refused before it is queued and never reaches U; (b)
+RST_STREAM is accepted only after all of the request's records are in and queues behind them, so it cannot
+overtake an unreleased last DATA record, and U holds a body without END_STREAM, on which it does no
+inference (profile item 1); the request then ends before its release and costs the abandon fee; (c) after
+the release a request settles only on its own usage event or a provider error head, and otherwise its full
+reservation is charged, so a cancelled request never costs less than its bound; (d) a control record
+cannot carry a frame (above); (e) in framing "1.1" the head pins `Content-Length` and `Connection: close`,
+content beyond the body length is refused, a second request inside the body is body bytes, and TLS padding
+only shortens what U receives, stalling C's own request; (f) the HPACK table belongs to one HTTP/2
+connection, so a new TCP/TLS connection has no index 62, and C never holds $K_0$ to write a credential
+itself. Nor can request $k$ hide in request $k+1$: N accepts $k+1$ only after $k$ settled, and only a usage
+settlement keeps the connection, so $k$'s generation is over by then; stray frames of stream $k$ in $k+1$'s
+interval make $k+1$'s tail grammar fail (it accepts only streams 0, 1 and $k+1$'s), which costs C, not N;
+and a usage event names its stream in the frame headers N parses. The node gate runs each form with exact
+money (section 6.5).
 
 **P4 (accounting).** The billed usage is a substring of the authenticated response, proven under the
 connection's server secret and anchored to the end of the request's interval of server records. The
@@ -1169,9 +1224,14 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
    work, and reserve each request before accepting its records. They bound concurrent connections (32;
    a connection takes one slot for its life), the time to setup, the setup frame, the 2PC (180 s), the
    body (8 MiB), the requests per connection, its lifetime and its idle time. A client address may hold
-   only a bounded number of connections that have not yet released a body (twelve by default), and
-   connections that have not reserved yet are a separate, smaller pool in which the oldest is evicted
-   first. Opening a connection costs N about 16 MB of upload and 0.4 s of CPU, which the deposit
+   only a bounded number of connections that have not yet released a body (twelve by default) and of
+   connections in all (sixteen); when the node or an address is full, a new setup first closes the
+   longest-idle connection that already settled a request (it holds no deposit) and is refused only when
+   there is none, so cheap, mostly idle connections cannot hold every slot. At most eight requests in a
+   row may be refused on a connection. Connections that have not reserved yet are a separate, smaller
+   pool in which the oldest is evicted first. The relay's withdrawal of framing "2" counts only failures
+   no client can cause (no answer to the canonical ClientHello, `h2` not selected, a close right after the
+   connection head with no client record written), so no client can switch it off for others. Opening a connection costs N about 16 MB of upload and 0.4 s of CPU, which the deposit
    prices (section 8.1).
 7. *Error metadata.* On an upstream error N learns the status line, the response headers and the body
    length, but not the body.
@@ -1218,11 +1278,18 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
     account, but a provider (or its CDN) that would not otherwise group requests from different users
     of a node can group those that share a connection. The client's pool therefore never shares a
     connection between two *reuse scopes*; the daemon derives the scope from its local client by
-    default, and a caller that needs unlinkable requests uses a scope per request or framing "1.1".
+    default, so all requests made with one local API key are connection-linkable, across conversations
+    and applications sharing it. A request header narrows the scope (one conversation); a caller that
+    needs unlinkable requests uses `reuse: none` or framing "1.1". A passive observer of the node's link
+    to U sees one long-lived flow per connection, and a global observer can correlate the client's and
+    the node's traffic by timing and size.
     The same holds towards N: a client that pays each request with a fresh e-cash token is linked
     across them by the connection. A kept connection is also longer-lived state: one pair of traffic
-    secrets protects all its requests, so a compromise of C's process exposes the whole connection.
-    Linkability is by design; the scope is the tool to limit it.
+    secrets protects all its requests (C may not KeyUpdate under the frame rules), so a live compromise of
+    C's process exposes the connection's current and later traffic, and secrets retained after it ends
+    would expose the whole recorded connection. Clients erase them at the close and keep them out of
+    logs; operators keep the request and lifetime limits in proportion. Linkability is by design; the
+    scope, `reuse: none` and framing "1.1" are the tools to limit or avoid it.
 17. *$\pi_{WIN}$, the frame rules and the interval rule are new.* The argument above that the rules
     pin U's view of a request, and that the interval rule pins a usage event to its request, is ours
     and has had no external review. HTTP/2 has more parser state than HTTP/1.1 (CONTINUATION, padding
@@ -1235,7 +1302,25 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
 19. *The HPACK argument rests on the specification.* The read-back argument (above) holds for a
     conforming HPACK decoder. A provider stack with a non-standard extension that exposes table
     contents, or an intermediary that re-encodes requests and logs them, is outside it, as a
-    header-echoing endpoint is outside the HTTP/1.1 argument.
+    header-echoing endpoint is outside the HTTP/1.1 argument. The credential stays in the provider's
+    (or CDN's) decoder state for the connection's life: v3 does not reduce provider-side exposure.
+20. *A malicious N can change the request table.* Since $\pi_{NK}$ binds only the head (risk 1), N can
+    write further HEADERS frames in epoch 0 that add or evict table entries, so that index 62 no longer
+    names the proven credential entry, or that change the connection's state. C's own header blocks are
+    still proven, and this reveals neither the prompt nor the key, but it can change how C's requests
+    are authenticated or make them fail.
+21. *Receipts and attestations are linkable.* The per-request attestations and receipts of a connection
+    repeat its id, transcript hashes, $c_{commit}$, the certificate-chain hash and the request numbers and
+    intervals: anyone shown several can link them and see their order and gaps. They are private
+    documents of the client; unlinkable presentation to third parties would need a new signed format
+    (redacting fields of the signed ones breaks their signatures).
+22. *Body size and error heads.* The body length is exact unless C pads; the clients can pad with JSON
+    whitespace to a bucket (off by default, since N learns the prompt's token count at settlement
+    anyway). An error head is disclosed from byte 0 of its record, with only stream-0 control frames,
+    WINDOW_UPDATEs and frames of the probe stream allowed before it; a provider that splits a frame
+    across records right before an error head makes that error undisclosable, and after the release the
+    request is then charged in full (profile item H9). Late answers to the probe stream are skipped by the
+    usage-tail grammar, so billing does not depend on when they arrive.
 
 # 6. Implementation and evaluation
 
@@ -1303,7 +1388,7 @@ round-trip time the handshake stages take 0.32 s and the application stages 0.22
 |---|---|---|---|---|
 | $\pi_{NK}$ (connection head; benchmark: a 228-byte HTTP/1.1 head) | 0.16 s | 1.45 MB | 5 | 15 |
 | $\pi_{C3S}$ (usage; one 596-byte server record) | 0.20 s | 1.47 MB | 7 | 38 |
-| $\pi_{WIN}$ (a request's windows), over a pre-warmed proof channel | 39-66 ms | `[TO MEASURE]` | 7 | 1 per 16-byte block touched |
+| $\pi_{WIN}$ (a request's windows), over a pre-warmed proof channel | 39-66 ms | about 1.0 MB down, 86 kB up per request together with $\pi_{C3S}$ (the channel's top-up) | 7 | 1 per 16-byte block touched |
 
 The first two rows include the proof's own OT setup; over a pre-warmed proof channel $\pi_{NK}$ took
 0.06 s and $\pi_{C3S}$ 0.04 s in v2's live runs. $\pi_{WIN}$ needs about 160 k correlations plus 6.4 k
@@ -1314,30 +1399,29 @@ separately: `[TO MEASURE]`.
 
 ## 6.3 End to end
 
-**HTTP/2, live.** Sessions against api.venice.ai through the node, the SDK and the client daemon, all
-on one host (loopback between client and node; author measurements, 2026-11-11). These runs used the
-prototype before the smaller key schedule was merged, so the connection open carries v2's 22 MB 2PC.
+**Final build, through the node.** Connections against api.venice.ai through a node on loopback
+(reference client → node → relay → provider, `mistral-small-3-2-24b-instruct`, `max_tokens` 12;
+medians; time to first token counted from the connection's start for a cold request, from the claim
+for an armed connection, from the request on an open one; author measurements, 2026-11-12):
 
-| | Framing "2" (measured with the v2-size 2PC) | v2 (one handshake per request) |
+| | Framing "2" | Framing "1.1" |
 |---|---|---|
-| Opening a connection: C receives / sends | 23.7 MB / 2.6 MB | 22.1 MB / 1.2 MB of 2PC, plus proofs, per request |
-| Opening a connection: time | about 1.0-1.1 s | about 1.0 s (cold, body sent) |
-| Each later request: C receives / sends | 0.5-1.0 MB / about 85 kB | as the first |
-| Later request: body released after it is sent | about 60 ms | 0.035 s after a 1.0 s cold start, or pre-warmed |
-| Time to first token through the daemon, opening request | 2.0 s | |
-| Time to first token through the daemon, reused connection | 0.46-1.26 s | 0.9-1.5 s pre-warmed |
-| Image on an open connection: C sends / receives | 36 kB / the image plus about 9 kB | about 26 MB of protocol traffic |
+| Cold request (connection opened for it): time to first token | 1.38 s | 1.52 s |
+| Request on an armed connection | 0.81 s | 0.76 s |
+| Request on an open connection | 0.57 s | n/a (one request per connection) |
+| Cold: C sends / receives | 2.63 MB / 17.97 MB | about the same |
+| Request on an open connection: C sends / receives | 86 kB / 1.01 MB | n/a |
 
-With `split-public-1` the open should be about 6 MB smaller (16.4 MB of 2PC download instead of 22.1):
-`[TO MEASURE]`. The time to first token is dominated by the provider's own latency in every row; the
-protocol's own contribution on a reused connection is the 60 ms until the body is released. The data
-of a later request is the proof-channel traffic of $\pi_{WIN}$ and $\pi_{C3S}$; it does not depend on
-the 2PC.
-
-Framing "1.1" under v3 has not been measured end to end: `[TO MEASURE]`. Its flow is v2's with a
-smaller 2PC and with $\pi_{WIN}$ in place of the suffix proof, so we expect v2's figures (a cold request
-reaching the provider after about 1.0 s on one host, 2026-10-19, `docs/evidence/measure-2026-10-19/`)
-less the 2PC difference of section 6.2 plus the added round trips.
+Of the cold 17.97 MB, 16.38 MB are the 2PC and about 1.6 MB the proof channel's correlations; of the
+2.63 MB sent, 1.13 MB are the 2PC and 1.5 MB the proof channel. The megabyte of a request on an open
+connection is almost all the proof channel's top-up for $\pi_{WIN}$ and $\pi_{C3S}$; it does not depend on
+the 2PC. The time to first token is dominated by the provider's own latency in every row. Earlier
+prototype runs (2026-11-11, before `split-public-1` was merged, so with v2's 22 MB 2PC in the open:
+23.7 MB / 2.6 MB per open, 0.5-1.0 MB / 85 kB per later request, the body released about 60 ms after it
+was sent, time to first token through the daemon 0.46-1.26 s on a reused connection against 0.9-1.5 s for
+pre-warmed v2) are superseded by these. They do not show that v3 is faster than pre-warmed v2 for the
+first token: both are within the provider's latency; what v3 removes is the repeated 2PC traffic and the
+pre-warm prediction.
 
 **What became of pre-warming.** In v2 every request paid a two-party handshake, and pre-warming hid
 it: the client armed sessions ahead of requests, each bound to a model, a token cap and a body length,
@@ -1355,12 +1439,23 @@ connection of its key or opens one, up to a limit per key and in total; parallel
 connections, since requests on a connection are sequential. One-off e-cash tokens use framing "1.1" or
 a connection per token.
 
-**Against a deployed node.** v3 has not been measured over real links: `[TO MEASURE]`. For v2, with the
-22 MB download, a cold request from a home connection reached its first token after 6.7 to 21 s and a
-pre-warmed one after 1.1 to 1.5 s (2026-10-19, `deployed-cold.jsonl`, `deployed-arm.jsonl` in the
-evidence directory); on a download-limited link (about 2-5 Mbit/s from the node) a cold request waited
-about a minute (raw log not archived). The cold cost is bandwidth-bound, so the v3 open should scale
-with its smaller download (section 6.4), and it is paid per connection.
+**Shaped links.** The same runs with the relay behind a rate-limiting userspace proxy (one shared link
+per direction, 40 ms one way; reference client to the relay directly, no node), medians of 3:
+
+| Link (up / down for the client) | framing | cold | armed | open |
+|---|---|---|---|---|
+| 2 / 50 Mbit/s | "2" | 12.1 s | 1.43 s | 0.92 s |
+| 2 / 50 Mbit/s | "1.1" | 11.8 s | 1.38 s | n/a |
+| 2 / 10 Mbit/s | "2" | 18.9 s | 1.59 s | 1.23 s |
+| 2 / 10 Mbit/s | "1.1" | 19.2 s | 1.85 s | n/a |
+
+At 2 Mbit/s up the cold time is the 2.63 MB upload (about 10.5 s): the proof channel's 1.5 MB shares the
+uplink with the 2PC, so the 2PC-only figure of section 6.4 (7.0 s) is not the time to first token.
+
+**Against a deployed node.** v3 has not been measured from a remote client to a deployed node:
+`[TO MEASURE]`. For v2, with the 22 MB download, a cold request from a home connection reached its first
+token after 6.7 to 21 s and a pre-warmed one after 1.1 to 1.5 s (2026-10-19, `deployed-cold.jsonl`,
+`deployed-arm.jsonl` in the evidence directory).
 
 ## 6.4 Over a network and bandwidth
 
@@ -1382,45 +1477,58 @@ On a 2 Mbit/s uplink with a fast downlink C's Ferret upload is the critical path
 the download is the bottleneck (10 Mbit/s) v3 saves 4.5 s: 16.4 MB take 13.1 s of the 15.6 s.
 
 **Data per request.** v2 moved about 23.3 MB of 2PC traffic and 4.4 MB of proofs for every request,
-about 28 MB, of which N uploaded about 24 MB. With framing "2", opening a connection moved 23.7 MB to
-the client and 2.6 MB from it with the v2-size 2PC (about 6 MB less expected with the current one,
-`[TO MEASURE]`), and every later request 0.5 to 1.0 MB and 85 kB. For a connection of $r$ requests the
-average per request is therefore about $(24 + 0.75\,(r - 1)) / r$ MB to the client: 24 MB for one,
-about 3 MB for ten, about 1 MB for a hundred. The 2PC cost is constant in the size of the prompt and
-the response; $\pi_{WIN}$ grows with the number of body records (two AES blocks per DATA record), not
-with their content.
+about 28 MB, of which N uploaded about 24 MB. With framing "2" on the final build, opening a connection
+moves 17.97 MB to the client and 2.63 MB from it, and every later request about 1.0 MB and 86 kB. For a
+connection of $r$ requests the average per request is about $(18 + 1.0\,(r - 1)) / r$ MB to the client:
+18 MB for one, about 2.7 MB for ten, about 1.2 MB for a hundred. (With the prototype's v2-size 2PC the
+open was 23.7 MB; the same arithmetic then started at 24 MB.) The 2PC cost is constant in the size of the
+prompt and the response; $\pi_{WIN}$ grows with the number of body records (two AES blocks per DATA
+record), not with their content, and a body of more records than one $\pi_{WIN}$ holds is proven in
+several batches before any of it is written (section 4).
+
+**What reuse needs.** The large saving holds only for sequential, settled requests that share a node, a
+credential and a reuse scope: parallel requests need connections of their own, an error head ends the
+connection, and one-off e-cash bearers, `reuse: none` and framing "1.1" keep one connection per request.
+Every reused request still costs a reservation, a `request_ok` round trip, $\pi_{WIN}$, $\pi_{C3S}$ (or
+`accept`) and a settlement; the node keeps the provider socket and the proof channel of an idle
+connection. At commodity prices the megabyte and two proof verifications of a reused request are worth well
+under a millisatoshi, so usage at the frozen rates covers them except for the smallest requests; an
+operator who wants a margin sets the rate surcharge (`PROTOCOL-V3.md` §8.5).
 
 ## 6.5 Live verification
 
-**Provider behaviour.** Before framing "2" was built we checked live against the case-study provider
-(2026-11-11) the behaviours it depends on: a TLS KeyUpdate directly after the first flight of an
-HTTP/2 connection is accepted; `HEADER_TABLE_SIZE = 0` is honoured for response headers; a 200 kB
-request body passes flow control; a request that names `authorization` by index only is still
-authenticated after 150 s of idle; and no part of the credential appeared in any of eight response
-paths we examined (success and error responses of the routes used). The gate
-`provider-profile-check.py --h2` checks the same list (section 3.1) and is what an operator runs
-before listing "2".
+**Provider behaviour.** `provider-profile-check.py --h2` checks what framing "2" depends on (section
+3.1) and passed against the case-study provider on 2026-11-12 with 300 s of idle and an 8 MiB body: ALPN
+`h2` with the client's one suite and P-256; a TLS KeyUpdate directly after the connection head accepted;
+`HEADER_TABLE_SIZE` left at 4096 (the credential entry is 94 bytes); response headers decodable with an
+empty table; a request naming `authorization` by index authenticated before and after the idle time (and
+refused without the field); 8 MiB in 1026 DATA frames answered; no reflection of the credential on seven
+response paths; the event stream ending as the usage disclosure parses it. The check refuses any
+argument it does not know, so a mistyped mode cannot pass for a check that did not run.
 
 **Honest runs.** Sequential chat requests on one connection, bursts over several connections, image
-requests on an open connection, and runs with HTTP/2 disabled completed through the node and the
-daemon with all proofs verified and signed receipts passing every client check; the gates compare the
-node's database balance with the expected money outcome of every case.
+requests on an open connection, armed connections, refused requests followed by good ones, forced
+framing "1.1" and the fallback from a failing framing "2" completed through the node and the daemon with
+all proofs verified and signed receipts passing every client check; the gates compare the node's
+database balance with the expected money outcome of every case.
 
-**Attacks.** The gates (`crypto/tools/v3-h2-check.sh` against the relay, `v3-h2-node-check.sh` through
-a node) run a dishonest reference client with an expected outcome per case. Each of these was refused
-before the provider received the request:
+**Attacks.** The gates (`crypto/tools/v3-check.sh` against the relay, `v3-node-check.sh` through a node,
+with exact money) run a dishonest reference client with an expected outcome per case. Each of these was
+refused before the provider received a request it would bill wrongly:
 
 - a HEADERS frame hidden inside the payload of a body record;
 - TLS padding used to shift a frame boundary;
-- a suffix other than the canonical one;
+- a suffix other than the canonical one, another model's suffix, another cap;
 - a header block naming another path;
 - a usage event replayed from an earlier request of the same connection;
-- a tampered image suffix.
+- a tampered image suffix;
+- records before `request_ok`, the client's own key share, a v2 2PC peer;
+- a request force-stopped with RST_STREAM so that a later one could ride on the stored credential
+  unbilled (section 5): a HEADERS record without `request`, RST_STREAM before or after the release, a
+  control record carrying a HEADERS frame, and on framing "1.1" a record after the final one or a second
+  request inside the body.
 
-An honest control and a v2 control run in the same gates. The attacks v2's gate covered (a
-pricier model in the body with the suffix withheld, another model's suffix, a client's own key share
-in the ClientHello) fail for the same reasons as before; the adversarial model-swap gate has not been
-re-run on the final v3 build: `[TO MEASURE]`.
+An honest control and a v2-socket control run in the same gates.
 
 **Scope.** One provider was tested. The HTTP/2 behaviours above are properties of that provider's
 front end on the day of the test.
