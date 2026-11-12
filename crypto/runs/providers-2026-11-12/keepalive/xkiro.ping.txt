@@ -1,0 +1,3 @@
+keepalive xkiro ping total=900s every=120s host=api.xkiro.com model=mistralai/ministral-3b start=2026-11-12T18:17:20Z
+ping: first request -> 200
+ping: still open after 901 s (8 frames sent) -> 200

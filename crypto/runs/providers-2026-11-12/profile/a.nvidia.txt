@@ -1,0 +1,18 @@
+  items: A9,A11,A1,A2,A4,A5,A6,A7,A12,A10
+provider profile check  2026-11-12T18:11:58Z
+  provider: https://integrate.api.nvidia.com/v1/chat/completions  build: ? (probe 200)
+  models: cheap=nvidia/nemotron-3.5-bolt-e4b reasoning=nvidia/nemotron-3.5-bolt-e4b text_only=nvidia/nemotron-3.5-bolt-e4b vision=nvidia/nemotron-3.5-bolt-e4b
+  offer file: offers/offer.nvidia.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+PASS         A9 TLS 1.3 / AES-128-GCM only / P-256 only / ALPN http/1.1: offered only TLS_AES_128_GCM_SHA256+P-256+http/1.1 -> TLSv1.3 TLS_AES_128_GCM_SHA256 group=ECDH p256=True alpn=http/1.1 verify=0
+PASS         A11 client KeyUpdate between head and body; complete answer; server closes: keyupdate_sent=True TLSv1.3 TLS_AES_128_GCM_SHA256 -> 200 complete_stream=True server_closed=True conn_hdr=close
+PASS         A1 waits for the full body: 0 bytes in 8 s with body incomplete; then 200 complete=True
+FAIL         A2 duplicate keys: last wins: bad-then-good model -> 404 (None); good-then-bad -> 200 'data: {"id":"chatcmpl-d7a0adc8-321f-413f-a5a4-f7d4'; max_tokens 200 then 8 -> 8 tokens
+FAIL         A4 unknown top-level field rejected: control -> 200; with field -> 400 '{"message":"Validation: Unsupported parameter(s): `no_such_field_xyz`"'
+FAIL         A5 suffix cannot land inside a nested object or string: control -> 200; open object -> 400 '{"error":{"message":"request body is not'; open string -> 400 '{"error":{"message":"request body is not'
+PASS         A6 max_completion_tokens caps output incl. reasoning: -> 200, completion_tokens=20 (reasoning 0) with cap 20, margin 16
+PASS         A7 last event carries usage + model, then [DONE]: -> 200 model=nvidia/nemotron-3.5-bolt-e4b usage=12+4 (body 164 bytes) choices=[] done=True
+PASS         A12 SSE framing: LF-only, one data: line per event: -> 200, 6 events, LF-only
+FAIL         A10 unpinned price-changing fields rejected: control -> 200; service_tier -> 200 'data: {"id":"chatcmpl-13ab10c8-f374-46b8-a10a-654c'; web_search_options -> 200 'data: {"id":"chatcmpl-9e84056a-34b0-49b1-b155-5568'; prediction -> 200 'data: {"id":"chatcmpl-476f8480-2c0b-4418-8eab-8231'
+summary: 6 PASS, 4 FAIL, 0 INCONCLUSIVE of 10
+exit status 1

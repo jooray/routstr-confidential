@@ -1,0 +1,3 @@
+keepalive nvidia ping total=900s every=120s host=integrate.api.nvidia.com model=nvidia/nemotron-3.5-bolt-e4b start=2026-11-12T18:17:20Z
+ping: first request -> 200
+ping: still open after 900 s (8 frames sent) -> 200

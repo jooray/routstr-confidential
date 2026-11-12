@@ -1,0 +1,26 @@
+h2-selfcheck: 134 checks passed
+h2-conn-test: 7 checks passed
+== h2-one (expect: settled:2:1) ==
+   PASS
+   rc=0 [2/1:200 cold rel=60ms ttft=258ms rec=2]
+== h11-one (expect: settled:1.1:1) ==
+   PASS
+   rc=0 [1.1/1:200 cold rel=813ms ttft=896ms rec=2]
+== h2-three (expect: settled:2:3) ==
+   PASS
+   rc=0 [2/1:200 cold rel=60ms ttft=252ms rec=2] [2/2:200 open rel=220ms ttft=376ms rec=2] [2/3:200 open rel=57ms ttft=209ms rec=2]
+== h2-decoy (expect: decoy:2:nvidia/nemotron-3.5-bolt-e4b) ==
+   DEVIATION: TIMEOUT (rc=124)
+   rc=124
+== h11-decoy (expect: decoy:1.1:nvidia/nemotron-3.5-bolt-e4b) ==
+   DEVIATION: TIMEOUT (rc=124)
+   rc=124
+
+case       expected                                verdict                      evidence
+h2-one     settled:2:1                             PASS                         rc=0 [2/1:200 cold rel=60ms ttft=258ms rec=2]
+h11-one    settled:1.1:1                           PASS                         rc=0 [1.1/1:200 cold rel=813ms ttft=896ms rec=2]
+h2-three   settled:2:3                             PASS                         rc=0 [2/1:200 cold rel=60ms ttft=252ms rec=2] [2/2:200 open rel=220ms ttft=376ms rec=2] [2/3:200 open rel=57ms ttft=209ms rec=2]
+h2-decoy   decoy:2:nvidia/nemotron-3.5-bolt-e4b    DEVIATION: TIMEOUT (rc=124)  rc=124
+h11-decoy  decoy:1.1:nvidia/nemotron-3.5-bolt-e4b  DEVIATION: TIMEOUT (rc=124)  rc=124
+
+FAILED: 2 of 5 cases deviated (evidence in /private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/prov/e2e/v3-nvidia)

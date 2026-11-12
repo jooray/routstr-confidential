@@ -1,0 +1,14 @@
+h2-selfcheck: 134 checks passed
+h2-conn-test: 7 checks passed
+== h2-one (expect: settled:2:1) ==
+   DEVIATION: no protocol-v3 result (driver exit != 0 or no E2E_JSON)
+   rc=1 
+== h11-one (expect: settled:1.1:1) ==
+   DEVIATION: no protocol-v3 result (driver exit != 0 or no E2E_JSON)
+   rc=1 
+
+case     expected       verdict                                                             evidence
+h2-one   settled:2:1    DEVIATION: no protocol-v3 result (driver exit != 0 or no E2E_JSON)  rc=1 
+h11-one  settled:1.1:1  DEVIATION: no protocol-v3 result (driver exit != 0 or no E2E_JSON)  rc=1 
+
+FAILED: 2 of 2 cases deviated (evidence in /private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/prov/e2e/v3-openrouter)

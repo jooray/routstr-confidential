@@ -1,0 +1,10 @@
+case	expected	verdict	evidence
+h2-one	settled:2:1	PASS	rc=0 [2/1:200 cold rel=59ms ttft=2822ms rec=2]
+h11-one	settled:1.1:1	PASS	rc=0 [1.1/1:200 cold rel=1085ms ttft=5647ms rec=2]
+h2-three	settled:2:3	PASS	rc=0 [2/1:200 cold rel=59ms ttft=16138ms rec=2] [2/2:200 open rel=211ms ttft=3720ms rec=2] [2/3:200 open rel=211ms ttft=1463ms rec=2]
+h11-two	settled:1.1:2	PASS	rc=0 [1.1/1:200 cold rel=1157ms ttft=8395ms rec=2] [1.1/1:200 cold rel=969ms ttft=3697ms rec=2]
+h2-big	big:2:13	PASS	rc=0 [2/1:200 cold rel=671ms ttft=7428ms rec=14]
+h2-decoy	decoy:2:moonshotai/kimi-k3.1-pro	PASS	rc=0 [2/1:200 cold rel=58ms ttft=1971ms rec=2] reported_model=moonshotai/kimi-k3.1-pro
+h11-decoy	decoy:1.1:moonshotai/kimi-k3.1-pro	PASS	rc=0 [1.1/1:200 cold rel=1090ms ttft=3390ms rec=2] reported_model=moonshotai/kimi-k3.1-pro
+h2-idle	settled:2:2	PASS	rc=0 [2/1:200 cold rel=58ms ttft=3311ms rec=2] [2/2:200 open rel=74ms ttft=10453ms rec=2]
+h2-c-model-swap	refused:2:1:pi_win failed	PASS	rc=0 adv={"mode": "suffix", "http": "2", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [CheckResult { label: \\\"anchor\\\", ok: true, got: \\\"d4cedb3930953c74c354219bbf5cb604454ee4302fab12f88890912656e4c05e\\\", first_diff: None }, CheckResult { label: \\\"windows\\\", ok: fa

@@ -1,0 +1,15 @@
+  items: A9,A11,A1,A2,A4,A7,A12
+provider profile check  2026-11-12T18:11:58Z
+  provider: https://openrouter.ai/api/v1/chat/completions  build: ? (probe 200)
+  models: cheap=liquid/lfm-2.5-2.6b:free reasoning=liquid/lfm-2.5-2.6b:free text_only=liquid/lfm-2.5-2.6b:free vision=liquid/lfm-2.5-2.6b:free
+  offer file: offers/offer.openrouter.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+PASS         A9 TLS 1.3 / AES-128-GCM only / P-256 only / ALPN http/1.1: offered only TLS_AES_128_GCM_SHA256+P-256+http/1.1 -> TLSv1.3 TLS_AES_128_GCM_SHA256 group=ECDH p256=True alpn=http/1.1 verify=0
+PASS         A11 client KeyUpdate between head and body; complete answer; server closes: keyupdate_sent=True TLSv1.3 TLS_AES_128_GCM_SHA256 -> 200 complete_stream=True server_closed=True conn_hdr=close
+PASS         A1 waits for the full body: 0 bytes in 8 s with body incomplete; then 200 complete=True
+FAIL         A2 duplicate keys: last wins: bad-then-good model -> 200 (liquid/lfm-2.5-2.6b:free); good-then-bad -> 400 '{"error":{"message":"no-such-model is not a valid '; max_tokens 200 then 8 -> 8 tokens
+FAIL         A4 unknown top-level field rejected: control -> 200; with field -> 200 'data: {"id":"gen-1794507156-KpvFEQPtCkCEnJRr89Fh","object":"chat.compl'
+FAIL         A7 last event carries usage + model, then [DONE]: -> 200 model=liquid/lfm-2.5-2.6b:free usage=13+4 (body 160 bytes) choices=[{'index': 0, 'delta': {'content': '', 'role': 'assistant'}, 'finish_reason': 'length', 'native_finish_reason': 'length'}] done=True
+FAIL         A12 SSE framing: LF-only, one data: line per event: -> 200, 6 events, event is not one data: line ': OPENROUTER PROCESSING'
+summary: 3 PASS, 4 FAIL, 0 INCONCLUSIVE of 7
+exit status 1

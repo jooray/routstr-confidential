@@ -1,0 +1,217 @@
+[2m2026-11-12T18:42:59.466917Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m loaded upstream API key [3mkey_len[0m[2m=[0m76
+[2m2026-11-12T18:42:59.467056Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m running WITHOUT --node-settles: the stub settlement signs its own receipts; a node in front of this sidecar would charge every request its full reservation
+[2m2026-11-12T18:42:59.467115Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m framing "2" offered [3mprobe_path[0m[2m=[0m/api/v1/models [3midle_secs[0m[2m=[0m590 [3mmax_requests[0m[2m=[0m100 [3mmax_lifetime_s[0m[2m=[0m3600 [3mkinds[0m[2m=[0m["chat"]
+[2m2026-11-12T18:42:59.467127Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m framings offered, in order of preference [3mhttp[0m[2m=[0m["2", "1.1"]
+[2m2026-11-12T18:42:59.467133Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m TEST HOOKS for framing "2" are active [3mfail_file[0m[2m=[0mSome("/private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/prov/e2e/v3-numes/h2-fail") [3mretry_secs[0m[2m=[0m45
+[2m2026-11-12T18:42:59.467260Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m cu-sidecar listening [3mlisten[0m[2m=[0m127.0.0.1:7492 [3mtoken[0m[2m=[0mfalse
+[2m2026-11-12T18:43:01.066177Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"193691dddfcc"
+[2m2026-11-12T18:43:01.066929Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"193691dddfcc"
+[2m2026-11-12T18:43:01.519659Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=13ms/0B preprocess=439ms/2958237B
+[2m2026-11-12T18:43:01.847089Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:43:02.310002Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:43:02.310103Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m48e367631cb6ade39286293bc85c9d480d964eb8b1f402b9a66580f5dce246bf
+[2m2026-11-12T18:43:02.337801Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=710.3462499999999ms key_share=41.83675ms ectf=2.118084ms phase_a=33.343542ms phase_b=105.749834ms
+[2m2026-11-12T18:43:02.337918Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:43:02.337929Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m1271 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:43:02.373617Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m33
+[2m2026-11-12T18:43:02.373691Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:02.406079Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m225
+[2m2026-11-12T18:43:02.541999Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m57
+[2m2026-11-12T18:43:02.542060Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:02.542128Z[0m [32m INFO[0m [2mcu_sidecar::h2_session[0m[2m:[0m π_WIN verified; request released to the upstream [3mn[0m[2m=[0m1
+[2m2026-11-12T18:43:09.834015Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m77
+[2m2026-11-12T18:43:09.834086Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:10.338446Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m proof channel top-up failed [3merror[0m[2m=[0mtop-up
+[2m2026-11-12T18:43:10.338543Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m9271 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:43:10.745778Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"14e63c80369c"
+[2m2026-11-12T18:43:10.746017Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"14e63c80369c"
+[2m2026-11-12T18:43:10.936929Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=189ms/2958293B
+[2m2026-11-12T18:43:11.180125Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:43:11.667171Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:43:11.667258Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m69cd2db196cf9ea3064f73688345eb6ae40a057b115fdd2e10dd38465aa5e2c0
+[2m2026-11-12T18:43:11.694220Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=381.674833ms key_share=47.142666ms ectf=3.6485ms phase_a=32.372875ms phase_b=124.516ms
+[2m2026-11-12T18:43:11.694329Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:43:11.694331Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m948 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:43:11.734625Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m38
+[2m2026-11-12T18:43:11.734676Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:11.772463Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m283
+[2m2026-11-12T18:43:11.773135Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m final body record held until π_WIN verifies
+[2m2026-11-12T18:43:11.824104Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m50
+[2m2026-11-12T18:43:11.824149Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:11.824191Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m π_WIN verified; final body record released to the upstream
+[2m2026-11-12T18:43:18.456579Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m upstream closed the connection
+[2m2026-11-12T18:43:18.458846Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m pi_c3s records [3mseqs[0m[2m=[0m[7, 8] [3mlens[0m[2m=[0m[585, 6] [3mr_len[0m[2m=[0m575
+[2m2026-11-12T18:43:18.538226Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m78
+[2m2026-11-12T18:43:18.538278Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:18.538949Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m7792 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:43:19.427825Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"9e235980a006"
+[2m2026-11-12T18:43:19.427959Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"9e235980a006"
+[2m2026-11-12T18:43:19.615302Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=185ms/2958293B
+[2m2026-11-12T18:43:19.865938Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:43:20.356483Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:43:20.356573Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m98bb626aeee473509c35567051199efd465fd85e0e82c5baba219ea359df8bef
+[2m2026-11-12T18:43:20.383811Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=388.29283300000003ms key_share=45.376292ms ectf=2.2615830000000003ms phase_a=33.696749999999994ms phase_b=126.26175ms
+[2m2026-11-12T18:43:20.383913Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:43:20.383917Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m956 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:43:20.416519Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m31
+[2m2026-11-12T18:43:20.416580Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:20.448572Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m225
+[2m2026-11-12T18:43:20.586281Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m56
+[2m2026-11-12T18:43:20.586336Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:20.586390Z[0m [32m INFO[0m [2mcu_sidecar::h2_session[0m[2m:[0m π_WIN verified; request released to the upstream [3mn[0m[2m=[0m1
+[2m2026-11-12T18:43:39.185123Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m76
+[2m2026-11-12T18:43:39.185182Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:39.271379Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan topup [3mallow[0m[2m=[0mtrue [3mbefore[0m[2m=[0m526634 [3mafter[0m[2m=[0m1493769 [3mbytes[0m[2m=[0m610463 [3mstep[0m[2m=[0m900000 [3mtopups[0m[2m=[0m1 [3mtopup_bytes[0m[2m=[0m610463 [3melapsed_ms[0m[2m=[0m84
+[2m2026-11-12T18:43:39.397015Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m54
+[2m2026-11-12T18:43:39.397074Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:39.397181Z[0m [32m INFO[0m [2mcu_sidecar::h2_session[0m[2m:[0m π_WIN verified; request released to the upstream [3mn[0m[2m=[0m2
+[2m2026-11-12T18:43:46.820308Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m76
+[2m2026-11-12T18:43:46.822779Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:46.912249Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan topup [3mallow[0m[2m=[0mtrue [3mbefore[0m[2m=[0m831125 [3mafter[0m[2m=[0m1798260 [3mbytes[0m[2m=[0m610463 [3mstep[0m[2m=[0m900000 [3mtopups[0m[2m=[0m2 [3mtopup_bytes[0m[2m=[0m1220926 [3melapsed_ms[0m[2m=[0m83
+[2m2026-11-12T18:43:47.038694Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m54
+[2m2026-11-12T18:43:47.038771Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:47.038884Z[0m [32m INFO[0m [2mcu_sidecar::h2_session[0m[2m:[0m π_WIN verified; request released to the upstream [3mn[0m[2m=[0m3
+[2m2026-11-12T18:43:50.366752Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m76
+[2m2026-11-12T18:43:50.366822Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:50.369448Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m30941 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:43:51.255315Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"cadf93a28001"
+[2m2026-11-12T18:43:51.255424Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"cadf93a28001"
+[2m2026-11-12T18:43:51.445053Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=187ms/2958293B
+[2m2026-11-12T18:43:51.682329Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:43:52.248186Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:43:52.248277Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m28ac698085d605bfdedcc0aae26d80dcf38648e741c05e2b3ba42cb182f0a663
+[2m2026-11-12T18:43:52.275429Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=371.604583ms key_share=50.530291999999996ms ectf=2.070459ms phase_a=33.019958ms phase_b=122.773584ms
+[2m2026-11-12T18:43:52.275560Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m1020 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:43:52.275575Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:43:52.315809Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m38
+[2m2026-11-12T18:43:52.315879Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:52.353811Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m283
+[2m2026-11-12T18:43:52.354363Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m final body record held until π_WIN verifies
+[2m2026-11-12T18:43:52.405531Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m50
+[2m2026-11-12T18:43:52.405595Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:43:52.405644Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m π_WIN verified; final body record released to the upstream
+[2m2026-11-12T18:44:00.400503Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m upstream closed the connection
+[2m2026-11-12T18:44:00.402803Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m pi_c3s records [3mseqs[0m[2m=[0m[7, 8] [3mlens[0m[2m=[0m[585, 6] [3mr_len[0m[2m=[0m575
+[2m2026-11-12T18:44:00.479758Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m76
+[2m2026-11-12T18:44:00.479829Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:00.480629Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m9225 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:00.485426Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"6d947663e5fc"
+[2m2026-11-12T18:44:00.485493Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"6d947663e5fc"
+[2m2026-11-12T18:44:00.735411Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=248ms/2958293B
+[2m2026-11-12T18:44:00.897326Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:44:01.292007Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:44:01.292080Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m74916842396654387d5d6680070a03e30e78242e61d4e04d9a19f6b94b290b7e
+[2m2026-11-12T18:44:01.319523Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=358.273458ms key_share=51.277334ms ectf=0.8018329999999999ms phase_a=33.490249999999996ms phase_b=36.118792ms
+[2m2026-11-12T18:44:01.319618Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m834 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:01.319658Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:44:01.359339Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m38
+[2m2026-11-12T18:44:01.359381Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:01.398297Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m283
+[2m2026-11-12T18:44:01.399018Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m final body record held until π_WIN verifies
+[2m2026-11-12T18:44:01.450510Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m50
+[2m2026-11-12T18:44:01.450561Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:01.450611Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m π_WIN verified; final body record released to the upstream
+[2m2026-11-12T18:44:07.392602Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m upstream closed the connection
+[2m2026-11-12T18:44:07.394116Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m pi_c3s records [3mseqs[0m[2m=[0m[8, 9] [3mlens[0m[2m=[0m[575, 6] [3mr_len[0m[2m=[0m575
+[2m2026-11-12T18:44:07.470463Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m75
+[2m2026-11-12T18:44:07.470512Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:07.471213Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m6985 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:08.367641Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"071c82b9595b"
+[2m2026-11-12T18:44:08.367860Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"071c82b9595b"
+[2m2026-11-12T18:44:08.553772Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=184ms/2958283B
+[2m2026-11-12T18:44:08.782282Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:44:09.270258Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:44:09.270354Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m4812b10d47a427da05de60d03e90b76c84e64afbf44bea8382242c74ec0b4d39
+[2m2026-11-12T18:44:09.297873Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=356.918834ms key_share=52.851833ms ectf=5.5433330000000005ms phase_a=35.432832999999995ms phase_b=125.446542ms
+[2m2026-11-12T18:44:09.298007Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m930 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:09.298008Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:44:09.330982Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m31
+[2m2026-11-12T18:44:09.331042Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:09.363469Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m225
+[2m2026-11-12T18:44:09.537302Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m79
+[2m2026-11-12T18:44:09.537353Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:10.113411Z[0m [32m INFO[0m [2mcu_sidecar::h2_session[0m[2m:[0m π_WIN verified; request released to the upstream [3mn[0m[2m=[0m1
+[2m2026-11-12T18:44:22.462247Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m75
+[2m2026-11-12T18:44:22.462311Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:22.966071Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m proof channel top-up failed [3merror[0m[2m=[0mtop-up
+[2m2026-11-12T18:44:22.966379Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m14598 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:23.352647Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"1d931229acf3"
+[2m2026-11-12T18:44:23.352828Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"1d931229acf3"
+[2m2026-11-12T18:44:23.615664Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=261ms/2958293B
+[2m2026-11-12T18:44:23.779452Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:44:24.266559Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:44:24.266658Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0mb5e0ed72ddb03246d66896da104e094296d6b83148d8e1e6c4227f929d5d6f13
+[2m2026-11-12T18:44:24.293421Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=365.039333ms key_share=57.029291ms ectf=5.498792ms phase_a=37.413333ms phase_b=123.997375ms
+[2m2026-11-12T18:44:24.293542Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m940 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:24.293556Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:44:24.326292Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m30
+[2m2026-11-12T18:44:24.326343Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:24.356877Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m225
+[2m2026-11-12T18:44:24.510738Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m55
+[2m2026-11-12T18:44:24.510784Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:24.510832Z[0m [32m INFO[0m [2mcu_sidecar::h2_session[0m[2m:[0m π_WIN verified; request released to the upstream [3mn[0m[2m=[0m1
+[2m2026-11-12T18:44:26.733499Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m78
+[2m2026-11-12T18:44:26.733552Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:26.735996Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m3383 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:27.630998Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"f5518b96aec2"
+[2m2026-11-12T18:44:27.631180Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"f5518b96aec2"
+[2m2026-11-12T18:44:27.812872Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=3ms/0B preprocess=179ms/2958293B
+[2m2026-11-12T18:44:28.067007Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:44:28.556486Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:44:28.556574Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0madc6b12f9101078d45875433bac53abca43812723a4c077f936dd89756ab366d
+[2m2026-11-12T18:44:28.583474Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=374.104125ms key_share=56.594792ms ectf=3.914125ms phase_a=34.618875ms phase_b=125.98445799999999ms
+[2m2026-11-12T18:44:28.583616Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:44:28.583616Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m952 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:28.623244Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m37
+[2m2026-11-12T18:44:28.623297Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:28.661969Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m283
+[2m2026-11-12T18:44:28.662610Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m final body record held until π_WIN verifies
+[2m2026-11-12T18:44:28.713135Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m49
+[2m2026-11-12T18:44:28.713178Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:28.713213Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m π_WIN verified; final body record released to the upstream
+[2m2026-11-12T18:44:35.572123Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m upstream closed the connection
+[2m2026-11-12T18:44:35.574236Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m pi_c3s records [3mseqs[0m[2m=[0m[9, 10, 11] [3mlens[0m[2m=[0m[571, 20, 6] [3mr_len[0m[2m=[0m580
+[2m2026-11-12T18:44:35.653127Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m78
+[2m2026-11-12T18:44:35.653177Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:35.654004Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m8022 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:36.539973Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"247e44cd1522"
+[2m2026-11-12T18:44:36.540137Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"247e44cd1522"
+[2m2026-11-12T18:44:36.724888Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=183ms/2958293B
+[2m2026-11-12T18:44:36.956743Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:44:37.509937Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:44:37.510036Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m167cf06d27943c652412e53d7261d7fb7fa3bfe7c72a9ad6419a79e8d113d584
+[2m2026-11-12T18:44:37.537295Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=359.403792ms key_share=52.622291000000004ms ectf=2.010709ms phase_a=33.004958ms phase_b=124.106417ms
+[2m2026-11-12T18:44:37.537415Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:44:37.537426Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m997 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:44:37.570977Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m31
+[2m2026-11-12T18:44:37.571028Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:37.602988Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m225
+[2m2026-11-12T18:44:37.747003Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m55
+[2m2026-11-12T18:44:37.747057Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:37.747114Z[0m [32m INFO[0m [2mcu_sidecar::h2_session[0m[2m:[0m π_WIN verified; request released to the upstream [3mn[0m[2m=[0m1
+[2m2026-11-12T18:44:42.979671Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m75
+[2m2026-11-12T18:44:42.979726Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:44:43.064513Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan topup [3mallow[0m[2m=[0mtrue [3mbefore[0m[2m=[0m526634 [3mafter[0m[2m=[0m1493769 [3mbytes[0m[2m=[0m610463 [3mstep[0m[2m=[0m900000 [3mtopups[0m[2m=[0m1 [3mtopup_bytes[0m[2m=[0m610463 [3melapsed_ms[0m[2m=[0m83
+[2m2026-11-12T18:45:43.060382Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m71
+[2m2026-11-12T18:45:43.060445Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:45:43.060530Z[0m [32m INFO[0m [2mcu_sidecar::h2_session[0m[2m:[0m π_WIN verified; request released to the upstream [3mn[0m[2m=[0m2
+[2m2026-11-12T18:45:58.524257Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m80
+[2m2026-11-12T18:45:58.524318Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:45:59.028459Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m proof channel top-up failed [3merror[0m[2m=[0mtop-up
+[2m2026-11-12T18:45:59.028680Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m82486 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:45:59.416129Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"3b0a509b8973"
+[2m2026-11-12T18:45:59.416273Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"3b0a509b8973"
+[2m2026-11-12T18:45:59.667476Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=249ms/2958293B
+[2m2026-11-12T18:45:59.837034Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-12T18:46:00.341537Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0804" [3msig_len[0m[2m=[0m256
+[2m2026-11-12T18:46:00.341621Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0mb8f4d33587953de1578b22de84f081e34e581d8b3635a0454f8f45fa2804cff6
+[2m2026-11-12T18:46:00.367178Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=365.82475ms key_share=50.919334ms ectf=1.8809580000000001ms phase_a=41.105875ms phase_b=125.191375ms
+[2m2026-11-12T18:46:00.367294Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m951 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:46:00.367300Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-12T18:46:00.401028Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m32
+[2m2026-11-12T18:46:00.401086Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-12T18:46:00.431770Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m225
+[2m2026-11-12T18:46:00.575625Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mfalse [3melapsed_ms[0m[2m=[0m56
+[2m2026-11-12T18:46:00.575690Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mfalse [3merr[0m[2m=[0mSome("proof checks failed: [CheckResult { label: \"anchor\", ok: true, got: \"d4cedb3930953c74c354219bbf5cb604454ee4302fab12f88890912656e4c05e\", first_diff: None }, CheckResult { label: \"windows\", ok: false, got: \"00\", first_diff: Some(0) }]")
+[2m2026-11-12T18:46:00.575726Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m1159 [3mok[0m[2m=[0mtrue
+[2m2026-11-12T18:46:00.576724Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m session ended with error [3merror[0m[2m=[0mproof pi_win failed: Some("proof checks failed: [CheckResult { label: \"anchor\", ok: true, got: \"d4cedb3930953c74c354219bbf5cb604454ee4302fab12f88890912656e4c05e\", first_diff: None }, CheckResult { label: \"windows\", ok: false, got: \"00\", first_diff: Some(0) }]")

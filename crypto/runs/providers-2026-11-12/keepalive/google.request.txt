@@ -1,0 +1,6 @@
+keepalive google request total=600s every=150s host=generativelanguage.googleapis.com model=gemini-flash-lite-latest start=2026-11-12T18:32:43Z
+request: first request -> 200
+request: request 1 at 158 s -> 200
+request: request 2 at 309 s -> 200
+request: request 3 at 460 s -> 200
+request: still open after 607 s (3 frames sent) -> 200

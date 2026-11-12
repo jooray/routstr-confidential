@@ -1,0 +1,18 @@
+provider profile check  2026-11-12T18:12:31Z
+  provider: https://api.cloudflare.com/client/v4/accounts/***/ai/v1/chat/completions  build: ? (probe 200)
+  models: cheap=@cf/meta/llama-3.2-1b-instruct reasoning=@cf/meta/llama-3.2-1b-instruct text_only=@cf/meta/llama-3.2-1b-instruct vision=@cf/meta/llama-3.2-1b-instruct
+  offer file: offers/offer.cloudflare.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+  framing "2": probe /client/v4/accounts/***/ai/v1/models, idle 60 s (offer h2.idle_secs 300), body 20000 bytes, images no
+PASS         H1 TLS 1.3 with ALPN h2 (the one suite, P-256 only): offered only TLS_AES_128_GCM_SHA256+P-256+h2 -> TLSv1.3 TLS_AES_128_GCM_SHA256 p256=True alpn=h2 verify=0
+PASS         H2 KeyUpdate right after the connection head is accepted: head, KeyUpdate (sent=1), then a request -> 200, complete stream; control without KeyUpdate -> 200
+PASS         H3 the request dynamic table is kept (credential entry fits; SETTINGS do not shrink it): SETTINGS HEADER_TABLE_SIZE=default 4096 (credential entry 105 bytes, 1 SETTINGS frame(s)); request naming index 62 -> 200
+PASS         H6 a body of the node's limit passes flow control: 20000 byte body in 3 DATA frames, provider window 65536, 4 WINDOW_UPDATE frames -> 200
+INCONCLUSIVE H5 authorization by index only is authenticated, also after the idle time: indexed -> 200; no authorization field -> 401 (control); idle 60 s (0 PING answered), then indexed -> 200; but the offer's h2.idle_secs is 300: run with --h2-idle 300 or lower h2.idle_secs to 60
+PASS         H4 HEADER_TABLE_SIZE = 0 honoured for response headers: 8 response header blocks on 3 connections decode with an empty dynamic table; table size updates: [0]
+INCONCLUSIVE H7 no response reflects the credential: not every response path was read (missing: -; unexpected status: ['probe GET -> 405', 'chat, unknown field -> 200']); clean so far: probe GET 405; chat by index 200; chat without authorization 401; chat, unknown model 400; chat, unknown field 200
+PASS         H8 the usage event and [DONE] end the stream as the disclosure parses it: 4 streams end in the usage event and [DONE] (343 byte tail, LF only), END_STREAM on the last DATA frame
+summary: 6 PASS, 0 FAIL, 2 INCONCLUSIVE of 8
+offer "2": not yet, because the check is incomplete (H5: indexed -> 200; no authorization field -> 401 (control); idle 60 s (0 PING answered), then indexed -> 200; but the offer's h2.idle_secs is 300: run with --h2-idle 300 or lower h2.idle_secs to 60; H7: not every response path was read (missing: -; unexpected status: ['probe GET -> 405', 'chat, unknown field -> 200']); clean so far: probe GET 405; chat by index 200; chat without authorization 401; chat, unknown model 400; chat, unknown field 200)
+  run it again; add "2" only after a run in which H1-H8 all pass.
+exit status 2

@@ -1,0 +1,3 @@
+keepalive numes ping total=900s every=120s host=api.numes.ai model=moonshotai/kimi-k3.1-pro start=2026-11-12T18:17:20Z
+ping: first request -> 200
+ping: closed after 600 s idle (goaway= (GOAWAY error 0 ''), closed=False, frames_sent=4)

@@ -1,0 +1,9 @@
+[client h11] <- ready
+[client h11] <- request_ok
+[client h11] <- hs_verified
+[client h11] <- c_commit
+[client h11] <- head_written
+[client h11] <- zk_params
+[client h11] <- body_released
+[client h11] <- attestation
+[client] FAILED: Error: could not extract a valid usage disclosure R

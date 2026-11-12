@@ -1,0 +1,3 @@
+keepalive google ping total=900s every=120s host=generativelanguage.googleapis.com model=gemini-flash-lite-latest start=2026-11-12T18:17:20Z
+ping: first request -> 200
+ping: closed after 240 s idle (goaway= (GOAWAY error 0 'session_timed_out'), closed=False, frames_sent=1)

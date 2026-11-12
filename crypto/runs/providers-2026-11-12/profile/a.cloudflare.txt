@@ -1,0 +1,18 @@
+  items: A9,A11,A1,A2,A4,A5,A6,A7,A12,A10
+provider profile check  2026-11-12T18:11:58Z
+  provider: https://api.cloudflare.com/client/v4/accounts/***/ai/v1/chat/completions  build: ? (probe 200)
+  models: cheap=@cf/meta/llama-3.2-1b-instruct reasoning=@cf/meta/llama-3.2-1b-instruct text_only=@cf/meta/llama-3.2-1b-instruct vision=@cf/meta/llama-3.2-1b-instruct
+  offer file: offers/offer.cloudflare.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+PASS         A9 TLS 1.3 / AES-128-GCM only / P-256 only / ALPN http/1.1: offered only TLS_AES_128_GCM_SHA256+P-256+http/1.1 -> TLSv1.3 TLS_AES_128_GCM_SHA256 group=ECDH p256=True alpn=http/1.1 verify=0
+PASS         A11 client KeyUpdate between head and body; complete answer; server closes: keyupdate_sent=True TLSv1.3 TLS_AES_128_GCM_SHA256 -> 200 complete_stream=True server_closed=True conn_hdr=close
+PASS         A1 waits for the full body: 0 bytes in 8 s with body incomplete; then 200 complete=True
+FAIL         A2 duplicate keys: last wins: bad-then-good model -> 200 (@cf/meta/llama-3.2-1b-instruct); good-then-bad -> 400 '{"errors":[{"message":"AiError: No such model: No '; max_tokens 200 then 8 -> 8 tokens
+FAIL         A4 unknown top-level field rejected: control -> 200; with field -> 200 'data: {"id":"id-1794507137920","created":1794507137,"model":"@cf/meta/'
+FAIL         A5 suffix cannot land inside a nested object or string: control -> 200; open object -> 400 '{"errors":[{"code":"invalid_type","expec'; open string -> 400 '{"errors":[{"code":"invalid_type","expec'
+PASS         A6 max_completion_tokens caps output incl. reasoning: -> 200, completion_tokens=20 (reasoning None) with cap 20, margin 16
+FAIL         A7 last event carries usage + model, then [DONE]: -> 200 model=@cf/meta/llama-3.2-1b-instruct usage=14+4 (body 166 bytes) choices=[{'index': 0, 'delta': {}, 'finish_reason': 'stop'}] done=True
+PASS         A12 SSE framing: LF-only, one data: line per event: -> 200, 6 events, LF-only
+FAIL         A10 unpinned price-changing fields rejected: control -> 200; service_tier -> 200 'data: {"id":"id-1794507148096","created":179450714'; web_search_options -> 200 'data: {"id":"id-1794507149382","created":179450714'; prediction -> 200 'data: {"id":"id-1794507150645","created":179450715'
+summary: 5 PASS, 5 FAIL, 0 INCONCLUSIVE of 10
+exit status 1

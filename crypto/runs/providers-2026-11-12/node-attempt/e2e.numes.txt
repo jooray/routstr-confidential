@@ -1,0 +1,2 @@
+offer: no price for moonshotai/kimi-k3.1-pro
+the node's offer is not usable; see /private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/prov/e2e/numes/offer.json and /private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/prov/e2e/numes/node.out

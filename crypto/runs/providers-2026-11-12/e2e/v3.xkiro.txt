@@ -1,0 +1,42 @@
+h2-selfcheck: 134 checks passed
+h2-conn-test: 7 checks passed
+== h2-one (expect: settled:2:1) ==
+   PASS
+   rc=0 [2/1:200 cold rel=62ms ttft=679ms rec=2]
+== h11-one (expect: settled:1.1:1) ==
+   PASS
+   rc=0 [1.1/1:200 cold rel=750ms ttft=1329ms rec=2]
+== h2-three (expect: settled:2:3) ==
+   PASS
+   rc=0 [2/1:200 cold rel=60ms ttft=664ms rec=2] [2/2:200 open rel=220ms ttft=791ms rec=2] [2/3:200 open rel=56ms ttft=651ms rec=2]
+== h11-two (expect: settled:1.1:2) ==
+   PASS
+   rc=0 [1.1/1:200 cold rel=762ms ttft=1369ms rec=2] [1.1/1:200 cold rel=624ms ttft=1328ms rec=2]
+== h2-big (expect: big:2:13) ==
+   PASS
+   rc=0 [2/1:200 cold rel=140ms ttft=2786ms rec=14]
+== h2-decoy (expect: decoy:2:mistralai/ministral-3b) ==
+   PASS
+   rc=0 [2/1:200 cold rel=60ms ttft=671ms rec=2] reported_model=mistralai/ministral-3b
+== h11-decoy (expect: decoy:1.1:mistralai/ministral-3b) ==
+   PASS
+   rc=0 [1.1/1:200 cold rel=819ms ttft=1380ms rec=2] reported_model=mistralai/ministral-3b
+== h2-idle (expect: settled:2:2) ==
+   PASS
+   rc=0 [2/1:200 cold rel=59ms ttft=635ms rec=2] [2/2:200 open rel=57ms ttft=719ms rec=2]
+== h2-c-model-swap (expect: refused:2:1:pi_win failed) ==
+   PASS
+   rc=0 adv={"mode": "suffix", "http": "2", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [CheckResult { label: \\\"anchor\\\", ok: true, got: \\\"bb8280466bfbaf548b82925b58af6bffabb70009ee42293e0db2153aa9602021\\\", first_diff: None }, CheckResult { label: \\\"windows\\\", ok: fa
+
+case             expected                          verdict  evidence
+h2-one           settled:2:1                       PASS     rc=0 [2/1:200 cold rel=62ms ttft=679ms rec=2]
+h11-one          settled:1.1:1                     PASS     rc=0 [1.1/1:200 cold rel=750ms ttft=1329ms rec=2]
+h2-three         settled:2:3                       PASS     rc=0 [2/1:200 cold rel=60ms ttft=664ms rec=2] [2/2:200 open rel=220ms ttft=791ms rec=2] [2/3:200 open rel=56ms ttft=651ms rec=2]
+h11-two          settled:1.1:2                     PASS     rc=0 [1.1/1:200 cold rel=762ms ttft=1369ms rec=2] [1.1/1:200 cold rel=624ms ttft=1328ms rec=2]
+h2-big           big:2:13                          PASS     rc=0 [2/1:200 cold rel=140ms ttft=2786ms rec=14]
+h2-decoy         decoy:2:mistralai/ministral-3b    PASS     rc=0 [2/1:200 cold rel=60ms ttft=671ms rec=2] reported_model=mistralai/ministral-3b
+h11-decoy        decoy:1.1:mistralai/ministral-3b  PASS     rc=0 [1.1/1:200 cold rel=819ms ttft=1380ms rec=2] reported_model=mistralai/ministral-3b
+h2-idle          settled:2:2                       PASS     rc=0 [2/1:200 cold rel=59ms ttft=635ms rec=2] [2/2:200 open rel=57ms ttft=719ms rec=2]
+h2-c-model-swap  refused:2:1:pi_win failed         PASS     rc=0 adv={"mode": "suffix", "http": "2", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [CheckResult { label: \\\"anchor\\\", ok: true, got:
+
+OK: all 9 cases as expected (evidence in /private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/prov/e2e/v3-xkiro)

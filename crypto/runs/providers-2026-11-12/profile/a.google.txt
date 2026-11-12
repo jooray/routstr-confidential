@@ -1,0 +1,18 @@
+  items: A9,A11,A1,A2,A4,A5,A6,A7,A12,A10
+provider profile check  2026-11-12T18:11:58Z
+  provider: https://generativelanguage.googleapis.com/v1beta/openai/chat/completions  build: ? (probe 200)
+  models: cheap=gemini-flash-lite-latest reasoning=gemini-flash-lite-latest text_only=gemini-flash-lite-latest vision=gemini-flash-lite-latest
+  offer file: offers/offer.google.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+PASS         A9 TLS 1.3 / AES-128-GCM only / P-256 only / ALPN http/1.1: offered only TLS_AES_128_GCM_SHA256+P-256+http/1.1 -> TLSv1.3 TLS_AES_128_GCM_SHA256 group=ECDH p256=True alpn=http/1.1 verify=0
+PASS         A11 client KeyUpdate between head and body; complete answer; server closes: keyupdate_sent=True TLSv1.3 TLS_AES_128_GCM_SHA256 -> 200 complete_stream=True server_closed=True conn_hdr=close
+PASS         A1 waits for the full body: 0 bytes in 8 s with body incomplete; then 200 complete=True
+FAIL         A2 duplicate keys: last wins: bad-then-good model -> 200 (gemini-flash-lite-latest); good-then-bad -> 404 '[{\n  "error": {\n    "code": 404,\n    "message": "m'; max_tokens 200 then 8 -> None tokens
+FAIL         A4 unknown top-level field rejected: control -> 200; with field -> 400 '[{\n  "error": {\n    "code": 400,\n    "message": "Invalid JSON payload '
+FAIL         A5 suffix cannot land inside a nested object or string: control -> 200; open object -> 400 '[{\n  "error": {\n    "code": 400,\n    "me'; open string -> 400 '[{\n  "error": {\n    "code": 400,\n    "me'
+FAIL         A6 max_completion_tokens caps output incl. reasoning: -> 400, completion_tokens=None (reasoning None) with cap 20, margin 16
+FAIL         A7 last event carries usage + model, then [DONE]: -> 200 model=gemini-flash-lite-latest usage=4+0 (body 160 bytes) choices=[{'delta': {'extra_content': {'google': {'thought_signature': 'EmIKYAFpFH0TcfApF9WqIHJB51EjscVDO4YEhBq0sBodgKodz9Y0kiTiBGOF8mhzyYZfoKa2v796puLybg7dyney6i6eGcK/HFsSp1BTtTyucJQhUaknu0Qp1nUNR9u48lgs8w=='}}, 'role': 'assistant'}, 'finish_reason': 'length', 'index': 0}] done=True
+PASS         A12 SSE framing: LF-only, one data: line per event: -> 200, 2 events, LF-only
+FAIL         A10 unpinned price-changing fields rejected: control -> 200; service_tier -> 200 'data: {"choices":[{"delta":{"extra_content":{"goog'; web_search_options -> 400 '[{\n  "error": {\n    "code": 400,\n    "message": "I'; prediction -> 400 '[{\n  "error": {\n    "code": 400,\n    "message": "I'
+summary: 4 PASS, 6 FAIL, 0 INCONCLUSIVE of 10
+exit status 1

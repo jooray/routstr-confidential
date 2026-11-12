@@ -1,0 +1,10 @@
+  items: A9,A7
+provider profile check  2026-11-12T18:09:48Z
+  provider: https://integrate.api.nvidia.com/v1/chat/completions  build: ? (probe 200)
+  models: cheap=nvidia/nemotron-3.5-bolt-e4b reasoning=nvidia/nemotron-3.5-bolt-e4b text_only=nvidia/nemotron-3.5-bolt-e4b vision=nvidia/nemotron-3.5-bolt-e4b
+  offer file: offers/offer.nvidia.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+PASS         A9 TLS 1.3 / AES-128-GCM only / P-256 only / ALPN http/1.1: offered only TLS_AES_128_GCM_SHA256+P-256+http/1.1 -> TLSv1.3 TLS_AES_128_GCM_SHA256 group=ECDH p256=True alpn=http/1.1 verify=0
+PASS         A7 last event carries usage + model, then [DONE]: -> 200 model=nvidia/nemotron-3.5-bolt-e4b usage=12+4 (body 164 bytes) choices=[] done=True
+summary: 2 PASS, 0 FAIL, 0 INCONCLUSIVE of 2
+exit status 0

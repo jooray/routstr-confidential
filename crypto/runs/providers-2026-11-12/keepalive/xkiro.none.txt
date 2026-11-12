@@ -1,0 +1,3 @@
+keepalive xkiro none total=1200s every=10s host=api.xkiro.com model=mistralai/ministral-3b start=2026-11-12T18:17:20Z
+none: first request -> 200
+none: closed after 400 s idle (goaway= (GOAWAY error 0 ''), closed=False, frames_sent=0)

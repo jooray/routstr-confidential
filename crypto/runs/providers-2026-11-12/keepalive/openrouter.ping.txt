@@ -1,0 +1,3 @@
+keepalive openrouter ping total=900s every=120s host=openrouter.ai model=liquid/lfm-2.5-2.6b:free start=2026-11-12T18:17:20Z
+ping: first request -> 200
+ping: still open after 900 s (8 frames sent) -> 200

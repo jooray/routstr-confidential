@@ -1,0 +1,7 @@
+keepalive numes request total=900s every=200s host=api.numes.ai model=moonshotai/kimi-k3.1-pro start=2026-11-12T18:32:43Z
+request: first request -> 200
+request: request 1 at 203 s -> 200
+request: request 2 at 407 s -> 200
+request: request 3 at 609 s -> 200
+request: request 4 at 836 s -> 200
+request: still open after 902 s (4 frames sent) -> 200
