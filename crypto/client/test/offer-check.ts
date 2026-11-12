@@ -2,7 +2,7 @@
 // (`src/offer.ts`): the receipt's upper bound and the image count key.
 //   node --experimental-strip-types test/offer-check.ts
 import assert from 'node:assert/strict'
-import { checkImagesBlock, imageCountKeyForRoute, maxUsageCharge } from '../src/offer.ts'
+import { MAX_BODY_LEN, checkImagesBlock, imageCountKeyForRoute, maxUsageCharge, padBody, paddedBodyLength } from '../src/offer.ts'
 
 // The bound is the node's own formula: a usage with cached reads is bounded
 // at the cached price, never at the uncached one.
@@ -38,4 +38,21 @@ assert.throws(() => checkImagesBlock(block('/api/v1/image/generate', 'n')), /cou
 assert.throws(() => checkImagesBlock(block('/v1/images/generations', 'variants')), /count_key/)
 assert.throws(() => checkImagesBlock(block('/v1/images/generations')), /count_key/)
 assert.throws(() => checkImagesBlock(block('/v1/images/edits', 'n')), /head_template/)
+// The optional body-size bucket: off, a multiple, a power of two, the cap.
+assert.equal(paddedBodyLength(1234, undefined), 1234)
+assert.equal(paddedBodyLength(1234, 4096), 4096)
+assert.equal(paddedBodyLength(4096, 4096), 4096)
+assert.equal(paddedBodyLength(4097, 4096), 8192)
+assert.equal(paddedBodyLength(100, 'pow2'), 1024)
+assert.equal(paddedBodyLength(5000, 'pow2'), 8192)
+assert.equal(paddedBodyLength(MAX_BODY_LEN - 5, 'pow2'), MAX_BODY_LEN)
+assert.equal(paddedBodyLength(MAX_BODY_LEN - 5, 3 << 20), MAX_BODY_LEN)
+assert.throws(() => paddedBodyLength(10, 3), /bucket/)
+{
+  const enc = new TextEncoder()
+  const body = padBody(enc.encode('{"messages":[]'), enc.encode(',"model":"m"}'), 64)
+  assert.equal(body.length, 64)
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(body)), { messages: [], model: 'm' })
+  assert.ok(new TextDecoder().decode(body).endsWith(' ,"model":"m"}'))
+}
 console.log('offer-check: ok')

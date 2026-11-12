@@ -8,6 +8,9 @@ Run against the real provider with a real key (costs a fraction of a cent):
     VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8
     python3 -I crypto/tools/provider-profile-check.py --self-test   # offline, mocked
 
+Any other argument (a mistyped mode, ``--h2`` with ``--images``, an option
+without its value) is refused with exit status 2 before anything runs.
+
 The provider is the one a sidecar offer file names: ``--offer FILE`` (default
 ``crypto/relay/offer.venice.json``) gives the host, the chat route, the fixed
 pins and the ``h2`` block; ``--key-env NAME`` (default ``VENICE_API_KEY``) the
@@ -135,6 +138,47 @@ import cu_h2 as h2  # noqa: E402
 from dataclasses import dataclass, field
 from typing import Callable
 
+
+
+# Every option this script takes. Anything else is refused before any check
+# runs: a mistyped or unsupported mode must never fall back to another check
+# and end in a PASS for something that was not checked.
+_VALUE_OPTIONS = ("--offer", "--key-env", "--model", "--image-model", "--h2-idle", "--h2-body-bytes")
+_SWITCHES = ("--self-test", "--h2", "--images", "--h2-no-images")
+
+
+def _argv_problem(argv: list[str]) -> str | None:
+    """Why ``argv`` (without the program name) is refused, or ``None``."""
+    i = 0
+    seen: set[str] = set()
+    while i < len(argv):
+        a = argv[i]
+        if a in seen:
+            return f"{a} given twice"
+        seen.add(a)
+        if a in _VALUE_OPTIONS:
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                return f"{a} needs a value"
+            i += 2
+            continue
+        if a not in _SWITCHES:
+            return f"unknown argument {a!r}"
+        i += 1
+    if "--h2" in seen and "--images" in seen:
+        return "--h2 and --images are separate runs"
+    if "--h2-no-images" in seen and "--h2" not in seen:
+        return "--h2-no-images belongs to --h2"
+    for a in ("--h2-idle", "--h2-body-bytes"):
+        if a in seen and "--h2" not in seen:
+            return f"{a} belongs to --h2"
+    return None
+
+
+if __name__ == "__main__" and (_problem := _argv_problem(sys.argv[1:])):
+    print(f"provider-profile-check: {_problem}", file=sys.stderr)
+    print("usage: provider-profile-check.py [--self-test | --images | --h2 [--h2-idle S] [--h2-body-bytes N] "
+          "[--h2-no-images]] [--offer FILE] [--key-env VAR] [--model ID] [--image-model ID]", file=sys.stderr)
+    sys.exit(2)
 
 
 def _flag(name: str, default: str | None = None) -> str | None:
@@ -1577,8 +1621,21 @@ class MockProvider:
         return SClient(0, out, "", False)
 
 
+def _self_test_argv() -> bool:
+    """The argument check: every mode and option is known, anything else refused."""
+    good = [[], ["--h2"], ["--images"], ["--self-test"], ["--h2", "--h2-idle", "30", "--h2-body-bytes", "1024", "--h2-no-images"],
+            ["--offer", "f.json", "--key-env", "K", "--model", "m", "--image-model", "i"]]
+    bad = [["--h3"], ["--h2", "--images"], ["--offer"], ["--offer", "--h2"], ["--h2-idle", "30"], ["--h2-no-images"],
+           ["--model", "a", "--model", "b"], ["h2"], ["--self-test", "extra"]]
+    ok = all(_argv_problem(a) is None for a in good) and all(_argv_problem(a) for a in bad)
+    print(f"  {'PASS' if ok else 'FAIL'}  unknown or conflicting arguments are refused, the known ones accepted")
+    return ok
+
+
 def self_test() -> int:
     global RETRIES, BACKOFF, KEY
+    if not _self_test_argv():
+        return 1
     RETRIES, BACKOFF = 1, [0.0]
     KEY = KEY or "sk-selftest-not-a-key"
     saved = dict(TRANSPORT)

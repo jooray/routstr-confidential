@@ -1526,7 +1526,7 @@ enum ClientMsg {
         count: Option<u64>,
     },
     /// Framing "2": the client's next record is this control frame
-    /// (`settings_ack`, `ping_ack`, `window_update`, `rst_stream`).
+    /// (`settings_ack`, `ping_ack`, `rst_stream`; no `window_update`, §5.1).
     Ctl {
         frame: String,
     },
@@ -1799,7 +1799,13 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 // limit, a settled error), and its deadline moves with its
                 // requests.
                 if let Some(reason) = h.closing.take() {
-                    let _ = to_client.send(Message::Text(serde_json::json!({"type":"closed","reason":reason}).to_string().into()));
+                    let mut closed = serde_json::json!({"type":"closed","reason":reason});
+                    if reason == "upstream_closed" && h.client_frames_before_request() {
+                        // The client wrote records before any request (control
+                        // frames): the close may be its own doing (§12.10 row 5).
+                        closed["after_client_frames"] = true.into();
+                    }
+                    let _ = to_client.send(Message::Text(closed.to_string().into()));
                     side(&mut st, format!("connection closed: {reason}"));
                     break;
                 }

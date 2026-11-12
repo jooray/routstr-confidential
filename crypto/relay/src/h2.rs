@@ -23,6 +23,13 @@ pub const PING: u8 = 6;
 pub const GOAWAY: u8 = 7;
 pub const WINDOW_UPDATE: u8 = 8;
 
+pub const CONTINUATION: u8 = 9;
+
+/// The probe stream of the connection head (reset by N in the same flight).
+pub const PROBE_STREAM: u32 = 1;
+/// The frames a late answer to the probe GET may consist of.
+const PROBE_FRAMES: [u8; 5] = [HEADERS, CONTINUATION, DATA, RST_STREAM, WINDOW_UPDATE];
+
 pub const END_STREAM: u8 = 0x1;
 pub const ACK: u8 = 0x1;
 pub const END_HEADERS: u8 = 0x4;
@@ -198,12 +205,18 @@ pub fn request_stream(n: u32) -> u32 {
     2 * n + 1
 }
 
-/// A control frame C may send (A.4 rule 4).
+/// A control frame C may send (`PROTOCOL-V3.md` §5.1 rule 4).
+///
+/// No WINDOW_UPDATE: the connection head opens the provider's windows to
+/// 2^31-1 (stream and connection) and a connection is retired after 1 GiB
+/// received, so C never needs one. Its 4-byte increment would be the one
+/// client-chosen payload of a control frame N relays: a zero increment is a
+/// connection error and any positive one on stream 0 overflows the window,
+/// so the provider would close the connection on a record C chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctl {
     SettingsAck,
     PingAck,
-    WindowUpdate,
     RstStream,
 }
 
@@ -212,7 +225,6 @@ impl Ctl {
         Some(match s {
             "settings_ack" => Ctl::SettingsAck,
             "ping_ack" => Ctl::PingAck,
-            "window_update" => Ctl::WindowUpdate,
             "rst_stream" => Ctl::RstStream,
             _ => return None,
         })
@@ -222,7 +234,7 @@ impl Ctl {
         match self {
             Ctl::SettingsAck => 0,
             Ctl::PingAck => 8,
-            Ctl::WindowUpdate | Ctl::RstStream => 4,
+            Ctl::RstStream => 4,
         }
     }
 
@@ -232,7 +244,6 @@ impl Ctl {
         match self {
             Ctl::SettingsAck => frame_header(0, SETTINGS, ACK, 0),
             Ctl::PingAck => frame_header(8, PING, ACK, 0),
-            Ctl::WindowUpdate => frame_header(4, WINDOW_UPDATE, 0, 0),
             Ctl::RstStream => frame_header(4, RST_STREAM, 0, stream),
         }
     }
@@ -288,6 +299,13 @@ fn parse_header(b: &[u8]) -> Option<(usize, u8, u8, u32)> {
 /// one HEADERS with END_STREAM on `stream` (trailers), and SETTINGS, PING,
 /// WINDOW_UPDATE and GOAWAY on stream 0 (WINDOW_UPDATE also on `stream`).
 /// The stream must end (END_STREAM) inside `R`, and nothing may follow on it.
+///
+/// Frames of the probe stream (stream 1: the GET of the connection head,
+/// reset in the same flight) are skipped, whole, payload and all: the
+/// provider may still answer it, late, and its answer is no part of the
+/// request's event stream. Only stream 1, and only complete frames of the
+/// kinds a response to a GET consists of (HEADERS, CONTINUATION, DATA,
+/// RST_STREAM, WINDOW_UPDATE); a frame on any other stream is refused.
 pub fn parse_usage_tail(r: &[u8], stream: u32) -> Result<String> {
     let mut text: Vec<u8> = Vec::new();
     let mut p = 0usize;
@@ -323,6 +341,7 @@ pub fn parse_usage_tail(r: &[u8], stream: u32) -> Result<String> {
             (PING, 0) if len == 8 => {}
             (GOAWAY, 0) if len >= 8 => {}
             (WINDOW_UPDATE, s) if len == 4 && (s == 0 || s == stream) => {}
+            (ty, PROBE_STREAM) if PROBE_FRAMES.contains(&ty) && stream != PROBE_STREAM => {}
             _ => bail!("R: unexpected frame type {ty} on stream {s}"),
         }
         p += 9 + len;
@@ -358,10 +377,44 @@ pub fn usage_event(text: &str) -> Result<serde_json::Value> {
     Ok(v)
 }
 
-/// A disclosed error head (A.7): `R` is exactly one HEADERS frame on
+/// A disclosed error head (`PROTOCOL-V3.md` §5.4): `R` is the plaintext of
+/// a server record from its byte 0 to the end of one HEADERS frame on
 /// `stream` with END_HEADERS, whose block decodes without a dynamic table to
 /// a `:status` of 400..=599. Returns the status.
+///
+/// The HEADERS frame need not start the record: frames the provider wrote
+/// into the same record before it come first in `R`, whole, and may only be
+/// SETTINGS, PING, WINDOW_UPDATE or GOAWAY on stream 0, a WINDOW_UPDATE on
+/// `stream`, or a frame of the probe stream (stream 1). None of them carries
+/// the client's private bytes (the request's own stream has nothing before
+/// its response head), and walking them from byte 0 lands on the HEADERS
+/// frame exactly as the provider framed it: the claim is no weaker than one
+/// at byte 0, which is what every disclosure rests on (residual risk 5).
 pub fn parse_error_head(r: &[u8], stream: u32) -> Result<u16> {
+    let mut p = 0usize;
+    loop {
+        let (len, ty, flags, s) = parse_header(&r[p..]).ok_or_else(|| anyhow!("error R: shorter than a frame header"))?;
+        if len > MAX_FRAME {
+            bail!("error R: frame of {len} bytes");
+        }
+        let ok = match (ty, s) {
+            (HEADERS, s) if s == stream => break,
+            (SETTINGS, 0) => len % 6 == 0 && flags & !ACK == 0,
+            (PING, 0) => len == 8,
+            (GOAWAY, 0) => len >= 8,
+            (WINDOW_UPDATE, s) => len == 4 && (s == 0 || s == stream),
+            (ty, PROBE_STREAM) => PROBE_FRAMES.contains(&ty) && stream != PROBE_STREAM,
+            _ => false,
+        };
+        if !ok {
+            bail!("error R: a frame of type {ty} on stream {s} before the response head");
+        }
+        p += 9 + len;
+        if p >= r.len() {
+            bail!("error R: no HEADERS frame on the request's stream");
+        }
+    }
+    let r = &r[p..];
     let (len, ty, flags, s) = parse_header(r).ok_or_else(|| anyhow!("error R: shorter than a frame header"))?;
     if ty != HEADERS || s != stream {
         bail!("error R: not a HEADERS frame on the request's stream");
@@ -636,6 +689,70 @@ mod tests {
         }
     }
 
+    /// A late answer to the probe GET (stream 1) inside a usage tail is
+    /// skipped: frames of stream 1 only, payloads left out of the text.
+    #[test]
+    fn usage_tail_skips_late_frames_of_the_probe_stream() {
+        let probe = [
+            frame(HEADERS, END_HEADERS, PROBE_STREAM, &[0x88]),
+            frame(DATA, 0, PROBE_STREAM, b"{\"data\":[]}\x00\x00 not text"),
+            frame(CONTINUATION, END_HEADERS, PROBE_STREAM, &[0x00]),
+            frame(DATA, END_STREAM, PROBE_STREAM, b""),
+            frame(RST_STREAM, 0, PROBE_STREAM, &[0, 0, 0, 8]),
+            frame(WINDOW_UPDATE, 0, PROBE_STREAM, &[0, 0, 1, 0]),
+        ];
+        // Before the usage event's frame (R starting at a line feed inside the
+        // previous frame), between its frames, and after END_STREAM.
+        let usage = data(3, 0, &format!("data: {USAGE}\n\n"));
+        for at in 0..3 {
+            let mut r = Vec::new();
+            if at == 0 {
+                r.extend(b"\n");
+                r.extend(&probe[0]);
+                r.extend(&probe[1]);
+                r.extend(&usage[9..]);
+                // (a raw LF must be followed by "data: ": not this one)
+                assert!(usage_of(&r, 3).is_err());
+                r = Vec::new();
+                r.extend(&usage);
+                for f in &probe {
+                    r.extend(f);
+                }
+                r.extend(data(3, 0, "data: [DONE]\n\n"));
+                r.extend(data(3, END_STREAM, ""));
+            } else if at == 1 {
+                r.extend(&usage);
+                r.extend(data(3, 0, "data: [DONE]\n\n"));
+                for f in &probe {
+                    r.extend(f);
+                }
+                r.extend(data(3, END_STREAM, ""));
+            } else {
+                r.extend(venice_tail(3));
+                for f in &probe {
+                    r.extend(f);
+                }
+            }
+            let v = usage_of(&r, 3).unwrap();
+            assert_eq!(v["usage"]["prompt_tokens"], 7, "case {at}");
+        }
+        // Nothing of the probe's payload joins the event stream, and other
+        // frame types, or other streams, are still refused.
+        for bad in [frame(PING, 0, PROBE_STREAM, &[0; 8]), frame(SETTINGS, 0, PROBE_STREAM, &[]), frame(DATA, 0, 5, b"x"), frame(HEADERS, END_HEADERS, 7, &[0x88])] {
+            let mut r = usage.clone();
+            r.extend(&bad);
+            r.extend(data(3, 0, "data: [DONE]\n\n"));
+            r.extend(data(3, END_STREAM, ""));
+            assert!(usage_of(&r, 3).is_err(), "{bad:?}");
+        }
+        // A probe DATA frame cannot stand in for the request's own: text in it
+        // is not the request's event stream.
+        let mut r = data(3, 0, &format!("data: {USAGE}\n\n"));
+        r.extend(frame(DATA, 0, PROBE_STREAM, b"data: [DONE]\n\n"));
+        r.extend(data(3, END_STREAM, ""));
+        assert!(usage_of(&r, 3).is_err());
+    }
+
     #[test]
     fn usage_tail_must_end_the_stream_once() {
         // No END_STREAM.
@@ -725,6 +842,58 @@ mod tests {
         // the reserved bit set in the stream id
         let mut r = head(END_HEADERS, 3, &block);
         r[5] |= 0x80;
+        assert!(parse_error_head(&r, 3).is_err());
+    }
+
+    /// The response head need not start its record: the frames before it in
+    /// the record (stream 0 control frames, a WINDOW_UPDATE on the stream,
+    /// the probe's late answer) come first in R, whole.
+    #[test]
+    fn error_head_after_other_frames_in_its_record() {
+        let block = [0x20, 0x8d, 0x00, 0x04, b'd', b'a', b't', b'e', 0x01, b'x'];
+        let head = frame(HEADERS, END_HEADERS, 3, &block);
+        let before = [
+            frame(WINDOW_UPDATE, 0, 0, &[0, 0, 1, 0]),
+            frame(WINDOW_UPDATE, 0, 3, &[0, 0, 1, 0]),
+            frame(SETTINGS, ACK, 0, &[]),
+            frame(PING, ACK, 0, &[1; 8]),
+            frame(DATA, END_STREAM, PROBE_STREAM, b"{\"data\":[]}"),
+            frame(HEADERS, END_HEADERS, PROBE_STREAM, &[0x88]),
+            frame(RST_STREAM, 0, PROBE_STREAM, &[0, 0, 0, 8]),
+            frame(GOAWAY, 0, 0, &[0; 8]),
+        ];
+        let mut r: Vec<u8> = before.concat();
+        r.extend(&head);
+        assert_eq!(parse_error_head(&r, 3).unwrap(), 404);
+        for (i, f) in before.iter().enumerate() {
+            let mut r = f.clone();
+            r.extend(&head);
+            assert_eq!(parse_error_head(&r, 3).unwrap(), 404, "prefix {i}");
+        }
+        // Not allowed before it: anything of the request's stream but a
+        // WINDOW_UPDATE, another request stream, unknown kinds, a frame that
+        // runs into the head, a prefix with no head at all.
+        for bad in [
+            frame(DATA, 0, 3, b"private"),
+            frame(HEADERS, 0, 5, &[0x88]),
+            frame(DATA, 0, 5, b"x"),
+            frame(RST_STREAM, 0, 3, &[0; 4]),
+            frame(PING, 0, 3, &[0; 8]),
+            frame(5, 0, 0, &[0; 4]),
+        ] {
+            let mut r = bad.clone();
+            r.extend(&head);
+            assert!(parse_error_head(&r, 3).is_err(), "{bad:?}");
+        }
+        let mut r = frame(PING, ACK, 0, &[1; 8]);
+        r[2] = 12; // its length runs into the head
+        r.extend(&head);
+        assert!(parse_error_head(&r, 3).is_err());
+        assert!(parse_error_head(&frame(PING, ACK, 0, &[1; 8]), 3).is_err());
+        // The head must still end R exactly.
+        let mut r = before[0].clone();
+        r.extend(&head);
+        r.extend(frame(DATA, 0, 3, b"{}"));
         assert!(parse_error_head(&r, 3).is_err());
     }
 }

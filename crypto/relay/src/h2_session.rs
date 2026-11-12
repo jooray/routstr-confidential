@@ -182,6 +182,15 @@ impl H2 {
             && self.head_at.is_some_and(|t| now.saturating_duration_since(t) < H2_OPEN_WINDOW)
     }
 
+    /// The client had a record written to the provider while the connection
+    /// had carried no request: only control frames, whose effect on the
+    /// provider (an unsolicited SETTINGS ACK is a connection error for some
+    /// servers) is the client's. A provider close then is not "the provider
+    /// closed the open, idle connection" (§12.10 row 5).
+    pub(crate) fn client_frames_before_request(&self) -> bool {
+        self.client_written && self.requests == 0
+    }
+
     /// No request in flight: an expired deadline is the idle limit.
     pub(crate) fn idle(&self) -> bool {
         self.req.is_none()
@@ -559,6 +568,11 @@ async fn flush(
             break;
         }
         if front.req_idx > 0 {
+            // No record of a request is written before every one of its
+            // records is proven (a long body takes several π_WIN batches).
+            if !request_proven(h) {
+                break;
+            }
             let q = h.req.as_mut().ok_or_else(|| anyhow!("a request record without its request"))?;
             if front.req_idx > q.upto {
                 break;
@@ -601,8 +615,20 @@ async fn flush(
     Ok(())
 }
 
+/// The request in flight is complete and every one of its queued records is
+/// proven: only then may any of them be written (`PROTOCOL-V3.md` §5.1 rule 2).
+fn request_proven(h: &H2) -> bool {
+    h.req.as_ref().is_some_and(|q| q.complete) && h.queue.iter().all(|r| r.req_idx == 0 || r.proven)
+}
+
 /// If no π_WIN is in flight and unproven records wait (and no request is
 /// half received), fix the parameters of the next one and send them.
+///
+/// One π_WIN holds at most `MAX_WIN_WINDOWS` windows and `MAX_WIN_BYTES` of
+/// ciphertext. A body the record rules allow (up to `max_records(body_len)`
+/// records) can need more, so the queued records are proven in consecutive,
+/// disjoint batches, each as large as the limits allow; `flush` writes none
+/// of the request's records before the last batch verified.
 fn next_batch(shared: &Arc<SessionShared>, to_client: &mpsc::UnboundedSender<Message>, st: &mut Session) -> Result<()> {
     let h1 = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?.h1;
     let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
@@ -610,8 +636,30 @@ fn next_batch(shared: &Arc<SessionShared>, to_client: &mpsc::UnboundedSender<Mes
         return Ok(());
     }
     let Some(first) = h.queue.iter().position(|r| !r.proven) else { return Ok(()) };
+    let (windows, count) = batch_windows(h, first)?;
+    let first_seq = h.queue[first].seq;
+    let p = zkbench::statements::PiWin { anchor: h1, key_updates: 0, windows };
+    zkbench::statements::check_pi_win(&p).context("a π_WIN batch exceeds the statement's limits")?;
+    let params = Params::PiWin(p);
+    shared.set_params("pi_win", params.clone());
+    h.win = Some(WinInflight::Records(count));
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"zk_params","proof":"pi_win","purpose":"records","first_seq":first_seq,"count":count,"params":params})
+            .to_string()
+            .into(),
+    ));
+    Ok(())
+}
+
+/// The windows of the next batch, starting at the queued record `first`:
+/// as many consecutive unproven records as fit one π_WIN. Returns the
+/// windows and the number of records they cover (at least one).
+fn batch_windows(h: &H2, first: usize) -> Result<(Vec<zkbench::statements::WinWindow>, usize)> {
+    use zkbench::statements::{MAX_WIN_BYTES, MAX_WIN_WINDOWS};
     let stream = h.req.as_ref().map_or(0, |q| q.stream);
     let mut windows = Vec::new();
+    let mut ct_bytes = 0usize;
+    let mut count = 0usize;
     for rec in h.queue.iter().skip(first) {
         let payload = &rec.bytes[5..];
         let inner = payload.len() - 16;
@@ -628,21 +676,16 @@ fn next_batch(shared: &Arc<SessionShared>, to_client: &mpsc::UnboundedSender<Mes
                 (h2::frame_header(inner - 10, h2::DATA, flags, q.stream).to_vec(), tail)
             }
         };
-        windows.extend(h2::windows_for(rec.seq, payload, &head, tail)?);
+        let w = h2::windows_for(rec.seq, payload, &head, tail)?;
+        let bytes: usize = w.iter().map(|x| x.ct.len()).sum();
+        if count > 0 && (windows.len() + w.len() > MAX_WIN_WINDOWS || ct_bytes + bytes > MAX_WIN_BYTES) {
+            break;
+        }
+        windows.extend(w);
+        ct_bytes += bytes;
+        count += 1;
     }
-    let count = h.queue.len() - first;
-    let first_seq = h.queue[first].seq;
-    let p = zkbench::statements::PiWin { anchor: h1, key_updates: 0, windows };
-    zkbench::statements::check_pi_win(&p).context("the queued records exceed one π_WIN")?;
-    let params = Params::PiWin(p);
-    shared.set_params("pi_win", params.clone());
-    h.win = Some(WinInflight::Records(count));
-    let _ = to_client.send(Message::Text(
-        serde_json::json!({"type":"zk_params","proof":"pi_win","purpose":"records","first_seq":first_seq,"count":count,"params":params})
-            .to_string()
-            .into(),
-    ));
-    Ok(())
+    Ok((windows, count))
 }
 
 /// A π_WIN or π_C3S of this session verified against `proven`.
@@ -1146,9 +1189,10 @@ mod tests {
         client_bytes(&mut st, &record(10)).unwrap();
         on_ctl(&mut st, "ping_ack").unwrap();
         client_bytes(&mut st, &record(18)).unwrap();
-        on_ctl(&mut st, "window_update").unwrap();
-        client_bytes(&mut st, &record(14)).unwrap();
-        assert_eq!(kinds(&st), vec!["Ctl(SettingsAck)/0", "Ctl(PingAck)/0", "Ctl(WindowUpdate)/0"]);
+        // No WINDOW_UPDATE: its increment is the client's to choose (zero or an
+        // overflow makes the provider close the connection).
+        assert!(on_ctl(&mut st, "window_update").is_err());
+        assert_eq!(kinds(&st), vec!["Ctl(SettingsAck)/0", "Ctl(PingAck)/0"]);
         // The wrong size for the declared frame, an unknown name, a reset with no request.
         on_ctl(&mut st, "settings_ack").unwrap();
         assert!(client_bytes(&mut st, &record(11)).is_err());
@@ -1160,6 +1204,22 @@ mod tests {
         let mut st = session_with_request(5000, "sfx");
         client_bytes(&mut st, &record(60)[..7]).unwrap();
         assert!(on_ctl(&mut st, "ping_ack").is_err());
+    }
+
+    /// A provider close after the client wrote control frames on a connection
+    /// that carried no request is flagged (`after_client_frames`): the node
+    /// does not read it as the provider closing an idle connection.
+    #[test]
+    fn client_frames_before_any_request_are_flagged() {
+        let mut st = session_with_request(5000, "sfx");
+        let h = st.h2.as_mut().unwrap();
+        h.req = None;
+        h.requests = 0;
+        assert!(!h.client_frames_before_request());
+        h.client_written = true;
+        assert!(h.client_frames_before_request());
+        h.requests = 1;
+        assert!(!h.client_frames_before_request());
     }
 
     #[test]
@@ -1400,6 +1460,101 @@ mod tests {
         assert_eq!(read_some(&mut up).await.len(), record(10 + 4000).len() + record(10 + 1000).len() + record(18).len());
         assert!(st.h2.as_ref().unwrap().req.as_ref().unwrap().released);
         assert!(st.h2.as_ref().unwrap().queue.is_empty());
+    }
+
+    /// Feed a request of `data` DATA records (each `size` payload bytes, the
+    /// last holding the rest) and return the HEADERS record's inner length.
+    fn feed_many(st: &mut Session, body_len: usize, data: usize, size: usize) {
+        let block = h2::request_block("h", "/api/v1/chat/completions").len();
+        client_bytes(st, &record(9 + block + 1)).unwrap();
+        for i in 0..data {
+            let n = if i + 1 == data { body_len - size * (data - 1) } else { size };
+            client_bytes(st, &record(10 + n)).unwrap();
+        }
+        assert!(st.h2.as_ref().unwrap().req.as_ref().unwrap().complete);
+    }
+
+    /// The largest body the record rules allow, in the most records they
+    /// allow: more windows than one π_WIN holds. It is proven in several
+    /// disjoint batches, every one within the statement's limits, and not one
+    /// record reaches the upstream before the last batch verified.
+    #[tokio::test]
+    async fn a_body_of_the_most_records_is_proven_in_batches_before_any_is_written() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, mut up) = upstream().await;
+        // The upstream reads all the time (8 MiB does not fit a socket buffer).
+        let got = Arc::new(StdMutex::new(Vec::new()));
+        let sink = got.clone();
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1 << 16];
+            while let Ok(n) = up.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        let log = RelayLog::default();
+        let body_len = 8 << 20;
+        let mut st = open_session(body_len);
+        let data = max_records(body_len) - 1;
+        feed_many(&mut st, body_len, data, 4092);
+        on_release(&mut st, 1, data + 1).unwrap();
+        let mut batches = Vec::new();
+        loop {
+            pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+            let asked: Vec<_> = texts(&mut rx).into_iter().filter(|m| m["type"] == "zk_params").collect();
+            if asked.is_empty() {
+                break;
+            }
+            assert_eq!(asked.len(), 1, "one π_WIN at a time");
+            let Params::PiWin(p) = serde_json::from_value(asked[0]["params"].clone()).unwrap() else { panic!() };
+            zkbench::statements::check_pi_win(&p).unwrap();
+            batches.push((asked[0]["first_seq"].as_u64().unwrap(), asked[0]["count"].as_u64().unwrap()));
+            let all_proven = st.h2.as_ref().unwrap().queue.iter().filter(|r| !r.proven).count() as u64 == batches.last().unwrap().1;
+            prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+            if !all_proven {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(got.lock().unwrap().is_empty(), "a record was written before the whole request was proven");
+                assert!(!st.h2.as_ref().unwrap().req.as_ref().unwrap().released);
+            }
+        }
+        assert!(batches.len() >= 2, "{batches:?}");
+        // Disjoint and consecutive, covering every record.
+        let mut next = 0;
+        for (first, count) in &batches {
+            assert_eq!(*first, next);
+            next += count;
+        }
+        assert_eq!(next as usize, data + 1);
+        assert!(st.h2.as_ref().unwrap().req.as_ref().unwrap().released);
+        assert!(st.h2.as_ref().unwrap().queue.is_empty());
+        let want = (data + 1) * 21 + 10 + h2::request_block("h", "/api/v1/chat/completions").len() + data * 10 + body_len;
+        drop(w);
+        reader.await.unwrap();
+        assert_eq!(got.lock().unwrap().len(), want);
+    }
+
+    /// The boundary: a HEADERS record (one window) and 1099 DATA records (two
+    /// each) are 2199 windows, one proof; one DATA record more is two.
+    #[test]
+    fn the_batch_boundary_follows_the_window_limit() {
+        for (data, batches) in [(1099usize, 1usize), (1100, 2)] {
+            let body_len = data * 4096;
+            let mut st = open_session(body_len);
+            feed_many(&mut st, body_len, data, 4096);
+            let h = st.h2.as_ref().unwrap();
+            let (w, count) = batch_windows(h, 0).unwrap();
+            assert!(w.len() <= zkbench::statements::MAX_WIN_WINDOWS);
+            assert_eq!(count == data + 1, batches == 1, "{data} DATA records: {count} in the first batch");
+            if batches == 2 {
+                let (w2, rest) = batch_windows(h, count).unwrap();
+                assert_eq!(count + rest, data + 1);
+                assert!(!w2.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

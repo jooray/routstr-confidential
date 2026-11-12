@@ -69,7 +69,7 @@ import { RequestRefused, advOutcome, type Ctx, type Framing, type ImageTerms, ty
 import { H11 } from './driver-h11.ts'
 import { H2Conn, runHttp2 } from './driver-h2.ts'
 import { MAX_DATA_IN_RECORD, chatPath, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
-import { chatBlockProblem, checkImagesBlock, maxUsageCharge, renderChatSuffix, renderImagesSuffix } from './offer.ts'
+import { chatBlockProblem, checkImagesBlock, maxUsageCharge, padBody, renderChatSuffix, renderImagesSuffix } from './offer.ts'
 import { checkHeadTemplate, checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
 import { errText, shown, termSafe } from './term.ts'
@@ -130,6 +130,10 @@ const PRIVATE_EXTRA_AT = Number(arg('--private-extra-at', '0'))
 const DECOY = arg('--decoy-model')
 const PAUSE_MS = Number(arg('--pause-ms', '0'))
 const BODY_BYTES = Number(arg('--body-bytes', '0'))
+// Optional body-size bucket (off by default): --pad-bucket N (a multiple of N
+// bytes) or pow2; JSON whitespace before the canonical suffix.
+const PAD_ARG = arg('--pad-bucket')
+const PAD_BUCKET: number | 'pow2' | undefined = PAD_ARG === undefined ? undefined : PAD_ARG === 'pow2' ? 'pow2' : Number(PAD_ARG)
 const H2_CHUNK = Number(arg('--h2-chunk', String(MAX_DATA_IN_RECORD)))
 const LINGER_MS = Number(arg('--linger-ms', '0'))
 const MAX_DEPOSIT = Number(arg('--max-deposit', '100000'))
@@ -407,7 +411,7 @@ function buildBody(g: number): ReqBody {
     // The attack: a suffix that orders more images than the request pays for, or another model.
     const sfx = wrong ? renderImagesSuffix(im, ADV_SUFFIX_MODEL ?? model, ADV_SUFFIX_MODEL !== undefined ? ADV_IMAGE_COUNT ?? terms.count : ADV_IMAGE_COUNT ?? terms.count + 1, pins) : canonicalSuffix
     const p = `{"prompt":${JSON.stringify(PROMPT)}${extra}`
-    return { kind: 'images', model, maxTokens: 0, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix, image: terms }
+    return { kind: 'images', model, maxTokens: 0, body: padBody(enc.encode(p), enc.encode(sfx), PAD_BUCKET), suffix: enc.encode(sfx), canonicalSuffix, image: terms }
   }
   const model = MODELS[g - 1] ?? MODEL
   const canonicalSuffix = renderChatSuffix(OFFER.chat, model, MAX_TOKENS)
@@ -419,7 +423,7 @@ function buildBody(g: number): ReqBody {
   let p = `{"messages":[{"role":"user","content":${JSON.stringify(userContent(content))}}]`
   if (DECOY) p += `,"model":${JSON.stringify(DECOY)}`
   p += extra
-  return { kind: 'chat', model, maxTokens: MAX_TOKENS, body: enc.encode(p + sfx), suffix: enc.encode(sfx), canonicalSuffix }
+  return { kind: 'chat', model, maxTokens: MAX_TOKENS, body: padBody(enc.encode(p), enc.encode(sfx), PAD_BUCKET), suffix: enc.encode(sfx), canonicalSuffix }
 }
 
 // ---------------------------------------------------------------------------

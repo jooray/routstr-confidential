@@ -275,6 +275,34 @@ export class FrameReader {
  * Split a request body into DATA payloads of at most `chunk` bytes, the last
  * one holding at least the pinned suffix (it must be the tail of one frame).
  */
+/**
+ * The frames before a response head in its server record (PROTOCOL-V3.md
+ * §5.4, `disclose_head`): the error head's R runs from the record's byte 0,
+ * so these are disclosed too. Only frames that carry nothing of ours may be:
+ * SETTINGS, PING, GOAWAY on stream 0, WINDOW_UPDATE on stream 0 or the
+ * request's stream, and the probe stream's (1) late answer. Returns a reason
+ * when the prefix is anything else (then the head is not disclosed).
+ */
+export function errorHeadPrefixProblem(prefix: Uint8Array, stream: number): string | undefined {
+  let p = 0
+  while (p < prefix.length) {
+    if (prefix.length - p < 9) return 'a partial frame header before the response head'
+    const len = (prefix[p]! << 16) | (prefix[p + 1]! << 8) | prefix[p + 2]!
+    const type = prefix[p + 3]!
+    const flags = prefix[p + 4]!
+    const s = ((prefix[p + 5]! << 24) | (prefix[p + 6]! << 16) | (prefix[p + 7]! << 8) | prefix[p + 8]!) >>> 0
+    const ok =
+      (s === 0 && type === FRAME.SETTINGS && len % 6 === 0 && (flags & ~FLAG.ACK) === 0) ||
+      (s === 0 && type === FRAME.PING && len === 8) ||
+      (s === 0 && type === FRAME.GOAWAY && len >= 8) ||
+      (type === FRAME.WINDOW_UPDATE && len === 4 && (s === 0 || s === stream)) ||
+      (s === 1 && stream !== 1 && [FRAME.HEADERS, FRAME.CONTINUATION, FRAME.DATA, FRAME.RST_STREAM, FRAME.WINDOW_UPDATE].includes(type as never))
+    if (!ok) return `a frame of type ${type} on stream ${s} before the response head`
+    p += 9 + len
+  }
+  return p === prefix.length ? undefined : 'a frame before the response head runs into it'
+}
+
 export function splitBody(body: Uint8Array, suffixLen: number, chunk = MAX_DATA_IN_RECORD): Uint8Array[] {
   if (suffixLen > chunk || suffixLen > body.length) fail('h2: the suffix does not fit one DATA frame')
   const parts: Uint8Array[] = []

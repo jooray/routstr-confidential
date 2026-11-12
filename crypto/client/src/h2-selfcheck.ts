@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs'
 
 import { RequestRefused, openRequest, requestMessage, type ReqBody } from './ctx.ts'
 import {
-  FLAG, FRAME, FrameReader, checkH2Offer, checkPiNKParamsH2, checkPiWinFinalRecord, checkPiWinParams, decodeBlock, frame, h2Head, huffmanDecode,
+  FLAG, FRAME, FrameReader, checkH2Offer, errorHeadPrefixProblem, checkPiNKParamsH2, checkPiWinFinalRecord, checkPiWinParams, decodeBlock, frame, h2Head, huffmanDecode,
   requestBlock, splitBody, type WinSource,
 } from './h2.ts'
 
@@ -200,6 +200,19 @@ ok(
   ok(other instanceof Error && !(other instanceof RequestRefused), 'request_ok for another connection')
   const accepted = await openRequest({ sid: 's', label: 't' }, base, 1, b, 27, true, () => {}, async () => ({ type: 'request_ok', sid: 's', n: 1, suffix: '' })).catch((e) => e)
   ok(String(accepted).includes('had to refuse'), 'refuse-first: an accepted bad request is a failure')
+}
+
+// The frames a response head may follow in its record (disclosed with it).
+{
+  const wu = (s: number) => frame(FRAME.WINDOW_UPDATE, 0, s, new Uint8Array([0, 0, 1, 0]))
+  const ping = frame(FRAME.PING, FLAG.ACK, 0, new Uint8Array(8))
+  const probe = frame(FRAME.DATA, FLAG.END_STREAM, 1, new TextEncoder().encode('{"data":[]}'))
+  const cat = (...xs: Uint8Array[]) => Uint8Array.from(xs.flatMap((x) => [...x]))
+  ok(errorHeadPrefixProblem(new Uint8Array(0), 3) === undefined, 'error head prefix: none')
+  ok(errorHeadPrefixProblem(cat(wu(0), wu(3), ping, probe, frame(FRAME.SETTINGS, FLAG.ACK, 0)), 3) === undefined, 'error head prefix: control and probe frames')
+  ok(errorHeadPrefixProblem(frame(FRAME.DATA, 0, 3, new Uint8Array([1])), 3) !== undefined, 'error head prefix: our own DATA is never disclosed')
+  ok(errorHeadPrefixProblem(wu(5), 3) !== undefined, 'error head prefix: another stream')
+  ok(errorHeadPrefixProblem(ping.subarray(0, 12), 3) !== undefined, 'error head prefix: a frame running into the head')
 }
 
 console.log(`h2-selfcheck: ${checks} checks passed`)

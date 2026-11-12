@@ -204,3 +204,39 @@ export function maxUsageCharge(rates: any, usage: any): number {
   // `cost(cached, 0)` is the uncached price when no cached reads are reported.
   return Math.max(cost(cached, 0), cost(cached, written))
 }
+
+/** The largest request body a node takes (`body_len`, PROTOCOL-V3.md §12.4). */
+export const MAX_BODY_LEN = 8 << 20
+
+/**
+ * The optional body-size bucket (off by default): the body's length rounded
+ * up to the next multiple of `bucket` bytes, or with `'pow2'` to the next
+ * power of two (at least 1 KiB), never above `MAX_BODY_LEN`. The client pads
+ * with JSON whitespace between the private part and the canonical suffix, so
+ * the provider parses the same object and `body_len`, the record sizes and
+ * the ciphertext show the bucket, not the length. (The node still learns the
+ * prompt's token count at settlement: this hides sizes from observers of the
+ * connections, not from the node.)
+ */
+export function paddedBodyLength(len: number, bucket: number | 'pow2' | undefined): number {
+  if (bucket === undefined || len >= MAX_BODY_LEN) return len
+  let want = len
+  if (bucket === 'pow2') {
+    want = 1024
+    while (want < len) want *= 2
+  } else {
+    if (!Number.isSafeInteger(bucket) || bucket < 16) throw new Error('a padding bucket is an integer of at least 16 bytes, or pow2')
+    want = Math.ceil(len / bucket) * bucket
+  }
+  return Math.min(want, MAX_BODY_LEN)
+}
+
+/** `prefix` ‖ spaces ‖ `suffix`, `paddedBodyLength` bytes long (UTF-8). */
+export function padBody(prefix: Uint8Array, suffix: Uint8Array, bucket: number | 'pow2' | undefined): Uint8Array {
+  const len = prefix.length + suffix.length
+  const out = new Uint8Array(paddedBodyLength(len, bucket))
+  out.set(prefix, 0)
+  out.fill(0x20, prefix.length, out.length - suffix.length)
+  out.set(suffix, out.length - suffix.length)
+  return out
+}

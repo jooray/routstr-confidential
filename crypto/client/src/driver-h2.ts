@@ -14,6 +14,7 @@ import { createHash } from 'node:crypto'
 import { concat, hex } from './advice.ts'
 import { advOutcome, noteDepositRelease, openRequest, takeReceipt, type Ctx, type ImageTerms } from './ctx.ts'
 import {
+  errorHeadPrefixProblem,
   FLAG, FRAME, FrameReader, chatPath, checkPiWinParams, decodeBlock, frame, frameHeader,
   requestBlock, requestStream, splitBody, type RxFrame, type WinSource,
 } from './h2.ts'
@@ -647,15 +648,23 @@ export class H2Conn {
     return { images: images.length, files, response_bytes: bodyBytes.length, response_frames: cur.parts.length, warnings }
   }
 
-  /** The error head (A.7): the response HEADERS frame, which must start a record. */
+  /**
+   * The error head (§5.4): R runs from byte 0 of the record that holds the
+   * response HEADERS frame to that frame's end; the frames before it in the
+   * record may only be ones that carry nothing of ours.
+   */
   private async settleErrorHead(cur: Cur): Promise<any> {
     const { s } = this
     await this.drained()
     // Our own records must be proven first (one π_WIN at a time).
     await this.until(() => [...this.out.keys()].every((seq) => cur.seqs.includes(seq)) && this.proofs.some((p) => p.proof === 'pi_win' && p.n === cur.n), 'our records to be proven', 60000)
-    const head = cur.head!
-    const rec = this.reader.recordAt(head.off)
-    if (rec.start !== head.off) throw new Error('the error head does not start a server record: it cannot be disclosed')
+    const frameHead = cur.head!
+    const rec = this.reader.recordAt(frameHead.off)
+    const prefix = this.reader.slice(rec.start, frameHead.off)
+    const problem = errorHeadPrefixProblem(prefix, cur.stream)
+    if (problem) throw new Error(`the error head cannot be disclosed: ${problem}`)
+    const head = { off: rec.start, raw: concat(prefix, frameHead.raw) }
+    if (prefix.length > 0) this.ctx.log({ ev: 'error_head_prefix', bytes: prefix.length })
     const postIdx = rec.abs - this.hsCipher
     let keyUpdates = 0
     let epochStart = 0
