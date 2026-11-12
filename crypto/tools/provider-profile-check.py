@@ -729,11 +729,11 @@ def a7_usage_event() -> None:
     tail_ok = r.text.rstrip().endswith("data: [DONE]")
     usage = last.get("usage") or {}
     check(
-        "A7 last event carries usage + model, then [DONE]",
+        "A7 last event carries usage + model (choices without content, §5.4), then [DONE]",
         r.status == 200
         and last.get("model") == CHEAP
         and bool(usage)
-        and last.get("choices") == []
+        and h2.usage_event_problem(last) is None
         and tail_ok
         and usage.get("prompt_tokens", 10**9) <= len(BASE.encode()),
         f"-> {r.status} model={last.get('model')} usage={usage.get('prompt_tokens')}+"

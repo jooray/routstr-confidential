@@ -9,6 +9,7 @@
 // control by `release`, and the per-request disclosure, attestation and
 // receipt.
 
+import { usageEventProblem } from './usage-rule.ts'
 import { createHash } from 'node:crypto'
 
 import { concat, hex } from './advice.ts'
@@ -568,8 +569,9 @@ export class H2Conn {
     const evStart = at >= 0 ? at + 2 : 0
     if (!before.startsWith('data: ', evStart) || !before.endsWith('\n\n')) throw new Error('no usage event before data: [DONE]')
     const ownUsage = JSON.parse(Buffer.from(before.slice(evStart + 6, before.length - 2), 'latin1').toString('utf8'))
-    if (!Array.isArray(ownUsage.choices) || ownUsage.choices.length !== 0 || ownUsage.usage?.prompt_tokens === undefined) {
-      throw new Error('the last event before data: [DONE] is not a usage event')
+    const notUsage = usageEventProblem(ownUsage)
+    if (notUsage) {
+      throw new Error(`the last event before data: [DONE] is not a usage event (${notUsage})`)
     }
     // Where the event starts in the received stream.
     let acc = 0

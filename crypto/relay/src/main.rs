@@ -32,6 +32,7 @@ mod h2_session;
 mod hpack;
 mod tls;
 mod tls_v2;
+mod usage_rule;
 mod wsio;
 
 use std::collections::HashMap;
@@ -3429,19 +3430,8 @@ fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
     };
     let ev = before[start..].trim();
     let v: serde_json::Value = serde_json::from_str(ev).context("R: usage event not JSON")?;
-    let empty_choices = v
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .map(|a| a.is_empty())
-        .unwrap_or(false);
-    if !empty_choices {
-        bail!("R: usage event has non-empty choices");
-    }
-    if v.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()).is_none()
-        || v.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).is_none()
-    {
-        bail!("R: usage event missing token counts");
-    }
+    // §5.4: `choices` is [] or one choice with no content (usage_rule).
+    usage_rule::check_usage_event(&v)?;
     Ok(v)
 }
 
@@ -3787,6 +3777,48 @@ mod disclosure_tests {
         }
         let r = format!("{n:x}\r\n{body}\r\n+0\r\n\r\n");
         assert!(validate_r(r.as_bytes()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod usage_shape_tests {
+    use super::validate_r;
+
+    fn chunked(body: &str) -> Vec<u8> {
+        format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).into_bytes()
+    }
+    const OPENROUTER_LAST: &str = r#"{"id":"gen-1","model":"liquid/lfm-2.5-2.6b:free","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"length","native_finish_reason":"length"}],"usage":{"prompt_tokens":13,"completion_tokens":4}}"#;
+    const CLOUDFLARE_LAST: &str = r#"{"id":"id-1","model":"@cf/meta/llama-3.2-1b-instruct","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":3}}"#;
+
+    #[test]
+    fn usage_event_with_an_empty_choice() {
+        for ev in [OPENROUTER_LAST, CLOUDFLARE_LAST] {
+            assert!(validate_r(&chunked(&format!("data: {ev}\n\ndata: [DONE]\n\n"))).is_ok());
+            // One chunk per event, R starting at the event's own line.
+            let r = format!("\ndata: {ev}\n\n\r\ne\r\ndata: [DONE]\n\n\r\n0\r\n\r\n");
+            assert!(validate_r(r.as_bytes()).is_ok());
+        }
+        for bad in [
+            r#"{"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"hm"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            r#"{"choices":[{"index":0,"delta":{"audio":{"transcript":"hi"}}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+        ] {
+            assert!(validate_r(&chunked(&format!("data: {bad}\n\ndata: [DONE]\n\n"))).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn usage_on_every_chunk_takes_the_last_event() {
+        // Cloudflare: usage on every chunk. The event judged is always the
+        // last one before [DONE]; a content chunk there (usage merged into
+        // content) is refused.
+        let content = r#"{"choices":[{"index":0,"delta":{"content":"Hello"}}],"usage":{"prompt_tokens":0,"completion_tokens":1}}"#;
+        let ok = format!("data: {content}\n\ndata: {CLOUDFLARE_LAST}\n\ndata: [DONE]\n\n");
+        let v = validate_r(&chunked(&ok)).unwrap();
+        assert_eq!(v["usage"]["completion_tokens"], 3);
+        let bad = format!("data: {CLOUDFLARE_LAST}\n\ndata: {content}\n\ndata: [DONE]\n\n");
+        assert!(validate_r(&chunked(&bad)).is_err());
     }
 }
 

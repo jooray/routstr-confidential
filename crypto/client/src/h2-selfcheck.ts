@@ -215,4 +215,22 @@ ok(
   ok(errorHeadPrefixProblem(ping.subarray(0, 12), 3) !== undefined, 'error head prefix: a frame running into the head')
 }
 
+// The usage event rule (§5.4): the shared vectors, and the HTTP/1.1 R locator
+// with usage on every chunk (Cloudflare): R starts at the last event only.
+{
+  const { usageEventProblem } = await import('./usage-rule.ts')
+  const { extractR } = await import('./http1.ts')
+  const { readFileSync } = await import('node:fs')
+  const vec = JSON.parse(readFileSync(new URL('../../relay/usage-event-vectors.json', import.meta.url), 'utf8'))
+  for (const t of vec.vectors) ok((usageEventProblem(t.event) === null) === t.ok, `usage vector: ${t.name}`)
+  const content = '{"choices":[{"index":0,"delta":{"content":"Hello"}}],"usage":{"prompt_tokens":0,"completion_tokens":1}}'
+  const last = '{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":3}}'
+  const sse = `data: ${content}\n\ndata: ${last}\n\ndata: [DONE]\n\n`
+  const resp = new TextEncoder().encode(`HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n${sse.length.toString(16)}\r\n${sse}\r\n0\r\n\r\n`)
+  const r = extractR(resp)
+  ok(r !== null && new TextDecoder().decode(r).startsWith(`\ndata: ${last}`), 'usage on every chunk: R starts at the last event')
+  const merged = `data: ${last}\n\ndata: ${content}\n\ndata: [DONE]\n\n`
+  ok(extractR(new TextEncoder().encode(`HTTP/1.1 200 OK\r\n\r\n${merged.length.toString(16)}\r\n${merged}\r\n0\r\n\r\n`)) === null, 'usage merged into content: no R')
+}
+
 console.log(`h2-selfcheck: ${checks} checks passed`)

@@ -13,6 +13,8 @@ import prov  # noqa: E402
 
 TOOLS = "/Users/juraj/projects/routstr-confidential/crypto/tools"
 OFFERS = os.path.join(HERE, "offers")
+if not os.path.isdir(OFFERS):  # the committed layout: offers/ next to tools/
+    OFFERS = os.path.join(HERE, "..", "offers")
 
 # provider -> (offer file, cheap model, min seconds between requests)
 PROVIDERS = {

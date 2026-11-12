@@ -356,7 +356,7 @@ pub fn parse_usage_tail(r: &[u8], stream: u32) -> Result<String> {
 }
 
 /// The usage event of a disclosed tail: the text is exactly one event, the
-/// usage event (empty `choices`, token counts), then `data: [DONE]`.
+/// usage event (`choices` without content, token counts), then `data: [DONE]`.
 pub fn usage_event(text: &str) -> Result<serde_json::Value> {
     let ev = text
         .strip_prefix("data: ")
@@ -366,14 +366,8 @@ pub fn usage_event(text: &str) -> Result<serde_json::Value> {
         bail!("R: more than one event before data: [DONE]");
     }
     let v: serde_json::Value = serde_json::from_str(ev).map_err(|_| anyhow!("R: usage event not JSON"))?;
-    if !v.get("choices").and_then(|c| c.as_array()).is_some_and(|a| a.is_empty()) {
-        bail!("R: usage event has non-empty choices");
-    }
-    if v.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()).is_none()
-        || v.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).is_none()
-    {
-        bail!("R: usage event missing token counts");
-    }
+    // §5.4: `choices` is [] or one choice with no content (usage_rule).
+    crate::usage_rule::check_usage_event(&v)?;
     Ok(v)
 }
 
@@ -895,5 +889,63 @@ mod tests {
         r.extend(&head);
         r.extend(frame(DATA, 0, 3, b"{}"));
         assert!(parse_error_head(&r, 3).is_err());
+    }
+
+    // §5.4's usage event rule on framing "2": the shapes the providers send
+    // (2026-11-12), and content next to usage, which is refused.
+    const OPENROUTER_LAST: &str = r#"{"id":"gen-1","object":"chat.completion.chunk","model":"liquid/lfm-2.5-2.6b:free","provider":"Liquid","service_tier":null,"choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"length","native_finish_reason":"length"}],"usage":{"prompt_tokens":13,"completion_tokens":4,"total_tokens":17,"cost":0}}"#;
+    const CLOUDFLARE_LAST: &str = r#"{"id":"id-1","object":"chat.completion.chunk","model":"@cf/meta/llama-3.2-1b-instruct","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":3,"total_tokens":17,"neurons":0.08}}"#;
+
+    fn tail_with(stream: u32, events: &[&str]) -> Vec<u8> {
+        let mut r = Vec::new();
+        for e in events {
+            r.extend(data(stream, 0, &format!("data: {e}\n\n")));
+        }
+        r.extend(data(stream, 0, "data: [DONE]\n\n"));
+        r.extend(data(stream, END_STREAM, ""));
+        r
+    }
+
+    #[test]
+    fn usage_event_with_an_empty_choice() {
+        for ev in [OPENROUTER_LAST, CLOUDFLARE_LAST] {
+            let v = usage_of(&tail_with(3, &[ev]), 3).unwrap();
+            assert!(v["usage"]["completion_tokens"].as_u64().is_some());
+            // R from the line feed before the event inside one frame.
+            let text = format!("x\n\ndata: {ev}\n\n");
+            let mut f = data(3, 0, &text);
+            f.extend(data(3, END_STREAM, "data: [DONE]\n\n"));
+            let at = 9 + text.find("\ndata: ").unwrap();
+            assert!(usage_of(&f[at..], 3).is_ok());
+        }
+        for bad in [
+            r#"{"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning":"hm"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+            r#"{"choices":[{"index":0,"delta":{"refusal":"no"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#,
+        ] {
+            assert!(usage_of(&tail_with(3, &[bad]), 3).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn usage_on_every_chunk_discloses_only_the_last_event() {
+        // Cloudflare: every chunk carries usage. Only the last event before
+        // [DONE] may be disclosed: R holding an earlier (content) event as
+        // well is refused, and a content chunk is never a usage event.
+        let content = r#"{"choices":[{"index":0,"delta":{"content":"Hello"}}],"usage":{"prompt_tokens":0,"completion_tokens":1}}"#;
+        let r = tail_with(3, &[content, CLOUDFLARE_LAST]);
+        let first_len = 9 + format!("data: {content}\n\n").len();
+        assert!(usage_of(&r, 3).is_err(), "R starting at the content event");
+        assert!(usage_of(&r[first_len..], 3).is_ok());
+        // The content chunk as the last event (usage merged into content).
+        assert!(usage_of(&tail_with(3, &[CLOUDFLARE_LAST, content]), 3).is_err());
+        // Both events in one frame, R starting at the content one's line.
+        let text = format!("x\ndata: {content}\n\ndata: {CLOUDFLARE_LAST}\n\n");
+        let mut f = data(3, 0, &text);
+        f.extend(data(3, END_STREAM, "data: [DONE]\n\n"));
+        assert!(usage_of(&f[10..], 3).is_err());
+        let last = 9 + text.rfind("\ndata: ").unwrap();
+        assert!(usage_of(&f[last..], 3).is_ok());
     }
 }

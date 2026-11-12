@@ -516,6 +516,64 @@ class H2Client:
                 self._on_frame(*f)
 
 
+FINISH_REASONS = ("stop", "length", "tool_calls", "content_filter", "function_call")
+_EMPTY_TEXT_FIELDS = ("content", "reasoning", "reasoning_content", "refusal")
+
+
+def _identifier(v) -> bool:
+    return isinstance(v, str) and 1 <= len(v) <= 32 and all(c.isascii() and (c.isalpha() or c == "_") for c in v)
+
+
+def _uint(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def usage_event_problem(ev) -> str | None:
+    """PROTOCOL-V3.md §5.4: why ``ev`` is not a usage event, or None.
+
+    Token counts, and ``choices`` either ``[]`` or one choice with no content:
+    ``index``, ``finish_reason`` (an OpenAI value or null),
+    ``native_finish_reason`` (an identifier or null), ``logprobs: null``, and a
+    ``delta`` holding at most ``role: "assistant"``, empty or null
+    ``content``/``reasoning``/``reasoning_content``/``refusal`` and an empty
+    ``tool_calls``. The sidecar's ``usage_rule.rs``; vectors in
+    ``crypto/relay/usage-event-vectors.json``."""
+    if not isinstance(ev, dict):
+        return "not an object"
+    choices = ev.get("choices")
+    if not isinstance(choices, list):
+        return "no choices array"
+    if len(choices) > 1:
+        return "more than one choice"
+    for c in choices:
+        if not isinstance(c, dict):
+            return "a choice is not an object"
+        for k, v in c.items():
+            if k == "index":
+                ok = _uint(v)
+            elif k == "finish_reason":
+                ok = v is None or v in FINISH_REASONS
+            elif k == "native_finish_reason":
+                ok = v is None or _identifier(v)
+            elif k == "logprobs":
+                ok = v is None
+            elif k == "delta":
+                ok = isinstance(v, dict) and all(
+                    (dv is None or dv == "assistant") if dk == "role"
+                    else (dv is None or dv == []) if dk == "tool_calls"
+                    else (dv is None or dv == "") if dk in _EMPTY_TEXT_FIELDS
+                    else False
+                    for dk, dv in v.items())
+            else:
+                ok = False
+            if not ok:
+                return f"the choice carries {k!r}"
+    u = ev.get("usage")
+    if not isinstance(u, dict) or not _uint(u.get("prompt_tokens")) or not _uint(u.get("completion_tokens")):
+        return "no token counts"
+    return None
+
+
 def tail_problem(r: StreamResp) -> str | None:
     """Why a 2xx event stream does not end the way §5.4 parses it (H8), or None.
 
@@ -547,6 +605,9 @@ def tail_problem(r: StreamResp) -> str | None:
         return "the last event before [DONE] is not JSON"
     if not isinstance(ev, dict) or not isinstance(ev.get("usage"), dict):
         return "the last event before [DONE] is not the usage event"
+    bad = usage_event_problem(ev)
+    if bad:
+        return f"the last event before [DONE] is not a usage event: {bad}"
     size, trailers = len(body) - start, 0
     for t, flags, stream, n, before in r.frames:
         if before + (n if t == DATA and stream == r.stream else 0) <= start:
