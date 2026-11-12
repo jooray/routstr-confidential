@@ -526,8 +526,10 @@ row may be refused on one connection; the ninth refusal ends it (`error` 429).
 
 ### 8.5 Recurring cost
 
-A request on an open connection moves about 86 kB up and 1.0 MB down (mostly the proof channel's top-up for
-π_WIN and π_C3S) and costs the node two proof verifications. At commodity prices that is well under a
+A request on an open connection moves about 86 kB up and 13 kB down on its own path, plus on average about
+0.4 MB down (one 610 kB proof-channel top-up per 1.6 typical requests, §9.2, off the request path; without
+top-ups the same correlations cost about 1.0 MB, extended online in smaller Ferret iterations) and costs the
+node two proof verifications. At commodity prices that is well under a
 millisatoshi of traffic and CPU per request; usage at the frozen rates (plus `rate_surcharge_pct`, if the
 operator sets one) covers it except for the very smallest requests, and every request first needs a
 reservation of a full-context prompt plus `max_tokens`, so requests cannot be sent unfunded. Refused requests
@@ -564,7 +566,48 @@ connection), bound to the credential only.
 - Framing `"2"`: the client MAY keep one armed connection per pool key while there is traffic and every
   open connection is busy, so that a burst does not wait for a 2PC.
 - The pre-warmed proof channel holds correlations for π_NK and the first π_WIN and π_C3S; on a kept
-  connection it is topped up while idle.
+  connection it is **topped up while idle** (below), so later requests prove from preprocessed
+  correlations instead of extending online.
+
+**Top-up (framing `"2"`).** Chain cp (C proves π_WIN and π_C3S, N holds Δ) is a Ferret RCOT chain; a proof
+that needs more correlations than it holds extends it online, inside the proof, on the request path (about
+0.5–1.5 MB from N per request from the third request on, measured before the top-up existed). Instead:
+
+- **When.** C asks after `head_written` and after each settlement whose connection stays READY, never
+  while a request of its own is open (C sends no `request` until its top-up is answered and run; a request
+  that arrives meanwhile waits for it, see below). Framing `"1.1"` has one request per connection and never
+  asks.
+- **What.** One message on the proof channel's control stream, C → N `topup`; N answers `TopupGrant
+  {target}`. `target = 0`: nothing (no traffic). Else `target = available + step`, and both parties run one
+  Ferret extension of chain cp to `target`, in lockstep, exactly as the preprocessing does (same messages,
+  same consistency check; no base OT). `step` is the smaller of the two parties' `topup` in the channel's
+  hello (default 900 000: one typical request, π_WIN over the HEADERS, DATA and suffix records and π_C3S
+  over the usage tail, about 560 000 measured, with a margin; it is below the 967 135 net correlations of
+  one Ferret iteration at n = 1 024 000, so a top-up is exactly one such iteration: about 580 kB N → C and
+  30 kB C → N). `step = 0` turns top-ups off.
+- **Granted only when** chain cp holds fewer than `step` correlations, N holds no parameters of a proof that
+  has not run yet (a request's π_WIN or π_C3S is due: a top-up never delays a proof N asked for), and the
+  channel's top-ups so far moved less than 256 MiB. C refuses (and the channel is then closed) any grant
+  other than 0 or exactly `available + step`, so N cannot make C hold more than agreed.
+- **Bounds.** A top-up leaves at least `step` correlations, and the next one is granted only after proofs
+  consumed them, so an idle connection never grows (C does not even ask while the chain holds a step);
+  top-ups are bounded by the proofs, which are bounded by the requests (`h2.max_requests`), and in bytes by
+  the 256 MiB budget; memory by `2 · step` correlations per chain (about 30 MB of keys at N). Chain cp's
+  lifetime cap on the channel's multiplexer is 512 MiB (at 32 MiB a kept connection ran out after about 33
+  requests).
+- **A request during a top-up waits; it does not cancel.** The extension is a lockstep exchange whose
+  partial state cannot be dropped on one side only, so cancelling would need an abort protocol that poisons
+  the channel. Waiting costs at most the remainder of one iteration (about 170 ms on loopback, 0.1 s of
+  transfer at 50 Mbit/s), which is what the request would otherwise spend extending online; in the usual
+  case the top-up is done long before the request's first proof, which follows the `request` round trip,
+  the records and `zk_params`.
+- **Failure.** A top-up that fails or times out closes the proof channel, as a failed proof does; the
+  connection's next proof cannot run and the connection ends (deposit and request outcomes as for a client
+  that does not prove). Old clients (channel version 1) do not open the channel against a version-2 node
+  and prove one proof per socket.
+- **Measured** (loopback through a node, real provider, five requests on one connection with 3 s idle
+  between them): requests 3–5 downloaded 0.98–1.45 MB on the request path before, 13–15 kB after (the
+  request itself); the top-ups moved 610 kB each, three for the five requests, off the request path.
 
 ### 9.3 Body size
 
@@ -690,6 +733,22 @@ status 3 and code `twopc_version_mismatch` on another tag; the sidecar ends the 
 whose `code` is `twopc_version_mismatch`. `pi_win` and `pi_c3s` run once per `zk_params` on the channel
 (`cu-prover --channel`; the earlier `--multi` is the only mode) or on a socket of their own; `pi_nk` once
 per connection.
+
+**Proof channel** (`zkbench::channel`, version 2). One socket per connection; its bytes are mux frames
+`[u8 stream][u32 BE length][payload]`, streams 0 = control, 1 = chain nk (N proves π_NK), 2 = chain cp (C
+proves π_WIN, π_C3S); lifetime inbound caps 1 MiB, 32 MiB and 512 MiB. Control messages (bincode, in
+order):
+
+| Direction | Message | When |
+|---|---|---|
+| both | `Hello {version: 2, nk, cp, topup}` | first; each chain's preallocation and the top-up step are the smaller of the two; another version ends the channel (the client proves per socket) |
+| C → N | `ProofReq {proof: "pi_nk" \| "pi_win" \| "pi_c3s"}` | then the proof on its chain, against N's own `zk_params` |
+| C → N | `ProofReq {proof: "topup"}` | framing `"2"`, idle (§9.2); C sends it only while chain cp holds fewer than `step` |
+| N → C | `TopupGrant {target: u64}` | the answer: 0, or `available + step`, then one Ferret extension of chain cp to `target` |
+
+The client process (`cu-prover --channel`, the browser library's wasm driver) takes `{"cmd":"topup","id"}`
+and answers `{"ev":"done","proof":"topup","ok","granted","before","after","bytes","ms","avail":[nk,cp]}`;
+it runs its commands in order, so a proof sent after a top-up waits for it.
 
 ### 12.3 `setup`, `ready`
 
@@ -1076,3 +1135,4 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | the `split-public-1` statement: the inner-digest message rule, assumption (3), the idealized 3-bit model, label-check pairs augment the report hash | §4 |
 | privacy: linkability and its off switches, body padding (off by default), residual risks 7-10 | §1, §9.1, §9.3, §10 |
 | a cancelled request cannot lend its credential reference (the attack and why each form fails) | §5.3.1 |
+| the proof channel's top-up between requests (channel version 2: `topup`, `TopupGrant`, step, bounds, a request waits for it); chain cp's mux cap 512 MiB | §8.5, §9.2, §12.2 |
