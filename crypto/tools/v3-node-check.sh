@@ -219,6 +219,9 @@ start_sidecar
 # throwaway one.
 NSEC="$(openssl rand -hex 32)"
 UPSTREAM_BASE="${CU_UPSTREAM_BASE:-https://api.venice.ai/api/v1}"
+# The node lists models at its base URL with the provider key: it must be the sidecar's provider host.
+UP_HOST="${CU_UPSTREAM:-api.venice.ai:443}"; UP_HOST="${UP_HOST%:*}"
+case "$UPSTREAM_BASE" in "https://$UP_HOST/"*|"https://$UP_HOST") ;; *) echo "CU_UPSTREAM_BASE ($UPSTREAM_BASE) is not on $UP_HOST" >&2; exit 2 ;; esac
 start_node() {
   (
     cd "$OUT/node"

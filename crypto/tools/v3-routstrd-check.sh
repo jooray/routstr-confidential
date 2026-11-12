@@ -178,6 +178,14 @@ trap 'exit 1' INT TERM
 fail() { echo "FAILED: $*" >&2; exit 1; }
 
 # --- sidecar, stub mint, node ----------------------------------------------------
+# Read before the subshells below clear the environment: otherwise they fall
+# back to Venice's offer and base URL, and the node would send another
+# provider's key to api.venice.ai when it lists models.
+UPSTREAM="${CU_UPSTREAM:-api.venice.ai:443}"
+SIDE_OFFER="${CU_V3_OFFER:-$CRYPTO/relay/offer.venice.json}"
+UPSTREAM_BASE="${CU_UPSTREAM_BASE:-https://api.venice.ai/api/v1}"
+# The node's base URL must be on the sidecar's provider host.
+case "$UPSTREAM_BASE" in "https://${UPSTREAM%:*}/"*|"https://${UPSTREAM%:*}") ;; *) die "CU_UPSTREAM_BASE ($UPSTREAM_BASE) is not on CU_UPSTREAM (${UPSTREAM%:*})" ;; esac
 # A clean environment for each; the provider key stays in the environment
 # (never an argument, never a file of ours).
 (
@@ -187,8 +195,8 @@ fail() { echo "FAILED: $*" >&2; exit 1; }
   done
   export CU_GATE_KEY="$key" CU_TEST_H2_FAIL_FILE="$FAIL_FILE" CU_TEST_H2_RETRY_SECS=8
   unset key
-  exec "$CRYPTO/zkbench/target/release/cu-sidecar" --listen "127.0.0.1:$SPORT" --upstream "${CU_UPSTREAM:-api.venice.ai:443}" \
-    --key-env CU_GATE_KEY --offer "${CU_V3_OFFER:-$CRYPTO/relay/offer.venice.json}" --node-settles --runs-dir "$OUT/sidecar-runs"
+  exec "$CRYPTO/zkbench/target/release/cu-sidecar" --listen "127.0.0.1:$SPORT" --upstream "$UPSTREAM" \
+    --key-env CU_GATE_KEY --offer "$SIDE_OFFER" --node-settles --runs-dir "$OUT/sidecar-runs"
 ) > "$OUT/sidecar.log" 2>&1 &
 SIDECAR_PID=$!
 for _ in $(seq 1 50); do
@@ -217,7 +225,7 @@ start_node() {
     done
     export DATABASE_URL="sqlite+aiosqlite:///$DB" NSEC="$NSEC" \
       CONFIDENTIAL_SIDECAR_URL="$SIDECAR" CASHU_MINTS="$MINT" \
-      UPSTREAM_BASE_URL="${CU_UPSTREAM_BASE:-https://api.venice.ai/api/v1}" UPSTREAM_API_KEY="$key" \
+      UPSTREAM_BASE_URL="$UPSTREAM_BASE" UPSTREAM_API_KEY="$key" \
       HTTP_URL="$NODE" RELAYS='["ws://127.0.0.1:9"]' ENABLE_ANALYTICS_SHARING=false \
       CONFIDENTIAL_SESSION_FEE_MSAT="$FEE" CONFIDENTIAL_ABANDON_FEE_MSAT="$ABANDON" \
       CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT="$DEPOSIT" CONFIDENTIAL_IDLE_TIMEOUT_S=120
@@ -253,8 +261,7 @@ PUBKEY="$(bun -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv
 # --- routstrd ----------------------------------------------------------------------
 # Scratch HOME and state directories; every non-loopback HTTP request goes to
 # a dead proxy, so the daemon reaches only the local node and the stub mint.
-UP_HOST="${CU_UPSTREAM:-api.venice.ai:443}"
-CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-${UP_HOST%:*}}" CU_TEST_KEY="sk-$KEY" bun "$HELP/seed.ts" init "$OUT/rd" "$RD" "$NODE" "$MINT" "$RPORT" "$PROVER" "$PUBKEY" \
+CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-${UPSTREAM%:*}}" CU_TEST_KEY="sk-$KEY" bun "$HELP/seed.ts" init "$OUT/rd" "$RD" "$NODE" "$MINT" "$RPORT" "$PROVER" "$PUBKEY" \
   || fail "could not write routstrd's scratch state"
 rd_log() { cat "$OUT"/rd/logs/*.log 2> /dev/null; }
 rd_lines() { rd_log | wc -l | tr -d ' '; }
