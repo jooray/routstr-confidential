@@ -112,7 +112,8 @@ elif kind == "nohttp2":
     if rc == 0 or "offer_no_http2" not in err or sids:
         dev.append("--http 2 was not refused on the offer (before any setup)")
 elif kind in ("settled", "error", "big", "image", "armed", "refusedfirst", "auto", "decoy"):
-    parts = rest.split(":")
+    # A model id may itself hold ":" (OpenRouter's `:free`): only the decoy names one, last.
+    parts = rest.split(":", 1) if kind == "decoy" else rest.split(":")
     http = parts[0]
     evidence += " " + req_line()
     if kind == "settled":
