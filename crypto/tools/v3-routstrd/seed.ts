@@ -76,7 +76,7 @@ writeFileSync(
       relays: ["ws://127.0.0.1:9"],
       confidentialUpstream: {
         enabled: true,
-        trusted_hosts: ["api.venice.ai"],
+        trusted_hosts: (process.env.CU_TRUSTED_HOSTS ?? "api.venice.ai").split(",").filter(Boolean),
         node_pubkeys: [pubkey],
         prover_path: prover,
         http: "auto",

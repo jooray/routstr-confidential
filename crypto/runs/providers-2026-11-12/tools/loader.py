@@ -25,6 +25,7 @@ PROVIDERS = {
     "cloudflare": ("offer.cloudflare.json", "@cf/meta/llama-3.2-1b-instruct", 1.0),
     "unorouter": ("offer.unorouter.json", "glm-5.3-flash:free", 62.0),
     "opencodego": ("offer.opencodego.json", "glm-5.3-flash", 1.0),
+    "opencodezen": ("offer.opencodezen.json", "deepseek-v4.1-flash-free", 1.0),
     "xkiro": ("offer.xkiro.json", "mistralai/ministral-3b", 1.0),
 }
 

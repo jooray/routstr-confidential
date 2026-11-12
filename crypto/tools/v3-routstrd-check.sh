@@ -38,7 +38,10 @@
 #   CU_KEY_ENV       variable holding the provider key (default VENICE_API_KEY)
 #   CU_UPSTREAM      provider host:port (default api.venice.ai:443)
 #   CU_UPSTREAM_BASE the provider's API base for the node (default https://api.venice.ai/api/v1)
-#   CU_MODEL         chat model (default mistral-small-3-2-24b-instruct)
+#   CU_MODEL         chat model (default mistral-small-3-2-24b-instruct; the node's public id)
+#   CU_PROVIDER_TYPE the node's provider_type for the provider row (default venice)
+#   CU_HOST_MATCH    a substring of the provider's base URL (default venice)
+#   CU_TRUSTED_HOSTS routstrd's trusted provider hosts, comma-separated (default the host of CU_UPSTREAM)
 #   CU_IMAGE_MODEL   image model of the image case (default z-image-turbo; empty: skip)
 #   CU_PAUSE         seconds between the requests of a pre-warmed run (default 4:
 #                    the next armed connection is prepared meanwhile)
@@ -234,7 +237,7 @@ start_node() {
 # has no models; as `venice` (AGENTS.md) the second start prices them.
 start_node
 stop "$NODE_PID"; NODE_PID=""
-sqlite3 "$DB" "delete from upstream_providers where base_url not like '%venice%'; update upstream_providers set provider_type='venice';"
+sqlite3 "$DB" "delete from upstream_providers where base_url not like '%${CU_HOST_MATCH:-venice}%'; update upstream_providers set provider_type='${CU_PROVIDER_TYPE:-venice}';"
 # The test credential: `sk-<hex>`, stored under the hex itself.
 KEY="$(openssl rand -hex 32)"
 sqlite3 "$DB" "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('$KEY',$START_BALANCE,0,0,0);"
@@ -250,7 +253,8 @@ PUBKEY="$(bun -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv
 # --- routstrd ----------------------------------------------------------------------
 # Scratch HOME and state directories; every non-loopback HTTP request goes to
 # a dead proxy, so the daemon reaches only the local node and the stub mint.
-CU_TEST_KEY="sk-$KEY" bun "$HELP/seed.ts" init "$OUT/rd" "$RD" "$NODE" "$MINT" "$RPORT" "$PROVER" "$PUBKEY" \
+UP_HOST="${CU_UPSTREAM:-api.venice.ai:443}"
+CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-${UP_HOST%:*}}" CU_TEST_KEY="sk-$KEY" bun "$HELP/seed.ts" init "$OUT/rd" "$RD" "$NODE" "$MINT" "$RPORT" "$PROVER" "$PUBKEY" \
   || fail "could not write routstrd's scratch state"
 rd_log() { cat "$OUT"/rd/logs/*.log 2> /dev/null; }
 rd_lines() { rd_log | wc -l | tr -d ' '; }

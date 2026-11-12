@@ -1,0 +1,18 @@
+  items: A9,A11,A1,A2,A4,A5,A6,A7,A12,A10
+provider profile check  2026-11-12T20:26:58Z
+  provider: https://opencode.ai/zen/v1/chat/completions  build: ? (probe 429)
+  models: cheap=deepseek-v4.1-flash-free reasoning=deepseek-v4.1-flash-free text_only=deepseek-v4.1-flash-free vision=deepseek-v4.1-flash-free
+  offer file: ../offers/offer.opencodezen.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+PASS         A9 TLS 1.3 / AES-128-GCM only / P-256 only / ALPN http/1.1: offered only TLS_AES_128_GCM_SHA256+P-256+http/1.1 -> TLSv1.3 TLS_AES_128_GCM_SHA256 group=ECDH p256=True alpn=http/1.1 verify=0
+INCONCLUSIVE A11 (a11_keyupdate_mid_request): A11: HTTP 429 after 3 attempts
+INCONCLUSIVE A1 (a1_waits_for_body): A1: still transient after 3 attempts (last: HTTP 429 '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached.')
+INCONCLUSIVE A2 (a2_last_wins): A2.1: still transient after 3 attempts (last: HTTP 429 '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached.')
+INCONCLUSIVE A4 (a4_unknown_rejected): A4 control: still transient after 3 attempts (last: HTTP 429 '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached.')
+INCONCLUSIVE A5 (a5_malformed_rejected): A5 control: still transient after 3 attempts (last: HTTP 429 '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached.')
+INCONCLUSIVE A6 (a6_cap_includes_reasoning): A6: still transient after 3 attempts (last: HTTP 429 '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached.')
+INCONCLUSIVE A7 (a7_usage_event): A7: still transient after 3 attempts (last: HTTP 429 '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached.')
+INCONCLUSIVE A12 (a12_sse_framing): A12: still transient after 3 attempts (last: HTTP 429 '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached.')
+INCONCLUSIVE A10 (a10_price_fields): A10 control: still transient after 3 attempts (last: HTTP 429 '{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached.')
+summary: 1 PASS, 0 FAIL, 9 INCONCLUSIVE of 10
+exit status 2

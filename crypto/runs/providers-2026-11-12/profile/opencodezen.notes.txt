@@ -1,0 +1,14 @@
+OpenCode Zen (https://opencode.ai/zen/v1), key OPENCODE_GO_API_KEY, 2026-11-12 ~20:27-20:35 UTC
+
+GET /zen/v1/models -> 200, 47 models; free ones: mimo-v2.6-flash-free, deepseek-v4.1-flash-free,
+  glm-5.3-flash-free, longcat-2.5-free, iceman-free, inkling-2-small-free, beam-free, flint-40b-free,
+  nemotron-3.5-super-vl-free, nemotron-3.5-lightning-free, minimax-m3.1-flash-free
+TLS: TLSv1.3 TLS_AES_128_GCM_SHA256 with P-256 only (A9 PASS, a.opencodezen.txt)
+ALPN: asked h2 -> no ALPN selected; asked http/1.1 -> http/1.1  => no framing "2" (H1 fails)
+POST /zen/v1/chat/completions, deepseek-v4.1-flash-free and glm-5.3-flash-free, with or without
+  x-opencode-session: 429 {"type":"FreeUsageLimitError","message":"Free usage limit reached. Free models
+  work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: ..."}, retry-after 12655 s
+Session header: an unknown model without x-opencode-session -> 400 "Upstream request failed: Model is
+  unavailable." (the same with it); a paid model without it -> 402 "Insufficient balance" (workspace id in
+  the message, not kept here). OpenCode Go answered 400 MissingSessionID before anything else; Zen does not
+  ask for the header.

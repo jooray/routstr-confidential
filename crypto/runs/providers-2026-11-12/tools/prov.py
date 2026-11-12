@@ -48,6 +48,8 @@ def all_keys() -> dict:
         k["numes"] = os.environ["NUMES_API_KEY"]
     if os.environ.get("OPENCODE_GO_API_KEY"):
         k["opencodego"] = os.environ["OPENCODE_GO_API_KEY"]
+        # OpenCode Zen takes the same key (https://opencode.ai/zen/v1).
+        k["opencodezen"] = os.environ["OPENCODE_GO_API_KEY"]
     return k
 
 

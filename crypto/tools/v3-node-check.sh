@@ -36,6 +36,11 @@
 #   CU_MODEL         chat model (default mistral-small-3-2-24b-instruct)
 #   CU_SWAP_MODEL    the model of the model-swap attacks (default deepseek-v4-pro)
 #   CU_IMAGE_MODEL   image model (default venice-sd35; its first offered variant, one image)
+#   CU_DECOY_MODEL   the model the decoy cases name in the private part (default CU_SWAP_MODEL)
+#   CU_PROVIDER_TYPE the node's provider_type for the provider row (default venice; generic,
+#                    openrouter, … for other providers)
+#   CU_HOST_MATCH    a substring of the provider's base URL: the other provider rows are
+#                    deleted (default venice)
 #   CU_NO_IMAGES     1: skip the two paid image cases
 #   CU_CASES         optional space-separated subset of case ids ("fb" selects the
 #                    whole fallback group)
@@ -51,6 +56,7 @@
 #   h2-one, h11-one         one chat request: usage + F, D back in its receipt
 #   h2-three                three requests on one connection: F once
 #   h11-two                 two requests, one connection each: F and D each time
+#   h2-decoy, h11-decoy     another model named in the private part: the pinned one runs and is billed
 #   h2-big, h11-big         a ~200 kB body
 #   h2-armed, h11-armed     a connection armed first (bound to the credential only)
 #   h2-chat-image           a chat request, then an image request on one connection:
@@ -160,6 +166,8 @@ done
 
 rm -rf "$OUT"
 mkdir -p "$OUT/node" "$OUT/sidecar-runs" "$OUT/client-runs"
+# The node's database holds the provider key while it runs: owner only.
+chmod 700 "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 # The node resolves its migrations and writes its logs relative to its
 # working directory: it runs in the scratch directory.
@@ -242,7 +250,7 @@ start_node() {
 # offer has no models; as `venice` (AGENTS.md) the second start prices them.
 start_node
 stop "$NODE_PID"; NODE_PID=""
-sqlite3 "$DB" "delete from upstream_providers where base_url not like '%venice%'; update upstream_providers set provider_type='venice';"
+sqlite3 "$DB" "delete from upstream_providers where base_url not like '%${CU_HOST_MATCH:-venice}%'; update upstream_providers set provider_type='${CU_PROVIDER_TYPE:-venice}';"
 # An admin token for the one case that changes a setting while the node runs.
 ADMIN_TOKEN="$(openssl rand -hex 24)"
 sqlite3 "$DB" "insert into cli_tokens(id,token,name,created_at) values('v3-node-check','$ADMIN_TOKEN','v3-node-check',strftime('%s','now'));"
@@ -409,6 +417,8 @@ run_case h2-one        "settled:2:chat:nofallback"      "$B" none -- --http 2
 run_case h11-one       "settled:1.1:chat"               "$B" none -- --http 1.1
 run_case h2-three      "settled:2:chat,chat,chat"       "$B" none -- --http 2 --requests 3
 run_case h11-two       "settled:1.1:chat,chat"          "$B" none -- --http 1.1 --requests 2
+run_case h2-decoy      "settled:2:chat:decoy"           "$B" none -- --http 2 --decoy-model "${CU_DECOY_MODEL:-$SWAP_MODEL}"
+run_case h11-decoy     "settled:1.1:chat:decoy"         "$B" none -- --http 1.1 --decoy-model "${CU_DECOY_MODEL:-$SWAP_MODEL}"
 run_case h2-big        "settled:2:chat:big"             "$B" none -- --http 2 --body-bytes 200000 --prompt "$BIG"
 run_case h11-big       "settled:1.1:chat:big"           "$B" none -- --http 1.1 --body-bytes 200000 --prompt "$BIG"
 run_case h2-armed      "settled:2:chat:armed"           "$B" go   -- --http 2 --arm

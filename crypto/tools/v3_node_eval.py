@@ -28,6 +28,8 @@ the arithmetic. `expect` is one of (H is the framing, "2" or "1.1"):
                                              then the connection's own offer, on the same connection
                                   fallback   a framing-"2" open failed first (deposit released,
                                              `provider_unreachable`) and the request ran on "1.1"
+                                  decoy      the private part named another model: the provider
+                                             reported the pinned one
                                   nofallback no fallback happened
   error:H:<n>:<status>          requests 1..n-1 settle, request n ends in a disclosed error head:
                                 429/503/401/402/403 cost F if still due, another 4xx A, another 5xx
@@ -224,6 +226,11 @@ def image_variant(model, variant):
 seen_first = set()  # connections whose first settlement was checked
 
 
+def pinned_ids(model):
+    """The id the suffix pins for ``model`` under the offers of the case."""
+    return {((o.get("upstream_models") or {}).get(model) or model) for o in offers}
+
+
 def check_request(r, status=200):
     """One settled request: its reservation, its charge, its receipt, the
     node's log and the deposit. Appends the charge."""
@@ -275,6 +282,12 @@ def check_request(r, status=200):
         rates = rec.get("rates") or {}
         if rates not in [(o.get("price_list") or {}).get(rec.get("model")) for o in offers]:
             dev.append(f"{tag}: the receipt's rates are not the signed offer's")
+        # The receipt names the requested (public) id and, where the offer's
+        # upstream_models lists it, the provider's id the suffix pinned.
+        if rec.get("model") != r.get("model"):
+            dev.append(f"{tag}: the receipt names model {rec.get('model')}, the request {r.get('model')}")
+        if (rec.get("upstream_model") or rec.get("model")) not in pinned_ids(r.get("model")):
+            dev.append(f"{tag}: the receipt's pinned model {rec.get('upstream_model') or rec.get('model')} is not the offer's {sorted(pinned_ids(r.get('model')))}")
         want_res = chat_reservations(r.get("model"), ctx["max_tokens"])
         if res and res[-1] not in want_res:
             dev.append(f"{tag}: reserved {res[-1]}, a full-context prompt plus the cap plus the abandon fee is {sorted(want_res)}")
@@ -439,6 +452,11 @@ elif kind == "settled":
             dev.append("a framing-1.1 connection did not close with `done`")
         if "armed" in flags and (not reqs or reqs[0].get("mode") != "armed" or "ARMED sid=" not in out):
             dev.append("the first connection was not armed before its request")
+        if "decoy" in flags:
+            got = [q.get("reported_model") for q in reqs]
+            evidence += f" reported_model={got}"
+            if not reqs or any(m not in pinned_ids(q.get("model")) for q, m in zip(reqs, got)):
+                dev.append(f"the provider did not run the pinned model (reported {got})")
         if "big" in flags and (not reqs or (reqs[0].get("body_len") or 0) < 200000 or (reqs[0].get("usage") or {}).get("prompt_tokens", 0) < 20000):
             dev.append("not a big body")
         if "idle" in flags:
