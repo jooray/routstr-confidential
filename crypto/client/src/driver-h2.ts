@@ -847,6 +847,10 @@ export async function runHttp2(s: any, conn: H2Conn, from: number): Promise<{ re
   conn.sendSettingsSeen()
   s.tOpen = Date.now()
   s.setupBytes = s.allBytes()
+  // Idle after the head: top the proof channel up (§9.2; a no-op while the
+  // preprocessed chain is still full). A request's proofs queue behind it.
+  const topup = () => (ctx.topup ? void s.zkchan?.topup() : undefined)
+  topup()
   const results: any[] = []
   let adv: any
   for (let n = from; n <= ctx.requests; n++) {
@@ -862,6 +866,8 @@ export async function runHttp2(s: any, conn: H2Conn, from: number): Promise<{ re
         break
       }
       results.push(r)
+      // Settled and the connection stays: idle until the next request.
+      if (r.status < 400 && !attack) topup()
       console.log(
         `[client ${s.label}] request ${n}: status=${r.status} released_ms=${r.released_ms} ttft_ms=${r.ttft_ms} total_ms=${r.total_ms} ` +
           `usage=${JSON.stringify(r.usage ?? null)} receipt_sig_ok=${r.receipt_sig_ok}`,

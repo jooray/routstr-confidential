@@ -33,6 +33,15 @@ export interface ZkDone {
   err?: string
 }
 
+/** What one top-up did (PROTOCOL-V3.md §9.2). */
+export interface TopupDone {
+  granted: boolean
+  before: number
+  after: number
+  bytes: number
+  ms: number
+}
+
 export class ZkChan {
   private child!: ChildProcess
   private ws!: WebSocket
@@ -56,6 +65,9 @@ export class ZkChan {
   /** Bytes on the proof-channel WebSocket, each way (measurements). */
   bytesSent = 0
   bytesRecv = 0
+  /** Top-ups that ran (granted), and their bytes. */
+  topups: TopupDone[] = []
+  private topupP: Promise<TopupDone | undefined> | undefined
 
   constructor() {
     this.readyP = new Promise((res, rej) => {
@@ -207,6 +219,45 @@ export class ZkChan {
     // A verification with no checks proved nothing: refused like a failed one.
     if (cmd === 'verify' && !(m.checks?.length && m.checks.every((c) => c.ok))) throw new Error(`proof channel: ${proof} checks failed`)
     return m
+  }
+
+  /**
+   * Between requests on a kept connection: ask the node to top up the proof
+   * chain to one more request's worth (PROTOCOL-V3.md §9.2). cu-prover runs
+   * its commands in order, so a proof asked for meanwhile waits for it. At
+   * most one top-up is outstanding; a failed one fails the channel (as a
+   * failed proof would: the connection is over).
+   */
+  topup(ms = 60_000): Promise<TopupDone | undefined> {
+    if (this.failure || this.closing || !this.used) return Promise.resolve(undefined)
+    if (this.topupP) return this.topupP
+    const id = this.nextId++
+    const p = new Promise<ZkDone & Partial<TopupDone>>((res, rej) => {
+      const t = setTimeout(() => {
+        this.pending.delete(id)
+        rej(new Error('proof channel: top-up timed out'))
+      }, ms)
+      this.pending.set(id, {
+        res: (m) => (clearTimeout(t), res(m)),
+        rej: (e) => (clearTimeout(t), rej(e)),
+      })
+    })
+    this.toChild(frame(1, Buffer.from(JSON.stringify({ cmd: 'topup', id }))))
+    this.topupP = p
+      .then((m) => {
+        if (!m.ok) throw new Error(`proof channel: top-up failed: ${m.err}`)
+        const d: TopupDone = { granted: !!m.granted, before: m.before ?? 0, after: m.after ?? 0, bytes: m.bytes ?? 0, ms: m.ms ?? 0 }
+        if (d.granted) this.topups.push(d)
+        return d
+      })
+      .catch((e) => {
+        this.fail(e as Error)
+        return undefined
+      })
+      .finally(() => {
+        this.topupP = undefined
+      })
+    return this.topupP
   }
 
   close(): void {

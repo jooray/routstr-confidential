@@ -336,7 +336,7 @@ fn demand_grows_with_records_not_bytes() {
 
 async fn open_pair() -> (ZkChannel, ZkChannel) {
     let (a, b, _) = zkbench::transport::emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
-    let pre = Prealloc { nk: 0, cp: 300_000 };
+    let pre = Prealloc { nk: 0, cp: 300_000, topup: 0 };
     let c = tokio::spawn(async move { ZkChannel::open(a, Party::Client, pre).await });
     let n = tokio::spawn(async move { ZkChannel::open(b, Party::Node, pre).await });
     (c.await.unwrap().unwrap(), n.await.unwrap().unwrap())

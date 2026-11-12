@@ -33,6 +33,21 @@
 //!   and the transport is untrusted in either case (the node relays it).
 //! * A failed or aborted proof poisons the channel: no further proof runs on
 //!   it, so a cheating prover can never probe a Δ more than once.
+//!
+//! **Top-up** (protocol v3, a kept framing `"2"` connection; PROTOCOL-V3.md
+//! §9.2). Between requests the client asks for a top-up of chain cp
+//! (`ProofReq { proof: "topup" }`), and the node answers with a
+//! [`TopupGrant`]: `target = 0` (nothing to do) or `target = available +
+//! step`, granted only while chain cp holds fewer than `step` correlations
+//! (`step` = the agreed [`Prealloc::topup`], sized for one typical request)
+//! and the channel's top-up traffic is under [`TOPUP_MAX_BYTES`]. Both sides
+//! then run one Ferret extension to `target` in lockstep, exactly as the
+//! preprocessing does. The next request's proofs consume what it made instead
+//! of extending online. Top-ups never grow an idle channel: one leaves at
+//! least `step` correlations, and the next is granted only after proofs
+//! consumed them. The control channel stays strictly client-driven (a request,
+//! then an answer), so a top-up and a proof never interleave: a proof the
+//! client asks for during a top-up waits for it.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -56,7 +71,8 @@ use crate::proofs::{CheckResult, ferret_config, prove_with, verify_with};
 use crate::statements::{Params, Witness, build};
 
 /// Wire version of the channel (bumped on any change to its message flow).
-pub const CHANNEL_VERSION: u32 = 1;
+/// 2: the top-up (`Hello.topup`, `ProofReq "topup"` and [`TopupGrant`]).
+pub const CHANNEL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // A shared, re-usable RCOT handle
@@ -357,6 +373,10 @@ pub struct Prealloc {
     pub nk: usize,
     /// Chain cp (π_WIN and π_C3S).
     pub cp: usize,
+    /// The top-up step on chain cp: a top-up runs only while the chain holds
+    /// fewer than this, and adds this many (0: no top-ups).
+    #[serde(default)]
+    pub topup: usize,
 }
 
 impl Default for Prealloc {
@@ -375,14 +395,42 @@ impl Default for Prealloc {
     /// preprocessing: 457 246 on nk (heads up to about 1 kB) and 1 195 758 on
     /// cp (the suffix record plus a tail of about 1.9 kB), the same Ferret
     /// step and the same 2.96 MB of setup traffic as the former cp = 800 000.
-    /// A second request on the channel, or anything larger, extends online.
+    /// A second request on the channel, or anything larger, extends online
+    /// unless the client topped the chain up in between.
+    ///
+    /// * topup: 900 000, one typical framing `"2"` request (π_WIN over the
+    ///   HEADERS and DATA records with the suffix, π_C3S over the usage tail:
+    ///   about 560 000 measured) with a margin, and below the 967 135 net
+    ///   correlations of one Ferret iteration at n = 1 024 000, so a top-up is
+    ///   exactly one such iteration (about 580 kB from the node, 30 kB back)
+    ///   and the chain never holds more than about 1.9 M (30 MB of keys).
     fn default() -> Self {
-        Self { nk: 300_000, cp: 1_000_000 }
+        Self { nk: 300_000, cp: 1_000_000, topup: TOPUP_STEP }
     }
 }
 
 /// Upper bound on one chain's preallocation, whatever either side asks for.
 const MAX_PREALLOC: u64 = 1 << 25;
+
+/// The default top-up step ([`Prealloc::topup`]).
+pub const TOPUP_STEP: usize = 900_000;
+
+/// Upper bound on the top-up step, whatever either side asks for.
+const MAX_TOPUP_STEP: u64 = 4_000_000;
+
+/// The most traffic (both directions, frame headers included) the top-ups of
+/// one channel may move. Past it the node grants no more top-ups and the
+/// proofs extend online, as without top-ups (bounded by the chain's inbound
+/// cap). At about 610 kB per top-up and one top-up per 1.6 typical requests
+/// this covers some 650 requests.
+pub const TOPUP_MAX_BYTES: u64 = 256 << 20;
+
+/// Lifetime inbound cap of each correlation chain on the mux (either party).
+/// A kept connection serves up to `h2.max_requests` (at most 1000) requests,
+/// each moving about 0.4 MB (with top-ups) to 1.5 MB (online extension) on
+/// chain cp; the cap bounds traffic, while the memory a peer can fill on a
+/// channel nobody reads is bounded by the mux's buffer.
+const CHAIN_CAP: u64 = 512 << 20;
 
 /// One chain's preallocation as both parties compute it from their own value
 /// and the peer's: the smaller one, so a peer can only lower it.
@@ -417,6 +465,25 @@ struct Hello {
     version: u32,
     nk: u64,
     cp: u64,
+    topup: u64,
+}
+
+/// The node's answer to a top-up request (node → client, control channel):
+/// `target` = 0 for none, else the number of correlations chain cp is to hold
+/// after the top-up (its current count plus the agreed step).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct TopupGrant {
+    pub target: u64,
+}
+
+/// What a top-up did, for logs and measurements.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct TopupOutcome {
+    /// Chain cp's count before and after.
+    pub before: usize,
+    pub after: usize,
+    /// Bytes this top-up moved (0 when nothing was granted).
+    pub bytes: u64,
 }
 
 /// One proof request (client → node, on the control channel).
@@ -438,11 +505,15 @@ pub struct Timing {
 fn chain_of(proof: &str) -> Result<bool> {
     // true = chain nk (node proves), false = chain cp (client proves).
     match proof {
+        TOPUP => bail!("a top-up is not a proof"),
         "pi_nk" => Ok(true),
         "pi_win" | "pi_c3s" => Ok(false),
         other => bail!("proof {other} is not served on the proof channel"),
     }
 }
+
+/// The control request name of a top-up (not a proof).
+pub const TOPUP: &str = "topup";
 
 fn params_name(params: &Params) -> &'static str {
     params.proof().name()
@@ -470,6 +541,11 @@ pub struct ZkChannel {
     nk_done: bool,
     /// Set by any failure: the channel never runs another proof.
     poisoned: bool,
+    /// The agreed top-up step (0: none).
+    topup_step: usize,
+    /// Traffic of all top-ups so far, and their number.
+    topup_bytes: u64,
+    topups: u32,
     timings: Vec<Timing>,
     last: (u64, u64),
 }
@@ -490,7 +566,10 @@ impl ZkChannel {
         // Preprocessing moves under 3 MB in both directions together, so the
         // client holds the node to the same caps.
         const MIB: u64 = 1 << 20;
-        let caps: [u64; 3] = [MIB, 32 * MIB, 32 * MIB];
+        // Chain cp carries every request's proofs and top-ups for the life of
+        // a kept connection: CHAIN_CAP (see there). Chain nk carries the
+        // preprocessing and one π_NK.
+        let caps: [u64; 3] = [MIB, 32 * MIB, CHAIN_CAP];
         let (mux, mut chans) = Mux::start(io, 3, &caps);
         let counters = mux.counters.clone();
         let cp_io = chans.pop().expect("3 channels");
@@ -500,7 +579,7 @@ impl ZkChannel {
         let mut nk_ctx = Context::new_single_threaded(nk_io.compat());
         let mut cp_ctx = Context::new_single_threaded(cp_io.compat());
 
-        let mine = Hello { version: CHANNEL_VERSION, nk: prealloc.nk as u64, cp: prealloc.cp as u64 };
+        let mine = Hello { version: CHANNEL_VERSION, nk: prealloc.nk as u64, cp: prealloc.cp as u64, topup: prealloc.topup as u64 };
         ctl.io_mut().send(mine).await.context("proof channel hello")?;
         let peer: Hello = tokio::time::timeout(HELLO_TIMEOUT, ctl.io_mut().expect_next())
             .await
@@ -514,6 +593,7 @@ impl ZkChannel {
         // online). Both sides compute the same value.
         let nk_n = agreed_prealloc(prealloc.nk, peer.nk);
         let cp_n = agreed_prealloc(prealloc.cp, peer.cp);
+        let topup_step = (prealloc.topup as u64).min(peer.topup).min(MAX_TOPUP_STEP) as usize;
 
         let nk = Chain::new(party == Party::Node);
         let cp = Chain::new(party == Party::Client);
@@ -534,6 +614,9 @@ impl ZkChannel {
             counters,
             nk_done: false,
             poisoned: false,
+            topup_step,
+            topup_bytes: 0,
+            topups: 0,
             timings: vec![Timing { step: "hello".into(), ms: hello_ms.as_secs_f64() * 1e3, bytes_sent: 0, bytes_recv: 0 }],
             last: (0, 0),
         };
@@ -636,6 +719,89 @@ impl ZkChannel {
         }
         self.mark(proof, t);
         r
+    }
+
+    /// The agreed top-up step, the top-ups so far and their traffic.
+    pub fn topup_stats(&self) -> (usize, u32, u64) {
+        (self.topup_step, self.topups, self.topup_bytes)
+    }
+
+    /// Both sides: one Ferret extension of chain cp to `target` (a grant).
+    async fn run_topup(&mut self, target: u64, t: Instant) -> Result<TopupOutcome> {
+        let before = self.cp.available();
+        let (s0, r0) = (self.counters.sent(), self.counters.recv());
+        if target > 0 {
+            let r = self.cp.preprocess(target as usize, &mut self.cp_ctx).await;
+            if let Err(e) = r {
+                self.poisoned = true;
+                return Err(e.context("top-up"));
+            }
+            self.topups += 1;
+        }
+        let bytes = (self.counters.sent() - s0) + (self.counters.recv() - r0);
+        self.topup_bytes += bytes;
+        self.mark(TOPUP, t);
+        Ok(TopupOutcome { before, after: self.cp.available(), bytes })
+    }
+
+    /// Client: ask the node for a top-up of chain cp and run it if granted.
+    /// Call only between requests: a proof asked for meanwhile waits for it.
+    /// A grant other than none or exactly `available + step` (a node that
+    /// would make the client hold more than agreed, or a desynchronised
+    /// chain) poisons the channel.
+    pub async fn topup(&mut self) -> Result<TopupOutcome> {
+        if self.party != Party::Client {
+            bail!("only the client asks for a top-up");
+        }
+        if self.poisoned {
+            bail!("proof channel is closed after a failure");
+        }
+        let t = Instant::now();
+        // Nothing the node could grant: no round trip.
+        if self.topup_step == 0 || self.cp.available() >= self.topup_step || self.topup_bytes >= TOPUP_MAX_BYTES {
+            return Ok(TopupOutcome { before: self.cp.available(), after: self.cp.available(), bytes: 0 });
+        }
+        let grant: Result<TopupGrant> = async {
+            self.ctl.io_mut().send(ProofReq { proof: TOPUP.to_string() }).await?;
+            Ok(self.ctl.io_mut().expect_next::<TopupGrant>().await?)
+        }
+        .await;
+        let grant = match grant {
+            Ok(g) => g,
+            Err(e) => {
+                self.poisoned = true;
+                return Err(e.context("top-up request"));
+            }
+        };
+        let have = self.cp.available() as u64;
+        if grant.target != 0 && grant.target != have + self.topup_step as u64 {
+            self.poisoned = true;
+            bail!("top-up: the node granted {} correlations, expected {} (+{})", grant.target, have, self.topup_step);
+        }
+        self.run_topup(grant.target, t).await
+    }
+
+    /// Node: answer a client's top-up request (after [`ZkChannel::next_request`]
+    /// returned `proof == "topup"`). Grants one step while chain cp holds fewer
+    /// than a step and the channel's top-ups moved less than
+    /// [`TOPUP_MAX_BYTES`]; `allow = false` refuses (target 0) whatever the
+    /// state, e.g. while a request is in flight.
+    pub async fn serve_topup(&mut self, allow: bool) -> Result<TopupOutcome> {
+        if self.party != Party::Node {
+            bail!("only the node serves top-ups");
+        }
+        if self.poisoned {
+            bail!("proof channel is closed after a failure");
+        }
+        let t = Instant::now();
+        let have = self.cp.available();
+        let grant = allow && self.topup_step > 0 && have < self.topup_step && self.topup_bytes < TOPUP_MAX_BYTES;
+        let target = if grant { (have + self.topup_step) as u64 } else { 0 };
+        if let Err(e) = self.ctl.io_mut().send(TopupGrant { target }).await {
+            self.poisoned = true;
+            return Err(anyhow!("top-up grant: {e}"));
+        }
+        self.run_topup(target, t).await
     }
 
     /// Mark the channel unusable (e.g. a proof timed out on the caller's side).

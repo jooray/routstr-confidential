@@ -44,6 +44,8 @@ export interface Ctx {
   /** Requests asked for (`--requests`). */
   requests: number
   pauseMs: number
+  /** Framing "2": top up the proof channel between requests (§9.2; `--no-topup` turns it off). */
+  topup: boolean
   /** After the last request: wait this long for the node to close the idle connection. */
   lingerMs?: number
   /** Framing "2": largest DATA payload per record. */

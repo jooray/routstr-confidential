@@ -32,7 +32,7 @@
 //   --retry-refused-ms N       (node) a request refused with 402 is sent again after N ms, same n
 //   --offer-at K               (node) request K names the offer as refetched just before it; on
 //                              `offer_changed` it is sent again naming the connection's own offer
-//   --pause-ms N  --linger-ms N  --h2-chunk N  --max-deposit MSAT [100000]  --no-zkchan
+//   --pause-ms N  --linger-ms N  --h2-chunk N  --max-deposit MSAT [100000]  --no-zkchan  --no-topup
 //   --auth CREDENTIAL  --node-pubkey HEX|npub  --trusted-host H  --runs-dir DIR  --no-accept-fee
 //   --legacy-v2-socket [--legacy-no-v]   open a protocol-v2 socket and print the peer's answer (LEGACY_JSON)
 //   --adv MODE [--adv-at N]    an attack on request N (also --adv-h2):
@@ -163,6 +163,9 @@ const NO_ACCEPT_FEE = argv.includes('--no-accept-fee')
 // Proofs run over the connection's pre-warmed proof channel; `--no-zkchan`
 // forces one socket per proof (at most 6 `/zk` sockets per connection).
 const ZKCHAN = !argv.includes('--no-zkchan')
+// Framing "2": the proof channel is topped up after the head and after each
+// settlement (PROTOCOL-V3.md §9.2); `--no-topup` leaves it to extend online.
+const TOPUP = !argv.includes('--no-topup')
 const LEGACY = argv.includes('--legacy-v2-socket')
 // --- attacks by a malicious client (crypto/tools/v3-check.sh) -----------------
 const ADV_SUFFIX_MODEL = arg('--adv-suffix-model')
@@ -1007,6 +1010,7 @@ function makeCtx(label: string): Ctx {
     checkReceipt: NODE_MODE ? checkReceipt(label) : undefined,
     requests: REQUESTS,
     pauseMs: PAUSE_MS,
+    topup: TOPUP,
     lingerMs: LINGER_MS,
     chunk: H2_CHUNK,
     buildBody,
@@ -1255,6 +1259,7 @@ async function main() {
     conns.push({
       sid: s.sid, http: framing, armed: out.armed, requests: out.results.length, phases: s.phases(out.tClaim),
       setup_bytes: s.setupBytes, total_bytes: s.allBytes(), deposit: s.deposit, closed: lastClosed,
+      topups: s.zkchan?.topups.length ? s.zkchan.topups : undefined,
     })
     writePrivate(`${s.runDir}/client.jsonl`, s.logLines.join('\n') + '\n')
     adv = out.adv

@@ -52,6 +52,15 @@ fn spawn_node_notify(
                 Ok(Some(r)) => r,
                 Ok(None) | Err(_) => break,
             };
+            if req.proof == "topup" {
+                let r = node.serve_topup(true).await;
+                let ok = r.is_ok();
+                out.push(("topup".into(), matches!(&r, Ok(o) if o.after > o.before)));
+                if !ok {
+                    break;
+                }
+                continue;
+            }
             let (params, witness) = match req.proof.as_str() {
                 "pi_nk" => (s.nk.0.clone(), Some(s.nk.1.clone())),
                 "pi_win" => (s.win.0.clone(), None),
@@ -130,7 +139,7 @@ async fn preprocess_then_prove_all_three() {
 async fn short_preallocation_extends_online() {
     let (a, b, counters) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
     // Far less than any proof needs: every chain must extend during the proofs.
-    let pre = Prealloc { nk: 1000, cp: 1000 };
+    let pre = Prealloc { nk: 1000, cp: 1000, topup: 0 };
     let (mut client, node) = open_pair(a, b, pre).await;
     let after_setup = counters.total();
     let node_task = spawn_node(node, session());
@@ -149,7 +158,7 @@ async fn short_preallocation_extends_online() {
 async fn peer_cannot_raise_the_preallocation() {
     let (a, b, _counters) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
     // A client asking for the most correlations gets the node's (smaller) amount.
-    let greedy = Prealloc { nk: 1 << 25, cp: 1 << 25 };
+    let greedy = Prealloc { nk: 1 << 25, cp: 1 << 25, topup: 1 << 25 };
     let c = tokio::spawn(async move { ZkChannel::open(a, Party::Client, greedy).await });
     let n = tokio::spawn(async move { ZkChannel::open(b, Party::Node, Prealloc::default()).await });
     let (mut client, node) = (c.await.unwrap().expect("client open"), n.await.unwrap().expect("node open"));
@@ -248,6 +257,111 @@ async fn win_and_c3s_run_twice_on_one_channel() {
     let want: Vec<(String, bool)> =
         ["pi_nk", "pi_win", "pi_c3s", "pi_win", "pi_c3s"].iter().map(|p| (p.to_string(), true)).collect();
     assert_eq!(served, want);
+}
+
+/// A kept connection (PROTOCOL-V3.md §9.2): a top-up between requests refills
+/// chain cp, so every later request's π_WIN and π_C3S only consume (no online
+/// extension on the request path); a top-up with the chain above its step is a
+/// no-op without a round trip, so an idle channel never grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topup_between_requests_keeps_proofs_offline() {
+    let (a, b, counters) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
+    let (mut client, node) = open_pair(a, b, Prealloc::default()).await;
+    let node_task = spawn_node(node, session_1k_tail());
+    let s = session_1k_tail();
+    client.request(&s.nk.0, None).await.expect("pi_nk");
+    // After the head: the chain is full, nothing to do.
+    let o = client.topup().await.unwrap();
+    assert_eq!((o.bytes, o.after), (0, o.before), "a top-up ran on a full chain");
+    let mut granted = 0;
+    for round in 0..6 {
+        let before = counters.total();
+        let cp0 = client.available().1;
+        for (p, w) in [&s.win, &s.c3s] {
+            client.request(p, Some(w)).await.unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+        }
+        let moved = counters.total() - before;
+        assert!(moved < 200_000, "round {round} moved {moved} B on the request path (cp {cp0}): an extension ran online");
+        // Settled: top up while idle, twice (the second finds a full chain).
+        let o = client.topup().await.unwrap();
+        if o.after > o.before {
+            granted += 1;
+            assert!(o.after >= o.before + zkbench::channel::TOPUP_STEP, "{o:?}");
+            assert!(o.bytes > 100_000 && o.bytes < 1_000_000, "{o:?}");
+        } else {
+            assert_eq!(o.bytes, 0);
+        }
+        assert!(client.available().1 >= zkbench::channel::TOPUP_STEP);
+        let again = client.topup().await.unwrap();
+        assert_eq!((again.bytes, again.after), (0, again.before), "an idle channel grew");
+    }
+    assert!(granted >= 3, "only {granted} top-ups in six rounds");
+    let (step, n, bytes) = client.topup_stats();
+    assert_eq!((step, n as usize), (zkbench::channel::TOPUP_STEP, granted));
+    assert!(bytes < 1_000_000 * granted as u64);
+    client.close().await;
+    let served = node_task.await.unwrap();
+    assert!(served.iter().all(|(p, ok)| *ok || p == "topup"), "{served:?}");
+    assert_eq!(served.iter().filter(|(p, ok)| p == "topup" && *ok).count(), granted);
+}
+
+/// A node that refuses a top-up (a proof's parameters are waiting) answers
+/// target 0; nothing is extended and the channel serves on, extending online.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_topup_leaves_the_channel_usable() {
+    let (a, b, _) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
+    let (mut client, mut node) = open_pair(a, b, Prealloc::default()).await;
+    let s = session();
+    let (win_p, _) = fixtures::pi_win_suffix();
+    let (c3s_p, _) = fixtures::pi_c3s();
+    let node_task = tokio::spawn(async move {
+        let mut log = Vec::new();
+        while let Ok(Some(req)) = node.next_request().await {
+            match req.proof.as_str() {
+                "topup" => {
+                    let o = node.serve_topup(false).await.unwrap();
+                    log.push(o.after > o.before);
+                }
+                "pi_win" => assert!(node.serve("pi_win", &win_p, None).await.unwrap().iter().all(|c| c.ok)),
+                "pi_c3s" => assert!(node.serve("pi_c3s", &c3s_p, None).await.unwrap().iter().all(|c| c.ok)),
+                _ => break,
+            }
+        }
+        node.close().await;
+        log
+    });
+    for _ in 0..3 {
+        client.request(&s.win.0, Some(&s.win.1)).await.unwrap();
+        client.request(&s.c3s.0, Some(&s.c3s.1)).await.unwrap();
+        let o = client.topup().await.unwrap();
+        assert_eq!(o.after, o.before);
+    }
+    assert!(!client.is_poisoned());
+    client.close().await;
+    let log = node_task.await.unwrap();
+    assert!(!log.is_empty() && log.iter().all(|g| !g), "{log:?}");
+}
+
+/// A client that asks for no top-ups (step 0) never sends one, and the node
+/// grants none: the agreed step is the smaller one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topup_step_zero_disables_topups() {
+    let (a, b, counters) = emulated_link(Duration::ZERO, f64::INFINITY, f64::INFINITY);
+    let c = tokio::spawn(async move { ZkChannel::open(a, Party::Client, Prealloc { topup: 0, ..Prealloc::default() }).await });
+    let n = tokio::spawn(async move { ZkChannel::open(b, Party::Node, Prealloc::default()).await });
+    let (mut client, node) = (c.await.unwrap().unwrap(), n.await.unwrap().unwrap());
+    assert_eq!(node.topup_stats().0, 0);
+    let node_task = spawn_node(node, session());
+    let s = session();
+    for _ in 0..2 {
+        client.request(&s.win.0, Some(&s.win.1)).await.unwrap();
+        client.request(&s.c3s.0, Some(&s.c3s.1)).await.unwrap();
+        let before = counters.total();
+        let o = client.topup().await.unwrap();
+        assert_eq!((o.bytes, counters.total() - before), (0, 0));
+    }
+    client.close().await;
+    assert!(node_task.await.unwrap().iter().all(|(p, _)| p != "topup"));
 }
 
 /// A connection has one credential record: π_NK runs once per channel, and
@@ -513,6 +627,21 @@ async fn cu_prover_channel_mode() {
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(r["id"], c["id"]);
     }
+    // A top-up between requests: granted (the chain is below its step after
+    // two rounds), then a no-op; the next proofs still verify.
+    to_child_tx.send(frame(1, serde_json::json!({"cmd":"topup","id":30}).to_string().as_bytes())).unwrap();
+    let r = next_ctl(&mut ctl_rx).await;
+    assert_eq!((r["id"].as_i64(), r["ok"].as_bool(), r["granted"].as_bool()), (Some(30), Some(true), Some(true)), "{r}");
+    assert!(r["bytes"].as_u64().unwrap() > 100_000, "{r}");
+    to_child_tx.send(frame(1, serde_json::json!({"cmd":"topup","id":31}).to_string().as_bytes())).unwrap();
+    let r = next_ctl(&mut ctl_rx).await;
+    assert_eq!((r["ok"].as_bool(), r["granted"].as_bool(), r["bytes"].as_u64()), (Some(true), Some(false), Some(0)), "{r}");
+    to_child_tx
+        .send(frame(1, serde_json::json!({"cmd":"prove","id":32,"proof":"pi_win","params":s.win.0,"witness":s.win.1}).to_string().as_bytes()))
+        .unwrap();
+    let r = next_ctl(&mut ctl_rx).await;
+    assert_eq!((r["id"].as_i64(), r["ok"].as_bool()), (Some(32), Some(true)), "{r}");
+    assert!(r["bytes_recv"].as_u64().unwrap() < 100_000, "the proof after a top-up extended online: {r}");
     // pi_nk does not: the client end refuses a second run.
     to_child_tx
         .send(frame(1, serde_json::json!({"cmd":"verify","id":20,"proof":"pi_nk","params":s.nk.0}).to_string().as_bytes()))
@@ -523,7 +652,7 @@ async fn cu_prover_channel_mode() {
     to_child_tx.send(frame(1, br#"{"cmd":"close"}"#)).unwrap();
     let served = tokio::time::timeout(Duration::from_secs(30), node_task).await.unwrap().unwrap();
     let want: Vec<(String, bool)> =
-        ["pi_nk", "pi_win", "pi_c3s", "pi_win", "pi_c3s"].iter().map(|p| (p.to_string(), true)).collect();
+        ["pi_nk", "pi_win", "pi_c3s", "pi_win", "pi_c3s", "topup", "pi_win"].iter().map(|p| (p.to_string(), true)).collect();
     assert_eq!(served, want);
     let status = tokio::time::timeout(Duration::from_secs(10), child.wait()).await.unwrap().unwrap();
     assert!(status.success());

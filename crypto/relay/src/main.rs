@@ -3239,6 +3239,31 @@ where
         let Some(req) = req else { break };
         let proof = req.proof;
         let t = std::time::Instant::now();
+        if proof == zkbench::channel::TOPUP {
+            // Between requests (PROTOCOL-V3.md §9.2): granted only while no
+            // proof's parameters wait (a proof the node asked for is never
+            // delayed by a top-up) and within the channel's own bounds
+            // (`serve_topup`). A failure ends the channel; the session goes on
+            // until its next proof cannot run.
+            let allow = shared.fresh.lock().unwrap().is_empty();
+            match tokio::time::timeout(PROOF_TIMEOUT, ch.serve_topup(allow)).await {
+                Ok(Ok(o)) => {
+                    let (step, n, total) = ch.topup_stats();
+                    info!(allow, before = o.before, after = o.after, bytes = o.bytes, step, topups = n, topup_bytes = total,
+                          elapsed_ms = t.elapsed().as_millis() as u64, "zkchan topup");
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "proof channel top-up failed");
+                    break;
+                }
+                Err(_) => {
+                    ch.poison();
+                    warn!("proof channel top-up timed out");
+                    break;
+                }
+            }
+        }
         // A request the node cannot run (a name it does not serve, no
         // parameters yet, the proof lock busy, a proof that already ran) did
         // not run a proof: it closes

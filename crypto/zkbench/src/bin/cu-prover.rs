@@ -21,6 +21,11 @@
 //!   out {"ev":"done","id":n,"proof":..,"ok":true,"checks":[{"label","ok"}],
 //!        "ms":..,"bytes_sent":..,"bytes_recv":..}
 //!   out {"ev":"done","id":n,"proof":..,"ok":false,"err":".."} (channel closed)
+//!   in  {"cmd":"topup","id":n}       between requests: ask the node to top up
+//!                                    the proof chain (PROTOCOL-V3.md §9.2)
+//!   out {"ev":"done","id":n,"proof":"topup","ok":true,"granted":bool,
+//!        "before":..,"after":..,"bytes":..,"ms":..}
+//!   (every "done" also carries "avail":[nk,cp], the correlations left)
 //!   in  {"cmd":"close"}                                      → flush, exit 0
 //!   out {"ev":"error","msg":..} and exit 1 on a channel failure
 //!   ```
@@ -292,6 +297,25 @@ async fn channel_loop(
         if name == "close" {
             break;
         }
+        if name == "topup" {
+            let t = std::time::Instant::now();
+            let r = match tokio::time::timeout(PROOF_TIMEOUT, ch.topup()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    ch.poison();
+                    Err(anyhow::anyhow!("top-up timed out on the proof channel"))
+                }
+            };
+            let _ = ch.take_timings();
+            let (nk, cp) = ch.available();
+            let ms = (t.elapsed().as_secs_f64() * 1e6).round() / 1000.0;
+            match r {
+                Ok(o) => emit(&out, json!({"ev":"done","id":id,"proof":"topup","ok":true,"granted":o.after > o.before,
+                                           "before":o.before,"after":o.after,"bytes":o.bytes,"ms":ms,"avail":[nk,cp]})),
+                Err(e) => emit(&out, json!({"ev":"done","id":id,"proof":"topup","ok":false,"err":format!("{e:#}"),"ms":ms})),
+            }
+            continue;
+        }
         if name != "prove" && name != "verify" {
             emit(&out, json!({"ev":"done","id":id,"ok":false,"err":format!("unknown command {name:?}")}));
             continue;
@@ -330,11 +354,12 @@ async fn channel_loop(
         .await;
         let t = ch.take_timings();
         let (ms, sent, recv) = t.last().map(|x| (x.ms, x.bytes_sent, x.bytes_recv)).unwrap_or((0.0, 0, 0));
+        let (nk, cp) = ch.available();
         match res {
             Ok(checks) => {
                 let cs: Vec<_> = checks.iter().map(|c| json!({"label":c.label,"ok":c.ok})).collect();
                 emit(&out, json!({"ev":"done","id":id,"proof":proof,"ok":true,"checks":cs,
-                                  "ms":(ms * 1000.0).round() / 1000.0,"bytes_sent":sent,"bytes_recv":recv}));
+                                  "ms":(ms * 1000.0).round() / 1000.0,"bytes_sent":sent,"bytes_recv":recv,"avail":[nk,cp]}));
             }
             Err(e) => {
                 emit(&out, json!({"ev":"done","id":id,"proof":proof,"ok":false,"err":format!("{e:#}"),"ms":ms}));
@@ -353,6 +378,9 @@ async fn run_channel(args: &[String]) -> Result<()> {
     }
     if let Some(v) = arg_value(args, "--prealloc-cp") {
         prealloc.cp = v.parse().context("--prealloc-cp")?;
+    }
+    if let Some(v) = arg_value(args, "--topup-step") {
+        prealloc.topup = v.parse().context("--topup-step")?;
     }
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<serde_json::Value>();
