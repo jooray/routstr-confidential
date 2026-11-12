@@ -86,6 +86,9 @@ The operator states what their upstream supports. Nothing is probed or assumed.
 - `connection_deposit_msat`, `idle_timeout_s` (§8).
 - everything v2's offer has: `upstream_host`, `head_template` (framing `"1.1"`), `chat`, `images`,
   `price_list`, `session_fee_msat`, `abandon_fee_msat`, `max_tokens_cap`, …
+- `upstream_models` (optional): public id → the provider's own id, for the chat models of `price_list`
+  whose two ids differ (§12.1). The request, `price_list`, `/v1/models` and the receipt's `model` name the
+  public id; the chat suffix pins the provider's id.
 
 ### 2.3 Client choice
 
@@ -379,6 +382,46 @@ every case above with exact money (`h2-k-*`, `h11-k-extra-record`, `h11-k-pipeli
   such a frame. N parses text and frames alternately; the DATA payload bytes on the request's stream from
   `R`'s start to END_STREAM must be exactly `data: <usage JSON>\n\ndata: [DONE]\n\n`, and the stream must
   end inside `R`. π_C3S, unchanged circuit.
+- **The usage event** (both framings; framing `"1.1"`: the last event before `data: [DONE]` in `R`). It
+  carries `usage.prompt_tokens` and `usage.completion_tokens` (non-negative integers), and `choices` is
+  either `[]` or **one choice with no content**: an object whose members are only
+  - `index`: a non-negative integer;
+  - `finish_reason`: `null` or one of `stop`, `length`, `tool_calls`, `content_filter`, `function_call`;
+  - `native_finish_reason`: `null` or an identifier, `[A-Za-z_]{1,32}`;
+  - `logprobs`: `null`;
+  - `delta`: an object whose members are only `role` (`null` or `"assistant"`), `content`, `reasoning`,
+    `reasoning_content`, `refusal` (each `null` or `""`) and `tool_calls` (`null` or `[]`).
+
+  Anything else refuses the event: a non-empty content, reasoning or refusal string, a tool call, `audio`,
+  `logprobs` with tokens, a field not on this list (at any level of the choice), a second choice. The
+  members outside `choices` are unconstrained, as before (the provider's own fields: `id`, `model`,
+  `usage`, `provider`, …). Measured shapes (2026-11-12): Venice, Numes, xKiro, NVIDIA send `choices: []`;
+  OpenRouter `[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"length",
+  "native_finish_reason":"length"}]`; Cloudflare `[{"index":0,"delta":{},"finish_reason":"stop"}]`.
+  Conformance vectors: `crypto/relay/usage-event-vectors.json` (the sidecar, the reference driver, the SDK
+  and the browser library run the same file).
+
+  *Why this discloses no response text.* Every string a choice may carry is either empty, the fixed
+  `"assistant"`, one of five fixed finish reasons, or an identifier of at most 32 letters and underscores
+  set by the provider's front end (`native_finish_reason`, e.g. `length`, `STOP`, `end_turn`); none is
+  model output. What N learns beyond the `choices: []` case is the finish reason: whether the output hit
+  the cap (already implied by `completion_tokens` against the pinned `max_tokens`), stopped, was filtered or
+  ended in a tool call, under 3 bits per request. Model output can only reach these fields through a
+  provider bug that puts it into `native_finish_reason`, and then at most 32 letters; text with a space,
+  digit or punctuation is refused. The allow-list is closed: a field a provider adds later refuses the
+  event until it is reviewed and added here.
+
+  *Usage on every chunk* (Cloudflare). The disclosed event is still only the last one before
+  `data: [DONE]`: in framing `"2"` the disclosed text is exactly one event and `[DONE]` (a disclosure that
+  starts at an earlier event is refused), in framing `"1.1"` the sidecar judges the last event and the
+  clients start `R` at its line. An earlier chunk (content with a partial usage) can neither be disclosed in
+  place of the last nor make the disclosure start earlier, and a last chunk that carries content next to
+  its usage is refused. The usage of the last event is the provider's total; the earlier partial counts are
+  never read.
+
+  *Not supported:* a provider that merges the usage into the last content chunk (Google AI Studio's
+  OpenAI-compatible endpoint: `delta.content` with text, `delta.extra_content`): disclosing that event would
+  disclose output, so it is refused and such a provider cannot be offered.
 - **The probe stream.** The provider may still answer the probe (stream 1, reset by N in the connection
   head), late. Complete frames of stream 1 of the kinds a GET response consists of (HEADERS, CONTINUATION,
   DATA, RST_STREAM, WINDOW_UPDATE) are **skipped** by the tail grammar: their payloads are no part of the
@@ -709,6 +752,16 @@ the v2 checks (signature, host, chat block, head template, images block). An off
 configured (§11), and each confidential model in `GET /v1/models` has
 `confidential_upstream: {"v":3,"offer_url"[,"session_fee_msat","abandon_fee_msat","rate_surcharge_pct"][,"kind":"images"]}`.
 
+**`upstream_models`** (N, optional): `{"<public id>": "<provider id>", …}` for the models of `price_list`
+whose public id is not the provider's own (routstr lists models without their `org/` prefix:
+`kimi-k3.1-pro` for Numes' `moonshotai/kimi-k3.1-pro`). Absent when every id is the provider's own (Venice),
+so such an offer is unchanged. Each key is a key of `price_list`; each value is the id the node's plain
+path sends that provider, printable ASCII without `"` or `\`, at most 256 bytes, never equal to its key.
+The chat suffix of a request for model `m` pins `upstream_models[m]` when present, else `m`
+(docs/CHAT-SUFFIX.md); the client renders it from the offer its request names and compares it with
+`request_ok.suffix`. The sidecar's `model_allowlist` names provider ids (what the sidecar sees). Image
+models are keyed by the provider's id in `images.price_list` already and are not listed.
+
 **Connection-level fields** of an offer: `v`, `twopc`, `upstream_host`, `head_template`, `chat`, `h2`,
 `connection_deposit_msat`, `idle_timeout_s`, and the `images` block without its `price_list`. A `request`
 that names an offer in which one of these differs from the offer of the `setup`, or whose `http` no longer
@@ -792,7 +845,8 @@ or `{"type":"request","n":k,"kind":"images","model","variant","count","body_len"
   `ready`, **before the ClientHello**; exactly one request is accepted on the connection.
 - The node validates, reserves (chat: a full-context prompt plus `max_tokens`; images:
   `msat_per_image × count`; each plus `max(session fee still due, abandon fee)`), and forwards
-  **S** `{"type":"request","n","kind","model","max_tokens","body_len"}` or
+  **S** `{"type":"request","n","kind","model","max_tokens","body_len"}` (chat: `model` is the id the
+  suffix pins, the offer's `upstream_models[model]` when listed; the client named the public id) or
   `{"type":"request","n","kind":"images","model","count","body_len","suffix":<the node's rendering>}`.
   A chat request may carry `suffix`; it must equal the canonical one.
 - **S** `N → C  {"type":"request_ok","sid","n","suffix":<the canonical suffix>}` plus `"stream": 2k+1`
@@ -959,7 +1013,8 @@ receipt's canonical JSON, the text the node signed (`sig`: BIP-340 over its SHA-
 |---|---|---|
 | `v` | always | `1`, the receipt format |
 | `sid`, `http`, `n` | always | the connection, its framing, the request |
-| `model` | always | the pinned model |
+| `model` | always | the model the request named (the public id; for images the offer's id) |
+| `upstream_model` | chat, when it differs from `model` | the provider's id the suffix pinned (`upstream_models`) |
 | `usage` | always | the `usage` of the S frame: the provider's usage event, `{"error_status","choices":[]}`, or `{"flat":true,"kind":"images","count"}` |
 | `cost_msats` | always | what the request was charged |
 | `reserved_msats` | always | what was reserved for it |
@@ -1135,4 +1190,6 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | the `split-public-1` statement: the inner-digest message rule, assumption (3), the idealized 3-bit model, label-check pairs augment the report hash | §4 |
 | privacy: linkability and its off switches, body padding (off by default), residual risks 7-10 | §1, §9.1, §9.3, §10 |
 | a cancelled request cannot lend its credential reference (the attack and why each form fails) | §5.3.1 |
+| the usage event: `choices` may hold one choice with no content (allow-list), the argument, usage on every chunk, Google unsupported | §5.4 |
+| `upstream_models`: org/-prefixed models offered under their public id, the suffix pins the provider's id; receipt `upstream_model` | §2.2, §12.1, §12.4, §12.8 |
 | the proof channel's top-up between requests (channel version 2: `topup`, `TopupGrant`, step, bounds, a request waits for it); chain cp's mux cap 512 MiB | §8.5, §9.2, §12.2 |

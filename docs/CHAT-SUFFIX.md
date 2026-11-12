@@ -125,6 +125,12 @@ with the caller's choice silently replaced.
   names and returns it in `request_ok`. The client renders it too and
   refuses a difference. On an HTTP/2 connection every request has its own
   suffix, so the model and cap can differ from request to request.
+- **The pinned model id.** The suffix's `model` is the id the provider is
+  sent: the offer's `upstream_models[model]` when the offer lists the
+  request's model there (a public id without the provider's `org/` prefix,
+  e.g. `kimi-k3.1-pro` for `moonshotai/kimi-k3.1-pro`), else the request's
+  `model` itself (PROTOCOL-V3.md §12.1). The request and the receipt's
+  `model` name the public id; the receipt's `upstream_model` the pinned one.
 - **The offer the suffix comes from.** A request names an offer by its
   signature. Its connection-level fields must equal those of the offer the
   connection was opened on (`offer_changed` otherwise). The chat block is
