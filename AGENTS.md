@@ -443,8 +443,15 @@ Both still speak protocol v2 (branch `twopc-v2` crates); the v3 port is open.
     credential only, with one pre-warmed proof channel
     (`/zk?proof=zkchan`, `cu-prover --channel`, `zkbench/src/channel.rs`)
     holding the correlations for π_NK and the first π_WIN and π_C3S;
-    per-proof `/zk?proof=pi_*` is the fallback.
-  - The browser library and the PWA are not ported to v3.
+    per-proof `/zk?proof=pi_*` is the fallback. On a kept framing-"2"
+    connection every client tops the channel up while idle (channel version 2,
+    `topup` / `TopupGrant`, PROTOCOL-V3.md §9.2: one 900 000-correlation step,
+    ~610 kB, while the chain holds less than a step; a request that starts
+    meanwhile waits for it); measure with `crypto/tools/v3-topup-bench.sh`
+    (`CU_NO_TOPUP=1` for the old behaviour). An old client (channel version 1)
+    falls back to one socket per proof.
+  - The browser library and the PWA are on v3 (local branches `v3`; PWA
+    0.2.1); the library's `wasm/pkg` is a local macOS build until CI replaces it.
   - v3 is not pushed, not deployed and not in the upstream PRs; the SDK
     release and routstrd's `@routstr/sdk` bump are the maintainers' step.
   - The sidecar and prover are not yet in any upstream repo.

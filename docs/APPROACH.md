@@ -168,7 +168,7 @@ request on an open one):
 | Cold request, framing "2" | 2.63 MB / 17.97 MB | 1.38 s | 12.1 s | 18.9 s |
 | Cold request, framing "1.1" | about the same | 1.52 s | 11.8 s | 19.2 s |
 | Armed connection, "2" / "1.1" | 83 kB / 87 kB; 77 kB / 93 kB | 0.81 / 0.76 s | 1.43 / 1.38 s | 1.59 / 1.85 s |
-| Request on an open HTTP/2 connection | 86 kB / 1.01 MB (the proof channel's top-up) | 0.57 s | 0.92 s | 1.23 s |
+| Request on an open HTTP/2 connection | 81 kB / 12 kB on its path (plus a 610 kB proof-channel top-up per ~1.6 requests while idle; before the top-up, up to 1.45 MB on the path) | 0.57 s | 0.92 s | 1.23 s |
 | v2, pre-warmed session, for comparison | about 28 MB per request | 0.9–1.5 s | | |
 
 (The shaped rows are the reference client against the sidecar through `shape-proxy.py`; the loopback row
