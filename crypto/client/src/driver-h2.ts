@@ -12,7 +12,7 @@
 import { createHash } from 'node:crypto'
 
 import { concat, hex } from './advice.ts'
-import { advOutcome, noteDepositRelease, openRequest, takeReceipt, type Ctx, type ImageTerms } from './ctx.ts'
+import { advOutcome, noteDepositRelease, openRequest, requestMessage, takeReceipt, type Ctx, type ImageTerms } from './ctx.ts'
 import {
   errorHeadPrefixProblem,
   FLAG, FRAME, FrameReader, chatPath, checkPiWinParams, decodeBlock, frame, frameHeader,
@@ -245,6 +245,9 @@ export class H2Conn {
     return this.sendRecord(f, [[0, 9], [f.length, f.length + 1]], name)
   }
 
+  /** The `rst-before-final` attack: never release the request's last record. */
+  private releaseCap: number | undefined
+
   /** Release as many of the request's records as the provider's windows allow. */
   private updateRelease(): void {
     const cur = this.cur
@@ -257,6 +260,7 @@ export class H2Conn {
       sum += len
       upto++
     }
+    if (this.releaseCap !== undefined) upto = Math.min(upto, this.releaseCap)
     if (upto > cur.upto) {
       cur.upto = upto
       this.sendOrdered({ type: 'release', n: cur.n, upto })
@@ -423,10 +427,19 @@ export class H2Conn {
       this.unackedSettings--
       void this.sendCtl('settings_ack', new Uint8Array(0))
     }
+    if (adv === 'ctl-headers') {
+      // A record declared as a PING ACK (inner length 18) whose content is a
+      // HEADERS frame for the next stream naming the credential by index: the
+      // frame header is proven, so the proof fails and nothing is written.
+      const hidden = frame(FRAME.HEADERS, FLAG.END_HEADERS | FLAG.END_STREAM, stream + 2, Uint8Array.from([0x82, 0x87, 0x84, 0xbe, 0x40, 0x01, 0x78, 0x00]))
+      await this.sendRecord(hidden, [], 'ping_ack')
+    }
+    if (adv === 'rst-before-final') this.releaseCap = plan.length - 1
     for (const p of plan) cur.seqs.push(await this.sendRecord(p.content, p.pub, undefined, p.raw))
     cur.dataLens = plan.slice(1).map((p) => p.data)
     this.updateRelease()
     ctx.log({ ev: 'h2_request_sent', n, records: plan.length, body_len: bodyLen })
+    if (adv?.startsWith('rst-')) return await this.cancelAndReuse(adv, cur, b, bodyLen)
 
     if (adv === 'replay-usage') return await this.replayUsage(cur)
     if (adv === 'no-proof') {
@@ -503,6 +516,39 @@ export class H2Conn {
       proofs: this.proofs.slice(proofs0),
       bytes: delta,
     }
+  }
+
+  /**
+   * The cancel-and-reuse attacks (PROTOCOL-V3.md §5.5): request n is
+   * force-stopped with RST_STREAM and a later request is to ride on the
+   * credential entry without a `request` the node bills. Each must be
+   * refused; the money outcome is the gate's.
+   */
+  private async cancelAndReuse(adv: string, cur: Cur, b: ReturnType<Ctx['buildBody']>, bodyLen: number): Promise<any> {
+    const { s, ctx } = this
+    const rst = () => this.sendRecord(frame(FRAME.RST_STREAM, 0, cur.stream, Uint8Array.from([0, 0, 0, 8])), [[0, 9], [13, 14]], 'rst_stream')
+    const next = () => this.sendOrdered(requestMessage(ctx, cur.n + 1, b, bodyLen))
+    if (adv === 'rst-before-final') {
+      // The provider has HEADERS and all DATA but the last (no END_STREAM).
+      await sleep(1500)
+      if (cur.released) throw new Error('body_released although the last record was never released')
+      await rst()
+      await sleep(1500)
+      next()
+    } else {
+      await this.until(() => cur.released, `body_released for request ${cur.n}`, 60000)
+      await rst()
+      await sleep(1500)
+      if (adv === 'rst-after-release') next()
+      else {
+        // A HEADERS record with no `request`: the next stream, or the same one again.
+        const stream = adv === 'rst-reuse' ? cur.stream + 2 : cur.stream
+        const headers = frame(FRAME.HEADERS, FLAG.END_HEADERS, stream, requestBlock(ctx.offer.upstream_host, chatPath(ctx.offer.head_template)))
+        await this.sendRecord(headers, [[0, headers.length + 1]])
+      }
+    }
+    await this.until(() => !!s.peerError, 'the peer to refuse', 30000)
+    throw new Error(`refused: ${String(s.peerError?.reason ?? '')}`)
   }
 
   // --- disclosures ------------------------------------------------------------

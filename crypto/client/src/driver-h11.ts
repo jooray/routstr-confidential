@@ -103,6 +103,14 @@ export class H11 {
     const rel = await s.waitT('body_released', 60000)
     if (rel.n !== 1) throw new Error('body_released names another request')
     const tReleased = Date.now()
+    if (adv === 'extra-record') {
+      // One more record after the proven final one, carrying a second request.
+      const enc = new TextEncoder()
+      await s.tls.write(enc.encode('POST /api/v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}'))
+      const t0 = Date.now()
+      while (!s.peerError && Date.now() - t0 < 30000) await sleep(20)
+      throw new Error(`refused: ${String(s.peerError?.reason ?? 'not refused')}`)
+    }
 
     // The provider closes after its response; the node then attests on its own.
     const attMsg = await s.waitT('attestation', 600000)

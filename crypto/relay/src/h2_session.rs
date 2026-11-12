@@ -1206,6 +1206,43 @@ mod tests {
         assert!(on_ctl(&mut st, "ping_ack").is_err());
     }
 
+    /// Cancel and reuse: once a request is complete, a RST_STREAM may follow,
+    /// but no further request record without a `request` (a HEADERS record
+    /// for the next stream or the same one again is refused before it is
+    /// queued, so it can never reach the provider); after the settlement there
+    /// is no request at all to attach one to. A control record is proven
+    /// against the frame header of its declared kind, so a "PING ACK" that
+    /// carries a HEADERS frame fails its proof.
+    #[test]
+    fn a_cancelled_request_lends_its_credential_reference_to_nothing() {
+        let block = h2::request_block("h", "/api/v1/chat/completions");
+        for next_stream in [3u32, 5] {
+            let mut st = session_with_request(300, "sfx");
+            client_bytes(&mut st, &record(9 + block.len() + 1)).unwrap();
+            client_bytes(&mut st, &record(10 + 300)).unwrap();
+            on_ctl(&mut st, "rst_stream").unwrap();
+            client_bytes(&mut st, &record(14)).unwrap();
+            let before = st.h2.as_ref().unwrap().queue.len();
+            let err = client_bytes(&mut st, &record(9 + block.len() + 1)).unwrap_err();
+            assert!(err.to_string().contains("outside a request"), "stream {next_stream}: {err}");
+            assert_eq!(st.h2.as_ref().unwrap().queue.len(), before);
+        }
+        // A RST_STREAM before the request's records are all in is refused.
+        let mut st = session_with_request(300, "sfx");
+        client_bytes(&mut st, &record(9 + block.len() + 1)).unwrap();
+        on_ctl(&mut st, "rst_stream").unwrap();
+        assert!(client_bytes(&mut st, &record(14)).is_err());
+        // The windows of a declared PING ACK pin its header.
+        let mut st = session_with_request(300, "sfx");
+        st.h2.as_mut().unwrap().req = None;
+        on_ctl(&mut st, "ping_ack").unwrap();
+        client_bytes(&mut st, &record(18)).unwrap();
+        let h = st.h2.as_ref().unwrap();
+        let (w, count) = batch_windows(h, 0).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(w[0].expected, h2::frame_header(8, h2::PING, h2::ACK, 0));
+    }
+
     /// A provider close after the client wrote control frames on a connection
     /// that carried no request is flagged (`after_client_frames`): the node
     /// does not read it as the provider closing an idle connection.

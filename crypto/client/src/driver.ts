@@ -40,6 +40,14 @@
 //                      cap swap, --adv-image-count N), padding, early-record, no-proof, own-keyshare, twopc-tag
 //       framing "2":   hidden-headers, path [--adv-h2-path P], replay-usage
 //       framing "1.1": not-alone (the suffix is not alone in the final record)
+//       cancel-and-reuse (a later request that refers to the credential unbilled):
+//         framing "2": rst-reuse / rst-reuse-same (after body_released: RST_STREAM, then a HEADERS record
+//         for the next / the same stream with no `request`), rst-before-final (the last DATA record never
+//         released, RST_STREAM, then the next `request`), rst-after-release (RST_STREAM after
+//         body_released, no disclosure, then the next `request`), ctl-headers (a record declared as a
+//         PING ACK that carries a HEADERS frame);
+//         framing "1.1": extra-record (after body_released, one more record carrying a second HTTP
+//         request); a second request inside the body is --private-extra with raw CRLF text
 //     --adv-accept-any (accept an image response whatever its status), --decoy-model M (neutralised)
 //
 // Output: `E2E_JSON {…}` (every request with its bytes each way and times), one `BENCH {…}` line per
@@ -170,6 +178,9 @@ const ADV_MODE: string | undefined =
 const ADV_MODES: Record<string, Framing[]> = {
   suffix: ['2', '1.1'], padding: ['2', '1.1'], 'early-record': ['2', '1.1'], 'no-proof': ['2', '1.1'], 'own-keyshare': ['2', '1.1'], 'twopc-tag': ['2', '1.1'],
   'hidden-headers': ['2'], path: ['2'], 'replay-usage': ['2'], 'not-alone': ['1.1'],
+  // A cancelled request whose credential reference a later one reuses, unbilled:
+  'rst-reuse': ['2'], 'rst-reuse-same': ['2'], 'rst-before-final': ['2'], 'rst-after-release': ['2'], 'ctl-headers': ['2'],
+  'extra-record': ['1.1'],
 }
 if (ADV_MODE !== undefined && !ADV_MODES[ADV_MODE]) usage(`--adv ${ADV_MODE}: one of ${Object.keys(ADV_MODES).join(', ')}`)
 const ADV_AT = Number(arg('--adv-at', ADV_MODE === 'replay-usage' ? '2' : '1'))

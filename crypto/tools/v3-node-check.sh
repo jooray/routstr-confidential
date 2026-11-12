@@ -79,6 +79,20 @@
 #                           refused, its reservation is charged in full
 #   h2-g-early-record, h2-i-own-keyshare
 #                           the connection itself: D charged (`unused`)
+#  cancel and reuse (a force-stopped request whose credential reference a later one rides on)
+#   h2-k-rst-reuse, h2-k-rst-reuse-same   request 2 released, RST_STREAM, then a HEADERS record for
+#                           the next / the same stream with no `request`: refused before it is queued
+#                           (nothing reaches the provider), request 2's reservation charged in full
+#   h2-k-rst-before-final   request 2's last DATA record never released, RST_STREAM (held behind it),
+#                           then `request` 3: refused (one request at a time), request 2 released less A
+#   h2-k-rst-after-release  RST_STREAM after body_released, no disclosure, then `request` 3: refused,
+#                           request 2 charged in full (a cancelled request is never cheaper than its bound)
+#   h2-k-ctl-headers        a record declared as a PING ACK carrying a HEADERS frame: π_WIN fails,
+#                           nothing written, request 2 released less A
+#   h11-k-extra-record      a record carrying a second HTTP request after the final one: refused,
+#                           request 1 charged in full
+#   h11-k-pipelined         a second HTTP request inside the body: one body to the provider (400),
+#                           settled as an error head (A)
 #  the deposit table (§12.10)
 #   no-funds                row 1: a setup with an unfunded key (402), sidecar not dialed
 #   low-balance             row 1: funds below D (402 `connection_deposit_unfunded`)
@@ -429,6 +443,13 @@ run_case h11-c-suffix        "attack:1.1:1:abandoned:pi_win failed" "$B" none --
 run_case h11-c-model-swap    "attack:1.1:1:abandoned:."             "$B" none -- --http 1.1 --adv suffix --adv-suffix-model "$SWAP_MODEL"
 run_case h11-b-padding       "attack:1.1:1:abandoned:pi_win failed" "$B" none -- --http 1.1 --adv padding
 run_case h11-f-image-suffix  "attack:1.1:1:abandoned:pi_win failed" "$B" none -- --http 1.1 --image "${IMG[@]}" --adv suffix
+run_case h2-k-rst-reuse        "attack:2:2:charged:outside a request" "$B" none -- --http 2 --requests 2 --adv rst-reuse --adv-at 2
+run_case h2-k-rst-reuse-same   "attack:2:2:charged:outside a request" "$B" none -- --http 2 --requests 2 --adv rst-reuse-same --adv-at 2
+run_case h2-k-rst-before-final "attack:2:2:abandoned:already in flight" "$B" none -- --http 2 --requests 2 --adv rst-before-final --adv-at 2
+run_case h2-k-rst-after-release "attack:2:2:charged:already in flight" "$B" none -- --http 2 --requests 2 --adv rst-after-release --adv-at 2
+run_case h2-k-ctl-headers      "attack:2:2:abandoned:pi_win failed"   "$B" none -- --http 2 --requests 2 --adv ctl-headers --adv-at 2
+run_case h11-k-extra-record    "attack:1.1:1:charged:exceeds declared length" "$B" none -- --http 1.1 --adv extra-record
+run_case h11-k-pipelined       "error:1.1:1:400" "$B" none -- --http 1.1 --private-extra $'"x":1}\r\n\r\nPOST /api/v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n{'
 
 # --- the deposit table, versions ---------------------------------------------
 run_case no-funds      "setup-refused:402:insufficient"      0                 none -- --http 2
