@@ -1,31 +1,45 @@
 # Trying confidential mode
 
 Confidential mode lets a Routstr node serve your LLM request without seeing the prompt or the answer, and
-(protocol v2) without you ever being able to recover the node's provider API key. How it works:
-[`paper/paper.pdf`](../paper/paper.pdf); trade-offs between the retired protocol v1 and v2: [`V1-V2-ONE-PAGER.pdf`](V1-V2-ONE-PAGER.pdf).
+without you ever being able to recover the node's provider API key. How it works:
+[`paper/paper.pdf`](../paper/paper.pdf); the protocol: [`PROTOCOL-V3.md`](../PROTOCOL-V3.md).
+
+This file describes **protocol v3**, the only protocol the current code speaks. What changed from v2, for
+users and operators, on one page: [`V2-V3-ONE-PAGER.pdf`](V2-V3-ONE-PAGER.pdf) ([source](V2-V3-ONE-PAGER.md)).
+In short: the expensive two-party handshake is paid once per **connection** instead of once per request,
+and a connection to a provider that speaks HTTP/2 carries many requests. Operators: see "Upgrading from
+v2" at the end.
 
 This is **experimental**: the code lives on branches, not in Routstr releases yet, and the two-party
 computation is not externally reviewed. Use small amounts.
 
-| Repo | Branch | What |
+| Repo | Branch (v3) | What |
 |---|---|---|
-| [jooray/routstr-confidential](https://github.com/jooray/routstr-confidential/tree/twopc-v2) | `twopc-v2` | provers (`cu-prover`, `cu-2pc`), the node's sidecar (`cu-sidecar`), paper |
-| [jooray/routstr-sdk](https://github.com/jooray/routstr-sdk/tree/confidential-2pc) | `confidential-2pc` | the client transport |
-| [jooray/routstrd](https://github.com/jooray/routstrd/tree/confidential-upstream) | `confidential-upstream` | the daemon (opt-in header, config) |
-| [jooray/routstr-core](https://github.com/jooray/routstr-core/tree/confidential-2pc) | `confidential-2pc` | the node |
+| jooray/routstr-confidential | `v3-h2` | provers (`cu-prover`, `cu-2pc`), the node's sidecar (`cu-sidecar`), protocol, paper |
+| jooray/routstr-sdk | `confidential-v3` | the client transport |
+| jooray/routstrd | `confidential-v3` | the daemon (opt-in header, config) |
+| jooray/routstr-core | `confidential-v3` | the node |
+
+Until v3 is published and deployed, the public branches (`twopc-v2`, `confidential-2pc`,
+`confidential-upstream`) and the node at routstr.cypherpunk.today speak protocol v2; the v2 edition of this
+file is on the [`twopc-v2`](https://github.com/jooray/routstr-confidential/tree/twopc-v2) branch. v2 and v3
+do not interoperate: a v3 node answers a v2 client with `upgrade_required`, and a v3 client reports
+`node_protocol_outdated` for a v2 node.
 
 You need: git, Rust (stable), Bun, Node.js/npm (to build the SDK).
 
 ## 1. Client only (use an existing node)
 
 If you only want to try it as a user, you need routstrd and the two prover binaries. You then need a node
-that runs confidential mode; for example **https://routstr.cypherpunk.today** runs protocol v2 with Venice as
-the provider (it is announced on Nostr, so routstrd finds it).
+that runs confidential mode with the same protocol version as your client (a node's signed offer says so:
+`"v": 3`; its Nostr listing carries `confidential: 3`). **https://routstr.cypherpunk.today** runs confidential
+mode with Venice as the provider (protocol v2 until it is upgraded; it is announced on Nostr, so routstrd
+finds it).
 
 **Build the provers.**
 
 ```sh
-git clone -b twopc-v2 https://github.com/jooray/routstr-confidential
+git clone -b v3-h2 https://github.com/jooray/routstr-confidential
 cd routstr-confidential/crypto
 cargo build --release -p zkbench --bin cu-prover -p twopc --bin cu-2pc
 # binaries: crypto/zkbench/target/release/{cu-prover,cu-2pc} (keep them in one directory)
@@ -35,10 +49,10 @@ cd ../..
 **Build the SDK branch and routstrd against it.**
 
 ```sh
-git clone -b confidential-2pc https://github.com/jooray/routstr-sdk
+git clone -b confidential-v3 https://github.com/jooray/routstr-sdk
 (cd routstr-sdk && npm install && npm run build)
 
-git clone -b confidential-upstream https://github.com/jooray/routstrd
+git clone -b confidential-v3 https://github.com/jooray/routstrd
 cd routstrd
 bun install
 # use the SDK branch instead of the npm release
@@ -92,65 +106,64 @@ is required (it is pinned and reserved for; a value above the node's cap is lowe
 response then carries `x-routstr-confidential-max-tokens: <cap>; requested=<yours>`), and only models the node lists in its confidential offer are
 used (`GET https://<node>/v1/confidential/offer`).
 
-What to expect: each request first runs a two-party computation with the node, in which the client
-receives about 22 MB and sends about 1.2 MB. A cold request's waiting time is dominated by receiving those
-22 MB: seconds on a fast connection (about 3 s on a 100 Mbit/s link, about 7 s on a home connection with
-a 2 Mbit/s uplink and a 50 Mbit/s downlink), but about a minute on a slow or congested one (45-70 s to the
-first token, measured from a laptop on poor Wi-Fi behind a satellite link that got only 2-5 Mbit/s from
-the node). Measured from a good home connection (about 100 Mbit/s down) against a production node: about
-14-16 s to the first token cold, of which 5-12 s is receiving the 2PC data. The TLS session and the proofs
-then add well under a second, plus the provider's own latency. routstrd therefore **pre-warms**: once
-you send confidential requests, it prepares the expensive part for the next one in the background (see
-below), which hides it. The answer streams as usual. The node's signed receipt is checked against the
-usage the provider reported; a failed check fails the request.
+What to expect. Opening a **connection** runs a two-party computation with the node, in which the client
+receives about 16.4 MB and sends about 1.1 MB, plus about 1.5 MB each way to prepare the zero-knowledge
+proofs. What happens next depends on the framing the node offers for its provider (`http` in the signed
+offer; an application never sees it):
 
-**Pre-warming** is on by default and driven by your traffic. After a confidential request for a node,
-model and `max_tokens`, routstrd arms a session in the background (setup, reservation, the two-party
-preprocessing; no connection to the provider yet), so the next matching request skips the preprocessing.
-It keeps one armed session while requests keep coming, two once a key has seen 3 requests in 5 minutes, and
-at least as many as its requests have overlapped (at most 6 per key and 6 in total). It retires an armed
-session 480 s after its setup and closes a key's sessions once it has had no request for 10 minutes: an idle
-routstrd keeps nothing open and nothing reserved. Each
-armed session reserves funds on your node credential until it is used or closed (released, no charge unless the node has an abandon fee, below),
-and costs about 22 MB of download and 1.2 MB of upload to prepare. Tune or disable it in `config.json`:
+- **Framing `"2"` (HTTP/2).** The connection stays open and carries your next requests, one after the
+  other. Each later request costs about 85 kB up and 1 MB down and no two-party computation. Requests on
+  one connection are linkable for the provider (as requests under one API key are anyway); routstrd's
+  `http2.reuse` setting controls which requests may share one.
+- **Framing `"1.1"` (HTTP/1.1).** One request per connection, as in v2; routstrd pre-warms (below).
 
-```json
-"confidentialUpstream": {
-  "prewarm": { "enabled": true, "activityWindowMinutes": 10, "maxPerKey": 6, "maxTotal": 6, "maxArmedWithFee": 6, "maxAgeSeconds": 480 }
-}
-```
+Measured with the reference client against a sidecar and Venice (medians; time to the first token, of which
+about 0.45 s is the provider's own latency):
+
+| Link | cold (open + first request) | on an armed connection | on an open HTTP/2 connection |
+|---|---|---|---|
+| loopback | 1.2 s | 0.8 s | 0.56 s |
+| 2 Mbit/s up, 50 down, 40 ms one way | 12 s | 1.4 s | 0.9 s |
+| 2 Mbit/s up, 10 down, 40 ms one way | 19 s | 1.6 s | 1.2 s |
+
+On a slow uplink the cold time is the upload (2.6 MB at 2 Mbit/s is 10.5 s); on a slow downlink it is the
+16.4 MB download. The answer streams as usual. The node's signed receipt is checked against the usage the
+provider reported; a failed check fails the request.
+
+**Pre-warming** hides the cold cost: after a confidential request, routstrd **arms** a connection in the
+background (setup, deposit, the two-party preprocessing; no connection to the provider yet), bound to your
+credential only, not to a model or a body length as in v2. On framing `"2"` an open connection already
+serves the next request, so a second one is armed only while every open connection is busy. An armed
+connection lives at most 10 minutes; an idle routstrd keeps nothing open and nothing reserved. The
+settings (`confidentialUpstream.prewarm`, `confidentialUpstream.http2`, the largest deposit you accept)
+are described in `routstrd/docs/confidential-upstream.md`.
 
 **What you pay.** A confidential request costs the provider's usage at the rates in the node's signed
-offer, as a normal request does. To start it, the node reserves the worst case on your credential: a
-full-context prompt plus your `max_tokens` and a small completion margin (`reserve_margin_tokens` in the
-offer, 16 tokens by default), and releases what the usage does not need. A node may also charge for its own work (section 2): a percentage
-surcharge, already included in the offer's rates; a **session fee** added to each completed request
-(`session_fee_msat`); and an **abandon fee** (`abandon_fee_msat`, at least the session fee) for a session
-that is set up and then ends without a request reaching the provider, for example a pre-warmed session that
-is never used. The client accepts both fees from the signed offer, checks every receipt against usage × the
-signed rates + the session fee (a 429 or 503, or a 401/402/403 caused by the node's own provider key,
-costs the session fee, any other 4xx the abandon fee: the node did the 2PC for a request the provider
-rejected), and sizes its
-deposit to include the larger fee, which the node reserves. With an abandon fee, an armed session that is
-never used costs you that fee, so routstrd arms at most `prewarm.maxArmedWithFee` (default 6) sessions for
-such a node, and none if the
-abandon fee is above `prewarm.maxSessionFeeMsat` (default 5000 msat = 5 sat; `0` never pre-warms a node
-that charges one). Abandon fees paid for unused armed sessions are logged (`[confidential-prewarm] …
-abandon fee … paid`). Most nodes charge no fees; then nothing changes.
+offer, as a normal request does. Money is held at two moments:
 
-Nodes refuse more than 12 unused sessions per client address by default (see section 2), so keep
-`maxTotal` well below that (6 by default); a client behind a shared address (NAT, Tor) shares that limit
-with others.
-A request uses an armed session only if its model and `max_tokens` match exactly (they are pinned at
-setup) and its body fits the armed length; otherwise it runs cold. Responses carry
-`x-routstr-confidential-prewarmed: 1` when they used one. A pre-warmed request reaches its first token in
-about 2-3 s (the armed session also pre-generates the setup of the zero-knowledge proofs, so they take well
-under a second; most of a warm request is the provider's own latency, and a session armed through the
-handshake reached it in about 1 s). Arming runs in the background and takes about as long as the cold
-two-party computation.
+- *Opening a connection* reserves the node's **connection deposit** (`connection_deposit_msat` in the
+  offer; by default the larger of the node's fees and 1 sat). It is released when the first request on the
+  connection is settled. A connection that you open and never use (or abandon, or let idle out) loses the
+  deposit; one that fails because of the node, its sidecar or the provider does not. The outcome is signed
+  by the node in the connection's last message.
+- *Each request* reserves the worst case: a full-context prompt plus your `max_tokens` and a small
+  completion margin (`reserve_margin_tokens` in the offer, 16 tokens by default), released down to the
+  usage at the settlement.
 
-**In a browser.** The demo app <https://jooray.github.io/routstr-confidential-pwa/> does the same in a web
-page: fund it with Lightning or a Cashu token, chat, and see the provider's certificate chain, the proofs
+A node may also charge for its own work (section 2): a percentage surcharge, already included in the
+offer's rates; a **session fee** (`session_fee_msat`), now due **once per connection**, with its first
+settled request; and an **abandon fee** (`abandon_fee_msat`) for a request that is accepted and then
+dropped before it reaches the provider, on a connection whose deposit was already released. The client
+accepts the fees from the signed offer and checks every receipt against usage × the signed rates (cached
+tokens at the cached rate) + the fee that was due (a 429 or 503, or a 401/402/403 caused by the node's
+own provider key, costs the session fee if still due, any other 4xx the abandon fee). Most nodes charge
+no fees; then only the deposit is new.
+
+Nodes refuse more than 12 unused connections per client address by default (see section 2); a client
+behind a shared address (NAT, Tor) shares that limit with others.
+
+**In a browser.** The demo app <https://jooray.github.io/routstr-confidential-pwa/> (protocol v2 until it
+is ported; it works with v2 nodes only) does the same in a web page: fund it with Lightning or a Cashu token, chat, and see the provider's certificate chain, the proofs
 and the signed receipt. The library behind it, for your own web app:
 [jooray/routstr-confidential-web](https://github.com/jooray/routstr-confidential-web).
 
@@ -162,11 +175,59 @@ the node's normal reservation and settlement.
 
 **Provider requirements.** Confidential mode needs a provider whose API behaves predictably (it waits for the
 full request body, applies the last duplicate JSON key, enforces token caps, reports usage in the stream).
-Check yours before offering it:
+Check yours before offering it, with the offer file you will deploy and the variable that holds its key
+(the key is sent only to the offer's `upstream_host`; needs OpenSSL 1.1.1 or later):
 
 ```sh
-crypto/tools/provider-profile-check.py --help    # run it against your provider; it must pass every item
+T=crypto/tools/provider-profile-check.py
+python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --model <a cheap chat model>            # A1-A13: every item must pass
+python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --model <...> --h2                      # H1-H8: before you offer HTTP/2
+python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --image-model <...> --images            # I1-I9: before you offer images
 ```
+
+**Framings: the `http` list and the `h2` block.** The offer file says how clients talk to your provider.
+Nothing is probed or assumed: you state it.
+
+```json
+"http": ["2", "1.1"],
+"h2": {"probe_path": "/api/v1/models", "max_requests": 100, "max_lifetime_s": 3600, "idle_secs": 300, "kinds": ["chat", "images"]}
+```
+
+| Field | Range, default | Meaning |
+|---|---|---|
+| `http` | `"2"` and/or `"1.1"`, in your order of preference; default `["1.1"]` | `"1.1"`: one request per connection (works with every provider that passes A1-A13). `"2"`: an HTTP/2 connection that carries many requests; needs the `h2` block and a provider that passes `--h2` |
+| `h2.probe_path` | a path under 127 bytes | a cheap authenticated `GET` of the provider (its models list). The sidecar sends it once per connection: it is the request that stores the API key in the provider's header table |
+| `h2.max_requests` | 1..1000, 100 | requests per connection |
+| `h2.max_lifetime_s` | 60..86400, 3600 | a connection is closed at the first settlement after this long |
+| `h2.idle_secs` | 10..3600, 300 | the sidecar's idle limit, and the ceiling of the node's `CONFIDENTIAL_IDLE_TIMEOUT_S`. **Not longer than the idle time your `--h2` run passed H5 with** |
+| `h2.kinds` | `["chat"]` (default) or `["chat","images"]` | request kinds on an HTTP/2 connection (`images` needs `endpoints.images`) |
+
+**Run `--h2` before you add `"2"`.** It opens connections exactly as a confidential client and the sidecar
+do together (the client's TLS offer with ALPN `h2`, the connection head, a TLS KeyUpdate, requests that
+name the API key by its header-table index) and checks the eight things framing `"2"` needs (H1-H8 of
+`PROTOCOL-V3.md` §5.6): TLS 1.3 with `h2`; the KeyUpdate is accepted; the provider keeps its header table
+and the key in it, also after the idle time; it honours a zero-size table for response headers; a body of
+the sidecar's `--max-body` passes flow control; no response reflects the key; the usage event ends the
+stream as the proof parses it. It idles one connection for `--h2-idle` seconds (default: the file's
+`h2.idle_secs`, so 5 minutes), sends one body of `--h2-body-bytes` (default 8 MiB, mostly whitespace) and,
+when `h2.kinds` lists images, generates one image. It ends with a verdict:
+
+```
+offer "2": yes. api.venice.ai does what framing "2" needs (H1-H8).
+  "http": ["2", "1.1"] with "h2": {"probe_path": "/api/v1/models", "idle_secs": at most 300}; the sidecar's --max-body at most 8388608.
+```
+
+or `offer "2": no, because H5: …` (keep `"http": ["1.1"]`), or `not yet` when a check was inconclusive (an
+outage, a rate limit: run it again). Run it again after the provider changes its front end. List `"1.1"`
+after `"2"` unless you have a reason not to: clients fall back to it by themselves when an HTTP/2
+connection fails.
+
+**The sidecar watches framing `"2"` at run time.** After 5 consecutive HTTP/2 connections that failed to
+open, it logs `framing "2" withdrawn from the offer`, stops listing `"2"` in its offer and refuses setups
+for it for 10 minutes, then offers it again (`framing "2" is offered again`). Clients use `"1.1"`
+meanwhile. Only failures that no client can cause count (the provider closing on the ClientHello, not
+selecting `h2`, or closing on the connection head), so a client cannot switch HTTP/2 off for others. If
+you see the withdrawal repeat, run `--h2` and, if it fails, remove `"2"` from the file.
 
 The sidecar ships with an offer for Venice (`crypto/relay/offer.venice.json`: host, request-head template,
 the `chat` block that describes the pinned suffix); adapt it for another OpenAI-compatible provider. The
@@ -195,13 +256,15 @@ and an `images` price list in its signed offer) when its sidecar serves that blo
 it can price per image: the provider must list them with per-image books (on routstr-core, a `venice`-type
 provider row; a `generic` row lists no image models). Each variant is priced at the node's per-image price
 for that tier, plus any surcharge; settlement is flat (`msat_per_image × count` plus the session fee) after
-the client's `accept`, with no usage proof. Image setups are never armed. A deployment that copies the
+the client's `accept`, with no usage proof. A deployment that copies the
 offer file (for example to mount it) must add the block to its copy. Check the provider with
 `crypto/tools/provider-profile-check.py --images` (checks I1 to I9: duplicates, unknown fields and
 models, head reflection, open strings, paid extras and arrays, incomplete body, TLS with P-256, and a
-KeyUpdate mid-body; three paid images).
+KeyUpdate between head and body; three paid images). The `count_key` must be the one the route reads
+(`variants` for `/image/generate`, `n` for `/images/generations`): the sidecar refuses another at startup,
+and so do clients.
 
-**1. The sidecar** (container build, from the `twopc-v2` checkout):
+**1. The sidecar** (container build, from the `v3-h2` checkout):
 
 ```sh
 podman build -f crypto/Containerfile.sidecar -t cu-sidecar crypto   # or docker
@@ -214,10 +277,10 @@ Run it in the same container network as the node, with no published port. It nee
 openssl rand -hex 32    # the shared token: CU_SIDECAR_TOKEN here, CONFIDENTIAL_SIDECAR_TOKEN on the node
 podman run -d --name cu-sidecar --network <node network> -e UPSTREAM_API_KEY=... -e CU_SIDECAR_TOKEN=... cu-sidecar \
   --listen 0.0.0.0:7444 --upstream api.venice.ai:443 --key-env UPSTREAM_API_KEY \
-  --offer /etc/cu-sidecar/offer.json --node-settles --protocol 2 --runs-dir /runs
+  --offer /etc/cu-sidecar/offer.json --node-settles --runs-dir /runs
 ```
 
-**Run files.** For each session that wrote a credential record, the sidecar keeps its log, attestation
+**Run files.** For each connection that wrote a credential record, the sidecar keeps its log, attestation
 and (without `--node-settles`) receipt under `--runs-dir`, readable by its own user only. Nothing needs
 them after the session ends: the node settles from its own records and the client holds the attestation
 and receipt. They are kept 24 hours for debugging and then removed (checked every ten minutes);
@@ -235,10 +298,10 @@ host, or through an encrypted tunnel (WireGuard, or a TLS terminator in front of
 `https://` `CONFIDENTIAL_SIDECAR_URL`), never over a network others can read. To rotate the token, change it
 on both sides and restart both.
 
-**Denial-of-service limit.** The node refuses a new confidential session (HTTP 429, WebSocket close
+**Denial-of-service limit.** The node refuses a new confidential connection (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
-unused sessions. A session counts as unused from the moment its setup is reserved until the credential record
-is written (or the session ends). Pre-warmed sessions count. Connections that have not reserved yet (waiting for
+unused connections. A connection counts as unused from the moment its deposit is reserved until the body of
+its first request is released to the provider (or the connection ends). Armed connections count. Connections that have not reserved yet (waiting for
 the setup frame, which must come within 10 s and be at most 256 KiB, or with the reservation in progress) are a
 separate pending pool: at most 4 per address (IPv6 grouped by /64) and 1024 in all; when either is full, the
 oldest connection still waiting for its setup is evicted. The limit is
@@ -261,38 +324,39 @@ you do not trust local users, keep the node's port reachable only by the proxy (
 address). Never trust an address that something else (a Tor daemon, a port forwarder) also connects from
 without overwriting the header.
 
-**Surcharge and session fees (optional).** Each session costs the node about 22 MB of upload for the
-two-party computation alone (about 24 MB with the proofs, below) and 0.5 s of CPU, and a pre-warmed session costs it before any request exists. Three settings, all off (0) by
-default, let the node charge for that:
+**Deposit, idle time, surcharge and fees.** Opening a connection costs the node about 16.4 MB of upload
+for the two-party computation (about 18 MB with the proofs, below) and under 0.5 s of CPU, before any
+request exists. The settings:
 
-| Setting | Effect |
-|---|---|
-| `CONFIDENTIAL_RATE_SURCHARGE_PCT` | percentage added to the per-token rates of confidential sessions (the signed offer lists the surcharged rates) |
-| `CONFIDENTIAL_SESSION_FEE_MSAT` | flat fee added to every completed request; also charged when the provider is limiting or at capacity (429/503) or refuses the node's own key or account (401/402/403), or answers and closes before the request body is complete, since the request reached it; any other 4xx is charged the abandon fee |
-| `CONFIDENTIAL_ABANDON_FEE_MSAT` | charged instead when a session the sidecar accepted ends without a request reaching the provider (armed but never used, aborted, client gone); at least the session fee, and equal to it when unset. Reserved at setup |
+| Setting | Default | Effect |
+|---|---|---|
+| `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT` | max(abandon fee, session fee, 1000 msat) | reserved at the setup, released by the connection's first settled request, **charged** when a connection ends without one through the client's doing (opened and unused, abandoned, idled out, a failed handshake or proof). Released when the end was the node's, the sidecar's or the provider's. `0` = no deposit |
+| `CONFIDENTIAL_IDLE_TIMEOUT_S` | 120 | the node closes a connection with no request in flight after this long; at least 10, at most the sidecar's `h2.idle_secs` |
+| `CONFIDENTIAL_RATE_SURCHARGE_PCT` | 0 | percentage added to the per-token rates of confidential requests (the signed offer lists the surcharged rates) |
+| `CONFIDENTIAL_SESSION_FEE_MSAT` | 0 | flat fee for the two-party handshake, due **once per connection**, with its first settled request: added to a 2xx; the whole charge when the provider is limiting or at capacity (429/503) or refuses the node's own key or account (401/402/403), or answers and closes before the request body is complete |
+| `CONFIDENTIAL_ABANDON_FEE_MSAT` | the session fee | kept when an accepted request is dropped before it reached the provider, on a connection whose deposit was already released; also the charge for a 4xx other than the above |
 
-The abandon fee is the anti-DoS mechanism: together with the per-address limit above, every unused session
-now costs its holder money, while a session that is used costs only the session fee. For example, with an
-abandon fee of 10 sat and a session fee of 2 sat, a pre-warmed session that is used costs usage + 2 sat and
-one that is never used costs 10 sat. All values go into the signed offer (and the model listing), so clients
-see them before they pay. A client must accept the fees in its setup; older clients that do not are refused
-(HTTP 409 `session_fee_not_accepted`) rather than charged fees they do not check. Like the other settings,
-they are persisted in the node's database after the first start (change them with
-`PATCH /admin/api/settings`). Size the abandon fee to what one session's ~22 MB of egress and CPU cost the
-node; the session fee and the surcharge price the work of a request that is used. See
-`routstr-core/docs/confidential-upstream.md` for the exact rules.
+The deposit is the anti-DoS mechanism: together with the per-address limit above, every connection that
+is opened and wasted costs its holder the deposit, while a connection that is used costs only the session
+fee. A connection holds no reservation while it idles after its first settlement, so the idle timeout is
+what bounds how long a client can keep one of the node's connection slots (`--max-sessions`, 32) for free;
+with framing `"2"` a slot serves many requests, so size the slots to your concurrent clients, not to your
+request rate. All values go into the signed offer, so clients see them before they pay; a client that
+does not accept the fees is refused (409 `session_fee_not_accepted`), and one whose maximum deposit is
+below yours does not use the node. Like the other settings, they are persisted in the node's database
+after the first start (change them with `PATCH /admin/api/settings`). Size the deposit to what one
+connection's ~18 MB of egress and CPU cost the node. See `routstr-core/docs/confidential-upstream.md` for
+the exact rules, and `PROTOCOL-V3.md` §12.10 for every outcome.
 
-The sidecar speaks only protocol v2, the two-party handshake (`--protocol 2` is optional; protocol v1 is
-retired and `--protocol 1` is refused; it remains on the `v1-poc` branch). Limits: `--max-sessions`
-(32) and `--max-body` (8 MiB). The sidecar gives a session 600 s from its connection (armed time included)
-until it releases the final body record to the provider, and a fresh 600 s from that release for the
-response, the attestation and the disclosure. The node's limits match: 600 s from its own, earlier
-WebSocket accept (so before the release the node's limit is the one that applies), and up to 600 s after
-`body_released`. Client bytes held before the credential
-record is written are capped at about the declared body length, and a client cannot raise the proof
-channel's preallocation above the sidecar's own.
+The sidecar speaks only protocol v3 (it refuses `--protocol`, an offer file naming another `v`, and a
+setup without `"v": 3`). Limits: `--max-sessions` (32 connections) and `--max-body` (8 MiB per request).
+A connection has 600 s from its socket's accept (armed time included) until the connection head is
+written; a request has 600 s from `request_ok` until its last record is released to the provider, and a
+fresh 600 s from there for the response and the disclosure. The node's limits match. Client bytes held
+before a proof covers them are capped at about the declared body length, and a client cannot raise the
+proof channel's preallocation above the sidecar's own.
 
-**2. The node**: build routstr-core from the `confidential-2pc` branch (its `Dockerfile` is the upstream one)
+**2. The node**: build routstr-core from the `confidential-v3` branch (its `Dockerfile` is the upstream one)
 and set
 
 ```sh
@@ -310,28 +374,54 @@ key) and marks the offered models in `/v1/models` with `confidential_upstream`. 
 WebSockets for `/v1/confidential/ws` and `/v1/confidential/zk` (`Upgrade`/`Connection` headers, read timeout
 of a few minutes). Run the node's server with a long WebSocket ping timeout, e.g.
 `uvicorn routstr:fastapi_app --host 0.0.0.0 --port 8000 --proxy-headers --ws-ping-interval 20
---ws-ping-timeout 300` instead of the image's default `fastapi run routstr`: while ~22 MB of 2PC data is on
+--ws-ping-timeout 300` instead of the image's default `fastapi run routstr`: while ~16 MB of 2PC data is on
 its way to a client on a slow link, the keepalive waits behind it, and the default 20 s timeout drops the
-session. uvicorn's `--ws-max-size` (default 16 MiB) bounds each frame a client can send before it is
+connection. uvicorn's `--ws-max-size` (default 16 MiB) bounds each frame a client can send before it is
 authenticated; do not set it below 12 MiB, since a client may send a whole 8 MiB request body in one frame.
 
 **3. Check it.**
 
 ```sh
-curl -s https://<node>/v1/confidential/offer | jq '{v, upstream_host, models: (.price_list|keys)}'
+curl -s 'https://<node>/v1/confidential/offer?v=3' | jq '{v, http, h2, twopc, connection_deposit_msat, idle_timeout_s, upstream_host, models: (.price_list|keys)}'
 ```
 
-`v` must be `2`. Then run one request through routstrd as in section 1. On the node, each session logs the
-2PC, `credential record + KeyUpdate written to upstream (epoch 0)`, the three proofs and the settlement.
+`v` must be `3`, `twopc` `"split-public-1"`, and `http` what your offer file lists (without `"2"` while the
+sidecar has withdrawn it). Then run requests through routstrd as in section 1, or with the reference
+client below (`--http 2 --requests 3`, then `--http 1.1`). On the sidecar, each connection logs the 2PC,
+`ClientHello checked: canonical, one P-256 share, the joint key`, `credential record + KeyUpdate written
+to upstream`, and per request the proofs and the settlement.
 
-**Bandwidth and CPU.** Each confidential request costs the node about 24 MB of upload: about 22 MB for the
-two-party computation (its garbled circuits cannot be reused, so an armed session that is never used costs
-this too) and the rest for the proofs, and about 0.5 s of CPU to garble and prepare the checks,
-so budget roughly 0.3 Gbit/s at 100 requests per minute. Normal
-(non-confidential) requests are unaffected.
+**Bandwidth and CPU.** Each connection costs the node about 18 MB of upload: 16.4 MB for the two-party
+computation (its garbled circuit cannot be reused, so an armed connection that is never used costs this
+too) and the rest for the proofs, and under 0.5 s of CPU. On framing `"2"` each further request costs
+about 1 MB of upload (the proof correlations) and no two-party computation; on framing `"1.1"` every
+request is a connection. Normal (non-confidential) requests are unaffected.
 
 ## Reference client
 
-`crypto/client/src/driver.ts` is a self-contained client that runs one session against a node and prints every
-check (`node --experimental-strip-types src/driver.ts --node https://<node> --model <m> --max-tokens 40
---auth <sk-… or cashu…>`); see `AGENTS.md` for running the whole stack locally.
+`crypto/client/src/driver.ts` is a self-contained client that opens connections to a node and prints every
+check (`node --experimental-strip-types src/driver.ts --node https://<node> --node-pubkey <hex or npub>
+--model <m> --max-tokens 40 --http auto --requests 2 --auth <sk-… or cashu…>`; `--http 2` or `--http 1.1`
+forces a framing); see `AGENTS.md` for running the whole stack locally, the gates and the measurements.
+
+## Upgrading from v2
+
+v3 is a breaking change: there is no v2 fallback in nodes or clients. Upgrade the sidecar and the node
+together; clients must be v3 to use the node afterwards.
+
+1. **Sidecar.** Build from `v3-h2`. Remove `--protocol 2` from its command line (the flag is refused).
+   Your v2 offer file works as it is and then serves framing `"1.1"` only (the default when `http` is
+   absent). A deployment that copies the offer file must copy the new `http` and `h2` fields too.
+2. **Node.** Build routstr-core from `confidential-v3`. New settings: `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT`
+   and `CONFIDENTIAL_IDLE_TIMEOUT_S` (table above); the fee settings keep their names, but the session fee
+   is now charged once per connection. Keep `--ws-ping-timeout 300` and the single worker.
+3. **Check** the offer (`"v": 3`, `"http": ["1.1"]`) and run one request.
+4. **HTTP/2, when you want it.** Run `provider-profile-check.py --h2` against your provider with your
+   offer file. On `offer "2": yes`, add `"http": ["2", "1.1"]` and the `h2` block (with `idle_secs` no
+   longer than the idle time the check ran with), restart the sidecar, and check the offer again.
+5. **Clients.** v2 clients get `error 426 upgrade_required` (`min_v: 3`) from your node; v3 clients ask
+   for `/v1/confidential/offer?v=3`, so before you upgrade, your access log shows whether v3 clients are
+   already asking. A v3 client does not use a v2 node (`node_protocol_outdated`).
+6. **What your users see.** The first request to your node costs them 16.4 MB instead of 22 MB; with
+   HTTP/2 the following requests cost about 1 MB. They need a balance that covers your connection deposit.
+

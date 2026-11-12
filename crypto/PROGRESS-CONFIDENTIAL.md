@@ -607,3 +607,64 @@ Image button (downscale to ≤ 1568 px JPEG, data URI only, follows the node's
 - Browser library 1ba5316: the pre-warmer sizes the next armed session for the
   latest body instead of the largest one ever seen, so one image no longer pads
   every later prepared session.
+
+# Protocol v3, sidecar side (2026-11-12)
+
+`PROTOCOL-V3.md` is the specification; everything above this heading is the
+v1/v2 history. Branch `v3-h2`.
+
+- **Canonical ClientHello.** The sidecar relays one ClientHello only
+  (`relay/src/tls_v2.rs`, `canonical_client_hello`): record `16 03 03`, one
+  message, the extension set, order and values the three client stacks write
+  (reference driver, SDK fork, browser fork: byte-identical, kept as a test
+  vector), SNI = the offer's host, ALPN `h2` or `http/1.1` by framing, the
+  joint share. Free: the random and the session id.
+- **Withdrawal of framing "2".** A failed open is only what no client can
+  cause (`H2Guard` in `relay/src/main.rs`): no byte after the hello; a
+  verified handshake without `h2`; a close within 10 s of the head with no
+  client record written and the head written within 15 s of the dial.
+- **Gate.** `crypto/tools/v3-check.sh`: 49 of 49 cases in one run against
+  Venice (both framings: honest, big body, armed, refused, images, error
+  heads, every attack, a v2 socket, forced fallback and return).
+- **Provider profile, Venice** (`provider-profile-check.py`): A1-A13 13/13;
+  `--images` I1-I9 10/10; `--h2` H1-H8 8/8 with 300 s idle and an 8 MiB body:
+  ALPN `h2` with the one suite and P-256; KeyUpdate after the head accepted;
+  SETTINGS leave HEADER_TABLE_SIZE at 4096 (credential entry 94 bytes);
+  response headers decode with an empty table (10 blocks, size update 0);
+  indexed credential 200 before and after the idle time, no authorization
+  field 402; 8 388 608 bytes in 1026 DATA frames, 1027 WINDOW_UPDATEs, 200;
+  no reflection on 7 response paths; the stream ends in the usage event and
+  `[DONE]`, END_STREAM on the last DATA frame. `--self-test`: 34/34.
+- **Measurements** (`crypto/client/bench.sh`, reference client → sidecar →
+  Venice, `mistral-small-3-2-24b-instruct`, `max_tokens` 12; medians; time to
+  the first token from the connection's start (cold), from the claim (armed)
+  or from the request (open); shaped with `crypto/tools/shape-proxy.py`, one
+  shared link per direction, 40 ms one way):
+
+  | Link | framing | cold | armed | open |
+  |---|---|---|---|---|
+  | loopback (5 runs) | "2" | 1.20 s | 0.83 s | 0.56 s |
+  | loopback | "1.1" | 1.15 s | 0.79 s | n/a |
+  | 2 up / 50 down Mbit/s (3 runs) | "2" | 12.1 s | 1.43 s | 0.92 s |
+  | 2 / 50 | "1.1" | 11.8 s | 1.38 s | n/a |
+  | 2 up / 10 down Mbit/s (3 runs) | "2" | 18.9 s | 1.59 s | 1.23 s |
+  | 2 / 10 | "1.1" | 19.2 s | 1.85 s | n/a |
+
+  Bytes, client → node / node → client: cold 2.63 MB / 17.97 MB (2PC 1.13 /
+  16.38 MB, proof channel 1.50 / 1.57 MB, records and control 2 kB / 18 kB);
+  a request on an armed connection 83 kB / 87 kB ("2"), 77 kB / 93 kB
+  ("1.1"); a request on an open HTTP/2 connection 85 kB / 1.04 MB (the proof
+  channel's top-up). At 2 Mbit/s up the cold time is the 2.63 MB upload
+  (10.5 s): the proof channel's 1.5 MB shares the uplink with the 2PC, so the
+  2PC-only figure of `twopc/BENCH.md` (7.0 s) is not the time to first token.
+
+```bash
+# the gate, the profile, the measurements
+CU_V3_PORT=7444 crypto/tools/v3-check.sh
+python3 -I crypto/tools/provider-profile-check.py            # A1-A13
+python3 -I crypto/tools/provider-profile-check.py --images   # I1-I9, three paid images
+python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8, 5 minutes idle, one paid image
+(cd crypto/client && CU_SIDECAR=http://127.0.0.1:7444 ./bench.sh 5)
+python3 -I crypto/tools/shape-proxy.py --listen 127.0.0.1:7445 --target 127.0.0.1:7444 --up-mbit 2 --down-mbit 50 --delay-ms 40 &
+(cd crypto/client && CU_SIDECAR=http://127.0.0.1:7445 ./bench.sh 3)
+```
