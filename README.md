@@ -19,7 +19,7 @@ The protocol is **v3** ([`PROTOCOL-V3.md`](PROTOCOL-V3.md), the normative specif
 - A smaller two-party key schedule (`split-public-1`): 16.4 MB node→client instead of 22.1 MB.
 - One client statement, **π_WIN**, replaces π_C2S: the node holds every client record until it verifies.
 - Money: a connection deposit at the setup, a reservation per request, the session fee once per connection.
-- **v3 only.** A v3 node answers a v2 client with `upgrade_required`; a v3 client reports `node_protocol_outdated` for a v2-only node. v2 (one handshake per request) is retired and stays on the branch `twopc-v2` here and `confidential-2pc` in routstr-core and routstr-sdk; v1 (no two-party computation) on `v1-poc`.
+- **v3 only.** A v3 node answers a v2 client with `upgrade_required`; a v3 client reports `node_protocol_outdated` for a v2-only node. v2 (one handshake per request) is retired and archived on the branch `v2` here and `confidential-v2` in routstr-core, routstr-sdk and routstrd; v1 (no two-party computation) on `v1-poc`.
 - Limits: π_WIN, the HTTP/2 frame rules and the key schedule have had no external review; one provider (Venice) was tested; requests on one HTTP/2 connection are linkable for the provider.
 
 What changed and how to upgrade: [`docs/V2-V3-ONE-PAGER.md`](docs/V2-V3-ONE-PAGER.md). The reasoning: [`PROTOCOL-V3-DRAFT.md`](PROTOCOL-V3-DRAFT.md). The paper describes the guarantees and the two-party handshake.
@@ -40,37 +40,33 @@ What changed and how to upgrade: [`docs/V2-V3-ONE-PAGER.md`](docs/V2-V3-ONE-PAGE
 | `crypto/zkbench` | VOLE-ZK circuits (mpz2) for π_NK, π_WIN, π_C3S and the **`cu-prover`** binary used by clients |
 | `crypto/cu-crypto` | TLS 1.3 key schedule and AES-GCM record math (RFC 8448 / NIST vectors) |
 | `crypto/client` | reference TypeScript client (`driver.ts`) |
-| `crypto/tools` | validation gates, each exits non-zero on any deviation: `provider-profile-check.py` (live provider-profile gate A1–A13, incl. the pinned TLS suite, a mid-request KeyUpdate and the LF-only SSE framing), `regression-modality.py` (optional: the given models reject image URL and data-URI parts, for a text-only offer), `adversarial-model-swap.sh` (malicious-client attack cases plus an honest control), `stall-repro.sh` (N cold sessions, success-rate threshold); for v3 `provider-profile-check.py --h2` (what HTTP/2 framing needs from a provider), `v3-h2-check.sh`, `v3-h2-node-check.sh` and `v3-h2-routstrd-check.sh` (honest cases, attacks and the money outcome, against a sidecar, a node and routstrd). Also `probe-modality.py` (exploratory modality/token-amplification probe) and `cu_cashu.py` (test-mint helper: mint, balance, redeem) |
+| `crypto/tools` | validation gates, each exits non-zero on any deviation: `provider-profile-check.py` (live provider-profile gate A1–A13, incl. the pinned TLS suite, a mid-request KeyUpdate and the LF-only SSE framing), `regression-modality.py` (optional: the given models reject image URL and data-URI parts, for a text-only offer), `adversarial-model-swap.sh` (malicious-client attack cases plus an honest control), `stall-repro.sh` (N cold sessions, success-rate threshold); for v3 `provider-profile-check.py --h2` (what HTTP/2 framing needs from a provider), `v3-check.sh`, `v3-node-check.sh` and `v3-routstrd-check.sh` (honest cases, attacks and the money outcome, against a sidecar, a node and routstrd). Also `probe-modality.py` (exploratory modality/token-amplification probe) and `cu_cashu.py` (test-mint helper: mint, balance, redeem) |
 | `paper/` | the paper (`paper.md` → `build.sh`) |
 | `PROTOCOL-V3.md` | the protocol specification (lifecycle, framings, key schedule, proofs, money, wire format) |
 | `docs/` | `APPROACH.md` (engineering overview), `V2-V3-ONE-PAGER.md` (what changed, how to upgrade), `ADVERSARIAL-QA.md`, `TWOPC-DESIGN.md`, `CHAT-SUFFIX.md`, `CONFIDENTIAL-IMAGES.md`, `SETUP.md`, `REVIEW-2026-10-09.md` (findings and fixes), `ONE-PAGER.md` |
 
 ## Routstr integration (branches)
 
-Protocol v3 is on the branch `v3-h2` here and on `confidential-v3` in the three Routstr repositories.
-The pull requests open upstream (core
-[#855](https://github.com/Routstr/routstr-core/pull/855), SDK
+Protocol v3 is on the branch `main` here and on the fork branches below, which are the pull requests open
+upstream (core [#855](https://github.com/Routstr/routstr-core/pull/855), SDK
 [#112](https://github.com/Routstr/routstr-sdk/pull/112), routstrd
-[#155](https://github.com/Routstr/routstrd/pull/155)) were opened for protocol v2, from the v2 branches
-below. To try it: [`docs/SETUP.md`](docs/SETUP.md).
+[#155](https://github.com/Routstr/routstrd/pull/155)). The node at routstr.cypherpunk.today runs v3 since
+2026-11-12. To try it: [`docs/SETUP.md`](docs/SETUP.md).
 
 | Repo | Branch | What |
 |---|---|---|
-| routstr-core | `confidential-v3` | v3 node side: offer, connection deposit, per-request reservation and settlement; inert until `CONFIDENTIAL_SIDECAR_URL` is set |
-| routstr-sdk | `confidential-v3` | v3 client transport: both framings, the HTTP/2 pool, pre-warm |
-| routstrd | `confidential-v3` | opt-in header and config (`confidentialUpstream`, incl. `http2`, `prewarm`); the local OpenAI API is unchanged |
-| [jooray/routstr-core](https://github.com/jooray/routstr-core/tree/confidential-2pc) | `confidential-2pc` | v2 (retired): node side |
-| [jooray/routstr-sdk](https://github.com/jooray/routstr-sdk/tree/confidential-2pc) | `confidential-2pc` | v2 (retired): client transport |
-| [jooray/routstrd](https://github.com/jooray/routstrd/tree/confidential-upstream) | `confidential-upstream` | v2 (retired): opt-in header and config |
+| [jooray/routstr-core](https://github.com/jooray/routstr-core/tree/confidential-2pc) | `confidential-2pc` | v3 node side: offer, connection deposit, per-request reservation and settlement; inert until `CONFIDENTIAL_SIDECAR_URL` is set |
+| [jooray/routstr-sdk](https://github.com/jooray/routstr-sdk/tree/confidential-2pc) | `confidential-2pc` | v3 client transport: both framings, the HTTP/2 pool, pre-warm |
+| [jooray/routstrd](https://github.com/jooray/routstrd/tree/confidential-upstream) | `confidential-upstream` | v3 opt-in header and config (`confidentialUpstream`, incl. `http2`, `prewarm`); the local OpenAI API is unchanged |
 
-In this repo protocol v3 is the branch `v3-h2`; `twopc-v2` holds the retired protocol v2 and `v1-poc` the retired v1 proof of concept.
+The retired protocol v2 is archived on `confidential-v2` in all three forks. In this repo protocol v3 is the default branch `main`; `v2` holds the retired protocol v2 (the same as the old `twopc-v2`) and `v1-poc` the retired v1 proof of concept.
 
 ## In the browser
 
 A browser version runs the same client (2PC and proofs in WebAssembly) inside a static web page:
 library [jooray/routstr-confidential-web](https://github.com/jooray/routstr-confidential-web), demo PWA
 [jooray/routstr-confidential-pwa](https://github.com/jooray/routstr-confidential-pwa), live at
-<https://jooray.github.io/routstr-confidential-pwa/>. Its move to protocol v3 follows the SDK; until then it speaks v2 and a v3 node refuses it with `upgrade_required`.
+<https://jooray.github.io/routstr-confidential-pwa/>. Both speak protocol v3 (branch `main`; v2 is archived on their `v2` branches).
 
 ## Build
 

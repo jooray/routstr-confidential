@@ -319,9 +319,9 @@ instead of 1 and `application` 1.5 instead of 1 (N's B1 labels need no message f
 
 ## History: v2 and `Proven`
 
-- **v2** (branch `twopc-v2`; `confidential-2pc` in routstr-core and routstr-sdk): the whole key schedule in
+- **v2** (archive branch `v2`, the old `twopc-v2`; `confidential-v2` in routstr-core and routstr-sdk): the whole key schedule in
   two garbled phase circuits, MS crossing between them as XOR shares, a bare report hash, seven outcomes
-  (2.8 bits) per request. Deployed until v3.
+  (2.8 bits) per request. Deployed until v3 (2026-11-12).
 - **`Proven`** (prototype, removed 2026-11-11): `IS_k` to C only, the inner digests and anchors proven in
   zero knowledge. Fewer gates (19 compressions) but a larger upload, a second Ferret under Δ_A, and Δ_A used
   both as garbling offset and as MAC key. It kept the hash assumptions of v2 on C's side.

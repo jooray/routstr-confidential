@@ -611,7 +611,7 @@ Image button (downscale to ≤ 1568 px JPEG, data URI only, follows the node's
 # Protocol v3, sidecar side (2026-11-12)
 
 `PROTOCOL-V3.md` is the specification; everything above this heading is the
-v1/v2 history. Branch `v3-h2`.
+v1/v2 history. Branch `main` (built on `v3-h2`).
 
 - **Canonical ClientHello.** The sidecar relays one ClientHello only
   (`relay/src/tls_v2.rs`, `canonical_client_hello`): record `16 03 03`, one

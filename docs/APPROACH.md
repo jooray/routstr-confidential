@@ -2,7 +2,7 @@
 
 *2026-10-10, rewritten 2026-11-11 for protocol v3. This document is the engineering overview. The normative specification is `../PROTOCOL-V3.md` (wire format in its §12); the reasoning behind v3 is in `../PROTOCOL-V3-DRAFT.md`, the two-party handshake in `TWOPC-DESIGN.md` and `TWOPC-NODE-GARBLING.md`, the threat model and guarantees in the paper (`../paper/paper.md`). The authors' original working documents (`original/*`) are local only and not published.*
 
-*Protocol versions. The protocol is **v3**: a two-party TLS handshake per **connection**, and one or many requests on that connection. **v2** (one two-party handshake per request, HTTP/1.1 only) and **v1** (the client ran the handshake alone) are retired. v2's code is on the branches `twopc-v2` (this repo) and `confidential-2pc` (routstr-core, routstr-sdk); v1's on `v1-poc`. What changed from v2: `V2-V3-ONE-PAGER.md`. From v1 to v2: `V1-V2-ONE-PAGER.md` (historical).*
+*Protocol versions. The protocol is **v3**: a two-party TLS handshake per **connection**, and one or many requests on that connection. **v2** (one two-party handshake per request, HTTP/1.1 only) and **v1** (the client ran the handshake alone) are retired. v2's code is archived on the branches `v2` (this repo) and `confidential-v2` (routstr-core, routstr-sdk, routstrd); v1's on `v1-poc`. What changed from v2: `V2-V3-ONE-PAGER.md`. From v1 to v2: `V1-V2-ONE-PAGER.md` (historical).*
 
 ## The problem
 
@@ -206,9 +206,9 @@ Both the node and the sidecar validate the `setup` and every `request` (model; `
 
 ## Status / evidence
 
-- Built on the branch `v3-h2` here and `confidential-v3` in routstr-core, routstr-sdk and routstrd: the statement π_WIN, the sidecar's HTTP/2 mode, the reference driver, the node, the SDK pool and routstrd's pass-through. The repository `README.md` has the current state of each piece.
+- Published (2026-11-12) on the branch `main` here, `confidential-2pc` in routstr-core and routstr-sdk and `confidential-upstream` in routstrd (the upstream PRs), and deployed on routstr.cypherpunk.today: the statement π_WIN, the sidecar's HTTP/2 mode, the reference driver, the node, the SDK pool and routstrd's pass-through. The repository `README.md` has the current state of each piece.
 - Live against Venice: a TLS KeyUpdate on an HTTP/2 connection is accepted; `HEADER_TABLE_SIZE = 0` is honoured for response headers; a request that names `authorization` by index only is authenticated, also after 150 s of idle; no credential bytes appeared in eight response paths.
-- Gates (`crypto/tools/`, each exits non-zero on any deviation): `provider-profile-check.py` (A1–A13; `--h2` for H1–H8; `--images` for I1–I9), `v3-h2-check.sh` (honest cases, attacks, against its own sidecar), `v3-h2-node-check.sh` (every case's money outcome in the node's database), `v3-h2-routstrd-check.sh` (through a scratch routstrd), `adversarial-model-swap.sh`, `stall-repro.sh`.
+- Gates (`crypto/tools/`, each exits non-zero on any deviation): `provider-profile-check.py` (A1–A13; `--h2` for H1–H8; `--images` for I1–I9), `v3-check.sh` (honest cases, attacks, against its own sidecar), `v3-node-check.sh` (every case's money outcome in the node's database), `v3-routstrd-check.sh` (through a scratch routstrd), `adversarial-model-swap.sh`, `stall-repro.sh`.
 
 ## Known limits
 

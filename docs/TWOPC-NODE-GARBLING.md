@@ -246,7 +246,7 @@ a malicious N, be checkable in QuickSilver, and leak nothing usable to the other
   construction) need only KOS, Ferret and TCCR from mpz2, at the price of selective failure.
 - **PoC** (`crypto/twopc-ag`, half-gates, 128-bit rows): 1.21 MB up, 32.2 MB down, 11.5 s cold at 2/50
   Mbit/s. With KOS instead of Ferret for the MAC COTs: 0.06 MB up, 52.8 MB down.
-- **v2** (branch `twopc-v2`): the PoC integrated, with 64-bit salted rows (−5.3 MB) and three-halves tables
+- **v2** (archive branch `v2`, the old `twopc-v2`): the PoC integrated, with 64-bit salted rows (−5.3 MB) and three-halves tables
   (−4.8 MB), two phase circuits (656 179 AND gates, 31 compressions), MS crossing between the phases as XOR
   shares, outputs masked by input masks, a bare report hash. 1.21 MB up, 22.1 MB down, 7.4 s cold at 2/50.
   Seven observable outcomes, log2 7 ≈ 2.8 bits per session.

@@ -7,8 +7,8 @@ differs from sections 0 to 8, which were written for protocol v2, section 0a win
 `PROTOCOL-V3.md`.
 
 Status: implemented and deployed under protocol v2 (2026-10-19), with the decisions in section 0. The study sections
-below were written before the implementation, so their code references are to `twopc-v2` (this repo),
-`confidential-2pc` (routstr-core, routstr-sdk), the web library at `2af9a79` and the PWA at `ec06e83`;
+below were written before the implementation, so their code references are to the v2 code (now archived as `v2` in this repo,
+`confidential-v2` in routstr-core and routstr-sdk), the web library at `2af9a79` and the PWA at `ec06e83`;
 where they differ from section 0 or from the notes in this paragraph, those win:
 the image gate is `provider-profile-check.py --images`, checks I1 to I9 (output in `docs/evidence/`);
 `accept` is a claim, not a proof (an honest client sends it only for a 2xx; a dishonest one that
@@ -101,12 +101,12 @@ Cost of an image request (decision 8 and §5.8 give v2's figures, about 26 MB pe
   handshake.
 - On a new connection, either framing: one two-party handshake (16.38 MB down, 1.13 MB up) plus the proofs
   and the image. Total per framing: `[TO MEASURE]`.
-- The PWA's per-image data warning (decision 8) should use these figures once the web library speaks v3;
-  the web library has not been moved to v3 yet.
+- The PWA's per-image data warning (decision 8) should use these figures; the web library and the PWA
+  speak v3 since 2026-11-12.
 
 Live checks: `provider-profile-check.py --images` (I1 to I9) is unchanged. Image cases over HTTP/2 are in
-`crypto/tools/v3-h2-check.sh` (`h2-image`, a tampered image suffix), `v3-h2-node-check.sh` (image, chat
-then image, image suffix, with exact balances) and `v3-h2-routstrd-check.sh`; the reference driver runs
+`crypto/tools/v3-check.sh` (`h2-image`, a tampered image suffix), `v3-node-check.sh` (image, chat
+then image, image suffix, with exact balances) and `v3-routstrd-check.sh`; the reference driver runs
 them with `--http2 --image`.
 
 ## 1. What exists today

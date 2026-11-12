@@ -653,8 +653,8 @@ ECtF semi-honest; no proof of the garbler-only construction).
   access log shows that v3 clients are asking.
 - The node's Nostr listing carries the confidential version (`confidential: 3`), so clients can filter
   before fetching offers.
-- There is no v2 fallback in clients or nodes. The v2 code stays on the branches `twopc-v2` (this repo)
-  and `confidential-2pc` (routstr-core, routstr-sdk).
+- There is no v2 fallback in clients or nodes. The v2 code is archived on the branches `v2` (this repo)
+  and `confidential-v2` (routstr-core, routstr-sdk, routstrd).
 
 ## 12. Wire format
 

@@ -15,15 +15,14 @@ computation is not externally reviewed. Use small amounts.
 
 | Repo | Branch (v3) | What |
 |---|---|---|
-| jooray/routstr-confidential | `v3-h2` | provers (`cu-prover`, `cu-2pc`), the node's sidecar (`cu-sidecar`), protocol, paper |
-| jooray/routstr-sdk | `confidential-v3` | the client transport |
-| jooray/routstrd | `confidential-v3` | the daemon (opt-in header, config) |
-| jooray/routstr-core | `confidential-v3` | the node |
+| jooray/routstr-confidential | `main` | provers (`cu-prover`, `cu-2pc`), the node's sidecar (`cu-sidecar`), protocol, paper |
+| jooray/routstr-sdk | `confidential-2pc` | the client transport |
+| jooray/routstrd | `confidential-upstream` | the daemon (opt-in header, config) |
+| jooray/routstr-core | `confidential-2pc` | the node |
 
-Until v3 is published and deployed, the public branches (`twopc-v2`, `confidential-2pc`,
-`confidential-upstream`) and the node at routstr.cypherpunk.today speak protocol v2; the v2 edition of this
-file is on the [`twopc-v2`](https://github.com/jooray/routstr-confidential/tree/twopc-v2) branch. v2 and v3
-do not interoperate: a v3 node answers a v2 client with `upgrade_required`, and a v3 client reports
+Protocol v2 is retired and archived on the branches `v2` (this repo) and `confidential-v2` (routstr-core,
+routstr-sdk, routstrd); the v2 edition of this file is on the
+[`v2`](https://github.com/jooray/routstr-confidential/tree/v2) branch. v2 and v3 do not interoperate: a v3 node answers a v2 client with `upgrade_required`, and a v3 client reports
 `node_protocol_outdated` for a v2 node.
 
 You need: git, Rust (stable), Bun, Node.js/npm (to build the SDK).
@@ -33,13 +32,13 @@ You need: git, Rust (stable), Bun, Node.js/npm (to build the SDK).
 If you only want to try it as a user, you need routstrd and the two prover binaries. You then need a node
 that runs confidential mode with the same protocol version as your client (a node's signed offer says so:
 `"v": 3`; its Nostr listing carries `confidential: 3`). **https://routstr.cypherpunk.today** runs confidential
-mode with Venice as the provider (protocol v2 until it is upgraded; it is announced on Nostr, so routstrd
-finds it).
+mode with protocol v3 and Venice as the provider (framings `"2"` and `"1.1"`, a 2 sat connection deposit;
+it is announced on Nostr, so routstrd finds it).
 
 **Build the provers.**
 
 ```sh
-git clone -b v3-h2 https://github.com/jooray/routstr-confidential
+git clone https://github.com/jooray/routstr-confidential    # default branch: main
 cd routstr-confidential/crypto
 cargo build --release -p zkbench --bin cu-prover -p twopc --bin cu-2pc
 # binaries: crypto/zkbench/target/release/{cu-prover,cu-2pc} (keep them in one directory)
@@ -49,10 +48,10 @@ cd ../..
 **Build the SDK branch and routstrd against it.**
 
 ```sh
-git clone -b confidential-v3 https://github.com/jooray/routstr-sdk
+git clone -b confidential-2pc https://github.com/jooray/routstr-sdk
 (cd routstr-sdk && npm install && npm run build)
 
-git clone -b confidential-v3 https://github.com/jooray/routstrd
+git clone -b confidential-upstream https://github.com/jooray/routstrd
 cd routstrd
 bun install
 # use the SDK branch instead of the npm release
@@ -162,8 +161,8 @@ no fees; then only the deposit is new.
 Nodes refuse more than 12 unused connections per client address by default (see section 2); a client
 behind a shared address (NAT, Tor) shares that limit with others.
 
-**In a browser.** The demo app <https://jooray.github.io/routstr-confidential-pwa/> (protocol v2 until it
-is ported; it works with v2 nodes only) does the same in a web page: fund it with Lightning or a Cashu token, chat, and see the provider's certificate chain, the proofs
+**In a browser.** The demo app <https://jooray.github.io/routstr-confidential-pwa/> (protocol v3; a testing
+guide is at <https://jooray.github.io/routstr-confidential-pwa/testing/>) does the same in a web page: fund it with Lightning or a Cashu token, chat, and see the provider's certificate chain, the proofs
 and the signed receipt. The library behind it, for your own web app:
 [jooray/routstr-confidential-web](https://github.com/jooray/routstr-confidential-web).
 
@@ -264,7 +263,7 @@ KeyUpdate between head and body; three paid images). The `count_key` must be the
 (`variants` for `/image/generate`, `n` for `/images/generations`): the sidecar refuses another at startup,
 and so do clients.
 
-**1. The sidecar** (container build, from the `v3-h2` checkout):
+**1. The sidecar** (container build, from the `main` checkout):
 
 ```sh
 podman build -f crypto/Containerfile.sidecar -t cu-sidecar crypto   # or docker
@@ -356,7 +355,7 @@ fresh 600 s from there for the response and the disclosure. The node's limits ma
 before a proof covers them are capped at about the declared body length, and a client cannot raise the
 proof channel's preallocation above the sidecar's own.
 
-**2. The node**: build routstr-core from the `confidential-v3` branch (its `Dockerfile` is the upstream one)
+**2. The node**: build routstr-core from the `confidential-2pc` branch of jooray/routstr-core (its `Dockerfile` is the upstream one)
 and set
 
 ```sh
@@ -409,10 +408,10 @@ forces a framing); see `AGENTS.md` for running the whole stack locally, the gate
 v3 is a breaking change: there is no v2 fallback in nodes or clients. Upgrade the sidecar and the node
 together; clients must be v3 to use the node afterwards.
 
-1. **Sidecar.** Build from `v3-h2`. Remove `--protocol 2` from its command line (the flag is refused).
+1. **Sidecar.** Build from `main`. Remove `--protocol 2` from its command line (the flag is refused).
    Your v2 offer file works as it is and then serves framing `"1.1"` only (the default when `http` is
    absent). A deployment that copies the offer file must copy the new `http` and `h2` fields too.
-2. **Node.** Build routstr-core from `confidential-v3`. New settings: `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT`
+2. **Node.** Build routstr-core from `confidential-2pc` (v3 now; your v2 build came from the same branch, now archived as `confidential-v2`). New settings: `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT`
    and `CONFIDENTIAL_IDLE_TIMEOUT_S` (table above); the fee settings keep their names, but the session fee
    is now charged once per connection. Keep `--ws-ping-timeout 300` and the single worker.
 3. **Check** the offer (`"v": 3`, `"http": ["1.1"]`) and run one request.

@@ -1734,9 +1734,9 @@ proofs. The limits follow that split.
    a deposit only up to a configured maximum, closes idle connections before the node does, and logs
    every deposit it loses.
 
-**How the deployed node is set up.** The deployed case-study node still runs v2 at the time of
-writing. It charges no session fee and no surcharge, and an abandon fee of 2 sats, which under v3
-becomes the default deposit. A typical confidential chat on its cheapest models costs 0.1 to 1 sat of
+**How the deployed node is set up.** The deployed case-study node runs v3 since 2026-11-12
+(framings `"2"` and `"1.1"`). It charges no session fee and no surcharge, and an abandon fee of 2 sats,
+which under v3 is also its connection deposit (2000 msat). A typical confidential chat on its cheapest models costs 0.1 to 1 sat of
 inference: completed requests of up to 40 output tokens on two DeepSeek models were charged 11 to 27
 msat on 2026-10-19 (signed v2 receipts in `docs/evidence/deployed-receipts/`). So a paying user pays
 exactly the inference, and only waste is priced. Each chat request reserves the model's worst-case

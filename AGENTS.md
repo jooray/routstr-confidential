@@ -19,21 +19,21 @@ Each has `origin` = Routstr upstream and `fork` = `jooray/<repo>`.
 
 | Path | Git | What |
 |---|---|---|
-| `routstr-core/` | **`confidential-v3`** (v3, local, from `confidential-2pc`); `confidential-2pc` (v2: the open upstream PR, and what routstr.cypherpunk.today runs until v3 is deployed); `confidential-upstream` (retired v1, unmaintained) | the node (Python/FastAPI) |
-| `routstr-sdk/` | **`confidential-v3`** (v3, local); `confidential-2pc` (v2, the open PR); `confidential-upstream` (retired v1, unmaintained) | client SDK (TypeScript) |
-| `routstrd/` | **`confidential-v3`** (v3, local, from `confidential-upstream`); `confidential-upstream` (v2, the open PR) | client daemon (TypeScript/Bun) |
-| `crypto/` | this repo, branch **`v3-h2`** (v3; `twopc-v2` is v2 and still the default branch, `v1-poc` is v1) | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (the two-party key schedule `split-public-1` + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK statements π_NK, π_WIN, π_C3S; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (gates, the provider profile check, `shape-proxy.py`), `runs/` (evidence) |
+| `routstr-core/` | **`confidential-2pc`** on `fork` (v3: the open upstream PR #855, and what routstr.cypherpunk.today runs; the local checkout's branch is `confidential-v3`, pushed as `confidential-2pc`); `confidential-v2` (v2 archive); `confidential-upstream` (retired v1, unmaintained) | the node (Python/FastAPI) |
+| `routstr-sdk/` | **`confidential-2pc`** on `fork` (v3: the open PR #112; local branch `confidential-v3`, pushed as `confidential-2pc`); `confidential-v2` (v2 archive); `confidential-upstream` (retired v1, unmaintained) | client SDK (TypeScript) |
+| `routstrd/` | **`confidential-upstream`** on `fork` (v3: the open PR #155; local branch `confidential-v3`, pushed as `confidential-upstream`); `confidential-v2` (v2 archive) | client daemon (TypeScript/Bun) |
+| `crypto/` | this repo, branch **`main`** (v3, the default branch; `v2` is the v2 archive, the same as the old `twopc-v2`, which stays as it was; `v1-poc` is v1) | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (the two-party key schedule `split-public-1` + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK statements π_NK, π_WIN, π_C3S; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (gates, the provider profile check, `shape-proxy.py`), `runs/` (evidence) |
 | `paper/` | — | the paper (`paper.md` → `build.sh` → `paper.pdf`) |
 | `docs/` | — | engineering docs and research (below) |
 | `PROTOCOL-V3.md` | — | the v3 specification; `PROTOCOL-V3-DRAFT.md` has the reasoning |
 
-The upstream PRs are still the protocol v2 ones: core
+The upstream PRs carry protocol v3 (published 2026-11-12): core
 [#855](https://github.com/Routstr/routstr-core/pull/855), SDK
 [#112](https://github.com/Routstr/routstr-sdk/pull/112), routstrd
-[#155](https://github.com/Routstr/routstrd/pull/155), from the v2 branches
-above, rebased on upstream `main` (2026-11-09). routstrd's CI (`validate`) stays
+[#155](https://github.com/Routstr/routstrd/pull/155), from the fork branches
+above. routstrd's CI (`validate`) stays
 red until an SDK with the transport is on npm: it installs the published SDK.
-The v3 branches are local and not pushed. The v1 PRs (core #824, SDK
+The v2 code is archived on `confidential-v2` in the three forks. The v1 PRs (core #824, SDK
 #90, routstrd #137) are closed; their branches
 (`confidential-upstream` in core and SDK) are frozen with an "unmaintained"
 README note. Do not rebase or update them.
@@ -192,8 +192,9 @@ Live checks: `provider-profile-check.py --images` (I1-I9), `driver.ts
 alone with X25519; proofs π_C1, π_N, π_C2, π_C3) lives on the `v1-poc`
 branch here and the `confidential-upstream` branches of routstr-core and
 routstr-sdk. v2 (one session = one request over HTTP/1.1, π_C2S, a
-full-context reservation at the setup, 22 MB of 2PC) lives on `twopc-v2`
-here and `confidential-2pc` in routstr-core and routstr-sdk; the earlier
+full-context reservation at the setup, 22 MB of 2PC) lives on `v2`
+here (the old `twopc-v2`) and `confidential-v2` in routstr-core, routstr-sdk
+and routstrd; the earlier
 dual-execution 2PC is the tag `v2-symmetric`. There is no fallback: a v3 node
 answers a v2 socket with `error 426 upgrade_required` (`min_v: 3`), the
 sidecar refuses a `setup` without `"v":3` and an offer file naming another
@@ -252,7 +253,7 @@ cd /tmp/cu-mint && MINT_BACKEND_BOLT11_SAT=FakeWallet MINT_PRIVATE_KEY=TEST_PRIV
 # sidecar: as above, plus --node-settles (it hands the verified usage to the node)
 #   (on loopback no token is needed; off loopback it requires CU_SIDECAR_TOKEN, and the
 #    node sends the same value as CONFIDENTIAL_SIDECAR_TOKEN)
-# node (routstr-core on confidential-v3): RELAYS points nowhere so nothing is published to
+# node (routstr-core on confidential-2pc, v3): RELAYS points nowhere so nothing is published to
 # Nostr. Unset OPENAI_API_KEY, ANTHROPIC_API_KEY and the like first: each one seeds its provider.
 cd $P/routstr-core && DATABASE_URL=sqlite+aiosqlite:////tmp/node.db NSEC=<test nsec> \
   CONFIDENTIAL_SIDECAR_URL=http://127.0.0.1:7444 CASHU_MINTS=http://127.0.0.1:3338 \
@@ -289,13 +290,13 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   sidecar's own run files; exit ≠ 0 on any deviation. Two paid images
   (`CU_NO_IMAGES=1` skips them).
 - `crypto/tools/v3-node-check.sh` + `v3_node_eval.py` (**the node gate, owned
-  by the node work in routstr-core `confidential-v3`**): starts a sidecar and
+  by the node work in routstr-core `confidential-2pc`**): starts a sidecar and
   a node on scratch state and checks every case's money outcome (deposit,
   reservation, fees) in the node's database. Includes the cancel-and-reuse
   attacks (`h2-k-rst-reuse`, `-rst-reuse-same`, `-rst-before-final`,
   `-rst-after-release`, `-ctl-headers`, `h11-k-extra-record`,
   `h11-k-pipelined`; driver `--adv rst-*|ctl-headers|extra-record`).
-- `crypto/tools/v3-h2-routstrd-check.sh`: sidecar, node, stub mint and a
+- `crypto/tools/v3-routstrd-check.sh`: sidecar, node, stub mint and a
   scratch routstrd; curl through the local API (sequential, burst, forced
   "1.1"). Needs the SDK and routstrd checkouts built.
 - `crypto/tools/provider-profile-check.py` (`--offer FILE --key-env VAR
@@ -338,9 +339,9 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 | `crypto/client` (reference driver) | done for both framings; run live against the sidecar by `v3-check.sh` and against a node by the node gate |
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
 | measurements | loopback and shaped links (2/50, 2/10 Mbit/s, 40 ms one way) with `bench.sh` + `shape-proxy.py`: `crypto/PROGRESS-CONFIDENTIAL.md` |
-| `routstr-core` (node), `routstr-sdk`, `routstrd` | branches `confidential-v3`, local; their state and commands are reported by the agents working there (`routstr-core/docs/confidential-upstream.md`, `routstrd/docs/confidential-upstream.md`) |
-| browser library, PWA | **not ported**: they speak v2 and do not work against a v3 node (their ClientHello is already the canonical `http/1.1` one) |
-| deployment | routstr.cypherpunk.today still runs v2; nothing of v3 is pushed or deployed |
+| `routstr-core` (node), `routstr-sdk`, `routstrd` | published on the forks (`confidential-2pc` in routstr-core and routstr-sdk, `confidential-upstream` in routstrd; PRs #855, #112, #155); their state and commands: `routstr-core/docs/confidential-upstream.md`, `routstrd/docs/confidential-upstream.md` |
+| browser library, PWA | ported to v3: library `main`, pinned by the PWA at `1336b1f` (wasm built by CI); PWA 0.2.1 deployed |
+| deployment | routstr.cypherpunk.today runs v3 since 2026-11-12 11:43 UTC (node 0.5.1+gf11a1ea, sidecar from `main` bbcdb72, offer `http: ["2","1.1"]`, deposit 2000 msat) |
 
 Notes that outlive the port: the client needs `cu-2pc` next to `cu-prover`
 (or `CU_2PC`). The sidecar dials the provider only when the ClientHello
@@ -359,7 +360,8 @@ confidential mode when it detects more than one.
 `~/projects/routstr-confidential-pwa` (github jooray/routstr-confidential-pwa): the demo PWA, deployed by
 GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the library by commit:
 `node scripts/pin-lib.mjs <sha>`). Changes to `crypto/twopc` or `zkbench` here must be re-vendored there.
-Both still speak protocol v2 (branch `twopc-v2` crates); the v3 port is open.
+Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA pins library `main` at
+`1336b1f` with the wasm built by CI; PWA 0.2.1 is deployed, with a testing guide at `/testing/`.
 
 ## Gotchas
 
@@ -450,8 +452,9 @@ Both still speak protocol v2 (branch `twopc-v2` crates); the v3 port is open.
     meanwhile waits for it); measure with `crypto/tools/v3-topup-bench.sh`
     (`CU_NO_TOPUP=1` for the old behaviour). An old client (channel version 1)
     falls back to one socket per proof.
-  - The browser library and the PWA are on v3 (local branches `v3`; PWA
-    0.2.1); the library's `wasm/pkg` is a local macOS build until CI replaces it.
-  - v3 is not pushed, not deployed and not in the upstream PRs; the SDK
-    release and routstrd's `@routstr/sdk` bump are the maintainers' step.
+  - The browser library and the PWA are on v3 (`main`; PWA 0.2.1 deployed,
+    pinning library `1336b1f`, whose `wasm/pkg` is the CI build).
+  - v3 is published (2026-11-12) and in the upstream PRs (core #855, SDK #112,
+    routstrd #155); routstr.cypherpunk.today runs it. The SDK release and
+    routstrd's `@routstr/sdk` bump are the maintainers' step.
   - The sidecar and prover are not yet in any upstream repo.
