@@ -10,7 +10,8 @@
 #   AUTH=sk-... CU_NODE=http://127.0.0.1:8010 NODE_LOG=.../routstr-core/logs/app_YYYY-MM-DD.log \
 #     crypto/tools/adversarial-images.sh
 #
-# Paid: about five cheap images (z-image-turbo $0.01, one qwen-image-2-1-turbo $0.02).
+# Paid: five images (four of the flat model, one 1K image of the tiered one;
+# about $0.01 to $0.03 each). The models must be priced by the node's offer.
 #
 # Environment:
 #   AUTH        required: an sk- key of the node with a balance for the images
@@ -24,7 +25,8 @@
 #
 # Expected outcomes (machine-checked):
 #   img-control           honest, count 1: one image, receipt verified, flat charge
-#                         at the signed price; node: "settled".
+#                         at the signed price (plus the session fee: each case is
+#                         its own connection); node: "settled".
 #   img-decoy-model       an expensive model in the private part, honest suffix:
 #                         neutralised (last key wins): one image, charged the cheap
 #                         model's price, provider echo names the cheap model.
@@ -36,13 +38,14 @@
 #                         model: a 1K image (longest side <= 1536 px), 1K price.
 #   img-count-mismatch    the request names count 1, the body's suffix pins 4: the
 #                         proof of the suffix (pi_WIN) fails; the body is never
-#                         released; node: outcome=released.
+#                         released; node: outcome=released (the connection
+#                         deposit is charged; without one, the abandon fee).
 #   img-suffix-model      the request names the cheap model, the body's suffix the
 #                         expensive one: refused; node: outcome=released.
 #   img-no-proof-swap     the suffix pins count 4 and is never proven: the sidecar
 #                         holds the record(s); zero response bytes; node: released.
 #   img-error-honest      a field the provider rejects: 400, error head proven,
-#                         charged nothing (no session fee configured).
+#                         charged the abandon fee (nothing when the node has none).
 #   img-accept-on-error   the same, but the client sends `accept` anyway: the node
 #                         cannot see the status and charges the flat price. This
 #                         is the documented residual (paper §4.10: a dishonest
@@ -91,6 +94,14 @@ def price(m, v):
         if v in (None, "", x["id"]): return x["msat_per_image"], x["id"]
     return None, None
 flat, vid = price(model, variant)
+# Every run is its own connection, so its settlement is the connection's
+# first: the session fee is due with it; a 4xx the provider answers costs the
+# abandon fee; an attack refused before the release costs the connection
+# deposit when the node asks for one (the reservation is then released in
+# full), else the abandon fee.
+FEE = int(offer.get("session_fee_msat") or 0)
+ABANDON = max(int(offer.get("abandon_fee_msat") or 0), FEE)
+DEPOSIT = int(offer.get("connection_deposit_msat") or 0)
 dev = []
 e2e = None; adv = None
 for line in out.splitlines():
@@ -132,7 +143,7 @@ elif expect in ("images", "accept-residual"):
         if rc != 0: dev.append("driver failed")
         if e2e.get("images") != want_images: dev.append(f"expected {want_images} image(s)")
         if e2e.get("receipt_sig_ok") is not True: dev.append("receipt not verified")
-        if flat is None or e2e.get("cost_msats") != flat * count: dev.append("charge is not the signed flat price x count")
+        if flat is None or e2e.get("cost_msats") != flat * count + FEE: dev.append(f"charge is not the signed flat price x count + the session fee {FEE}")
         echo = e2e.get("echo") or {}
         if expect == "images":
             if "model" in echo and echo["model"] != model: dev.append(f"provider ran {echo['model']}")
@@ -146,8 +157,8 @@ elif expect in ("images", "accept-residual"):
             if not (e2e.get("status") or 0) >= 400: dev.append("the residual case did not get an upstream error")
 elif expect == "error-released":
     drv = f"rc={rc} " + (f"status={req.get('status')} cost_msats={req.get('cost_msats')} sig={req.get('receipt_sig_ok')}" if req else "no error receipt")
-    if rc != 0 or not req or not (req.get("status") or 0) >= 400 or req.get("cost_msats") != 0 or req.get("receipt_sig_ok") is not True:
-        dev.append("expected a verified zero-cost error receipt")
+    if rc != 0 or not req or not 400 <= (req.get("status") or 0) < 500 or req.get("cost_msats") != ABANDON or req.get("receipt_sig_ok") is not True:
+        dev.append(f"expected a verified 4xx error receipt that costs the abandon fee ({ABANDON})")
 else:  # refused / withheld
     if released_body: dev.append("final body record was released to the provider")
     if req and req.get("receipt_sig_ok"): dev.append("attack produced a receipt")
@@ -175,7 +186,8 @@ if slice_f != "-":
         elif msg.startswith("confidential ws: settled"):
             lines.append(f"settled cost_msats={j.get('cost_msats')}")
     node = "; ".join(lines) or "no session line"
-    want = "settled" if expect in ("images", "accept-residual", "error-released") else "aborted outcome=released"
+    abandoned = "released" if DEPOSIT > 0 or ABANDON == 0 else f"charged_abandon_fee:{ABANDON}"
+    want = "settled" if expect in ("images", "accept-residual", "error-released") else f"aborted outcome={abandoned}"
     if len(lines) != 1: dev.append(f"node: expected exactly one session line, got {len(lines)}")
     elif not lines[0].startswith(want): dev.append(f"node: expected '{want}'")
 verdict = "PASS" if not dev else "DEVIATION: " + "; ".join(dev)
