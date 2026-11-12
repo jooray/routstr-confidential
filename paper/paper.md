@@ -1388,7 +1388,7 @@ round-trip time the handshake stages take 0.32 s and the application stages 0.22
 |---|---|---|---|---|
 | $\pi_{NK}$ (connection head; benchmark: a 228-byte HTTP/1.1 head) | 0.16 s | 1.45 MB | 5 | 15 |
 | $\pi_{C3S}$ (usage; one 596-byte server record) | 0.20 s | 1.47 MB | 7 | 38 |
-| $\pi_{WIN}$ (a request's windows), over a pre-warmed proof channel | 39-66 ms | about 1.0 MB down, 86 kB up per request together with $\pi_{C3S}$ (the channel's top-up) | 7 | 1 per 16-byte block touched |
+| $\pi_{WIN}$ (a request's windows), over a pre-warmed proof channel | 39-66 ms | about 610 kB down per request together with $\pi_{C3S}$, moved off the request path by the top-up | 7 | 1 per 16-byte block touched |
 
 The first two rows include the proof's own OT setup; over a pre-warmed proof channel $\pi_{NK}$ took
 0.06 s and $\pi_{C3S}$ 0.04 s in v2's live runs. $\pi_{WIN}$ needs about 160 k correlations plus 6.4 k
@@ -1410,12 +1410,17 @@ for an armed connection, from the request on an open one; author measurements, 2
 | Request on an armed connection | 0.81 s | 0.76 s |
 | Request on an open connection | 0.57 s | n/a (one request per connection) |
 | Cold: C sends / receives | 2.63 MB / 17.97 MB | about the same |
-| Request on an open connection: C sends / receives | 86 kB / 1.01 MB | n/a |
+| Request on an open connection: C sends / receives | 86 kB / 12-15 kB (plus a 610 kB top-up between requests) | n/a |
 
 Of the cold 17.97 MB, 16.38 MB are the 2PC and about 1.6 MB the proof channel's correlations; of the
-2.63 MB sent, 1.13 MB are the 2PC and 1.5 MB the proof channel. The megabyte of a request on an open
-connection is almost all the proof channel's top-up for $\pi_{WIN}$ and $\pi_{C3S}$; it does not depend on
-the 2PC. The time to first token is dominated by the provider's own latency in every row. Earlier
+2.63 MB sent, 1.13 MB are the 2PC and 1.5 MB the proof channel. A request on an open connection would
+need about 560 k fresh correlations for $\pi_{WIN}$ and $\pi_{C3S}$. Without a top-up the channel
+extends online during the request (0.5-1.45 MB down on the request path, measured). With the top-up
+(§9.2 of the specification) the client asks for one Ferret iteration of 900 k correlations after the
+connection head and after each settled request, while no request is in flight: about 610 kB and 170 ms
+natively, off the request path. Measured on five requests 3 s apart on one connection: the request path
+then carries 12-15 kB down, and the proof channel downloads nothing during requests 2-5. It does not
+depend on the 2PC. The time to first token is dominated by the provider's own latency in every row. Earlier
 prototype runs (2026-11-11, before `split-public-1` was merged, so with v2's 22 MB 2PC in the open:
 23.7 MB / 2.6 MB per open, 0.5-1.0 MB / 85 kB per later request, the body released about 60 ms after it
 was sent, time to first token through the daemon 0.46-1.26 s on a reused connection against 0.9-1.5 s for
@@ -1432,7 +1437,7 @@ connection per pool key while there is traffic and every open connection is busy
 does not wait for a 2PC. On framing "1.1" armed connections work as v2's armed sessions did, without
 the binding, the padding and the reservation. The proof channel is still prepared ahead: it holds the
 OT/VOLE correlations for $\pi_{NK}$ and the first $\pi_{WIN}$ and $\pi_{C3S}$, and on a kept
-connection it is topped up while the connection is idle.
+connection it is topped up between requests, one bounded step at a time, at the client's request.
 
 **Client pool.** The SDK keeps connections per (node, credential, reuse scope). A request takes an idle
 connection of its key or opens one, up to a limit per key and in total; parallel requests use separate
