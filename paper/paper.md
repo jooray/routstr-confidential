@@ -871,8 +871,8 @@ request. Both go through the node's ordinary billing.
 1. **Connection deposit.** At the setup N reserves `connection_deposit_msat`, a value of the signed
    offer (by default the abandon fee, and at least the session fee), which C accepts only up to a
    configured maximum. It is **released when the first request of the connection reaches a
-   settlement**: a usage disclosure, an image `accept`, or an error head, that is, any request the
-   provider received. A connection that ends without a settled request is **charged** the deposit: the
+   settlement**: a usage disclosure, an image `accept`, an error head, or a disclosed refusal of the
+   request's stream, that is, any request the provider answered. A connection that ends without a settled request is **charged** the deposit: the
    client made N garble and send 16 MB and used none of it. The exception is an end that was N's, the
    relay's or the provider's failure before C could have had a request settled (a 2PC failure on N's
    side, the provider refusing the handshake or the head, the relay lost); then it is released. The
@@ -925,6 +925,22 @@ header before it, and JSON text has none of the zero bytes every frame header st
 the disclosure limit cannot be disclosed at all in framing "1.1" and is charged like a missing
 disclosure; in framing "2" the head is its own frame and the body's size does not matter.
 
+**Refused streams (framing "2").** An HTTP/2 server may refuse a stream without processing it:
+`RST_STREAM` with `REFUSED_STREAM`, or a GOAWAY whose last-stream-id is below the stream (RFC 9113
+§8.7), typically under load or at a graceful shutdown. Nothing ran and U bills nothing, but N cannot see
+either frame, so without a proof a refusal after the release would be charged the whole reservation, and
+a GOAWAY before it the deposit. C proves it with `disclose_reset`: one $\pi_{WIN}$ under $s_{ap,0}$, as for
+an error head, over the plaintext from byte 0 of a server record no later than the first record of the
+request's interval to the end of the refusing frame. N walks every frame in it: only stream-0 control
+frames, WINDOW_UPDATEs, the probe stream's frames and a GOAWAY that still covers the stream may come
+before the refusal, so a response on the stream (a head, a byte of DATA) stops the walk and no refusal
+after it can be disclosed. The reset must name the request's stream and code 7; the GOAWAY must carry
+`NO_ERROR` (a GOAWAY with an error code may be the client's doing). C cannot change the ciphertext N
+received from U, and it chooses only the record the walk starts at, which N bounds by the interval's
+start. The request is settled like a 429, $f_s$ if still due and nothing else, which releases the
+deposit; the connection closes and C runs the request again on a new connection. If U closes right
+after its GOAWAY, N keeps the request open briefly for this disclosure alone.
+
 **Fees.** N can publish, in the same signed offer, a rate surcharge (already folded into the signed
 price list), a session fee $f_s$ and an abandon fee $f_a \ge f_s$. C accepts both fees by echoing them
 in each request; N refuses a request that does not, so a client that does not know about fees is never
@@ -949,6 +965,7 @@ first.
 | A request is refused at its `request` message | nothing reserved; the connection stays ready |
 | Abort of a reserved request before its body is released (including a failed $\pi_{WIN}$) | U received no complete request; reservation released (less $f_a$); the connection ends |
 | U sent response bytes and closed the connection before the body was released (a refusal) | reservation released (less $f_s$ if still due) |
+| U refused the stream unprocessed (`REFUSED_STREAM`, or GOAWAY below it; disclosed, before or after the release) | reservation released (less $f_s$ if still due); the deposit released; the connection ends, C retries elsewhere |
 | Usage disclosed (chat) or `accept` (images) | charged per section 4.8; in framing "2" the connection is ready again |
 | U returned a 429, 503, 401, 402 or 403 (head disclosed) | reservation released (less $f_s$ if still due); the connection ends |
 | U returned another 4xx (head disclosed) | reservation released (less $f_a$); the connection ends |
@@ -1326,6 +1343,12 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
     across records right before an error head makes that error undisclosable, and after the release the
     request is then charged in full (profile item H9). Late answers to the probe stream are skipped by the
     usage-tail grammar, so billing does not depend on when they arrive.
+23. *Refused streams.* A disclosed refusal (section 4.8) rests on the provider's frame boundaries as an
+    error head does, and needs the records from the request's interval to the refusal to be walkable (at
+    most 8 records and 16 KiB, no KeyUpdate); otherwise the request is charged by what N saw, as before.
+    A client can still end an accepted request it never wrote for $f_s$ by holding it until the
+    provider's idle timer sends GOAWAY (at least `h2.idle_secs`): the provider did no work, and the gain
+    is at most $f_a$, or the deposit less $f_s$, per connection.
 
 # 6. Implementation and evaluation
 

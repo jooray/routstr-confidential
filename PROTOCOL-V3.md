@@ -122,7 +122,7 @@ socket per proof).
                                                                                               │ head_written
                                                                                               ▼
             ┌──────────────────────────────────────────────────────────────────────────── READY
-            │ request n            records, π_WIN, release        response      disclose / accept / disclose_head
+            │ request n            records, π_WIN, release        response      disclose / accept / disclose_head / disclose_reset
             └─► REQUEST(n) ───────────────────────────────► RELEASED ─────────► settlement, receipt ──► READY | CLOSED
 ```
 
@@ -212,6 +212,7 @@ reservation is at stake.
 | chat, 2xx | `disclose` (the usage event to the end of the response) | π_C3S | charges the usage at the frozen rates |
 | images, 2xx | `accept` | none | charges `msat_per_image × count` |
 | status ≥ 400 | `disclose_head` | framing `"2"`: π_WIN under `s_ap_0`; `"1.1"`: π_C3S head mode, as v2 | v2's error rules by status |
+| framing `"2"`, the provider refused the stream unprocessed (`RST_STREAM(REFUSED_STREAM)`, or GOAWAY below it) | `disclose_reset` (before or after `body_released`) | π_WIN under `s_ap_0` | as a 429: the session fee if still due; C may run the request again elsewhere |
 
 N answers with the attestation (per request), then the receipt (signed by the node, bound to `sid`, `n` and
 the attestation). Framing `"1.1"`: the attestation is sent when the provider closes the connection, before
@@ -446,9 +447,67 @@ every case above with exact money (`h2-k-*`, `h11-k-extra-record`, `h11-k-pipeli
   never has (risk 5). The prefix frames carry nothing of C's: the request's stream has nothing before its
   response head. What remains a provider requirement (§5.6, H9): a response head lies in a record that
   starts at a frame boundary.
+- `disclose_reset` (§5.4.1): the provider refused the request's stream without processing it. `R` runs
+  from **byte 0 of server record `i`**, `i` no later than `S_k`, to the end of the refusing frame:
+  `RST_STREAM` on the request's stream with `REFUSED_STREAM` (7), or GOAWAY (stream 0) with `NO_ERROR` and
+  a last-stream-id below the request's stream. Every frame before it in `R` may only be SETTINGS, PING,
+  WINDOW_UPDATE on stream 0 or the request's stream, a frame of the probe stream, or a GOAWAY that does not
+  refuse the stream (last-stream-id at least the stream). π_WIN under `s_ap_0`, as for an error head. N
+  settles it like a 429 (§12.10) and the connection closes.
 - Images: the response is one JSON body in DATA frames; C sends `accept` after END_STREAM on the request's
   stream (never by a length). N's connection head opens the windows to 2^31-1, so C sends no flow-control
   frame for a response; the connection is retired after 1 GiB received (`closed`, `max_bytes`).
+
+### 5.4.1 A refused stream (`disclose_reset`)
+
+RFC 9113 §8.7: a stream reset with `REFUSED_STREAM`, or one above the last-stream-id of a GOAWAY, was not
+processed, and a client may retry it. The provider did no work, so N's provider bills nothing for it. N
+cannot see either frame (they are under `s_ap_0`), so without a proof §12.10 would charge such a request
+like any other: after `body_released`, the whole reservation. C therefore proves the refusal:
+
+- **What R covers.** From byte 0 of server record `i` to the end of the refusing frame, walked frame by
+  frame, with `i ≤ S_k` (C uses the number of server records it had received when it sent the `request`,
+  which is no later than `S_k`: N counts a record before it relays it, and writes nothing of the request
+  before the request is accepted). So every frame the provider sent on the connection from the moment
+  the request's first record was written up to the refusal is in R. The walk admits nothing on the
+  request's stream but WINDOW_UPDATE and the refusal itself: no response HEADERS, no DATA, no trailers.
+  A provider that answered the request, even with one byte, has a frame on the stream before any later
+  reset, and that frame stops the walk.
+- **Before any record of the request was written** (`S_k` unset: C saw the refusal before it released
+  anything, or the proofs of its records were still running), only the GOAWAY form counts (a provider
+  cannot reset a stream it never saw), `i` is any record N still holds, and N fixes the request's
+  interval, empty, at the disclosure. None of the request's records is written after a disclosed refusal.
+- **The refusing frame.** `RST_STREAM` must be on the request's stream (the probe stream 1, another
+  request's stream, or stream 0 do not count) with payload length 4 and code 7; any other code (`CANCEL`,
+  `NO_ERROR`, `INTERNAL_ERROR`, …) is no statement that nothing was processed. GOAWAY must carry
+  `NO_ERROR`: a GOAWAY with an error code is a connection error, which C's own frames may have caused
+  (an unsolicited SETTINGS ACK, say), and a client must not be able to provoke a cheap end. A GOAWAY that
+  names the request's stream or a later one as processed does not count either.
+- **Why C cannot forge one.** C holds `s_ap_0`, so it could encrypt a refusal of its own; but π_WIN is
+  over the ciphertext N received from U on its own TCP connection (N takes every `ct` from its relay
+  buffer), so the claim is about bytes U sent, as for every disclosure (§2 of the paper: C could forge
+  server records for anyone but N). C chooses only the record `i` and how far R runs. Starting at a
+  record after `S_k` is refused (the walk would skip part of the interval); starting earlier only adds
+  frames to the walk. A fabricated frame inside a record needs the frame header's zero bytes at a place
+  the provider's own framing puts a frame boundary (risk 5), and the walk from byte 0 of a record lands
+  only on the provider's frame boundaries. Pointing at a refusal of the probe stream or another stream,
+  at a reset after a response head, or at a reset with another code is refused by the frame rules (the
+  gates run these as attacks: `h2-r-refusal-*`); presenting R that is not U's plaintext fails π_WIN.
+- **What a client can still cause.** A provider whose idle timer ends a connection with GOAWAY
+  (`NO_ERROR`, last-stream-id the previous request's) while a request is accepted and not yet written:
+  a C that holds an accepted request unwritten until then (at least `h2.idle_secs`, H5, and below the
+  600 s request limit) ends it for the session fee if still due instead of the abandon fee or the
+  deposit. The provider did no work for it; the difference is at most the abandon fee, or the deposit
+  less the session fee, per connection, for minutes of a held slot.
+- **The provider closes right after its GOAWAY** (the usual case). N then keeps the request open for
+  60 s for a `disclose_reset` alone (no other disclosure, nothing written); without it the request ends
+  as before (§12.10 rows 8, 9).
+- **What it costs C.** The session fee if still due, never more (§12.10); the connection closes, and C
+  runs the request again, on a new connection (clients class it as not processed: SDK
+  `StreamNotProcessedError`, retried; the browser library the same).
+- **What remains a provider requirement** (§5.6, H9): the records from `i` to the refusal start at frame
+  boundaries and hold no KeyUpdate; a refusal behind more than 8 records or 16 KiB from `i` cannot be
+  disclosed (then §12.10 applies as before: the request is charged by what N saw).
 
 ### 5.5 Why the credential cannot be read back
 
@@ -473,7 +532,7 @@ Checked by `provider-profile-check.py --h2`; an operator offers `"2"` only when 
 | H6 | request bodies up to the node's body limit pass flow control |
 | H7 | no response path reflects the `authorization` value (same list as item 8) |
 | H8 | the streamed usage event and `[DONE]` end the stream as §5.4 parses them |
-| H9 | an error response's HEADERS frame lies in a record that starts at a frame boundary (the frames before it in the record being of the kinds §5.4 allows) |
+| H9 | an error response's HEADERS frame lies in a record that starts at a frame boundary (the frames before it in the record being of the kinds §5.4 allows); the same for the records from a request's interval to a refusal of its stream (§5.4.1) |
 
 H9 is not checked by the profile tool (it sees no record boundaries); the clients check it on every error
 head and the gates exercise it. A provider that splits a frame across records right before an error head
@@ -540,8 +599,8 @@ correlations + 6.4 k per block).
 - `connection_deposit_msat` (signed offer; node setting `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT`, default
   max(abandon fee, session fee, 1000 msat); 0 = no deposit) is reserved at the `setup` through the node's
   ordinary reservation path, for both framings.
-- It is **released when the first request of the connection reaches a settlement** (usage, `accept`, or an
-  error head: any request the provider received).
+- It is **released when the first request of the connection reaches a settlement** (usage, `accept`, an
+  error head, or a disclosed refusal: any request the provider answered).
 - A connection that ends with no settled request: the deposit is **charged**, except when the end was the
   node's, the sidecar's or the provider's failure and not something C can cause: the provider unreachable,
   `h2` not selected, framing `"2"` withdrawn, a sidecar or node failure, the provider closing an open idle
@@ -681,7 +740,11 @@ Everything v2 checks (`params.ts`), with: π_WIN parameters (§7.1); the receipt
 by its own TLS stack. Framing `"2"`, the provider's frames as RFC 9113 has them: a frame above 16 KiB
 (the head never raises `SETTINGS_MAX_FRAME_SIZE`) ends the connection; a change of
 `SETTINGS_INITIAL_WINDOW_SIZE` applies to the open request's stream too; no record of a stream above a
-GOAWAY's last-stream-id is released (the request fails before its release and may run again elsewhere).
+GOAWAY's last-stream-id is released. A refusal of the request's stream (`RST_STREAM(REFUSED_STREAM)`, or
+GOAWAY with `NO_ERROR` below it) before any response on it is disclosed (`disclose_reset`, §5.4.1) and the
+request runs again on a new connection; one that cannot be disclosed (a GOAWAY with an error code, a walk
+that meets another frame) fails the request as before. Every receipt that names `reserved_msats` must name
+the `request_ok.reserved_msats` of its request (§12.4).
 
 ## 10. Residual risks that are new or changed
 
@@ -698,45 +761,40 @@ GOAWAY's last-stream-id is released (the request fails before its release and ma
 | 9 | Compromise scope: one `c_ap_1`/`s_ap_0` pair protects up to `h2.max_requests` requests (C may not KeyUpdate under π_WIN's rules). A live compromise of C exposes the connection's current and later traffic; a later forensic compromise of retained secrets exposes the whole recorded connection, not one request | best effort only: clients clear the traffic secrets they hold (zero the arrays, drop the references) when a connection closes and keep them out of logs. That is not cryptographic erasure: the clients are JavaScript, and copies the runtime made (garbage-collected buffers, heap snapshots, swap, core dumps) may remain. The levers are the connection's scope: operators keep `h2.max_requests` and `h2.max_lifetime_s` in proportion, and a user who needs one request per secret pair uses `reuse: none` or framing `"1.1"`. A per-request ratchet needs a new anchor protocol |
 | 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
 | 11 | `upstream_models` may map a public id to another provider prefix for the same name (`someorg/claude-opus-4.5` for `claude-opus-4.5`): the rule of §12.1 binds the name, not the publisher | matters only on a provider where anyone can publish models under their own namespace; closing it needs a per-host list of trusted prefixes, or showing the pinned id to the user. the node offers of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro; 970 mappings) and Cloudflare's `@cf/meta/<id>` all have the form `<prefix>/<public id>` |
+| 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5), and a client can end an accepted, unwritten request for the session fee by waiting for the provider's idle GOAWAY (§5.4.1) | the provider did no work; the gain is at most the abandon fee or the deposit less the session fee, per connection, after at least `h2.idle_secs` |
 
 v2's residual risks carry over unchanged (π_NK does not bind other epoch-0 records; provider reflection;
 ECtF semi-honest; no proof of the garbler-only construction).
 
-### 10.1 Open question: a stream the provider did not process (`REFUSED_STREAM`, GOAWAY)
+### 10.1 Decided (2026-11-13): a stream the provider did not process (`REFUSED_STREAM`, GOAWAY)
 
 A provider may answer a request's stream with `RST_STREAM(REFUSED_STREAM)` (code 7), or send a GOAWAY
 whose last-stream-id is below the stream. RFC 9113 §8.7 guarantees that such a stream was not processed:
-nothing ran and nothing is billed upstream. N cannot see either frame (they are under `s_ap_0`), so §12.10
-charges by what N sees: before `body_released` the abandon fee or the deposit (small), **after
-`body_released` with no settlement the whole reservation**, and C does not retry. The clients do not
-release records of a stream above a GOAWAY's last-stream-id they have read, so the GOAWAY case costs the
-full reservation only when it arrives after the release; `REFUSED_STREAM` typically arrives after the
-HEADERS record or after the whole body, so it can cost the full reservation. The money rules are
-unchanged until this is decided. The options:
+nothing ran and nothing is billed upstream. N cannot see either frame (they are under `s_ap_0`), so
+without a proof §12.10 charges by what N sees: before `body_released` the abandon fee or the deposit,
+**after `body_released` with no settlement the whole reservation**. Four options were weighed:
 
-1. **Keep the rule.** Simple and safe for N. A provider that refuses streams under load (concurrency
-   limits, overload shedding) costs C a full reservation per refusal; C may retry code 7 on a new request
-   (the SDK can class it as retryable), and pays again.
-2. **Disclose the reset, as an error head.** C sends `disclose_reset {n, record, r}`: one π_WIN under
-   `s_ap_0` (as `disclose_head` in framing `"2"`) shows that a server record in the request's interval
-   holds, at a frame boundary, `RST_STREAM` on the request's stream with code 7, after only the frames
-   §5.4 allows before an error head and with no HEADERS on the stream before it (a GOAWAY variant: the
-   GOAWAY frame and its last-stream-id below the stream). N settles it like 429/503: the session fee if
-   still due, nothing more. Soundness is that of the error head (risk 5: C cannot change the ciphertext
-   the sidecar received, and the frame must start a record or follow allowed frames). Cost: a new
-   message, a sidecar validator next to `validate_error_head`, the client side in three clients, gate
-   cases. It fixes the full-reservation case, and the provider's own guarantee is what makes it fair to N.
-3. **Bound the charge by what N sees.** E.g. charge only the abandon fee when every server record of the
-   interval is as small as a control frame. Not recommended: record sizes are the provider's choice
-   (frames coalesce), and a C that withholds a real response's disclosure must not be able to make it
-   look refused.
-4. **Retry on the same connection without a new reservation.** A refused request's reservation is moved
-   to a new stream. Needs N to trust C's claim that the stream was refused, so it reduces to option 2
-   with a different settlement.
+1. **Keep the rule.** A provider that refuses streams under load (concurrency limits, overload shedding)
+   costs C a full reservation per refusal, and again when C retries.
+2. **Disclose the refusal, as an error head.** One π_WIN under `s_ap_0` over the provider's own frames;
+   settled like a 429.
+3. **Bound the charge by what N sees** (only the abandon fee when every server record of the interval is
+   as small as a control frame). Record sizes are the provider's choice (frames coalesce), and a C that
+   withholds a real response's disclosure must not be able to make it look refused.
+4. **Retry on the same connection without a new reservation.** Needs N to trust C's claim that the
+   stream was refused, so it reduces to option 2 with a different settlement.
 
-Recommendation: option 2 (with code 7 classed as retryable in the clients meanwhile, which changes no
-money). An `RST_STREAM` with any other code, and a reset without an error head, stay as they are: the
-provider may have processed the request.
+**Decision: option 2**, as `disclose_reset` (§5.4.1, §12.8). The proof walks every frame from no later
+than the start of the request's interval to the refusing frame, so a refusal after any response on the
+stream cannot be disclosed; the reset must name the request's stream and code 7, the GOAWAY `NO_ERROR`
+and a last-stream-id below the stream. The request costs the session fee if still due and nothing else;
+it is the connection's settlement (the deposit comes back with its receipt) and the connection closes. A
+GOAWAY before `body_released` is the same proof: the provider ended the connection before it had the
+request, which is a provider-caused end, so it no longer falls in §12.10 row 9 once disclosed (also
+after the provider closed: N waits 60 s for the disclosure). C runs the request again on a new
+connection. An `RST_STREAM` with any other code, a GOAWAY with an error code, and a reset after a
+response head stay as they were: the provider may have processed the request, or C may have caused the
+end. Residual: risk 12.
 
 ## 11. Versions and upgrade
 
@@ -1043,6 +1101,22 @@ connection began (handshake flight included).
   the provider reset the stream after it (RFC 9113 §8.1: a server that answers before the request is
   complete resets it with `NO_ERROR`, often in the same record): the reset does not undo the status. C
   stops waiting for the error body at the reset.
+- A refused stream (§5.4.1): `C → N  {"type":"disclose_reset","n","record":i,"r":<hex>[,"key_updates","epoch_start"]}`:
+  `r` is the plaintext from byte 0 of server record `i` to the end of the refusing frame, at most 16 KiB
+  and 8 records. N checks, in order: a request `n` in flight with no disclosure yet; no π_WIN of client
+  records running (unproven records of the request may wait: none of them is written any more); `r` walks
+  as §5.4 says, ending exactly with `RST_STREAM(REFUSED_STREAM)` on the request's stream (only once a
+  record of the request was written) or GOAWAY(`NO_ERROR`, last-stream-id < stream); `i ≤ S_k` when `S_k`
+  is set, else any record N holds (then `S_k` := the server records received so far, the interval stays
+  empty); `i` is held, received and in the named key epoch. Then `attestation` (as for any request; with
+  no record written, `server_records` and `client_records` are 0), then
+  `{"type":"zk_params","proof":"pi_win","purpose":"refusal","n","record","params"}` (`anchor = h2`; per
+  covered record its bytes from offset 0 and its last byte = `17`, as for an error head). C checks the
+  windows like an error head's and proves with `s_ap_0`. Allowed before or after `body_released`; when the
+  provider closed the connection before `body_released`, N waits 60 s for it (and takes nothing else) after
+  `upstream_closed_early`. The settlement `usage` is `{"refused":"rst_stream","error_code":7,"choices":[]}`
+  or `{"refused":"goaway","error_code":0,"last_stream_id":L,"choices":[]}`; the connection then closes
+  (`closed`, `error_settled`).
 
 **Framing `"1.1"`.** The provider closes the connection after its response. N then sends the `attestation`
 on its own. After it:
@@ -1072,7 +1146,7 @@ and whose `n` is the request in flight; any other is dropped. A receipt's `attes
 `a_json`.
 
 **Settlement.** S with `--node-settles`:
-`{"type":"usage","sid","http","n","model":<pinned>,"usage":<the usage event | {"error_status","choices":[]} | {"flat":true,"kind":"images","count"}>[,"reported_model"]}`;
+`{"type":"usage","sid","http","n","model":<pinned>,"usage":<the usage event | {"error_status","choices":[]} | {"refused","error_code"[,"last_stream_id"],"choices":[]} | {"flat":true,"kind":"images","count"}>[,"reported_model"]}`;
 without it a stub `{"type":"receipt","n","receipt":{"sid","http","n",…},"receipt_json","sig"}`.
 **N** consumes `usage` (it is not relayed) and sends
 `{"type":"receipt","receipt":{…},"receipt_json","sig","sig_scheme":"schnorr-secp256k1"}`. `receipt_json` is the
@@ -1084,9 +1158,9 @@ receipt's canonical JSON, the text the node signed (`sig`: BIP-340 over its SHA-
 | `sid`, `http`, `n` | always | the connection, its framing, the request |
 | `model` | always | the model the request named (the public id; for images the offer's id) |
 | `upstream_model` | chat, when it differs from `model` | the provider's id the suffix pinned (`upstream_models`) |
-| `usage` | always | the `usage` of the S frame: the provider's usage event, `{"error_status","choices":[]}`, or `{"flat":true,"kind":"images","count"}` |
+| `usage` | always | the `usage` of the S frame: the provider's usage event, `{"error_status","choices":[]}`, a refusal `{"refused":"rst_stream"\|"goaway","error_code"[,"last_stream_id"],"choices":[]}`, or `{"flat":true,"kind":"images","count"}` |
 | `cost_msats` | always | what the request was charged |
-| `reserved_msats` | always | what was reserved for it |
+| `reserved_msats` | always | what was reserved for it; C refuses a receipt whose value differs from `request_ok.reserved_msats` (when that named one) |
 | `balance_msats` | always | the credential's balance after the charge (`null` if the key is gone) |
 | `rates` | chat | the frozen rates `{"in","cached_in","cache_write","out"}`, msat per 1000 tokens |
 | `kind:"images"`, `variant`, `count`, `msat_per_image` | images | the frozen variant and price (no `rates`) |
@@ -1110,7 +1184,7 @@ After a settled 2xx a framing-`"2"` connection is READY again. Otherwise the con
 | `reason` | When |
 |---|---|
 | `done` | framing `"1.1"`: its request was settled (2xx) |
-| `error_settled` | an error head was settled (both framings) |
+| `error_settled` | an error head (both framings) or a refusal (`disclose_reset`, framing `"2"`) was settled |
 | `idle` | no request in flight for the idle limit (the node's `idle_timeout_s`; the sidecar's `h2.idle_secs` behind it) |
 | `max_requests`, `max_lifetime`, `max_bytes` | framing `"2"`: at the settlement that reached `h2.max_requests`, `h2.max_lifetime_s`, or 1 GiB received |
 | `upstream_closed` | the provider closed an open connection with no request in flight; `"after_client_frames": true` when C had control frames written on a connection that carried no request (the close may be C's doing: not row 5 of 12.10) |
@@ -1122,7 +1196,8 @@ violation and failed proof. `fault` is `"upstream"` (the provider could not be r
 the framing needs) or `"node"` (the sidecar failed). `code`, when present: `upgrade_required`,
 `twopc_version_mismatch`, `upstream_unreachable`, `h2_not_selected`, `h2_withdrawn`, `h2_table_size`.
 `{"type":"upstream_closed_early","n","response_bytes"}` precedes the `error` when the provider closed before
-the request was fully written (N relays it).
+the request was fully written (N relays it). Framing `"2"`: N then keeps the request for 60 s, for a
+`disclose_reset` alone (§12.8); without one the `error` follows.
 
 **N** sends its own `error` frames as `{"type":"error","status","reason","detail"[,"fault":"node"]}`: a
 refused setup (12.3; the socket then closes), a protocol error in a `request` (12.4), a time limit (408),
@@ -1165,6 +1240,7 @@ the frame would be `{"type":"closed","reason":"ended"}`.
 | before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes) | released; the session fee is kept if still due |
 | after `body_released` with no settlement | charged in full |
 | settled 2xx | usage at the frozen rates (chat) or `msat_per_image × count` (images), plus the session fee if still due |
+| settled refusal (`disclose_reset`, framing `"2"`; before or after `body_released`) | the session fee if still due, the rest released; never more |
 | settled error head | 429/503 and 401/402/403: the session fee if still due; any other 4xx: the abandon fee; other 5xx: the reservation, at most the `reserved_msats` announced in `request_ok` (none announced: the session fee if still due); images: never more than `msat_per_image × count` + max(session fee if still due, abandon fee) |
 
 The session fee is "still due" until the connection's first settlement.
@@ -1182,14 +1258,23 @@ settled request, first matching row:
 | 5 | the provider closed the open, idle connection before any request (`closed`, `upstream_closed`, without `after_client_frames`) | released | `provider_closed` |
 | 6 | the node refused a request of this connection with a 5xx, or a settlement's billing write failed | released | `node_failure` |
 | 7 | a request was written in full (`body_released`) and never settled | released (the reservation is charged) | `request_received` |
-| 8 | the provider answered a request and closed before its body was complete | released (the request keeps the session fee) | `provider_refused` |
-| 9 | a request was accepted and the connection ended before its `body_released` for any other reason | **charged**; the reservation is released in full | `request_abandoned` |
+| 8 | the provider answered a request and closed before its body was complete (response bytes in the request's interval) | released (the request keeps the session fee) | `provider_refused` |
+| 9 | a request was accepted and the connection ended before its `body_released` for any other reason (N cannot see a GOAWAY: undisclosed, it lands here when the provider sent nothing in the interval) | **charged**; the reservation is released in full | `request_abandoned` |
 | 10 | no request in flight for `idle_timeout_s` | **charged** | `idle` |
 | 11 | `head_written` not reached within 600 s | **charged** | `setup_timeout` |
 | 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake or after the client's control frames (`after_client_frames`), only refused requests | **charged** | `unused` |
 
 A refused request (4xx) by itself costs nothing; the connection stays, and the deposit follows how the
 connection ends.
+
+**A provider refusal is a settlement.** A request whose stream the provider refused unprocessed
+(`RST_STREAM(REFUSED_STREAM)`, or GOAWAY with `NO_ERROR` below it), disclosed by C (`disclose_reset`,
+§5.4.1), is settled like a 429: the session fee if still due. Being a settlement, it releases the deposit
+with its receipt (`deposit_released_msat`), so such a connection is in none of the rows above: in
+particular a GOAWAY that ends the connection **before `body_released`** is a provider-caused end and no
+longer costs the deposit (row 9) once C discloses it, also after the provider closed the TCP connection
+(N waits 60 s). A GOAWAY C cannot disclose (an error code, which C's own frames may have caused; frames
+it cannot walk) stays in rows 8 and 9.
 
 ```
 {"type":"closed"|"error", …,
@@ -1265,3 +1350,4 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | `upstream_models` values must be `<prefix>/` + the public id (clients refuse anything else, N never signs it); the other-prefix gap is residual risk 11 (SDK review finding 17) | §2.2, §12.1, §10 |
 | a provider `HEADER_TABLE_SIZE` below 4096 ends the connection (`h2_table_size`), not only one below the credential entry | §5.6, §12.6 |
 | an error head followed by a reset is disclosed (finding 18); C's checks of the provider's frames (16 KiB, initial window, GOAWAY); `REFUSED_STREAM` as an open question | §9.4, §10.1, §12.8 |
+| a refused stream is proven (`disclose_reset`: `RST_STREAM(REFUSED_STREAM)`, GOAWAY(`NO_ERROR`) below the stream) and settled like a 429; a disclosed GOAWAY before `body_released` releases the deposit; N waits 60 s after the provider's early close; every receipt's `reserved_msats` equals `request_ok`'s; residual risk 12 | §3.5, §5.4.1, §9.4, §10.1, §12.8–§12.10 |

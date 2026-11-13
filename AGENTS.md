@@ -137,7 +137,10 @@ or `"1.1"` (one request). An application never sees the framing.
 9. *Response and end of a request.* The client decrypts and verifies the
    response. Chat 2xx: `disclose` the usage event, π_C3S. Images 2xx:
    `accept`. Status ≥ 400: `disclose_head` (framing "2": π_WIN under
-   `s_ap_0`; "1.1": π_C3S head mode). The sidecar signs an attestation per
+   `s_ap_0`; "1.1": π_C3S head mode). Framing "2", a stream the provider
+   refused unprocessed (RST_STREAM(REFUSED_STREAM), or GOAWAY NO_ERROR below
+   it): `disclose_reset`, π_WIN under `s_ap_0` from no later than `S_k` to
+   the refusing frame, settled like a 429 (§5.4.1). The sidecar signs an attestation per
    request (sid, n, stream, the request's interval of server records, record
    counts and hashes, both transcript hashes, `c_commit`); the node re-signs
    it, settles, and returns a signed receipt bound to sid, n and the
@@ -285,7 +288,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   head, 200 kB body, decoy model, armed, refused-then-good, image), a v2
   socket, every attack (hidden HEADERS, TLS padding, suffix/model/cap swap,
   path, usage replay, image suffix, early record, no proof, own key share,
-  2PC version tag), and the forced failure of "2" (fallback, withdrawal,
+  2PC version tag, forged refusals `h2-r-refusal-*`), and the forced failure of "2" (fallback, withdrawal,
   return). `v3_eval.py` judges each case from the driver's output and the
   sidecar's own run files; exit ≠ 0 on any deviation. Two paid images
   (`CU_NO_IMAGES=1` skips them).
@@ -319,7 +322,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   connections, fails below a success rate): ported to the v3 driver.
 - `crypto/tools/regression-modality.py`: image/data-URI rejection per model (only relevant if you restrict models with the sidecar offer's `model_allowlist`; the shipped offer leaves it empty, since the node reserves a full-context prompt). Vision models are served and FAIL it by design: chat with image input works (`driver.ts --attach`, the PWA's Image button).
 - Unit tests:
-  - `crypto`: `cargo test --release -p cu-sidecar` (97), `-p zkbench`, `-p twopc`
+  - `crypto`: `cargo test --release -p cu-sidecar` (120), `-p zkbench`, `-p twopc`
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
   - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`, `bun test tests/bun` (vitest
     reports those two files as failed: it cannot load `bun:test`)

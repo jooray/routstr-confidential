@@ -713,6 +713,7 @@ each is there:
 | A HEADERS record with another path, method or an extra header | the whole HEADERS record is proven equal to the public block built from the offer |
 | A second stream while one is open; a request without `request_ok` | the node expects exactly the frames of request `n` on stream `2n + 1`; anything else ends the connection |
 | Control frames as a vehicle (CONTINUATION, PRIORITY, a SETTINGS with values, a PUSH_PROMISE, a "PING ACK" whose payload is a HEADERS frame) | only SETTINGS ACK, PING ACK and RST_STREAM on the current stream are allowed, each announced, of fixed length and proven against its own frame header; no WINDOW_UPDATE (its increment was client-chosen, and zero or an overflow makes the provider close) |
+| Claiming the provider refused a request it answered (`disclose_reset`, settled like a 429) | π_WIN over the provider's own ciphertext from no later than the request's first interval record to the refusal; every frame in between is walked, and anything on the stream but a WINDOW_UPDATE (a response head, DATA) refuses the claim; only `REFUSED_STREAM` on the request's own stream or a `NO_ERROR` GOAWAY below it counts (`PROTOCOL-V3.md` §5.4.1; gate cases `h2-r-refusal-*`) |
 | Force-stopping a request (RST_STREAM) and reusing the stored credential for an unbilled one | a record outside an accepted `request` is refused before it is queued; RST_STREAM is accepted only after all of the request's records and queues behind them; after `body_released` an unsettled request is charged its full reservation; a new TCP/TLS connection has no index 62 (`PROTOCOL-V3.md` §5.3.1) |
 | A header block that adds or resizes table entries | refused; the block is public and fixed |
 | A KeyUpdate from the client, to move to keys the proof does not anchor | not allowed; π_WIN is anchored on `SHA256(c_ap_1)` with a public update count |
@@ -786,7 +787,8 @@ abandon fee for an unused session. v3:
 
 | How the connection ends | Deposit | Who bears the cost of the handshake |
 |---|---|---|
-| It settled at least one request (usage, `accept`, or an error head) | released with that settlement; the session fee is charged once, with request 1 | the client, through the session fee, if the node charges one |
+| It settled at least one request (usage, `accept`, an error head, or a disclosed refusal of its stream) | released with that settlement; the session fee is charged once, with request 1 | the client, through the session fee, if the node charges one |
+| The provider refused a request's stream unprocessed (`RST_STREAM(REFUSED_STREAM)`, or GOAWAY with `NO_ERROR` below the stream), before or after `body_released`, and the client disclosed it (`disclose_reset`) | released with that settlement (the request costs the session fee if still due); the connection ends, the client retries elsewhere | the client, through the session fee |
 | Opened and never used: the client left, the idle timeout, `head_written` not reached within 600 s, only refused requests | **charged** (`unused`, `idle`, `setup_timeout`) | the client |
 | A failed handshake or π_NK, a protocol error, the provider closing during the handshake | **charged** (`unused`) | the client |
 | A request was accepted and the connection ended before its `body_released` (a failed π_WIN, the client left) | **charged** (`request_abandoned`); the request's reservation is released in full, so the abandon fee is not taken on top | the client |
