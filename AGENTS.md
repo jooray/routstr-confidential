@@ -185,7 +185,7 @@ checks it byte-exactly; the count key must be the one the route reads
 and clients refuse another); on a 2xx the client sends `accept` after the
 response ended and the node charges `msat_per_image × count` plus the
 session fee if still due (`settle_flat`); an error head works as for chat.
-Live checks: `provider-profile-check.py --images` (I1-I9), `driver.ts
+Live checks: `provider-profile-check.py --images` (I1-I10), `driver.ts
 --image`, the image cases of `v3-check.sh`.
 
 **Protocols v1 and v2 are retired.** v1 (the client ran the TLS handshake
@@ -300,11 +300,13 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   scratch routstrd; curl through the local API (sequential, burst, forced
   "1.1"). Needs the SDK and routstrd checkouts built.
 - `crypto/tools/provider-profile-check.py` (`--offer FILE --key-env VAR
-  --model ID` for another provider): the provider assumptions A1–A13, live
+  --model ID` for another provider): the provider assumptions A1–A14, live
   (A9 = the client's TLS offer, P-256 only; A11 = a KeyUpdate between head
   and body; A12 = the LF-only SSE framing the usage proof parses; A13 = a
-  vision model bills an image as prompt tokens); `--images` I1–I9 (three paid
-  images); **`--h2` H1–H8** (§5.6: what framing "2" needs; idles one
+  vision model bills an image as prompt tokens; A14 = a cap alias such as
+  `max_output_tokens` in the private part does not lift the pinned cap);
+  `--images` I1–I10 (three paid images, up to four more for I10: the other
+  count key, an explicit size, the other format key in the private part); **`--h2` H1–H8** (§5.6: what framing "2" needs; idles one
   connection for `--h2-idle`, default the offer's `h2.idle_secs`, sends one
   body of `--h2-body-bytes`, default 8 MiB, one paid image; ends with
   `offer "2": yes | no, because …`). `--self-test` proves the negative

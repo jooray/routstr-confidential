@@ -3,8 +3,8 @@
 
 Run against the real provider with a real key (costs a fraction of a cent):
 
-    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py            # A1-A13
-    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --images   # I1-I9 (paid)
+    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py            # A1-A14
+    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --images   # I1-I10 (paid)
     VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8
     python3 -I crypto/tools/provider-profile-check.py --self-test   # offline, mocked
 
@@ -79,6 +79,11 @@ Assumptions (paper section 3.1):
       (200, usage event for the pinned model, [DONE], terminal chunk) and then
       closes the connection itself (``Connection: close`` honoured; our side of
       the pipe stays open, so the close is the server's)
+  A14 an output cap the provider recognizes under another name than the
+      offer's cap keys (``max_output_tokens``; any of max_tokens /
+      max_completion_tokens the offer does not pin) in the private part of the
+      body does not lift the pinned cap: the request is refused, or its
+      completion stays within the pinned cap (plus OUTPUT_MARGIN)
   A12 the event stream is framed the way the usage proof parses it: LF-only
       line endings (no CR anywhere in the dechunked body), every event a single
       ``data: `` line of JSON followed by a blank line, and the stream
@@ -723,6 +728,44 @@ def a6_cap_includes_reasoning() -> None:
     )
 
 
+# Output caps some providers recognize besides the ones the offer pins. A raw
+# client may put any of them in the private part of the body, where the suffix
+# cannot replace it (it pins only the offer's own cap keys).
+CAP_ALIASES = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+A14_PINNED_CAP = 8
+A14_ALIAS_CAP = 400
+
+
+def _client_refused(r: Resp) -> bool:
+    """A client-error refusal of the request itself (not auth, payment, rate)."""
+    return 400 <= r.status < 500 and r.status not in (401, 402, 403, 404, 429)
+
+
+def a14_cap_alias_in_private_part() -> None:
+    aliases = [k for k in CAP_ALIASES if k not in _CHAT["cap_keys"]]
+    count = '"messages":[{"role":"user","content":"Count from 1 to 300, one number per line."}]'
+    suffix = "," + ",".join([f'"model":"{CHEAP}"'] + [f'"{k}":{A14_PINNED_CAP}' for k in _CHAT["cap_keys"]]) + "," + STREAM + "}"
+    ok_c, ev_c = control("{" + count + suffix, CHEAP, "A14 control")
+    parts, all_ok = [], ok_c
+    for alias in aliases:
+        r = request("{" + count + f',"{alias}":{A14_ALIAS_CAP}' + suffix, f"A14 {alias}")
+        ct = (usage_of(r.text).get("usage") or {}).get("completion_tokens")
+        if _client_refused(r):
+            ok, what = True, f"refused {r.status} {snip(r.text, 50)}"
+        elif stream_ok(r, CHEAP) and isinstance(ct, int):
+            ok, what = ct <= A14_PINNED_CAP + OUTPUT_MARGIN, f"{r.status}, completion_tokens={ct}"
+        else:
+            ok, what = False, f"{r.status} {snip(r.text, 50)}"
+        all_ok = all_ok and ok
+        parts.append(f"{alias}:{A14_ALIAS_CAP} -> {what}")
+    check(
+        "A14 a recognized cap alias in the private part does not lift the pinned cap",
+        all_ok,
+        f"{ev_c}; pinned {'/'.join(_CHAT['cap_keys'])}={A14_PINNED_CAP} (margin {OUTPUT_MARGIN}); "
+        + ("; ".join(parts) if parts else "no other cap key to try"),
+    )
+
+
 def a7_usage_event() -> None:
     r = request(BASE, "A7")
     evs = events(r.text)
@@ -950,6 +993,7 @@ CHECKS = [
     a4_unknown_rejected,
     a5_malformed_rejected,
     a6_cap_includes_reasoning,
+    a14_cap_alias_in_private_part,
     a7_usage_event,
     a12_sse_framing,
     a8_text_only_rejects_images,
@@ -997,7 +1041,10 @@ def run_all(pause: float = 0.3, quiet: bool = False, checks: list | None = None)
 #   I2 unknown keys rejected                     I7 waits for the full body
 #   I3 unknown model refused, no fallback        I8 TLS 1.3 / suite / P-256 / ALPN
 #   I4 no head reflection (success and error)    I9 KeyUpdate after the head
-#   I5 an open string cannot swallow the suffix
+#   I5 an open string cannot swallow the suffix  I10 aliases in the private part
+#                                                    (the other count key, an explicit
+#                                                    size, the other format key) lose
+#                                                    to the pins or are refused
 # ---------------------------------------------------------------------------
 
 IMAGE_PATH = os.environ.get("CU_IMAGE_PATH") or _route(_IMAGES.get("head_template", "")) or "/api/v1/image/generate"
@@ -1107,8 +1154,125 @@ def i5_image_malformed() -> None:
           f"{r.status} {snip(r.text, 60)}")
 
 
+IMAGE_COUNT_KEY = _IMAGES.get("count_key") or ("variants" if "/image/generate" in IMAGE_PATH else "n")
+IMAGE_SHAPE = _IMAGES.get("response_shape", "venice")
+# Keys a provider may read for the same thing: the count, the size, the format.
+COUNT_KEYS = ("variants", "n")
+FORMAT_KEYS = ("format", "output_format")
+
+
+def _canon(v) -> str:
+    return json.dumps(v, sort_keys=True, separators=(",", ":"))
+
+
+def _image_suffix(pins: list) -> str:
+    """The suffix as the node renders it: model, count 1, the fixed pins, the variant pins."""
+    parts = [f'"model":{_canon(IMAGE_MODEL)}', f'"{IMAGE_COUNT_KEY}":1']
+    parts += [f"{_canon(k)}:{_canon(v)}" for k, v in _IMAGES.get("fixed_pins", [])]
+    parts += [f"{_canon(k)}:{_canon(v)}" for k, v in pins]
+    return "," + ",".join(parts) + "}"
+
+
+def image_info(raw: bytes) -> tuple[str, int, int] | None:
+    """Format and size of a PNG, JPEG or WebP image (None if unrecognized)."""
+    import struct
+    if raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) >= 24:
+        w, h = struct.unpack(">II", raw[16:24])
+        return "png", w, h
+    if raw[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 <= len(raw):
+            if raw[i] != 0xFF:
+                return None
+            m, n = raw[i + 1], struct.unpack(">H", raw[i + 2:i + 4])[0]
+            if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", raw[i + 5:i + 9])
+                return "jpeg", w, h
+            i += 2 + n
+        return None
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP" and len(raw) >= 30:
+        kind = raw[12:16]
+        if kind == b"VP8X":
+            return "webp", 1 + int.from_bytes(raw[24:27], "little"), 1 + int.from_bytes(raw[27:30], "little")
+        if kind == b"VP8 ":
+            w, h = struct.unpack("<HH", raw[26:30])
+            return "webp", w & 0x3FFF, h & 0x3FFF
+        if kind == b"VP8L" and len(raw) >= 25:
+            b = int.from_bytes(raw[21:25], "little")
+            return "webp", 1 + (b & 0x3FFF), 1 + ((b >> 14) & 0x3FFF)
+    return None
+
+
+def _images_of(r: Resp) -> list[bytes]:
+    d = _image_json(r)
+    items = d.get("images") if IMAGE_SHAPE == "venice" else [x.get("b64_json") for x in d.get("data") or [] if isinstance(x, dict)]
+    out = []
+    for b64 in items or []:
+        try:
+            out.append(base64.b64decode(b64 or ""))
+        except (ValueError, TypeError):
+            out.append(b"")
+    return out
+
+
+def _image_alias_plan() -> tuple[list, list]:
+    """The variant pins this check uses and, per alias, (what, private-part JSON, judge).
+
+    The pins take the first allowed value of the offer's size and format keys;
+    each alias names the same thing under a key the suffix does not pin, with
+    another value."""
+    space = _IMAGES.get("param_space") or {}
+    pins = []
+    dim_key = next((k for k in ("resolution", "size") if k in space), None)
+    if dim_key:
+        pins.append((dim_key, space[dim_key][0]))
+    fmt_key = next((k for k in FORMAT_KEYS if k in space), None)
+    if fmt_key:
+        pins.append((fmt_key, space[fmt_key][0]))
+    other_count = next(k for k in COUNT_KEYS if k != IMAGE_COUNT_KEY)
+    # An odd, non-square size that no pinned resolution produces.
+    dims = '"size":"1536x640"' if "width" in space else '"width":1536,"height":640'
+    pinned_fmt = fmt_key and space[fmt_key][0]
+    alias_fmt_key = next(k for k in FORMAT_KEYS if k != (fmt_key or "format"))
+    alias_fmt = "png" if pinned_fmt != "png" else "jpeg"
+    aliases = [
+        ("count", f'"{other_count}":4', lambda imgs, ctl: len(imgs) == 1),
+        ("size", dims, lambda imgs, ctl: len(imgs) == 1 and ctl is not None and image_info(imgs[0]) is not None
+         and image_info(imgs[0])[1:] == ctl[1:]),
+        ("format", f'"{alias_fmt_key}":"{alias_fmt}"', lambda imgs, ctl: len(imgs) == 1 and ctl is not None
+         and image_info(imgs[0]) is not None and image_info(imgs[0])[0] == ctl[0]),
+    ]
+    return pins, aliases
+
+
+def i10_image_aliases_in_private_part() -> None:
+    pins, aliases = _image_alias_plan()
+    suffix = _image_suffix(pins)
+    prompt = '{"prompt":"a small yellow star on a black background"'
+    c = image_request(prompt + suffix, "I10 control")
+    imgs = _images_of(c)
+    ctl = image_info(imgs[0]) if len(imgs) == 1 else None
+    if c.status != 200 or ctl is None:
+        check("I10 image route: recognized aliases in the private part do not override the pins (paid)", False,
+              f"control (pins {pins}) -> {c.status}, {len(imgs)} image(s), {ctl} {snip(c.text, 60)}")
+        return
+    parts, all_ok = [f"control (pins {dict(pins)}) -> {ctl[0]} {ctl[1]}x{ctl[2]}"], True
+    for what, private, judge in aliases:
+        r = image_request(prompt + "," + private + suffix, f"I10 {what}")
+        if _client_refused(r):
+            ok, ev = True, f"refused {r.status}"
+        else:
+            got = _images_of(r)
+            info = [image_info(x) for x in got]
+            ok, ev = r.status == 200 and judge(got, ctl), f"{r.status}, {len(got)} image(s) {info[:4]}"
+        all_ok = all_ok and ok
+        parts.append(f"{what} {{{private}}} -> {ev}")
+    check("I10 image route: recognized aliases in the private part do not override the pins (paid)", all_ok, "; ".join(parts))
+
+
 IMAGE_CHECKS = [i8_image_tls_p256, i2_image_unknown_rejected, i3_image_unknown_model, i5_image_malformed,
-                i1_image_last_wins, i7_image_waits_for_body, i9_image_keyupdate_mid_body]
+                i1_image_last_wins, i7_image_waits_for_body, i9_image_keyupdate_mid_body,
+                i10_image_aliases_in_private_part]
 
 
 # ---------------------------------------------------------------------------
@@ -1527,8 +1691,13 @@ class MockProvider:
                  hs_refuse: bool = False, timeout: bool = False, early: bool = False,
                  no_close: bool = False, no_ku: bool = False, crlf: bool = False,
                  pretty: bool = False, image_free: bool = False, image_fee: bool = False,
-                 h2_alpn: bool = True, open_auth: bool = False, reflect_body: bool = False, h2: dict | None = None) -> None:
+                 h2_alpn: bool = True, open_auth: bool = False, reflect_body: bool = False, h2: dict | None = None,
+                 alias_cap: bool = False, image_alias: bool = False, image_lenient: bool = False) -> None:
         self.h2_alpn, self.open_auth, self.reflect_body, self.h2_faults = h2_alpn, open_auth, reflect_body, h2 or {}
+        # alias_cap: max_output_tokens accepted and obeyed over the pinned caps;
+        # image_alias: the other count key, width/height and output_format
+        # accepted and obeyed over the pins; image_lenient: accepted, ignored.
+        self.alias_cap, self.image_alias, self.image_lenient = alias_cap, image_alias, image_lenient
         self.status, self.lenient, self.cipher = status, lenient, cipher
         self.hs_refuse, self.timeout, self.early = hs_refuse, timeout, early
         self.no_close, self.no_ku = no_close, no_ku
@@ -1544,7 +1713,7 @@ class MockProvider:
             d = json.loads(body)  # duplicate keys: last wins, objects replaced
         except json.JSONDecodeError:
             return Resp(400, '{"error":"Invalid JSON request"}')
-        extra = set(d) - self.ALLOWED
+        extra = set(d) - self.ALLOWED - ({"max_output_tokens"} if self.alias_cap else set())
         if extra and not self.lenient:
             return Resp(400, '{"error":"Invalid request parameters","details":{"_errors":["Unrecognized key(s) in object: '
                         + ", ".join(f"'{k}'" for k in sorted(extra)) + '"]}}')
@@ -1557,6 +1726,8 @@ class MockProvider:
             return Resp(400, '{"error":"Invalid request parameters","details":{"messages":{"_errors":["Image content is not supported by this model."]}}}')
         cap = min(d.get("max_completion_tokens") or 10**6, d.get("max_tokens") or 10**6)
         ct = min(cap, 10)
+        if self.alias_cap and "max_output_tokens" in d:
+            ct = d["max_output_tokens"]
         u = {"model": d["model"], "choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": ct}}
         if isinstance(content, list) and any(p.get("type") == "image_url" for p in content):
             u["usage"]["prompt_tokens"] += 0 if self.image_free else 80
@@ -1568,7 +1739,44 @@ class MockProvider:
             text = text.replace("\n", "\r\n")
         return Resp(200, text, {"x-venice-version": "mock"})
 
-    def http(self, body: str) -> Resp:
+    IMAGE_ALLOWED = {"prompt", "model", "variants", "return_binary", "enhance_prompt", "enable_web_search",
+                     "style_references", "resolution", "quality", "format"}
+
+    @staticmethod
+    def _fake_image(fmt: str, w: int, h: int) -> bytes:
+        """The header of an image of that format and size (all ``image_info`` reads)."""
+        if fmt == "png":
+            return b"\x89PNG\r\n\x1a\n" + b"\0\0\0\x0dIHDR" + w.to_bytes(4, "big") + h.to_bytes(4, "big") + b"\x08\x02\0\0\0"
+        if fmt == "jpeg":
+            return b"\xff\xd8\xff\xc0\x00\x11\x08" + h.to_bytes(2, "big") + w.to_bytes(2, "big") + b"\x03" + b"\0" * 9
+        return b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0" + (w - 1).to_bytes(3, "little") + (h - 1).to_bytes(3, "little")
+
+    def _image(self, body: str) -> Resp:
+        if self.timeout:
+            raise TransportError("timeout")
+        if self.status is not None:
+            return Resp(self.status, '{"error":"mock"}')
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            return Resp(400, '{"error":"Invalid JSON request"}')
+        extra = set(d) - self.IMAGE_ALLOWED - {IMAGE_COUNT_KEY}
+        if extra and not (self.image_alias or self.image_lenient):
+            return Resp(400, '{"error":"Unrecognized key(s) in object: ' + ", ".join(f"'{k}'" for k in sorted(extra)) + '"}')
+        count = d.get(IMAGE_COUNT_KEY, 1)
+        side = {"1K": 1024, "2K": 2048, "4K": 4096}.get(d.get("resolution"), 1024)
+        w, h, fmt = side, side, d.get("format", "webp")
+        if self.image_alias:
+            count = next((d[k] for k in COUNT_KEYS if k != IMAGE_COUNT_KEY and k in d), count)
+            w, h = d.get("width", w), d.get("height", h)
+            fmt = d.get("output_format", fmt)
+        imgs = [base64.b64encode(self._fake_image(fmt, w, h)).decode() for _ in range(count)]
+        out = {"images": imgs} if IMAGE_SHAPE == "venice" else {"data": [{"b64_json": x} for x in imgs]}
+        return Resp(200, json.dumps(out), {"content-type": "application/json"})
+
+    def http(self, body: str, path: str = "") -> Resp:
+        if path and path == IMAGE_PATH:
+            return self._image(body)
         return self._answer(body)
 
     def h2_app(self, path: str, body: str, authorized: bool) -> tuple[int, str, str]:
@@ -1646,7 +1854,7 @@ def self_test() -> int:
     def verdicts() -> dict:
         return {name.split()[0]: v for name, v, _ in RESULTS}
 
-    rejection = ["A2", "A3", "A4", "A5", "A8", "A10"]
+    rejection = ["A2", "A3", "A4", "A5", "A8", "A10", "A14"]
     scenarios = [
         ("healthy provider passes", MockProvider(),
          lambda v, rc: rc == 0 and all(x == "PASS" for x in v.values())),
@@ -1678,6 +1886,24 @@ def self_test() -> int:
          lambda v, rc: rc == 1 and v.get("A13") == "FAIL"),
         ("image billed outside the token counts fails A13", MockProvider(image_fee=True),
          lambda v, rc: rc == 1 and v.get("A13") == "FAIL"),
+        ("a cap alias (max_output_tokens) obeyed over the pinned cap fails A14", MockProvider(alias_cap=True),
+         lambda v, rc: rc == 1 and v.get("A14") == "FAIL" and v.get("A4") == "PASS"),
+    ]
+    # The image route (--images): I10 alone, offline; the other image checks
+    # read the provider's own echo and run live only.
+    image_scenarios = [
+        ("images: aliases refused passes I10", MockProvider(),
+         lambda v, rc: rc == 0 and v.get("I10") == "PASS"),
+        ("images: aliases accepted and ignored passes I10", MockProvider(image_lenient=True),
+         lambda v, rc: rc == 0 and v.get("I10") == "PASS"),
+        ("images: aliases obeyed over the pins fail I10", MockProvider(image_alias=True),
+         lambda v, rc: rc == 1 and v.get("I10") == "FAIL"),
+        ("images: outage (503) is inconclusive", MockProvider(status=503),
+         lambda v, rc: rc == 2 and v.get("I10") == "INCONCLUSIVE"),
+        ("images: bad key (401) fails the control", MockProvider(status=401),
+         lambda v, rc: rc == 1 and v.get("I10") == "FAIL"),
+        ("images: timeouts are inconclusive", MockProvider(timeout=True),
+         lambda v, rc: rc == 2 and v.get("I10") == "INCONCLUSIVE"),
     ]
     # Framing "2" (--h2): the same rules. A healthy provider passes H1-H8; each
     # fault fails its item; an outage or a timeout is never PASS.
@@ -1745,9 +1971,17 @@ def self_test() -> int:
             bad += not ok
             summary = " ".join(f"{k}={x[0]}" for k, x in v.items())
             print(f"{'ok  ' if ok else 'BAD '} {label}: exit={rc} [{summary}]")
+        for label, mock, pred in image_scenarios:
+            TRANSPORT.update(http=mock.http, partial=mock.partial, s_client=mock.s_client)
+            rc = run_all(pause=0.0, quiet=True, checks=[i10_image_aliases_in_private_part])
+            v = verdicts()
+            ok = pred(v, rc)
+            bad += not ok
+            summary = " ".join(f"{k}={x[0]}" for k, x in v.items())
+            print(f"{'ok  ' if ok else 'BAD '} {label}: exit={rc} [{summary}]")
     finally:
         TRANSPORT.update(saved)
-    total = len(scenarios) + len(h2_scenarios)
+    total = len(scenarios) + len(h2_scenarios) + len(image_scenarios)
     print(f"self-test: {total - bad}/{total} scenarios behave as required")
     return 1 if bad else 0
 
@@ -1773,7 +2007,7 @@ def main() -> int:
               f"body {H2_BODY_BYTES} bytes, images {'yes: one paid image of ' + IMAGE_MODEL if H2_IMAGES and not NO_H2_IMAGES else 'no'}")
         return run_h2()
     if "--images" in sys.argv[1:]:
-        print(f"  image route: {IMAGE_PATH} model={IMAGE_MODEL} (three paid images)")
+        print(f"  image route: {IMAGE_PATH} model={IMAGE_MODEL} (three paid images, and up to four for I10)")
         return run_all(checks=IMAGE_CHECKS)
     return run_all()
 
