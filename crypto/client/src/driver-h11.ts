@@ -26,6 +26,7 @@ export class H11 {
   readonly b: ReqBody
   ok: any
   refused: { status: number; reason: string } | undefined
+  reserved: number | undefined
   proofs: any[] = []
 
   constructor(s: any, ctx: Ctx, g: number) {
@@ -42,11 +43,12 @@ export class H11 {
   /** `request` 1 and its answer, before the ClientHello (§12.4). */
   async open(): Promise<void> {
     const { s, ctx, b } = this
-    const { ok, refused } = await openRequest(s, ctx, 1, b, b.body.length, ctx.refuseFirst && this.g === 1, (o) => s.sendText(o), (t, ms) => s.waitT(t, ms))
+    const { ok, refused, reserved } = await openRequest(s, ctx, 1, b, b.body.length, ctx.refuseFirst && this.g === 1, (o) => s.sendText(o), (t, ms) => s.waitT(t, ms))
     if (!this.adv && ok.suffix !== b.canonicalSuffix) throw new Error('node expects a different pinned suffix than ours')
     if (!Number.isSafeInteger(ok.head_len) || ok.head_len <= 0) throw new Error('request_ok names no head length')
     this.ok = ok
     this.refused = refused
+    this.reserved = reserved
   }
 
   /** After π_NK: the head, the body, π_WIN, the response and the settlement. */
@@ -165,7 +167,7 @@ export class H11 {
     } else {
       throw new Error(`status ${status} is neither a success nor a disclosable error`)
     }
-    ctx.checkReceipt?.(receipt, { n: 1, http: '1.1', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce })
+    ctx.checkReceipt?.(receipt, { n: 1, http: '1.1', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce, reserved: this.reserved })
     noteDepositRelease(s, ctx, receipt, 1)
     const tEnd = Date.now()
     // The connection's orderly end: `done` after a settled 2xx, `error_settled` after an error head.

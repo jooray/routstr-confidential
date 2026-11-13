@@ -56,7 +56,7 @@
 // was not refused, 6 node_protocol_outdated, 7 upgrade_required (the peer refused our protocol version).
 
 import { randomUUID, createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { argv } from 'node:process'
 import { fileURLToPath } from 'node:url'
@@ -77,8 +77,9 @@ import { RequestRefused, advOutcome, type Ctx, type Framing, type ImageTerms, ty
 import { H11 } from './driver-h11.ts'
 import { H2Conn, runHttp2 } from './driver-h2.ts'
 import { MAX_DATA_IN_RECORD, chatPath, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
-import { chatBlockProblem, checkImagesBlock, maxUsageCharge, padBody, pinnedModel, renderChatSuffix, renderImagesSuffix, upstreamModelsProblem } from './offer.ts'
+import { chatBlockProblem, checkImagesBlock, padBody, pinnedModel, renderChatSuffix, renderImagesSuffix, upstreamModelsProblem } from './offer.ts'
 import { checkHeadTemplate, checkPiNKParams, type ServerPostRecord } from './params.ts'
+import { makeReceiptChecker } from './receipt-check.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
 import { errText, shown, termSafe } from './term.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
@@ -98,7 +99,10 @@ const TWOPC = 'split-public-1'
 export const SID_RE = /^[0-9a-f]{64}$/
 
 /** Evidence files hold plaintext (prompt, response, receipt): owner-only. */
-const writePrivate = (path: string, data: string | Uint8Array) => writeFileSync(path, data, { mode: 0o600 })
+// Evidence is never overwritten: each file is created once (`wx`), readable by this user only.
+const writePrivate = (path: string, data: string | Uint8Array) => writeFileSync(path, data, { mode: 0o600, flag: 'wx' })
+/** The files a local sidecar writes into the same run directory (`crypto/runs/<sid>` by default). */
+const SIDECAR_RUN_FILES = new Set(['sidecar.jsonl', 'attestation.json', 'receipt.json'])
 
 function arg(name: string, dflt?: string): string | undefined {
   const i = argv.indexOf(name)
@@ -711,6 +715,11 @@ class Session {
     }
     this.runDir = `${RUNS}/${this.sid}`
     mkdirSync(this.runDir, { recursive: true, mode: 0o700 })
+    // A sid seen before (a node repeating an old one) would mix this
+    // connection's evidence with an earlier one's: refused. The directory
+    // itself may exist, holding a local sidecar's own files.
+    const earlier = readdirSync(this.runDir).filter((f) => !SIDECAR_RUN_FILES.has(f))
+    if (earlier.length > 0) throw new Error(`the run directory of sid ${this.sid} already holds a client's evidence (${shown(earlier.slice(0, 3).join(', '))}): a repeated sid`)
   }
 
   /** 2PC preprocessing, the joint key share and the proof channel: an armed connection stops here. */
@@ -929,60 +938,9 @@ function countKeyUpdates(content: Uint8Array): number {
   return n
 }
 
-/**
- * Node mode: a request's signed receipt against the signed offer. A receipt
- * never names larger fees than the offer; the session fee is charged with the
- * connection's first settlement only; the charge is at most what the usage at
- * the signed rates (or the error status) allows, and exactly the flat price
- * for accepted images.
- */
+/** Node mode: a request's signed receipt (`receipt-check.ts`) against the signed offer as fetched. */
 function checkReceipt(label: string): NonNullable<Ctx['checkReceipt']> {
-  return (receipt, q) => {
-    const feeDue = q.first ? SESSION_FEE : 0
-    // A chat receipt names the public id (`model`) and, where it differs, the
-    // provider's id the suffix pinned (`upstream_model`).
-    if (!q.image && q.model !== undefined && (receipt.upstream_model ?? receipt.model) !== pinnedModel(OFFER, q.model)) {
-      throw new Error(`receipt ${q.n} names the pinned model ${shown(receipt.upstream_model ?? receipt.model)}, not ${pinnedModel(OFFER, q.model)}`)
-    }
-    if ((receipt.session_fee_msat ?? 0) > feeDue || (receipt.abandon_fee_msat ?? 0) > ABANDON_FEE) {
-      throw new Error(`receipt ${q.n} names larger fees than the signed offer allows for this request`)
-    }
-    const cost = receipt.cost_msats
-    let bound: number
-    if (q.status >= 400 && !(q.image && receipt.usage?.flat === true)) {
-      // 429/503 and 401/402/403 (the provider's capacity, the node's own key
-      // or account): the session fee if still due; any other 4xx: the abandon
-      // fee; other 5xx: at most the reservation.
-      if ([401, 402, 403, 429, 503].includes(q.status)) bound = feeDue
-      else if (q.status < 500) bound = Math.max(feeDue, ABANDON_FEE)
-      else bound = Math.max(feeDue, typeof receipt.reserved_msats === 'number' ? receipt.reserved_msats : 0)
-      if (q.image && !(receipt.kind === 'images' && receipt.model === q.model && receipt.variant === q.image.variant && receipt.count === q.image.count)) {
-        throw new Error(`error receipt ${q.n} does not carry the image request's terms`)
-      }
-    } else if (q.image) {
-      const want = q.image.msatPerImage * q.image.count + feeDue
-      const ok =
-        receipt.kind === 'images' && receipt.usage?.flat === true && receipt.model === q.model && receipt.variant === q.image.variant &&
-        receipt.count === q.image.count && receipt.msat_per_image === q.image.msatPerImage && receipt.cost_msats === want
-      console.log(
-        `[client ${label}] receipt ${q.n}: images variant=${shown(receipt.variant)} count=${shown(receipt.count)} cost_msats=${shown(cost)} ` +
-          `reserved_msats=${shown(receipt.reserved_msats)} balance_msats=${shown(receipt.balance_msats)} want_msats=${want} cost_ok=${ok}`,
-      )
-      if (!ok) throw new Error(`image receipt ${q.n} is not ${q.image.count} × ${shown(q.image.variant)} at ${q.image.msatPerImage} msat + fee (${want} msat)`)
-      return
-    } else {
-      // At most the usage at the signed rates (the node may charge less, for cached input) plus the fee.
-      const rates = OFFER?.price_list?.[q.model]
-      if (!rates) throw new Error(`the signed offer does not price ${shown(q.model)}`)
-      bound = maxUsageCharge(rates, q.usage ?? {}) + feeDue
-    }
-    const costOk = Number.isSafeInteger(cost) && cost >= 0 && cost <= bound
-    console.log(
-      `[client ${label}] receipt ${q.n}: http=${q.http} status=${q.status} cost_msats=${shown(cost)} reserved_msats=${shown(receipt.reserved_msats)} ` +
-        `balance_msats=${shown(receipt.balance_msats)} session_fee_msat=${shown(receipt.session_fee_msat ?? 0)} bound_msats=${bound} cost_ok=${costOk}`,
-    )
-    if (!costOk) throw new Error(`receipt ${q.n} charges ${shown(cost)} msats, more than the ${bound} its ${q.status >= 400 ? 'error status' : 'usage at the signed rates'} allows`)
-  }
+  return makeReceiptChecker(label, () => ({ offer: OFFER, sessionFee: SESSION_FEE, abandonFee: ABANDON_FEE }))
 }
 
 // ---------------------------------------------------------------------------

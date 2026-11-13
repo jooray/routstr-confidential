@@ -4,6 +4,7 @@
 
 import { hex, sha256 } from './advice.ts'
 import type { H2OfferBlock } from './h2.ts'
+import { announcedReserve, type ReceiptQuery } from './receipt-check.ts'
 
 export type Framing = '2' | '1.1'
 
@@ -42,7 +43,7 @@ export interface Ctx {
   /** Node mode: fields every `request` carries (credential, offer signature, fee echoes). */
   requestExtras: Record<string, unknown>
   /** Node mode: check a request's signed receipt (the charge against our own usage or the error status); throws. */
-  checkReceipt?: (receipt: any, q: { n: number; http: Framing; model: string; status: number; usage: any; image?: ImageTerms; first: boolean }) => void
+  checkReceipt?: (receipt: any, q: ReceiptQuery) => void
   /** Requests asked for (`--requests`). */
   requests: number
   pauseMs: number
@@ -118,7 +119,7 @@ export async function openRequest(
   refuseFirst: boolean,
   send: (o: unknown) => void,
   wait: (types: string[], ms: number) => Promise<any>,
-): Promise<{ ok: any; refused?: { status: number; reason: string } }> {
+): Promise<{ ok: any; refused?: { status: number; reason: string }; reserved?: number }> {
   let refused: { status: number; reason: string } | undefined
   if (refuseFirst) {
     send(requestMessage(ctx, n, b, bodyLen, true))
@@ -139,7 +140,11 @@ export async function openRequest(
   }
   if (m.n !== n || (m.sid !== undefined && m.sid !== s.sid)) throw new Error('request_ok names another connection or request')
   if (typeof m.suffix !== 'string') throw new Error('request_ok names no pinned suffix')
-  return { ok: m, refused }
+  // A node announces what it reserved for the request (§12.4): the bound of
+  // a charge of the reservation (a 5xx), checked against the receipt.
+  const reserved = announcedReserve(m)
+  if (ctx.nodeMode) console.log(`[client ${s.label}] request ${n} accepted: announced reserved_msats=${reserved ?? 'none'}`)
+  return { ok: m, refused, reserved }
 }
 
 /**

@@ -438,7 +438,7 @@ export class H2Conn {
     }
     // `request`, then its answer; only then the records (§12.4). A refused
     // request leaves the connection READY and its number unused.
-    const { ok, refused } = await openRequest(s, ctx, n, b, bodyLen, ctx.refuseFirst && n === 1, (o) => this.sendOrdered(o), (t, ms) => this.wait(t, ms))
+    const { ok, refused, reserved } = await openRequest(s, ctx, n, b, bodyLen, ctx.refuseFirst && n === 1, (o) => this.sendOrdered(o), (t, ms) => this.wait(t, ms))
     if (ok.stream !== stream) throw new Error('request_ok names another stream')
     if (!adv && ok.suffix !== b.canonicalSuffix) throw new Error('node expects a different pinned suffix than ours')
     // Any SETTINGS acknowledgement and the records go as one π_WIN batch.
@@ -504,7 +504,7 @@ export class H2Conn {
     } else {
       throw new Error(`request ${n}: status ${status} is neither a success nor a disclosable error`)
     }
-    ctx.checkReceipt?.(receipt, { n, http: '2', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce })
+    ctx.checkReceipt?.(receipt, { n, http: '2', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce, reserved })
     const tEnd = Date.now()
     noteDepositRelease(s, ctx, receipt, n)
 

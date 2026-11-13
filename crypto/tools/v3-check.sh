@@ -156,7 +156,7 @@ case "$HTTP_LIST" in 2,1.1|1.1) ;; *) echo "CU_HTTP must be 2,1.1 or 1.1" >&2; e
 (cd "$CRYPTO/client" && node --experimental-strip-types src/h2-selfcheck.ts && node --experimental-strip-types src/h2-conn-test.ts \
   && node --experimental-strip-types src/fork-selfcheck.ts > /dev/null \
   && node --experimental-strip-types test/tls-fork-records-check.ts > /dev/null \
-  && node --experimental-strip-types test/offer-check.ts > /dev/null) || { echo "offline self-checks failed" >&2; exit 1; }
+  && node --experimental-strip-types test/offer-check.ts > /dev/null && node --experimental-strip-types test/receipt-check.ts > /dev/null) || { echo "offline self-checks failed" >&2; exit 1; }
 
 SUMMARY="$OUT/summary.tsv"
 printf 'case\texpected\tverdict\tevidence\n' > "$SUMMARY"
