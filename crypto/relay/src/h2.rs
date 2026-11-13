@@ -86,6 +86,10 @@ fn default_max_lifetime() -> u64 {
 /// The longest `max_lifetime_s` an offer may name.
 pub const MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(86400);
 
+/// RFC 9113 §6.5.2: the initial `SETTINGS_HEADER_TABLE_SIZE`. A provider
+/// that announces less needs a table size update the request block cannot carry.
+pub const DEFAULT_HEADER_TABLE_SIZE: u64 = 4096;
+
 /// The size of the credential's entry in the provider's HPACK table
 /// (RFC 7541 §4.1): name `authorization`, value `Bearer <key>`, 32 overhead.
 pub fn credential_entry_size(key_len: usize) -> u64 {

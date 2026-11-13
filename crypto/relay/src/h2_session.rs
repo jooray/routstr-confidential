@@ -421,19 +421,23 @@ pub(crate) fn on_request(
 }
 
 /// `settings_seen`: the provider's `SETTINGS_HEADER_TABLE_SIZE` as the
-/// client read it (`None`: not sent, the default 4096). Below the size of the
-/// credential's entry the provider no longer holds it: the connection ends
-/// (`PROTOCOL-V3.md` §5.6, H3 at run time). The value is the client's claim;
-/// a lying client only harms its own next request.
+/// client read it (`None`: not sent, the default 4096). Any value below 4096
+/// ends the connection (`PROTOCOL-V3.md` §5.6, H3 at run time): below the
+/// size of the credential's entry the provider no longer holds it, and any
+/// smaller table than the default needs a dynamic table size update at the
+/// start of the next header block once the client acknowledged the SETTINGS
+/// (RFC 7541 §4.2), which the pinned request block cannot carry (nghttp2 then
+/// ends the connection with COMPRESSION_ERROR). The value is the client's
+/// claim; a lying client only harms its own next request.
 pub(crate) fn on_settings_seen(app: &Arc<AppState>, st: &mut Session, header_table_size: Option<u64>) -> Result<()> {
     if st.state != SessionState::Body {
         bail!("settings_seen before the connection head was written");
     }
-    let need = h2::credential_entry_size(app.key.len());
+    let need = h2::credential_entry_size(app.key.len()).max(h2::DEFAULT_HEADER_TABLE_SIZE);
     if let Some(size) = header_table_size.filter(|s| *s < need) {
-        warn!(size, need, "the provider's HEADER_TABLE_SIZE (as the client reports it) is below the credential entry: framing \"2\" does not work with it");
+        warn!(size, need, "the provider's HEADER_TABLE_SIZE (as the client reports it) is below the default 4096: the pinned request block cannot carry the table size update, framing \"2\" does not work with it");
         st.code = Some("h2_table_size");
-        bail!("the provider's HEADER_TABLE_SIZE {size} is below the credential entry's {need} bytes");
+        bail!("the provider's HEADER_TABLE_SIZE {size} is below {need} bytes (the default; the request block cannot carry a table size update)");
     }
     let h = st.h2.as_mut().ok_or_else(|| anyhow!("settings_seen on a connection that is not framing 2"))?;
     h.settings_seen = true;
@@ -1278,6 +1282,29 @@ mod tests {
         assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().upto, 2);
         assert!(on_release(&mut st, 2, 1).is_err());
         assert!(on_release(&mut st, 1, 1 << 20).is_err());
+    }
+
+    #[test]
+    fn a_header_table_size_below_the_default_ends_the_connection() {
+        // nghttp2 (Node's http2 server) answers the first request after a
+        // SETTINGS_HEADER_TABLE_SIZE of 1024 or 4095 with GOAWAY
+        // COMPRESSION_ERROR: it expects a table size update the pinned
+        // request block cannot carry. 4096 and above, or none, are fine.
+        let app = app_state(false);
+        assert!(h2::credential_entry_size(app.key.len()) < 1024);
+        for size in [0, 1023, 1024, 4095] {
+            let mut st = session_with_request(10, "s");
+            st.h2.as_mut().unwrap().settings_seen = false;
+            assert!(on_settings_seen(&app, &mut st, Some(size)).is_err(), "{size}");
+            assert_eq!(st.code, Some("h2_table_size"), "{size}");
+            assert!(!st.h2.as_ref().unwrap().settings_seen);
+        }
+        for size in [None, Some(4096), Some(65536)] {
+            let mut st = session_with_request(10, "s");
+            st.h2.as_mut().unwrap().settings_seen = false;
+            on_settings_seen(&app, &mut st, size).unwrap();
+            assert!(st.h2.as_ref().unwrap().settings_seen && st.code.is_none(), "{size:?}");
+        }
     }
 
     // --- disclosures, proofs and the write gate, against a loopback "upstream" ---

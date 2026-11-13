@@ -99,9 +99,10 @@ Framing "2" (``--h2``, PROTOCOL-V3.md section 5.6):
       (the connection head) is accepted: the next request is answered.
       Control: the same connection without the KeyUpdate
   H3  the provider keeps the request dynamic table: its SETTINGS leave
-      HEADER_TABLE_SIZE at the default or at least at the size of the
-      credential entry, and a request that names the credential by index
-      (``be``) is authenticated
+      HEADER_TABLE_SIZE at the default 4096 or above (a smaller table needs
+      a table size update the pinned request block cannot carry; nghttp2
+      answers with COMPRESSION_ERROR), and a request that names the
+      credential by index (``be``) is authenticated
   H4  HEADER_TABLE_SIZE = 0 is honoured for response headers: every response
       header block decodes with an empty dynamic table
   H5  a request naming ``authorization`` by index only is authenticated right
@@ -1345,9 +1346,11 @@ def run_h2() -> int:
         # H3: the table size the provider announced, and the index worked.
         hts = a.header_table_size
         sizes = [s[h2.S_HEADER_TABLE_SIZE] for c in conns for s in c.peer_settings if h2.S_HEADER_TABLE_SIZE in s]
-        size_ok = all(v >= entry for v in sizes)
+        # Below the default the decoder expects a table size update the pinned
+        # request block cannot carry (RFC 7541 §4.2; the sidecar refuses it).
+        size_ok = all(v >= max(entry, 4096) for v in sizes)
         put("H3", "PASS" if size_ok and r1.status == 200 else "FAIL",
-            f"SETTINGS HEADER_TABLE_SIZE={'default 4096' if hts is None else hts} (credential entry {entry} bytes, "
+            f"SETTINGS HEADER_TABLE_SIZE={'default 4096' if hts is None else hts} (needs >= 4096; credential entry {entry} bytes, "
             f"{len(a.peer_settings)} SETTINGS frame(s)); request naming index 62 -> {r1.status}")
         # H5, first half and its control.
         r_no = h2_request(a, PATH, h2_body(), "chat without authorization", by_index=False)
@@ -1694,6 +1697,8 @@ def self_test() -> int:
         ("h2: SETTINGS HEADER_TABLE_SIZE 0 fails H3", MockProvider(h2={"table_size": 0}),
          lambda v, rc: rc == 1 and v.get("H3") == "FAIL" and v.get("H5") != "PASS"),
         ("h2: a table too small for the credential fails H3", MockProvider(h2={"table_size": 40}),
+         lambda v, rc: rc == 1 and v.get("H3") == "FAIL"),
+        ("h2: a table below the default 4096 fails H3", MockProvider(h2={"table_size": 1024}),
          lambda v, rc: rc == 1 and v.get("H3") == "FAIL"),
         ("h2: response headers through the dynamic table fail H4", MockProvider(h2={"dynamic_responses": True}),
          lambda v, rc: rc == 1 and v.get("H4") == "FAIL"),
