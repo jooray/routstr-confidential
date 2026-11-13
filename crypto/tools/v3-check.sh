@@ -64,6 +64,12 @@
 #   h2-e-path-long        the same with a longer path (refused on the record length)
 #   h2-d-replay-usage     request 1's usage tail presented as request 2's disclosure
 #                         (the request is honest; its settlement must be refused)
+#   h2-r-refusal-fake     a provider refusal (`disclose_reset`) claimed for an answered
+#                         request: a RST_STREAM(REFUSED_STREAM) it never sent (π_WIN fails)
+#   h2-r-refusal-after-head  … its true bytes up to the response head, then a reset (the
+#                         walk meets the response on the stream)
+#   h2-r-refusal-probe    … a reset of the probe stream (no refusal of the request's stream)
+#   h2-r-refusal-later    … from a record after the start of the interval
 #   h2-f-image-suffix     an image body whose suffix orders one image more
 #   h2-g-early-record     a record with no request open
 #   h2-h-no-proof         the records are never proven: held, the provider answers nothing
@@ -246,6 +252,10 @@ run_case h2-c-cap-swap       "refused:2:1:pi_win failed" 0 none -- --http 2 --ad
 run_case h2-e-path           "refused:2:2:pi_win failed" 0 none -- --http 2 --requests 2 --adv path --adv-at 2
 run_case h2-e-path-long      "refused:2:1:not its HEADERS frame" 0 none -- --http 2 --adv path --adv-h2-path /api/v1/api_keys/rate_limits
 run_case h2-d-replay-usage   "replay:2:interval" 0 none -- --http 2 --requests 2 --adv replay-usage
+run_case h2-r-refusal-fake       "forged:1:pi_win failed" 0 none -- --http 2 --adv refusal-fake
+run_case h2-r-refusal-after-head "forged:1:before the refusal" 0 none -- --http 2 --adv refusal-after-head
+run_case h2-r-refusal-probe      "forged:1:no refusal of the request" 0 none -- --http 2 --adv refusal-probe
+run_case h2-r-refusal-later      "forged:1:interval" 0 none -- --http 2 --adv refusal-later
 run_case h2-f-image-suffix   "refused:2:1:pi_win failed" 0 none -- --http 2 --image --image-model "$IMAGE_MODEL" --prompt "$RED" --adv suffix
 run_case h2-g-early-record   "refused:2:0:." 0 none -- --http 2 --adv early-record
 run_case h2-h-no-proof       "withheld:2:1" 0 none -- --http 2 --adv no-proof

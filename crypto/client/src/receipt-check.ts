@@ -24,6 +24,8 @@ export interface ReceiptQuery {
   first: boolean
   /** `request_ok.reserved_msats`: what the node reserved for the request, if it said. */
   reserved?: number
+  /** A provider refusal we disclosed (`disclose_reset`): `rst_stream` or `goaway`. */
+  refusal?: string
 }
 
 /** `request_ok.reserved_msats`: absent, or a non-negative safe integer (anything else is refused). */
@@ -60,7 +62,14 @@ export function makeReceiptChecker(label: string, terms: () => ReceiptTerms): (r
     }
     const cost = receipt.cost_msats
     let bound: number
-    if (q.status >= 400 && !(q.image && receipt.usage?.flat === true)) {
+    if (q.refusal !== undefined) {
+      // A stream the provider refused without processing it (§12.10): like a
+      // 429, the session fee if still due, nothing else.
+      if (receipt.usage?.refused !== q.refusal) {
+        throw new Error(`refusal receipt ${q.n} names ${shown(receipt.usage?.refused)}, not the ${q.refusal} we disclosed`)
+      }
+      bound = feeDue
+    } else if (q.status >= 400 && !(q.image && receipt.usage?.flat === true)) {
       // 429/503 and 401/402/403 (the provider's capacity, the node's own key
       // or account): the session fee if still due; any other 4xx: the abandon
       // fee; other 5xx: at most the reservation the node announced.

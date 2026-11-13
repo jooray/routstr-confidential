@@ -48,6 +48,10 @@
 //         PING ACK that carries a HEADERS frame);
 //         framing "1.1": extra-record (after body_released, one more record carrying a second HTTP
 //         request); a second request inside the body is --private-extra with raw CRLF text
+//       forged refusals (framing "2", `disclose_reset` for a request the provider answered):
+//         refusal-fake (a RST_STREAM(REFUSED_STREAM) it never sent: π_WIN fails), refusal-after-head
+//         (its true bytes up to the response head, then a reset), refusal-probe (a reset of the probe
+//         stream), refusal-later (from a record after the start of the interval)
 //     --adv-accept-any (accept an image response whatever its status), --decoy-model M (neutralised)
 //
 // Output: `E2E_JSON {…}` (every request with its bytes each way and times), one `BENCH {…}` line per
@@ -187,6 +191,8 @@ const ADV_MODES: Record<string, Framing[]> = {
   'hidden-headers': ['2'], path: ['2'], 'replay-usage': ['2'], 'not-alone': ['1.1'],
   // A cancelled request whose credential reference a later one reuses, unbilled:
   'rst-reuse': ['2'], 'rst-reuse-same': ['2'], 'rst-before-final': ['2'], 'rst-after-release': ['2'], 'ctl-headers': ['2'],
+  // A refusal (`disclose_reset`) claimed for a request the provider answered:
+  'refusal-fake': ['2'], 'refusal-after-head': ['2'], 'refusal-probe': ['2'], 'refusal-later': ['2'],
   'extra-record': ['1.1'],
 }
 if (ADV_MODE !== undefined && !ADV_MODES[ADV_MODE]) usage(`--adv ${ADV_MODE}: one of ${Object.keys(ADV_MODES).join(', ')}`)

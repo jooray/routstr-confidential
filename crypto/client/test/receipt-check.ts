@@ -47,6 +47,14 @@ try {
   check(ir({ cost_msats: 1500, reserved_msats: 1500 }), q({ image, reserved: 1500 }))
   assert.throws(() => check(ir({ cost_msats: 1501, reserved_msats: 1500 }), q({ image, reserved: 1500 })), /more than the 1500/)
   assert.throws(() => check(ir({ cost_msats: 1, reserved_msats: 1500, count: 1 }), q({ image, reserved: 1500 })), /image request's terms/)
+  // A disclosed refusal (`disclose_reset`): the session fee if still due, nothing else.
+  const refused = { refused: 'rst_stream', error_code: 7, choices: [] }
+  check(r({ cost_msats: 100, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000 }))
+  check(r({ cost_msats: 0, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000, first: false }))
+  assert.throws(() => check(r({ cost_msats: 101, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000 })), /more than the 100/)
+  assert.throws(() => check(r({ cost_msats: 1, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000, first: false })), /more than the 0/)
+  assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'goaway', reserved: 5000 })), /not the goaway/)
+  assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 4000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000 })), /announced 5000/)
   // An accepted image is the flat price exactly.
   check(ir({ cost_msats: 2100, usage: { flat: true }, msat_per_image: 1000 }), q({ status: 200, image }))
 } finally {

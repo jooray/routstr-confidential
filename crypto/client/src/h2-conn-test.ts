@@ -198,15 +198,54 @@ const opened = async (conn: any) => {
 }
 
 // 6. GOAWAY: a stream above its last-stream-id is not released, and the
-//    request ends without waiting out its timeouts.
+//    request ends without waiting out its timeouts. With an error code it is
+//    not disclosable (the client's own frames may have caused it).
 {
   const rig = requestRig(0)
-  const { conn, releases } = rig
+  const { conn, releases, wire } = rig
   // The GOAWAY (last stream 1, the probe's) arrives while the node accepts the request.
-  rig.onRequest = () => conn.onFrame(fr(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 0])))
+  rig.onRequest = () => conn.onFrame(fr(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 2])))
   const r = conn.request(1).catch((e: Error) => e)
   const out = await within(r, 5000, 'goaway')
   ok(String(out).includes("GOAWAY (last stream 1) excludes stream 3") && releases.length === 0, `nothing of a stream beyond GOAWAY is released (got: ${out}, releases ${releases})`)
+  ok(!wire.includes('disclose_reset'), 'a GOAWAY with an error code is not disclosed as a refusal')
+}
+
+// 6b. A refusal (§5.4, `disclose_reset`): GOAWAY(NO_ERROR) below the stream
+//     before anything was released, and RST_STREAM(REFUSED_STREAM) with no
+//     response head, are disclosed and settled; nothing more is released.
+for (const kind of ['goaway', 'rst_stream'] as const) {
+  const rig = requestRig(kind === 'goaway' ? 0 : 65535)
+  const { conn, releases, wire } = rig
+  let seen: any
+  conn.settleRefusal = async (c: any) => {
+    seen = c.refusal
+    wire.push('disclose_reset')
+    return { usage: { refused: kind }, cost_msats: 0 }
+  }
+  if (kind === 'goaway') rig.onRequest = () => conn.onFrame(fr(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 0])))
+  const r = conn.request(1).catch((e: Error) => e)
+  if (kind === 'rst_stream') {
+    await opened(conn)
+    conn.onFrame(fr(FRAME.RST_STREAM, 0, 3, Uint8Array.from([0, 0, 0, 7])))
+  }
+  const out = await within(r, 5000, kind)
+  ok(out?.refusal === kind && wire.includes('disclose_reset') && seen?.kind === kind && seen.end === (kind === 'goaway' ? 17 : 13), `a ${kind} refusal is disclosed and settled (got: ${out?.message ?? JSON.stringify(out?.refusal)})`)
+  ok(kind === 'rst_stream' || releases.length === 0, `nothing is released after a GOAWAY refusal (${releases})`)
+}
+{
+  // A response head first: the reset is no refusal of an unprocessed stream.
+  const { conn, wire } = requestRig()
+  conn.settleRefusal = async () => {
+    wire.push('disclose_reset')
+    return {}
+  }
+  const r = conn.request(1).catch((e: Error) => e)
+  await opened(conn)
+  conn.onFrame(fr(FRAME.HEADERS, FLAG.END_HEADERS, 3, Uint8Array.from([0x88])))
+  conn.onFrame(fr(FRAME.RST_STREAM, 0, 3, Uint8Array.from([0, 0, 0, 7])))
+  const out = await within(r, 5000, 'head then refused reset')
+  ok(!wire.includes('disclose_reset') && String(out).includes('reset stream 3'), `a reset after a response head is not disclosed (got: ${out})`)
 }
 
 // 7. SETTINGS_INITIAL_WINDOW_SIZE applies to the open stream (RFC 9113 §6.9.2).

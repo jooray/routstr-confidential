@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto'
 import { concat, hex } from './advice.ts'
 import { advOutcome, noteDepositRelease, openRequest, requestMessage, takeReceipt, type Ctx, type ImageTerms } from './ctx.ts'
 import {
-  errorHeadPrefixProblem,
+  errorHeadPrefixProblem, refusalProblem, NO_ERROR, REFUSED_STREAM,
   FLAG, FRAME, FrameReader, chatPath, checkPiWinParams, decodeBlock, frame, frameHeader,
   requestBlock, requestStream, splitBody, type RxFrame, type WinSource,
 } from './h2.ts'
@@ -58,6 +58,12 @@ interface Cur {
   parts: { off: number; data: Uint8Array }[]
   ended: boolean
   reset?: number
+  /**
+   * The provider refused the stream without processing it (RFC 9113 §8.7):
+   * RST_STREAM(REFUSED_STREAM) on it, or GOAWAY(NO_ERROR) below it, before
+   * any response on it; `end` is the stream offset after that frame.
+   */
+  refusal?: { kind: 'rst_stream' | 'goaway'; end: number; last?: number }
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -190,15 +196,26 @@ export class H2Conn {
       }
       case FRAME.GOAWAY: {
         this.goaway = true
-        if (f.payload.length >= 4) {
+        let code: number | undefined
+        if (f.payload.length >= 8) {
           const last = u32(f.payload) & 0x7fffffff
+          code = u32(f.payload, 4)
           this.goawayLast = Math.min(this.goawayLast ?? last, last)
+          // A graceful GOAWAY below the request's stream, before any response on it: disclosable.
+          if (cur && last < cur.stream && code === NO_ERROR && cur.status === undefined && !cur.refusal) {
+            cur.refusal = { kind: 'goaway', end: f.off + 9 + f.payload.length, last }
+          }
         }
-        this.ctx.log({ ev: 'h2_goaway', last_stream: this.goawayLast })
+        this.ctx.log({ ev: 'h2_goaway', last_stream: this.goawayLast, code })
         break
       }
       case FRAME.RST_STREAM:
-        if (cur && f.stream === cur.stream) cur.reset = u32(f.payload)
+        if (cur && f.stream === cur.stream && f.payload.length === 4) {
+          cur.reset = u32(f.payload)
+          if (cur.reset === REFUSED_STREAM && cur.status === undefined && !cur.refusal) {
+            cur.refusal = { kind: 'rst_stream', end: f.off + 9 + f.payload.length }
+          }
+        }
         break
       case FRAME.HEADERS: {
         if (!cur || f.stream !== cur.stream) break // the probe stream's answer, if any
@@ -462,6 +479,7 @@ export class H2Conn {
     if (adv?.startsWith('rst-')) return await this.cancelAndReuse(adv, cur, b, bodyLen)
 
     if (adv === 'replay-usage') return await this.replayUsage(cur)
+    if (adv?.startsWith('refusal-')) return await this.forgeRefusal(adv, cur)
     if (adv === 'no-proof') {
       // The records are never proven: the node must hold them all, so the
       // provider sees nothing of the request and answers nothing.
@@ -476,11 +494,20 @@ export class H2Conn {
     const beyond = () => this.goawayBeyond(cur)
     await this.until(() => cur.released || errored() || cur.reset !== undefined || beyond(), `body_released for request ${n}`, 180000)
     await this.until(() => cur.ended || cur.reset !== undefined || errored() || beyond(), `the response to request ${n}`, 600000)
+    // A stream the provider refused without processing it (RFC 9113 §8.7):
+    // the refusal is disclosed and settled like a 429 (§12.10); the request
+    // may run again on another connection.
+    let refusalReceipt: any
+    if (cur.refusal && !errored()) {
+      refusalReceipt = await this.settleRefusal(cur, reserved)
+    }
     // An error head the provider sent before it reset the stream (RFC 9113
     // §8.1: a server that answers before the request is complete resets it
-    // with NO_ERROR) is still disclosed and settled by its status (finding 18).
-    if (cur.reset !== undefined && !errored()) throw new Error(`the provider reset stream ${stream} (code ${cur.reset})`)
-    if (beyond() && !errored() && !cur.ended) {
+    // with NO_ERROR) is still disclosed and settled by its status.
+    if (refusalReceipt) {
+      // nothing more on this stream
+    } else if (cur.reset !== undefined && !errored()) throw new Error(`the provider reset stream ${stream} (code ${cur.reset})`)
+    if (!refusalReceipt && beyond() && !errored() && !cur.ended) {
       throw new Error(`the provider's GOAWAY (last stream ${this.goawayLast}) excludes stream ${stream}${cur.upto > 0 ? '' : ' (nothing released)'}`)
     }
     const status = cur.status ?? 0
@@ -488,7 +515,10 @@ export class H2Conn {
     let ownUsage: any
     let text = ''
     let imageOut: any
-    if (b.image && ((status >= 200 && status < 300) || (ctx.acceptAny && status > 0))) {
+    if (refusalReceipt) {
+      receipt = refusalReceipt
+      console.log(`[client ${s.label}] request ${n}: refused by the provider (${cur.refusal!.kind}), settled cost_msats=${receipt.cost_msats}; it may run again elsewhere`)
+    } else if (b.image && ((status >= 200 && status < 300) || (ctx.acceptAny && status > 0))) {
       await this.until(() => cur.ended, 'the end of the stream', 600000)
       receipt = await this.settleAccept(cur)
       imageOut = this.imageResult(cur, b.image)
@@ -504,7 +534,7 @@ export class H2Conn {
     } else {
       throw new Error(`request ${n}: status ${status} is neither a success nor a disclosable error`)
     }
-    ctx.checkReceipt?.(receipt, { n, http: '2', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce, reserved })
+    ctx.checkReceipt?.(receipt, { n, http: '2', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce, reserved, refusal: refusalReceipt ? cur.refusal!.kind : undefined })
     const tEnd = Date.now()
     noteDepositRelease(s, ctx, receipt, n)
 
@@ -527,6 +557,7 @@ export class H2Conn {
       stream,
       model: b.model,
       refused_first: refused,
+      ...(refusalReceipt ? { refusal: cur.refusal!.kind } : {}),
       ...(b.image ? { kind: 'images', variant: b.image.variant, count: b.image.count, ...imageOut } : {}),
       status,
       body_len: bodyLen,
@@ -789,6 +820,121 @@ export class H2Conn {
   }
 
   /**
+   * A refusal of the request's stream (§5.4, `disclose_reset`): R runs from
+   * byte 0 of the first server record we had not seen when we sent the
+   * request (no later than the node's S_k) to the end of the refusing frame,
+   * so every frame the provider sent since is disclosed and none of them may
+   * be a response on the stream. π_WIN under s_ap_0, as for an error head.
+   */
+  private async settleRefusal(cur: Cur, reserved: number | undefined): Promise<any> {
+    const { s } = this
+    await this.drained()
+    const refusal = cur.refusal!
+    // Our own records proven first (one π_WIN at a time).
+    await this.until(() => [...this.out.keys()].every((seq) => cur.seqs.includes(seq)) && this.proofs.some((p) => p.proof === 'pi_win' && p.n === cur.n), 'our records to be proven', 60000)
+    const first = this.reader.records.find((x) => x.abs === cur.recvAtSend)
+    if (!first) throw new Error(`the refusal cannot be disclosed: record ${cur.recvAtSend} is not held`)
+    const r = this.reader.slice(first.start, refusal.end)
+    const problem = refusalProblem(r, cur.stream, cur.upto > 0)
+    if (problem) throw new Error(`the refusal cannot be disclosed: ${problem}`)
+    const chunks = new Map<number, number>()
+    let left = r.length
+    for (const x of this.reader.records.filter((x) => x.abs >= first.abs)) {
+      if (left <= 0) break
+      const take = Math.min(left, x.content.length)
+      chunks.set(x.abs, take)
+      left -= take
+    }
+    const lastAbs = Math.max(...chunks.keys())
+    for (let abs = first.abs; abs <= lastAbs; abs++) {
+      if (!chunks.has(abs) || s.serverPost[abs - this.hsCipher]?.keyUpdates > 0) throw new Error('the refusal cannot be disclosed: a record without frames lies inside it')
+    }
+    if (chunks.size > 8 || r.length > 16 << 10) throw new Error('the refusal cannot be disclosed: it spans too much')
+    let keyUpdates = 0
+    let epochStart = 0
+    for (let i = 0; i < first.abs - this.hsCipher; i++) {
+      if (s.serverPost[i].keyUpdates > 0) {
+        keyUpdates += s.serverPost[i].keyUpdates
+        epochStart = i + 1
+      }
+    }
+    const msg: any = { type: 'disclose_reset', n: cur.n, record: first.abs, r: hex(r) }
+    if (keyUpdates > 0) {
+      msg.key_updates = keyUpdates
+      msg.epoch_start = epochStart
+    }
+    this.ctx.log({ ev: 'disclose_reset', n: cur.n, kind: refusal.kind, record: first.abs, r_len: r.length })
+    this.sendOrdered(msg)
+    const attJson = await this.checkAttestation(await this.wait('attestation', 60000), cur, undefined)
+    const m = await this.wait('zk_params:pi_win:refusal', 30000)
+    if (m.n !== cur.n || m.record !== first.abs) throw new Error('the refusal proof names another request or record')
+    const shape = checkPiWinParams(m.params, {
+      anchor: s.ap.h2,
+      keyUpdates,
+      lookup: (seq) => {
+        const abs = this.hsCipher + epochStart + seq
+        const take = chunks.get(abs)
+        const plain = this.plain.get(abs)
+        const wire: Uint8Array | undefined = s.serverRecords[abs]
+        if (take === undefined || !plain || !wire) return undefined
+        return { ct: wire.subarray(0, wire.length - 16), plain, pub: [[0, take], [plain.length - 1, plain.length]] }
+      },
+      covered: [...chunks.keys()].map((abs) => abs - this.hsCipher - epochStart),
+    })
+    const t = Date.now()
+    await s.proof('pi_win', 'prove', m.params, { Secret: Array.from(s.ap.serverAp0) })
+    const z = s.zkTimes.pi_win
+    this.proofs.push({ proof: 'pi_win', purpose: 'refusal', n: cur.n, ...shape, ms: Date.now() - t, inner_ms: z?.inner_ms, bytes_sent: z?.bytes_sent, bytes_recv: z?.bytes_recv })
+    const receipt = await this.receipt(cur, attJson)
+    const u = receipt.usage ?? {}
+    const want = refusal.kind === 'rst_stream' ? { refused: 'rst_stream', error_code: REFUSED_STREAM } : { refused: 'goaway', error_code: NO_ERROR, last_stream_id: refusal.last }
+    for (const [k, v] of Object.entries(want)) if (u[k] !== v) throw new Error(`the refusal receipt names ${k} ${JSON.stringify(u[k])}, not ${JSON.stringify(v)}`)
+    if (!Array.isArray(u.choices) || u.choices.length !== 0) throw new Error('the refusal receipt carries choices')
+    if (reserved !== undefined && receipt.reserved_msats !== reserved) throw new Error(`the refusal receipt names reserved_msats ${receipt.reserved_msats}, the node announced ${reserved}`)
+    return receipt
+  }
+
+  /**
+   * Forged refusals (the gates' negative cases): once request `cur` was
+   * released and answered, claim that the provider refused it.
+   *   refusal-fake        R = a RST_STREAM(REFUSED_STREAM) of our stream the provider never sent, from
+   *                       the first record of the interval: the sidecar takes the claim, π_WIN fails
+   *   refusal-after-head  R = the provider's true bytes from that record up to its response HEADERS,
+   *                       then a reset: the walk meets the response head, refused before any proof
+   *   refusal-probe       R = a RST_STREAM(REFUSED_STREAM) of the probe stream (1): refused
+   *   refusal-later       R = a reset at a record after the start of the interval: refused (the walk
+   *                       would skip the response)
+   */
+  private async forgeRefusal(adv: string, cur: Cur): Promise<any> {
+    const { s } = this
+    await this.until(() => cur.released && cur.status !== undefined, `body_released and the response head of request ${cur.n}`, 180000)
+    await this.until(() => cur.ended || cur.reset !== undefined, 'the end of the stream', 120000)
+    await this.drained()
+    const rst = (stream: number) => frame(FRAME.RST_STREAM, 0, stream, Uint8Array.from([0, 0, 0, REFUSED_STREAM]))
+    const first = this.reader.records.find((x) => x.abs === cur.recvAtSend)
+    if (!first) throw new Error(`record ${cur.recvAtSend} is not held`)
+    let record = first.abs
+    let r: Uint8Array
+    if (adv === 'refusal-fake') r = rst(cur.stream)
+    else if (adv === 'refusal-probe') r = rst(1)
+    else if (adv === 'refusal-after-head') r = concat(this.reader.slice(first.start, cur.head!.off + cur.head!.raw.length), rst(cur.stream))
+    else if (adv === 'refusal-later') {
+      record = this.recvCount() - 1
+      r = rst(cur.stream)
+    } else throw new Error(`unknown attack ${adv}`)
+    this.sendOrdered({ type: 'disclose_reset', n: cur.n, record, r: hex(r) })
+    const m = await this.wait(['attestation', 'zk_params:pi_win:refusal'], 30000)
+    if (m.type === 'attestation') {
+      // The claim passed the frame rules: prove it, without our own checks (they would stop us).
+      const z = await this.wait('zk_params:pi_win:refusal', 30000)
+      await s.proof('pi_win', 'prove', z.params, { Secret: Array.from(s.ap.serverAp0) }).catch(() => {})
+      const next = await this.wait('receipt', 30000)
+      return { adv, accepted: true, receipt: next.receipt }
+    }
+    return { adv, accepted: true }
+  }
+
+  /**
    * The per-request attestation: signed by the session key, naming this
    * session, handshake and request, an interval that starts no earlier than
    * the request and no later than its response, and hashes we can recompute
@@ -896,7 +1042,7 @@ export async function runHttp2(s: any, conn: H2Conn, from: number): Promise<{ re
       }
       results.push(r)
       // Settled and the connection stays: idle until the next request.
-      if (r.status < 400 && !attack) topup()
+      if (r.status < 400 && !r.refusal && !attack) topup()
       console.log(
         `[client ${s.label}] request ${n}: status=${r.status} released_ms=${r.released_ms} ttft_ms=${r.ttft_ms} total_ms=${r.total_ms} ` +
           `usage=${JSON.stringify(r.usage ?? null)} receipt_sig_ok=${r.receipt_sig_ok}`,
@@ -905,7 +1051,7 @@ export async function runHttp2(s: any, conn: H2Conn, from: number): Promise<{ re
         adv = { mode: ctx.adv!.mode, http: '2', at: n, refused: false, detail: 'the request settled' }
         break
       }
-      if (r.status >= 400) break // the node closes the connection after an error
+      if (r.status >= 400 || r.refusal) break // the node closes the connection after an error or a refusal
     } catch (e) {
       if (!attack) throw e
       const cur = conn.cur
@@ -914,7 +1060,7 @@ export async function runHttp2(s: any, conn: H2Conn, from: number): Promise<{ re
     }
   }
   let lingered: number | undefined
-  if (results.some((r) => r.status >= 400)) {
+  if (results.some((r) => r.status >= 400 || r.refusal)) {
     // An error head was settled: the node ends the connection (`closed`, `error_settled`).
     await Promise.race([s.waitT('closed', 5000).catch(() => {}), conn.failP.catch(() => {})])
   } else if ((ctx.lingerMs ?? 0) > 0 && !adv) {

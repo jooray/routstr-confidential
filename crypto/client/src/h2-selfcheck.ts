@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs'
 
 import { RequestRefused, openRequest, requestMessage, type ReqBody } from './ctx.ts'
 import {
-  FLAG, FRAME, FrameReader, checkH2Offer, errorHeadPrefixProblem, checkPiNKParamsH2, checkPiWinFinalRecord, checkPiWinParams, decodeBlock, frame, h2Head, huffmanDecode,
+  FLAG, FRAME, FrameReader, checkH2Offer, errorHeadPrefixProblem, refusalProblem, checkPiNKParamsH2, checkPiWinFinalRecord, checkPiWinParams, decodeBlock, frame, h2Head, huffmanDecode,
   requestBlock, splitBody, type WinSource,
 } from './h2.ts'
 
@@ -218,6 +218,32 @@ ok(
   ok(errorHeadPrefixProblem(frame(FRAME.DATA, 0, 3, new Uint8Array([1])), 3) !== undefined, 'error head prefix: our own DATA is never disclosed')
   ok(errorHeadPrefixProblem(wu(5), 3) !== undefined, 'error head prefix: another stream')
   ok(errorHeadPrefixProblem(ping.subarray(0, 12), 3) !== undefined, 'error head prefix: a frame running into the head')
+
+  // `disclose_reset` (§5.4): the same cases as the sidecar's `refusal_forms`
+  // and `refusals_that_do_not_count`.
+  const u32b = (x: number) => Uint8Array.from([x >>> 24, (x >>> 16) & 255, (x >>> 8) & 255, x & 255])
+  const rst = (stream: number, code: number) => frame(FRAME.RST_STREAM, 0, stream, u32b(code))
+  const goaway = (last: number, code: number, debug = new Uint8Array(0)) => frame(FRAME.GOAWAY, 0, 0, cat(u32b(last), u32b(code), debug))
+  ok(refusalProblem(rst(3, 7), 3) === undefined, 'refusal: RST_STREAM(REFUSED_STREAM)')
+  ok(refusalProblem(goaway(1, 0), 3) === undefined && refusalProblem(goaway(1, 0), 3, false) === undefined, 'refusal: GOAWAY below the stream')
+  ok(refusalProblem(goaway(0x80000001, 0), 5) === undefined, 'refusal: GOAWAY, reserved bit ignored')
+  ok(refusalProblem(goaway(3, 0, new TextEncoder().encode('bye')), 5) === undefined, 'refusal: GOAWAY with debug data')
+  const before = [wu(0), wu(3), frame(FRAME.SETTINGS, 0, 0, Uint8Array.from([0, 3, 0, 0, 0, 100])), frame(FRAME.SETTINGS, FLAG.ACK, 0), ping, probe, rst(1, 7), goaway(3, 0), goaway(0x7fffffff, 0)]
+  ok(refusalProblem(cat(...before, rst(3, 7)), 3) === undefined, 'refusal: after control, probe and non-refusing GOAWAY frames')
+  for (const [what, r, rstOk] of [
+    ['another code', rst(3, 8), true], ['NO_ERROR reset', rst(3, 0), true], ['another stream', rst(5, 7), true],
+    ['the probe stream', rst(1, 7), true], ['a reset before anything was written', rst(3, 7), false],
+    ['GOAWAY covering the stream', goaway(3, 0), true], ['GOAWAY with an error', goaway(1, 1), true],
+    ['a long reset', frame(FRAME.RST_STREAM, 0, 3, Uint8Array.from([0, 0, 0, 7, 0])), true], ['nothing', new Uint8Array(0), true],
+  ] as [string, Uint8Array, boolean][]) {
+    ok(refusalProblem(r, 3, rstOk) !== undefined, `refusal refused: ${what}`)
+  }
+  ok(refusalProblem(rst(1, 7), 1) !== undefined, 'refusal refused: of the probe stream itself')
+  for (const bad of [frame(FRAME.HEADERS, FLAG.END_HEADERS, 3, Uint8Array.from([0x88])), frame(FRAME.DATA, 0, 3, new Uint8Array([1])), frame(FRAME.DATA, 0, 5, new Uint8Array([1])), frame(FRAME.PING, 0, 3, new Uint8Array(8)), goaway(1, 2)]) {
+    ok(refusalProblem(cat(bad, rst(3, 7)), 3) !== undefined && refusalProblem(cat(bad, goaway(1, 0)), 3) !== undefined, `refusal refused after a frame of type ${bad[3]} on stream ${bad[8]}`)
+  }
+  ok(refusalProblem(cat(rst(3, 7), ping), 3) !== undefined, 'refusal refused: bytes after the refusal')
+  ok(refusalProblem(rst(3, 7).subarray(0, 12), 3) !== undefined, 'refusal refused: a partial reset')
 }
 
 // The usage event rule (§5.4): the shared vectors, and the HTTP/1.1 R locator

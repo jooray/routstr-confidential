@@ -308,6 +308,52 @@ export function errorHeadPrefixProblem(prefix: Uint8Array, stream: number): stri
   return p === prefix.length ? undefined : 'a frame before the response head runs into it'
 }
 
+/** RST_STREAM's code for a stream the server did not process (RFC 9113 §8.7). */
+export const REFUSED_STREAM = 7
+/** GOAWAY's code of a graceful end. */
+export const NO_ERROR = 0
+
+/**
+ * A disclosed refusal (PROTOCOL-V3.md §5.4, `disclose_reset`; the sidecar's
+ * `h2::parse_refusal`): `r` is the plaintext from byte 0 of a server record to
+ * the end of the frame that refuses `stream`, RST_STREAM(REFUSED_STREAM) on it
+ * (only when `rstAllowed`: some record of the request may have been written)
+ * or GOAWAY(NO_ERROR) with a last-stream-id below it. Before it only frames
+ * that carry nothing of ours and no response on the stream: SETTINGS, PING,
+ * WINDOW_UPDATE on stream 0 or `stream`, the probe stream's frames, and a
+ * GOAWAY that does not refuse `stream`. Returns why `r` is not one, or
+ * undefined.
+ */
+export function refusalProblem(r: Uint8Array, stream: number, rstAllowed = true): string | undefined {
+  if (stream === 0 || stream === 1) return 'not a request stream'
+  const u32 = (i: number) => ((r[i]! << 24) | (r[i + 1]! << 16) | (r[i + 2]! << 8) | r[i + 3]!) >>> 0
+  let p = 0
+  for (;;) {
+    if (r.length - p < 9) return 'a partial frame header'
+    const len = (r[p]! << 16) | (r[p + 1]! << 8) | r[p + 2]!
+    const type = r[p + 3]!
+    const flags = r[p + 4]!
+    const s = u32(p + 5)
+    if (len > 1 << 14) return `a frame of ${len} bytes`
+    if (p + 9 + len > r.length) return 'a frame runs past the disclosed bytes'
+    const end = p + 9 + len === r.length
+    const last = type === FRAME.GOAWAY && s === 0 && len >= 8 ? u32(p + 9) & 0x7fffffff : undefined
+    const refuses =
+      (type === FRAME.RST_STREAM && s === stream && len === 4 && u32(p + 9) === REFUSED_STREAM && rstAllowed) ||
+      (last !== undefined && last < stream && u32(p + 13) === NO_ERROR)
+    if (refuses) return end ? undefined : 'the refusing frame does not end the disclosed bytes'
+    const ok =
+      (s === 0 && type === FRAME.SETTINGS && len % 6 === 0 && (flags & ~FLAG.ACK) === 0) ||
+      (s === 0 && type === FRAME.PING && len === 8) ||
+      (last !== undefined && last >= stream) ||
+      (type === FRAME.WINDOW_UPDATE && len === 4 && (s === 0 || s === stream)) ||
+      (s === 1 && [FRAME.HEADERS, FRAME.CONTINUATION, FRAME.DATA, FRAME.RST_STREAM, FRAME.WINDOW_UPDATE].includes(type as never))
+    if (!ok) return `a frame of type ${type} on stream ${s} before the refusal`
+    p += 9 + len
+    if (end) return 'no refusal of the request stream'
+  }
+}
+
 export function splitBody(body: Uint8Array, suffixLen: number, chunk = MAX_DATA_IN_RECORD): Uint8Array[] {
   if (suffixLen > chunk || suffixLen > body.length) fail('h2: the suffix does not fit one DATA frame')
   const parts: Uint8Array[] = []

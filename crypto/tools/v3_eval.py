@@ -24,6 +24,9 @@ Arguments: case expect driver_rc driver_out driver_err sidecar_runs_dir
                          answers nothing
   replay:<n>:<regex>     (framing "2") the stale disclosure for request n is refused for that
                          reason; request n is never settled
+  forged:<n>:<regex>     (framing "2") a provider refusal (`disclose_reset`) claimed for request n,
+                         which the provider answered, is refused for that reason (by the frame
+                         rules, or by a failed π_WIN); request n was released and is never settled
   legacy                 a protocol-v2 setup is answered with `upgrade_required`
 """
 import json
@@ -242,6 +245,26 @@ elif kind == "replay":
             dev.append(f"request {n} was attested or settled on the stale disclosure")
         if not any(e.startswith(f"request n={n} released") for e in evs):
             dev.append(f"request {n} was never released (the probe did not reach the disclosure check)")
+elif kind == "forged":
+    n, _, reason = rest.partition(":")
+    n = int(n)
+    evs = sidecar_events(sids[-1] if sids else None)
+    evidence += f" adv={json.dumps(adv)[:260] if adv else None}"
+    if rc != 0 or not adv:
+        dev.append("CRASH or attack not refused (driver exit != 0 or no ADV line)")
+    elif adv.get("refused") is not True:
+        dev.append("the forged refusal was NOT refused")
+    elif not re.search(reason, f"{adv.get('reason', '')} {adv.get('code') or ''}", re.I):
+        dev.append(f"refused for the wrong reason (want /{reason}/)")
+    if e2e and len(reqs) != n - 1:
+        dev.append(f"expected {n - 1} honest request(s) before the attack")
+    if evs is None:
+        dev.append("no sidecar log for the connection")
+    else:
+        if any(e.startswith(f"request n={n} settled") for e in evs):
+            dev.append(f"request {n} was settled on the forged refusal")
+        if not any(e.startswith(f"request n={n} released") for e in evs):
+            dev.append(f"request {n} was never released (the claim did not follow a real response)")
 else:
     dev.append(f"unknown expectation {expect}")
 print(("PASS" if not dev else "DEVIATION: " + "; ".join(dev)) + "\t" + evidence)

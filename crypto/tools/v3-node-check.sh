@@ -94,6 +94,11 @@
 #                           reservation released in full
 #   h2-d-replay-usage       request 2 is released and "settled" with request 1's usage:
 #                           refused, its reservation is charged in full
+#   h2-r-refusal-fake, h2-r-refusal-after-head
+#                           a provider refusal (`disclose_reset`) claimed for request 1, which the
+#                           provider answered (a reset it never sent: π_WIN fails; its true bytes up
+#                           to the response head: the frame rules refuse): its reservation is charged
+#                           in full, the deposit released (`request_received`), no refusal settlement
 #   h2-g-early-record, h2-i-own-keyshare
 #                           the connection itself: D charged (`unused`)
 #  cancel and reuse (a force-stopped request whose credential reference a later one rides on)
@@ -472,6 +477,8 @@ run_case h2-b-padding        "attack:2:2:abandoned:pi_win failed" "$B" none -- -
 run_case h2-c-model-swap     "attack:2:2:abandoned:pi_win failed" "$B" none -- --http 2 --requests 2 --adv suffix --adv-suffix-model "$SWAP_MODEL" --adv-at 2
 run_case h2-c-suffix         "attack:2:1:abandoned:pi_win failed" "$B" none -- --http 2 --adv suffix
 run_case h2-d-replay-usage   "attack:2:2:charged:interval"        "$B" none -- --http 2 --requests 2 --adv replay-usage
+run_case h2-r-refusal-fake   "attack:2:1:charged:pi_win failed"   "$B" none -- --http 2 --adv refusal-fake
+run_case h2-r-refusal-after-head "attack:2:1:charged:before the refusal" "$B" none -- --http 2 --adv refusal-after-head
 run_case h2-f-image-suffix   "attack:2:2:abandoned:pi_win failed" "$B" none -- --http 2 --requests 2 --kinds chat,images "${IMG[@]}" --adv suffix --adv-at 2
 run_case h2-g-early-record   "attack:2:0:unused:."                "$B" none -- --http 2 --adv early-record
 run_case h2-i-own-keyshare   "attack:2:0:unused:share"            "$B" none -- --http 2 --adv own-keyshare
