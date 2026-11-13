@@ -214,9 +214,23 @@ So the effective model is always the suffix model. The question reduces to:
 Until 2026-10-28 a usage event naming another model was refused by the
 sidecar and charged the full reservation by the node. That added no binding
 (the request was already pinned) and turned a harmless change in the
-provider's spelling of a model id into a full-reservation charge. The node
-also offers a chat model confidentially only when its public id equals the
-provider's id, so the pinned suffix and the price list name the same model.
+provider's spelling of a model id into a full-reservation charge.
+
+The pinned suffix names the model the client asked for, or the provider's id
+for it where the two differ by a provider prefix: the signed offer's
+`upstream_models` maps a public id such as `kimi-k3.1-pro` to
+`moonshotai/kimi-k3.1-pro` (`PROTOCOL-V3.md` §12.1). That map comes from the
+node, so it is the one place where a node could make the suffix pin another
+model than the one priced and paid for (`claude-opus-4.5` at Opus rates mapped
+to `qwen/qwen3.8-27b`; SDK review finding 17). The rule is that the provider
+id equals the public id or ends with `"/"` + the public id. The clients
+(SDK, reference client, browser library) refuse an offer that breaks it, and
+the node never signs one: a model whose provider id breaks it is left out of
+the offer and logged (`pinned_id_problem` in `confidential.py`). Every
+mapping of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro,
+Cloudflare's `@cf/meta/<id>`) passes. What stays open is another prefix for
+the same name (`someorg/claude-opus-4.5`): it matters only on a provider where
+anyone can publish models under their own namespace (§1.6 row 14).
 
 ### 1.6 Remaining model-related attacks and their disposition
 
@@ -234,7 +248,8 @@ provider's id, so the pinned suffix and the price list name the same model.
 | 10 | Endpoint swap to a differently-priced API | **Sound.** The request line (`POST /api/v1/chat/completions`) is inside N's head record, proven by π_N against the offer template (`build_pi_n`). The client cannot reach `/v1/responses`, embeddings, etc.; the SDK and routstrd also refuse any endpoint but chat completions before a credential is used. |
 | 11 | **Model aliases**: the requested name resolves server-side to a differently-priced backend while the usage event reports the requested name | **Unknown — testable, bounded by ops.** Venice's usage event reports the requested string. If Venice ever aliases across price tiers, settlement by the node's price list under-charges while Venice's bill is higher. Mitigation: node-side monitoring comparing realized `cost` against `price_list` per model. **Test:** for each offered model, diff Venice's `cost` against the published per-token price over a sample of requests; alert on drift. |
 | 12 | Multimodal token amplification (image URL in `messages` → thousands of image tokens from ~100 body bytes) | **Bounded by the reservation (GAP-3 closed), and billed.** The reservation covers the model's full context at the input rate, whatever the body bytes, so vision models are offered (the shipped `model_allowlist` is empty). The provider reports the image as prompt tokens, which π_C3S discloses and the node charges at the frozen input rate; `provider-profile-check.py` A13 checks that, and on 2026-10-26 Venice's balance moved by exactly tokens x rate for image requests. `regression-modality.py` remains for operators who want text-only models. |
-| 13 | Malicious *node* downgrading the model to pocket the spread | **Sound.** The node writes only the head (no model field); the body is sealed under keys it never holds (SPEC §6 P2). It cannot alter the suffix or the private part. |
+| 13 | Malicious *node* downgrading the model to pocket the spread | **Sound.** The node writes only the head (no model field); the body is sealed under keys it never holds (SPEC §6 P2). It cannot alter the suffix or the private part. The suffix's model comes from the signed offer's `upstream_models` where it differs from the public id, and only by a provider prefix (row 14). |
+| 14 | Malicious node signing `upstream_models` that map the public id to a cheaper model (SDK review finding 17) | **Closed for another name; open for another prefix of the same name.** Clients refuse a provider id that is not the public id or `<prefix>/` + the public id, and the node never signs one (`PROTOCOL-V3.md` §12.1). A node can still map `claude-opus-4.5` to `someorg/claude-opus-4.5`; that matters only on a provider where anyone can publish under their own namespace, and closing it needs a per-host list of trusted prefixes or showing the pinned id to the user (`PROTOCOL-V3.md` §10, risk 11). |
 
 ### 1.7 Q1 verdict
 
@@ -840,8 +855,10 @@ after idle), and ends streams the way the usage proof parses them.
   offers. (Telling such a 401 from a revoked node key would need a
   comparison on framing "1.1" or an independent probe; not built.)
 - **A provider that shrinks the table.** The node ends the connection when
-  the provider's SETTINGS put `HEADER_TABLE_SIZE` below the credential
-  entry's size. (`h2_table_size`). The client reports the SETTINGS it saw; a client that lies
+  the provider's SETTINGS put `HEADER_TABLE_SIZE` below the default 4096
+  (`h2_table_size`): below the credential entry's size the entry is gone,
+  and any smaller value makes the decoder expect a table size update the
+  pinned request block cannot carry (nghttp2: GOAWAY `COMPRESSION_ERROR`). The client reports the SETTINGS it saw; a client that lies
   only makes its own next request unauthenticated.
 - **A provider that evicts or forgets the entry mid-connection.** The
   request is answered 401. The client discloses the error head, the node

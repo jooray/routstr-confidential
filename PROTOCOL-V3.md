@@ -88,7 +88,9 @@ The operator states what their upstream supports. Nothing is probed or assumed.
   `price_list`, `session_fee_msat`, `abandon_fee_msat`, `max_tokens_cap`, …
 - `upstream_models` (optional): public id → the provider's own id, for the chat models of `price_list`
   whose two ids differ (§12.1). The request, `price_list`, `/v1/models` and the receipt's `model` name the
-  public id; the chat suffix pins the provider's id.
+  public id; the chat suffix pins the provider's id. **Only a provider prefix may differ:** each provider id
+  ends with `"/"` + its public id. C refuses an offer that maps a public id to anything else, and N leaves
+  such a model out of its offer (else a node could pin a cheaper model under the id C pays for).
 
 ### 2.3 Client choice
 
@@ -460,7 +462,7 @@ Checked by `provider-profile-check.py --h2`; an operator offers `"2"` only when 
 |---|---|
 | H1 | TLS 1.3 with ALPN `h2` on the API host |
 | H2 | accepts a TLS KeyUpdate right after the first flight of an HTTP/2 connection |
-| H3 | keeps the request dynamic table (default size ≥ the credential entry) and does not shrink it by SETTINGS |
+| H3 | keeps the request dynamic table at the default size: its SETTINGS never set `HEADER_TABLE_SIZE` below 4096 |
 | H4 | honours `HEADER_TABLE_SIZE = 0` for response headers |
 | H5 | a request naming `authorization` by index only is authenticated, also after `idle_timeout_s` of idle |
 | H6 | request bodies up to the node's body limit pass flow control |
@@ -473,9 +475,13 @@ head and the gates exercise it. A provider that splits a frame across records ri
 makes that error undisclosable, and after `body_released` an undisclosed request is charged in full: the
 money consequence of H9 failing.
 
-N MUST end the connection if U's SETTINGS set `HEADER_TABLE_SIZE` below the size of the credential entry
-(H3 at run time; C reports the value in `settings_seen`, §12.6, and a lying C only harms itself: its
-next request is unauthenticated). Because the value is C's claim, this end does not count towards the
+N MUST end the connection if U's SETTINGS set `HEADER_TABLE_SIZE` below 4096, the default (H3 at run
+time; C reports the value in `settings_seen`, §12.6, and a lying C only harms itself: its next request is
+unauthenticated or refused). Below the credential entry's size the provider no longer holds the entry; and
+any smaller table than the default makes the provider's decoder expect a dynamic table size update at the
+start of the first header block after C acknowledged the SETTINGS (RFC 7541 §4.2), which the pinned
+request block cannot carry: nghttp2 (Node's http2 server) answers it with GOAWAY `COMPRESSION_ERROR` for
+1024 and for 4095 alike, and serves the same request at 4096 and above. Because the value is C's claim, this end does not count towards the
 withdrawal of §2.1 and the deposit is charged like any unused connection. H5 is checked for the idle time
 the node offers: `idle_timeout_s` MUST NOT exceed `h2.idle_secs`, and the operator sets `h2.idle_secs` no
 higher than the idle time the profile check ran with.
@@ -665,7 +671,10 @@ links measured. A client that cares about passive observers turns it on.
 
 Everything v2 checks (`params.ts`), with: π_WIN parameters (§7.1); the receipt's and attestation's `n`,
 `stream`, `s_k`; the connection head template per framing; U's certificate chain, hostname and handshake
-by its own TLS stack.
+by its own TLS stack. Framing `"2"`, the provider's frames as RFC 9113 has them: a frame above 16 KiB
+(the head never raises `SETTINGS_MAX_FRAME_SIZE`) ends the connection; a change of
+`SETTINGS_INITIAL_WINDOW_SIZE` applies to the open request's stream too; no record of a stream above a
+GOAWAY's last-stream-id is released (the request fails before its release and may run again elsewhere).
 
 ## 10. Residual risks that are new or changed
 
@@ -681,9 +690,46 @@ by its own TLS stack.
 | 8 | Receipts and attestations of one connection repeat `sid`, the transcript hashes, `c_commit`, the certificate-chain hash and the request numbers and intervals | anyone shown several of them can link them and see their order and gaps: they are **private documents** of the client. Showing them to third parties unlinkably would need a new signed presentation format; redacting fields of the signed ones breaks their signatures |
 | 9 | Compromise scope: one `c_ap_1`/`s_ap_0` pair protects up to `h2.max_requests` requests (C may not KeyUpdate under π_WIN's rules). A live compromise of C exposes the connection's current and later traffic; a later forensic compromise of retained secrets exposes the whole recorded connection, not one request | clients erase traffic secrets when a connection closes (and keep them out of logs and swap where they can); operators keep `h2.max_requests` and `h2.max_lifetime_s` in proportion. A per-request ratchet needs a new anchor protocol |
 | 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
+| 11 | `upstream_models` may map a public id to another provider prefix for the same name (`someorg/claude-opus-4.5` for `claude-opus-4.5`): the rule of §12.1 binds the name, not the publisher | matters only on a provider where anyone can publish models under their own namespace; closing it needs a per-host list of trusted prefixes, or showing the pinned id to the user. the node offers of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro; 970 mappings) and Cloudflare's `@cf/meta/<id>` all have the form `<prefix>/<public id>` |
 
 v2's residual risks carry over unchanged (π_NK does not bind other epoch-0 records; provider reflection;
 ECtF semi-honest; no proof of the garbler-only construction).
+
+### 10.1 Open question: a stream the provider did not process (`REFUSED_STREAM`, GOAWAY)
+
+A provider may answer a request's stream with `RST_STREAM(REFUSED_STREAM)` (code 7), or send a GOAWAY
+whose last-stream-id is below the stream. RFC 9113 §8.7 guarantees that such a stream was not processed:
+nothing ran and nothing is billed upstream. N cannot see either frame (they are under `s_ap_0`), so §12.10
+charges by what N sees: before `body_released` the abandon fee or the deposit (small), **after
+`body_released` with no settlement the whole reservation**, and C does not retry. The clients do not
+release records of a stream above a GOAWAY's last-stream-id they have read, so the GOAWAY case costs the
+full reservation only when it arrives after the release; `REFUSED_STREAM` typically arrives after the
+HEADERS record or after the whole body, so it can cost the full reservation. The money rules are
+unchanged until this is decided. The options:
+
+1. **Keep the rule.** Simple and safe for N. A provider that refuses streams under load (concurrency
+   limits, overload shedding) costs C a full reservation per refusal; C may retry code 7 on a new request
+   (the SDK can class it as retryable), and pays again.
+2. **Disclose the reset, as an error head.** C sends `disclose_reset {n, record, r}`: one π_WIN under
+   `s_ap_0` (as `disclose_head` in framing `"2"`) shows that a server record in the request's interval
+   holds, at a frame boundary, `RST_STREAM` on the request's stream with code 7, after only the frames
+   §5.4 allows before an error head and with no HEADERS on the stream before it (a GOAWAY variant: the
+   GOAWAY frame and its last-stream-id below the stream). N settles it like 429/503: the session fee if
+   still due, nothing more. Soundness is that of the error head (risk 5: C cannot change the ciphertext
+   the sidecar received, and the frame must start a record or follow allowed frames). Cost: a new
+   message, a sidecar validator next to `validate_error_head`, the client side in three clients, gate
+   cases. It fixes the full-reservation case, and the provider's own guarantee is what makes it fair to N.
+3. **Bound the charge by what N sees.** E.g. charge only the abandon fee when every server record of the
+   interval is as small as a control frame. Not recommended: record sizes are the provider's choice
+   (frames coalesce), and a C that withholds a real response's disclosure must not be able to make it
+   look refused.
+4. **Retry on the same connection without a new reservation.** A refused request's reservation is moved
+   to a new stream. Needs N to trust C's claim that the stream was refused, so it reduces to option 2
+   with a different settlement.
+
+Recommendation: option 2 (with code 7 classed as retryable in the clients meanwhile, which changes no
+money). An `RST_STREAM` with any other code, and a reset without an error head, stay as they are: the
+provider may have processed the request.
 
 ## 11. Versions and upgrade
 
@@ -756,7 +802,14 @@ configured (§11), and each confidential model in `GET /v1/models` has
 whose public id is not the provider's own (routstr lists models without their `org/` prefix:
 `kimi-k3.1-pro` for Numes' `moonshotai/kimi-k3.1-pro`). Absent when every id is the provider's own (Venice),
 so such an offer is unchanged. Each key is a key of `price_list`; each value is the id the node's plain
-path sends that provider, printable ASCII without `"` or `\`, at most 256 bytes, never equal to its key.
+path sends that provider, printable ASCII without `"` or `\`, at most 256 bytes, never equal to its key,
+and it **MUST end with `"/"` + its key**: only the provider's prefix may differ (`moonshotai/kimi-k3.1-pro`
+for `kimi-k3.1-pro`, `@cf/meta/llama-3.2-1b-instruct` for `meta/llama-3.2-1b-instruct`). C MUST refuse an
+offer with any other value; N MUST NOT sign one, and leaves a model whose provider id breaks the rule out
+of `price_list` (and logs it). Without the rule a node could sign `claude-opus-4.5` at Opus rates mapped to
+`qwen/qwen3.8-27b`: C would be charged Opus rates, the suffix would make the provider run Qwen, and the
+receipt (`upstream_model`) would verify. The rule leaves another prefix for the same name open (§10,
+risk 11).
 The chat suffix of a request for model `m` pins `upstream_models[m]` when present, else `m`
 (docs/CHAT-SUFFIX.md); the client renders it from the offer its request names and compares it with
 `request_ok.suffix`. The sidecar's `model_allowlist` names provider ids (what the sidecar sees). Image
@@ -905,8 +958,8 @@ HTTP/2 frame per record (§5.1), a DATA payload at most 16 375 bytes.
 - `C → N  {"type":"settings_seen","header_table_size":<integer or null>}`: the value of
   `SETTINGS_HEADER_TABLE_SIZE` in the provider's SETTINGS frames so far (the last one; `null` when the
   provider never sent the parameter, i.e. the default 4096). Required before the first `request`; sent again
-  whenever a later SETTINGS frame carries the parameter. A value below `32 + 13 + 7 + key_length` (the size
-  of the credential entry): `error` with `code: "h2_table_size"`.
+  whenever a later SETTINGS frame carries the parameter. A value below 4096 (the default; §5.6, H3): `error`
+  with `code: "h2_table_size"`, and C falls back to framing `"1.1"` (§2.3).
 - `C → N  {"type":"ctl","frame":"settings_ack"|"ping_ack"|"rst_stream"}`: the next record is that control
   frame (inner lengths 10, 18, 14). `rst_stream` on the current request's stream, once its records are all
   received. At most 16 unproven control records. (`window_update` is refused: §5.1 rule 4.)
@@ -973,7 +1026,10 @@ connection began (handshake flight included).
   an empty dynamic table, `:status` first, 400..599. Allowed once the request's first
   record was written and no client record is unproven. `attestation`, then
   `{"type":"zk_params","proof":"pi_win","purpose":"error_head","n","record","params"}` (`anchor = h2`; per
-  record the frame's bytes from offset 0 and the last byte = `17`).
+  record the frame's bytes from offset 0 and the last byte = `17`). C discloses an error head also when
+  the provider reset the stream after it (RFC 9113 §8.1: a server that answers before the request is
+  complete resets it with `NO_ERROR`, often in the same record): the reset does not undo the status. C
+  stops waiting for the error body at the reset.
 
 **Framing `"1.1"`.** The provider closes the connection after its response. N then sends the `attestation`
 on its own. After it:
@@ -1193,3 +1249,6 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | the usage event: `choices` may hold one choice with no content (allow-list), the argument, usage on every chunk, Google unsupported | §5.4 |
 | `upstream_models`: org/-prefixed models offered under their public id, the suffix pins the provider's id; receipt `upstream_model` | §2.2, §12.1, §12.4, §12.8 |
 | the proof channel's top-up between requests (channel version 2: `topup`, `TopupGrant`, step, bounds, a request waits for it); chain cp's mux cap 512 MiB | §8.5, §9.2, §12.2 |
+| `upstream_models` values must be `<prefix>/` + the public id (clients refuse anything else, N never signs it); the other-prefix gap is residual risk 11 (SDK review finding 17) | §2.2, §12.1, §10 |
+| a provider `HEADER_TABLE_SIZE` below 4096 ends the connection (`h2_table_size`), not only one below the credential entry | §5.6, §12.6 |
+| an error head followed by a reset is disclosed (finding 18); C's checks of the provider's frames (16 KiB, initial window, GOAWAY); `REFUSED_STREAM` as an open question | §9.4, §10.1, §12.8 |

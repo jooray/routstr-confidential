@@ -664,8 +664,9 @@ by C (section 5, residual risk 1).
 
 When $\pi_{NK}$ has verified, C releases the head. N writes the head record and the KeyUpdate in one
 write and tells C. C sends no record between its Finished and that message. In framing "2" C reports
-the SETTINGS values U sent; N ends the connection if U's `HEADER_TABLE_SIZE` is below the size of the
-credential entry, since the provider would then not keep it. A C that lies here only harms itself: its
+the SETTINGS values U sent; N ends the connection if U's `HEADER_TABLE_SIZE` is below the default 4096:
+below the credential entry's size the provider would not keep it, and any smaller table makes its decoder
+expect a table size update that the pinned request block cannot carry. A C that lies here only harms itself: its
 next request is unauthenticated.
 
 ## 4.6 Requests (epoch 1) and $\pi_{WIN}$

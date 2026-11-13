@@ -131,6 +131,9 @@ with the caller's choice silently replaced.
   e.g. `kimi-k3.1-pro` for `moonshotai/kimi-k3.1-pro`), else the request's
   `model` itself (PROTOCOL-V3.md §12.1). The request and the receipt's
   `model` name the public id; the receipt's `upstream_model` the pinned one.
+  Only the prefix may differ: an `upstream_models` value must end with
+  `"/"` + its public id, else the client refuses the offer (a node could
+  otherwise pin another model under the id the client pays for).
 - **The offer the suffix comes from.** A request names an offer by its
   signature. Its connection-level fields must equal those of the offer the
   connection was opened on (`offer_changed` otherwise). The chat block is
