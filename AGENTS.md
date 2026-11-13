@@ -284,7 +284,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 **Checks.**
 - `crypto/tools/v3-check.sh` (**the sidecar + reference client gate**; real
   provider, no node; `CU_V3_PORT` picks the sidecar port): the offline
-  self-checks, then 49 cases, both framings: honest (one, several, error
+  self-checks, then 53 cases (51 without the two paid images), both framings: honest (one, several, error
   head, 200 kB body, decoy model, armed, refused-then-good, image), a v2
   socket, every attack (hidden HEADERS, TLS padding, suffix/model/cap swap,
   path, usage replay, image suffix, early record, no proof, own key share,
@@ -340,7 +340,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 | Part | State |
 |---|---|
 | `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-1` with the version tag |
-| `crypto/relay` (sidecar) | done; 103 unit tests; `v3-check.sh` clean in one run (49 cases, 2026-11-12). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause |
+| `crypto/relay` (sidecar) | done; 120 unit tests; `v3-check.sh` clean in one run (51 cases without images, 2026-11-13). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause; a provider refusal of a stream is proven (`disclose_reset`) |
 | `crypto/client` (reference driver) | done for both framings; run live against the sidecar by `v3-check.sh` and against a node by the node gate |
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
 | measurements | loopback and shaped links (2/50, 2/10 Mbit/s, 40 ms one way) with `bench.sh` + `shape-proxy.py`: `crypto/PROGRESS-CONFIDENTIAL.md` |
