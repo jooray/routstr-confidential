@@ -59,6 +59,11 @@ ok(Buffer.from(got[1]!.payload).toString() === 'hello' && rd.atBoundary(), 'fram
 ok(rd.recordAt(15).abs === 8 && rd.recordAt(15).start === 11, 'record of a stream offset')
 ok(Buffer.from(rd.slice(15, stream.length)).equals(stream.subarray(15)), 'stream slice')
 
+// A frame above 16 KiB (the head never raises SETTINGS_MAX_FRAME_SIZE) is refused
+// from its header alone, before it is reassembled; one of exactly 16 KiB is read.
+throws(() => new FrameReader().push(Uint8Array.from([0x00, 0x40, 0x01, 0, 0, 0, 0, 0, 1]), 0), 'a frame above 16 KiB', /FRAME_SIZE_ERROR/)
+ok(new FrameReader().push(frame(FRAME.DATA, 0, 1, new Uint8Array(1 << 14)), 0).length === 1, 'a frame of 16 KiB')
+
 // Body split: every frame within the limit, the last one holds the suffix.
 for (const [len, sfx, chunk] of [[10, 4, 100], [100, 30, 40], [81, 30, 40], [16375 * 3 + 5, 200, 16375], [200, 200, 16375]] as const) {
   const parts = splitBody(new Uint8Array(len), sfx, chunk)

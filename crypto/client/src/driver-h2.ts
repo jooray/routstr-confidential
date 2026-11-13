@@ -85,6 +85,8 @@ export class H2Conn {
   private unackedSettings = 0
   private requestOpen = false
   goaway = false
+  /** The last-stream-id of the provider's GOAWAY: a stream above it is not processed (RFC 9113 §6.8). */
+  goawayLast: number | undefined
   cur: Cur | undefined
   proofs: any[] = []
   /** The last usage disclosure sent (the replay probe presents it again). */
@@ -156,13 +158,18 @@ export class H2Conn {
         for (let i = 0; i + 6 <= f.payload.length; i += 6) {
           const id = (f.payload[i]! << 8) | f.payload[i + 1]!
           const v = u32(f.payload, i + 2)
-          if (id === 4) this.initialWindow = v
+          if (id === 4) {
+            // RFC 9113 §6.9.2: a change applies to the open stream's window too.
+            if (cur) cur.streamCredit += v - this.initialWindow
+            this.initialWindow = v
+          }
           if (id === 1) {
             this.tableSize = v
             carried = true
           }
         }
         this.gotSettings = true
+        this.updateRelease()
         this.ctx.log({ ev: 'h2_settings', initial_window: this.initialWindow, header_table_size: this.tableSize })
         if (carried && this.settingsSeenSent) this.sendSettingsSeen()
         // Acknowledged with the next request's records (one π_WIN for both)
@@ -181,10 +188,15 @@ export class H2Conn {
         this.updateRelease()
         break
       }
-      case FRAME.GOAWAY:
+      case FRAME.GOAWAY: {
         this.goaway = true
-        this.ctx.log({ ev: 'h2_goaway' })
+        if (f.payload.length >= 4) {
+          const last = u32(f.payload) & 0x7fffffff
+          this.goawayLast = Math.min(this.goawayLast ?? last, last)
+        }
+        this.ctx.log({ ev: 'h2_goaway', last_stream: this.goawayLast })
         break
+      }
       case FRAME.RST_STREAM:
         if (cur && f.stream === cur.stream) cur.reset = u32(f.payload)
         break
@@ -249,10 +261,17 @@ export class H2Conn {
   /** The `rst-before-final` attack: never release the request's last record. */
   private releaseCap: number | undefined
 
+  /** The provider's GOAWAY excludes `cur`'s stream (RFC 9113 §6.8: it was not and will not be processed). */
+  private goawayBeyond(cur: Cur): boolean {
+    return this.goawayLast !== undefined && cur.stream > this.goawayLast
+  }
+
   /** Release as many of the request's records as the provider's windows allow. */
   private updateRelease(): void {
     const cur = this.cur
     if (!cur || cur.dataLens.length === 0) return
+    // A stream above the GOAWAY's last-stream-id will not be processed: none of it is released.
+    if (this.goawayBeyond(cur)) return
     const credit = Math.min(cur.streamCredit, this.connCredit)
     let upto = 1
     let sum = 0
@@ -453,9 +472,17 @@ export class H2Conn {
     }
 
     // Released (in steps, as the provider's window opens) or refused early.
-    await this.until(() => cur.released || (cur.status ?? 0) >= 400 || cur.reset !== undefined, `body_released for request ${n}`, 180000)
-    await this.until(() => cur.ended || cur.reset !== undefined || (cur.status ?? 0) >= 400, `the response to request ${n}`, 600000)
-    if (cur.reset !== undefined) throw new Error(`the provider reset stream ${stream} (code ${cur.reset})`)
+    const errored = () => (cur.status ?? 0) >= 400
+    const beyond = () => this.goawayBeyond(cur)
+    await this.until(() => cur.released || errored() || cur.reset !== undefined || beyond(), `body_released for request ${n}`, 180000)
+    await this.until(() => cur.ended || cur.reset !== undefined || errored() || beyond(), `the response to request ${n}`, 600000)
+    // An error head the provider sent before it reset the stream (RFC 9113
+    // §8.1: a server that answers before the request is complete resets it
+    // with NO_ERROR) is still disclosed and settled by its status (finding 18).
+    if (cur.reset !== undefined && !errored()) throw new Error(`the provider reset stream ${stream} (code ${cur.reset})`)
+    if (beyond() && !errored() && !cur.ended) {
+      throw new Error(`the provider's GOAWAY (last stream ${this.goawayLast}) excludes stream ${stream}${cur.upto > 0 ? '' : ' (nothing released)'}`)
+    }
     const status = cur.status ?? 0
     let receipt: any
     let ownUsage: any
@@ -470,7 +497,7 @@ export class H2Conn {
       ;({ receipt, ownUsage, text } = await this.settleUsage(cur))
     } else if (status >= 400) {
       // The error body is short; give it a moment for the evidence, no more.
-      await Promise.race([this.until(() => cur.ended, 'the error body', 3000).catch(() => {}), sleep(3000)])
+      await Promise.race([this.until(() => cur.ended || cur.reset !== undefined, 'the error body', 3000).catch(() => {}), sleep(3000)])
       receipt = await this.settleErrorHead(cur)
       text = Buffer.from(concat(...cur.parts.map((p) => p.data))).toString('utf8')
       console.log(`[client ${s.label}] request ${n}: upstream error ${status}: ${ctx.shown(text, 200)}`)

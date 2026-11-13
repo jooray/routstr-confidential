@@ -21,6 +21,8 @@ export const FLAG = { END_STREAM: 0x1, ACK: 0x1, END_HEADERS: 0x4, PADDED: 0x8, 
 
 /** The largest DATA payload in one record: one frame per record, 2^14 bytes of content. */
 export const MAX_DATA_IN_RECORD = (1 << 14) - 9
+/** RFC 9113 §6.5.2 default SETTINGS_MAX_FRAME_SIZE; the connection head never raises it. */
+export const MAX_FRAME_SIZE = 1 << 14
 
 class H2Error extends Error {}
 
@@ -226,6 +228,9 @@ export class FrameReader {
     while (this.pending.length >= 9) {
       const p = this.pending
       const len = (p[0]! << 16) | (p[1]! << 8) | p[2]!
+      // The head never raises SETTINGS_MAX_FRAME_SIZE (RFC 9113 §4.2): a larger
+      // frame is a FRAME_SIZE_ERROR, refused before it is reassembled.
+      if (len > MAX_FRAME_SIZE) fail(`h2: a frame of ${len} bytes (FRAME_SIZE_ERROR, the limit is ${MAX_FRAME_SIZE})`)
       if (p.length < 9 + len) break
       out.push({
         type: p[3]!,

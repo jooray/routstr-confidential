@@ -5,7 +5,7 @@
 
 import { Bus, waitMsg } from './bus.ts'
 import { H2Conn, type H2Ctx } from './driver-h2.ts'
-import { FRAME, type RxFrame } from './h2.ts'
+import { FLAG, FRAME, type RxFrame } from './h2.ts'
 
 let checks = 0
 function ok(cond: unknown, what: string): void {
@@ -121,6 +121,105 @@ function cur(n: number): any {
   const at = wire.indexOf('ctl:ping_ack')
   ok(wire[at + 1] === 'record', `ctl is followed by its record (wire: ${wire.join(', ')})`)
   ok(wire.includes('release'), 'the release was sent')
+}
+
+// 4-7. One request against the provider's frames (review of PR
+//      Routstr/routstr-sdk#112): the node accepts it, the records go out, and
+//      the frames below arrive. `wire` shows what the node is sent.
+const enc = new TextEncoder()
+function requestRig(initialWindow = 65535) {
+  const rig: any = fakeSession()
+  const { s, conn, bus, wire } = rig
+  const suffix = ',"model":"m","max_tokens":9}'
+  const body = enc.encode(`{"messages":[]${suffix}`)
+  Object.assign(conn.ctx, {
+    offer: { upstream_host: 'api.example', head_template: 'POST /v1/chat/completions HTTP/1.1\r\n' },
+    buildBody: () => ({ kind: 'chat', model: 'm', maxTokens: 9, body, suffix: enc.encode(suffix), canonicalSuffix: suffix }),
+    shown: (v: unknown) => String(v),
+    writePrivate: () => {},
+    depositMsat: 0,
+  })
+  Object.assign(s, { sid: 'sid', runDir: '/nonexistent', allBytes: () => ({}), flushChain: Promise.resolve() })
+  const send = s.sendText
+  s.sendText = (o: any) => {
+    send(o)
+    if (o.type === 'request') {
+      rig.onRequest()
+      setTimeout(() => bus.emit({ type: 'request_ok', n: o.n, suffix, stream: 2 * o.n + 1 }), 1)
+    }
+    if (o.type === 'release') rig.releases.push(o.upto)
+  }
+  conn.initialWindow = initialWindow
+  conn.settleErrorHead = async () => {
+    wire.push('disclose_head')
+    return { status: conn.cur.status }
+  }
+  return Object.assign(rig, { releases: [] as number[], onRequest: () => {} })
+}
+const fr = (type: number, flags: number, stream: number, payload = new Uint8Array(0)): RxFrame => ({ type, flags, stream, payload, off: 0 })
+const status429 = Uint8Array.from([0x08, 0x03, ...enc.encode('429')])
+const opened = async (conn: any) => {
+  for (let i = 0; i < 500 && !conn.cur?.seqs.length; i++) await sleep(2)
+  await sleep(10)
+}
+
+// 4. Finding 18: an error head with END_STREAM followed by RST_STREAM(NO_ERROR)
+//    in one record (both frames parsed before the wait wakes) is disclosed.
+{
+  const { conn, wire } = requestRig()
+  const r = conn.request(1).catch((e: Error) => e)
+  await opened(conn)
+  conn.onFrame(fr(FRAME.HEADERS, FLAG.END_HEADERS | FLAG.END_STREAM, 3, status429))
+  conn.onFrame(fr(FRAME.RST_STREAM, 0, 3, new Uint8Array(4)))
+  const out = await within(r, 5000, 'error head + reset')
+  ok(out?.status === 429 && wire.includes('disclose_head'), `an error head before a reset is disclosed (got: ${out?.message ?? JSON.stringify(out?.status)})`)
+}
+
+// 5. The follow-on: an error head without END_STREAM, then a reset, ends the
+//    error-body wait at once; a reset without an error head still fails.
+{
+  const { conn, wire } = requestRig()
+  const r = conn.request(1).catch((e: Error) => e)
+  await opened(conn)
+  conn.onFrame(fr(FRAME.HEADERS, FLAG.END_HEADERS, 3, status429))
+  await sleep(20)
+  const t = Date.now()
+  conn.onFrame(fr(FRAME.RST_STREAM, 0, 3, new Uint8Array(4)))
+  const out = await within(r, 5000, 'error head, then reset')
+  ok(out?.status === 429 && wire.includes('disclose_head') && Date.now() - t < 1000, `the error-body wait ends on the reset (${Date.now() - t} ms)`)
+}
+{
+  const { conn, wire } = requestRig()
+  const r = conn.request(1).catch((e: Error) => e)
+  await opened(conn)
+  conn.onFrame(fr(FRAME.RST_STREAM, 0, 3, Uint8Array.from([0, 0, 0, 2])))
+  const out = await within(r, 5000, 'reset alone')
+  ok(String(out).includes('reset stream 3') && !wire.includes('disclose_head'), `a reset without an error head fails the request (got: ${out})`)
+}
+
+// 6. GOAWAY: a stream above its last-stream-id is not released, and the
+//    request ends without waiting out its timeouts.
+{
+  const rig = requestRig(0)
+  const { conn, releases } = rig
+  // The GOAWAY (last stream 1, the probe's) arrives while the node accepts the request.
+  rig.onRequest = () => conn.onFrame(fr(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 0])))
+  const r = conn.request(1).catch((e: Error) => e)
+  const out = await within(r, 5000, 'goaway')
+  ok(String(out).includes("GOAWAY (last stream 1) excludes stream 3") && releases.length === 0, `nothing of a stream beyond GOAWAY is released (got: ${out}, releases ${releases})`)
+}
+
+// 7. SETTINGS_INITIAL_WINDOW_SIZE applies to the open stream (RFC 9113 §6.9.2).
+{
+  const { conn, releases } = requestRig(0)
+  const r = conn.request(1).catch((e: Error) => e)
+  await opened(conn)
+  ok(releases.join() === '1', `only the HEADERS record is released without stream credit (${releases})`)
+  conn.onFrame(fr(FRAME.SETTINGS, 0, 0, Uint8Array.from([0x00, 0x04, 0x00, 0x01, 0x00, 0x00])))
+  await sleep(5)
+  ok(conn.cur.streamCredit === 0x10000 && releases.join() === '1,2', `the new initial window releases the body (${releases})`)
+  conn.failRej(new Error('stop'))
+  await r
 }
 
 console.log(`h2-conn-test: ${checks} checks passed`)
