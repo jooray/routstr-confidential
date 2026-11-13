@@ -1,0 +1,19 @@
+  note: the 'chat, unknown field' request carries "top_p":2, instead of an unknown field
+provider profile check  2026-11-13T08:07:42Z
+  provider: https://openrouter.ai/api/v1/chat/completions  build: ? (probe 200)
+  models: cheap=liquid/lfm-2.5-2.6b:free reasoning=liquid/lfm-2.5-2.6b:free text_only=liquid/lfm-2.5-2.6b:free vision=liquid/lfm-2.5-2.6b:free
+  offer file: ../offers/offer.openrouter.json  key: $CU_KEY
+  openssl: /opt/homebrew/opt/openssl@3/bin/openssl  retries=2
+  framing "2": probe /api/v1/models, idle 390 s (offer h2.idle_secs 390), body 20000 bytes, images no
+PASS         H1 TLS 1.3 with ALPN h2 (the one suite, P-256 only): offered only TLS_AES_128_GCM_SHA256+P-256+h2 -> TLSv1.3 TLS_AES_128_GCM_SHA256 p256=True alpn=h2 verify=0
+PASS         H2 KeyUpdate right after the connection head is accepted: head, KeyUpdate (sent=1), then a request -> 200, complete stream; control without KeyUpdate -> 200
+PASS         H3 the request dynamic table is kept (credential entry fits; SETTINGS do not shrink it): SETTINGS HEADER_TABLE_SIZE=default 4096 (credential entry 125 bytes, 1 SETTINGS frame(s)); request naming index 62 -> 200
+PASS         H6 a body of the node's limit passes flow control: 20000 byte body in 3 DATA frames, provider window 65536, 4 WINDOW_UPDATE frames -> 200
+PASS         H5 authorization by index only is authenticated, also after the idle time: indexed -> 200; no authorization field -> 401 (control); idle 390 s (0 PING answered), then indexed -> 200
+PASS         H4 HEADER_TABLE_SIZE = 0 honoured for response headers: 8 response header blocks on 3 connections decode with an empty dynamic table; table size updates: [0]
+PASS         H7 no response reflects the credential: headers, trailers and bodies carry no credential: probe GET 200; chat by index 200; chat without authorization 401; chat, unknown model 400; chat, unknown field 400
+PASS         H8 the usage event and [DONE] end the stream as the disclosure parses it: 3 streams end in the usage event and [DONE] (718 byte tail, LF only), END_STREAM on the last DATA frame
+summary: 8 PASS, 0 FAIL, 0 INCONCLUSIVE of 8
+offer "2": yes. openrouter.ai does what framing "2" needs (H1-H8).
+  "http": ["2", "1.1"] with "h2": {"probe_path": "/api/v1/models", "idle_secs": at most 390}; the sidecar's --max-body at most 20000.
+exit status 0
