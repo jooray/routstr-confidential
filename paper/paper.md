@@ -935,7 +935,9 @@ request's interval to the end of the refusing frame. N walks every frame in it: 
 frames, WINDOW_UPDATEs, the probe stream's frames and a GOAWAY that still covers the stream may come
 before the refusal, so a response on the stream (a head, a byte of DATA) stops the walk and no refusal
 after it can be disclosed. The reset must name the request's stream and code 7; the GOAWAY must carry
-`NO_ERROR` (a GOAWAY with an error code may be the client's doing). C cannot change the ciphertext N
+`NO_ERROR` (a GOAWAY with an error code may be the client's doing), and when nothing of the request was
+written it must reach N within $\min(30\,\text{s}, \texttt{idle\_secs}/4)$ of accepting the request,
+so it cannot be an idle close the client waited for. C cannot change the ciphertext N
 received from U, and it chooses only the record the walk starts at, which N bounds by the interval's
 start. The request is settled like a 429, $f_s$ if still due and nothing else, which releases the
 deposit; the connection closes and C runs the request again on a new connection. If U closes right
@@ -1346,9 +1348,10 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
 23. *Refused streams.* A disclosed refusal (section 4.8) rests on the provider's frame boundaries as an
     error head does, and needs the records from the request's interval to the refusal to be walkable (at
     most 8 records and 16 KiB, no KeyUpdate); otherwise the request is charged by what N saw, as before.
-    A client can still end an accepted request it never wrote for $f_s$ by holding it until the
-    provider's idle timer sends GOAWAY (at least `h2.idle_secs`): the provider did no work, and the gain
-    is at most $f_a$, or the deposit less $f_s$, per connection.
+    A GOAWAY that refuses a request none of whose records was written counts only if N received it
+    within $\min(30\,\text{s}, \texttt{idle\_secs}/4)$ after accepting the request (and less than
+    `idle_secs` after its last write to U): the provider closes an idle connection no sooner than
+    `idle_secs`, so a client cannot wait for an idle close to end a request cheaply.
 
 # 6. Implementation and evaluation
 

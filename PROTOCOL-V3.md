@@ -477,6 +477,19 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   anything, or the proofs of its records were still running), only the GOAWAY form counts (a provider
   cannot reset a stream it never saw), `i` is any record N still holds, and N fixes the request's
   interval, empty, at the disclosure. None of the request's records is written after a disclosed refusal.
+  And the GOAWAY counts only if **N received it within the GOAWAY window**: no later than
+  `W = min(30 s, h2.idle_secs / 4)` after N sent `request_ok`, and less than `h2.idle_secs` after N's last
+  write to the provider (the head or a client record). The times are N's own observations, the record
+  holding the GOAWAY's last byte is the one judged, and a later GOAWAY is refused (`error`; the request
+  then ends as §12.10 rows 8 and 9 say). Why: a provider ends an idle connection no sooner than
+  `h2.idle_secs` after its last activity (H5; the node's `idle_timeout_s` is at most that), so a GOAWAY
+  inside the window is the provider's own decision (a shutdown, a restart), never an idle close that C
+  provoked by holding an accepted request unwritten. W is far above what an honest client needs between
+  `request_ok` and its first release (its records' π_WIN, under a second to a few seconds); 30 s bounds
+  it when the idle time is long, and a quarter of `idle_secs` keeps it clear of short ones (2.5 s at the
+  smallest, 10 s). W follows from the signed offer's `h2.idle_secs`; it is not a field of its own. Once a
+  record of the request was written the window does not apply: the provider then refused a stream it
+  had seen.
 - **The refusing frame.** `RST_STREAM` must be on the request's stream (the probe stream 1, another
   request's stream, or stream 0 do not count) with payload length 4 and code 7; any other code (`CANCEL`,
   `NO_ERROR`, `INTERNAL_ERROR`, …) is no statement that nothing was processed. GOAWAY must carry
@@ -493,12 +506,11 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   only on the provider's frame boundaries. Pointing at a refusal of the probe stream or another stream,
   at a reset after a response head, or at a reset with another code is refused by the frame rules (the
   gates run these as attacks: `h2-r-refusal-*`); presenting R that is not U's plaintext fails π_WIN.
-- **What a client can still cause.** A provider whose idle timer ends a connection with GOAWAY
-  (`NO_ERROR`, last-stream-id the previous request's) while a request is accepted and not yet written:
-  a C that holds an accepted request unwritten until then (at least `h2.idle_secs`, H5, and below the
-  600 s request limit) ends it for the session fee if still due instead of the abandon fee or the
-  deposit. The provider did no work for it; the difference is at most the abandon fee, or the deposit
-  less the session fee, per connection, for minutes of a held slot.
+- **The idle stall is closed.** A C that holds an accepted request unwritten until the provider's idle
+  timer sends GOAWAY (at least `h2.idle_secs` later, H5) gets nothing from it: that GOAWAY arrives after
+  the window, its disclosure is refused, and the request costs what an abandoned one costs (the abandon
+  fee, or the deposit on a connection with no settlement). The unit test
+  `a_goaway_after_the_window_does_not_refuse_an_unwritten_request` runs both edges of the window.
 - **The provider closes right after its GOAWAY** (the usual case). N then keeps the request open for
   60 s for a `disclose_reset` alone (no other disclosure, nothing written); without it the request ends
   as before (§12.10 rows 8, 9).
@@ -761,7 +773,7 @@ the `request_ok.reserved_msats` of its request (§12.4).
 | 9 | Compromise scope: one `c_ap_1`/`s_ap_0` pair protects up to `h2.max_requests` requests (C may not KeyUpdate under π_WIN's rules). A live compromise of C exposes the connection's current and later traffic; a later forensic compromise of retained secrets exposes the whole recorded connection, not one request | best effort only: clients clear the traffic secrets they hold (zero the arrays, drop the references) when a connection closes and keep them out of logs. That is not cryptographic erasure: the clients are JavaScript, and copies the runtime made (garbage-collected buffers, heap snapshots, swap, core dumps) may remain. The levers are the connection's scope: operators keep `h2.max_requests` and `h2.max_lifetime_s` in proportion, and a user who needs one request per secret pair uses `reuse: none` or framing `"1.1"`. A per-request ratchet needs a new anchor protocol |
 | 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
 | 11 | `upstream_models` may map a public id to another provider prefix for the same name (`someorg/claude-opus-4.5` for `claude-opus-4.5`): the rule of §12.1 binds the name, not the publisher | matters only on a provider where anyone can publish models under their own namespace; closing it needs a per-host list of trusted prefixes, or showing the pinned id to the user. the node offers of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro; 970 mappings) and Cloudflare's `@cf/meta/<id>` all have the form `<prefix>/<public id>` |
-| 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5), and a client can end an accepted, unwritten request for the session fee by waiting for the provider's idle GOAWAY (§5.4.1) | the provider did no work; the gain is at most the abandon fee or the deposit less the session fee, per connection, after at least `h2.idle_secs` |
+| 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5). (The idle stall, ending an accepted, unwritten request cheaply by waiting for the provider's idle GOAWAY, is closed by the GOAWAY window, §5.4.1.) | as risk 5 |
 
 v2's residual risks carry over unchanged (π_NK does not bind other epoch-0 records; provider reflection;
 ECtF semi-honest; no proof of the garbler-only construction).
@@ -794,7 +806,9 @@ request, which is a provider-caused end, so it no longer falls in §12.10 row 9 
 after the provider closed: N waits 60 s for the disclosure). C runs the request again on a new
 connection. An `RST_STREAM` with any other code, a GOAWAY with an error code, and a reset after a
 response head stay as they were: the provider may have processed the request, or C may have caused the
-end. Residual: risk 12.
+end. A GOAWAY before any record of the request was written counts only within the GOAWAY window after
+`request_ok` (§5.4.1), so a client cannot wait for the provider's idle close to end a request cheaply.
+Residual: risk 12.
 
 ## 11. Versions and upgrade
 
@@ -1107,8 +1121,9 @@ connection began (handshake flight included).
   records running (unproven records of the request may wait: none of them is written any more); `r` walks
   as §5.4 says, ending exactly with `RST_STREAM(REFUSED_STREAM)` on the request's stream (only once a
   record of the request was written) or GOAWAY(`NO_ERROR`, last-stream-id < stream); `i ≤ S_k` when `S_k`
-  is set, else any record N holds (then `S_k` := the server records received so far, the interval stays
-  empty); `i` is held, received and in the named key epoch. Then `attestation` (as for any request; with
+  is set, else any record N holds, and the record ending the GOAWAY arrived within the GOAWAY window
+  (§5.4.1: `min(30 s, h2.idle_secs / 4)` after `request_ok`, and under `h2.idle_secs` after N's last write
+  to the provider) (then `S_k` := the server records received so far, the interval stays empty); `i` is held, received and in the named key epoch. Then `attestation` (as for any request; with
   no record written, `server_records` and `client_records` are 0), then
   `{"type":"zk_params","proof":"pi_win","purpose":"refusal","n","record","params"}` (`anchor = h2`; per
   covered record its bytes from offset 0 and its last byte = `17`, as for an error head). C checks the
@@ -1273,7 +1288,8 @@ connection ends.
 with its receipt (`deposit_released_msat`), so such a connection is in none of the rows above: in
 particular a GOAWAY that ends the connection **before `body_released`** is a provider-caused end and no
 longer costs the deposit (row 9) once C discloses it, also after the provider closed the TCP connection
-(N waits 60 s). A GOAWAY C cannot disclose (an error code, which C's own frames may have caused; frames
+(N waits 60 s). When nothing of the request was written, that GOAWAY must have reached N within the
+GOAWAY window (§5.4.1); a later one (an idle close the client may have waited for) stays in row 9. A GOAWAY C cannot disclose (an error code, which C's own frames may have caused; frames
 it cannot walk) stays in rows 8 and 9.
 
 ```
@@ -1350,4 +1366,4 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | `upstream_models` values must be `<prefix>/` + the public id (clients refuse anything else, N never signs it); the other-prefix gap is residual risk 11 (SDK review finding 17) | §2.2, §12.1, §10 |
 | a provider `HEADER_TABLE_SIZE` below 4096 ends the connection (`h2_table_size`), not only one below the credential entry | §5.6, §12.6 |
 | an error head followed by a reset is disclosed (finding 18); C's checks of the provider's frames (16 KiB, initial window, GOAWAY); `REFUSED_STREAM` as an open question | §9.4, §10.1, §12.8 |
-| a refused stream is proven (`disclose_reset`: `RST_STREAM(REFUSED_STREAM)`, GOAWAY(`NO_ERROR`) below the stream) and settled like a 429; a disclosed GOAWAY before `body_released` releases the deposit; N waits 60 s after the provider's early close; every receipt's `reserved_msats` equals `request_ok`'s; residual risk 12 | §3.5, §5.4.1, §9.4, §10.1, §12.8–§12.10 |
+| a refused stream is proven (`disclose_reset`: `RST_STREAM(REFUSED_STREAM)`, GOAWAY(`NO_ERROR`) below the stream) and settled like a 429; a disclosed GOAWAY before `body_released` releases the deposit; with nothing of the request written only within the GOAWAY window `min(30 s, h2.idle_secs/4)` after `request_ok`; N waits 60 s after the provider's early close; every receipt's `reserved_msats` equals `request_ok`'s; residual risk 12 | §3.5, §5.4.1, §9.4, §10.1, §12.8–§12.10 |
