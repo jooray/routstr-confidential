@@ -69,7 +69,15 @@ assert.throws(() => paddedBodyLength(10, 3), /bucket/)
   for (const bad of [[], 'x', { other: 'a/b' }, { same: 'same' }, { same: 'a"b' }, { same: 'a\\b' }, { same: '' }, { same: 'a b' }, { same: 7 }]) {
     assert.notEqual(upstreamModelsProblem({ price_list: offer.price_list, upstream_models: bad }), null, JSON.stringify(bad))
   }
-  assert.equal(upstreamModelsProblem({ price_list: { a: rates }, upstream_models: { a: '@cf/meta/llama-3.2-1b-instruct' } }), null)
-  assert.equal(upstreamModelsProblem({ price_list: { a: rates }, upstream_models: { a: 'liquid/lfm-2.5-2.6b:free' } }), null)
+  const ok1 = 'llama-3.2-1b-instruct', ok2 = 'lfm-2.5-2.6b:free'
+  assert.equal(upstreamModelsProblem({ price_list: { [ok1]: rates }, upstream_models: { [ok1]: '@cf/meta/llama-3.2-1b-instruct' } }), null)
+  assert.equal(upstreamModelsProblem({ price_list: { [ok2]: rates }, upstream_models: { [ok2]: 'liquid/lfm-2.5-2.6b:free' } }), null)
+  assert.equal(upstreamModelsProblem({ price_list: { 'claude-fable-latest': rates }, upstream_models: { 'claude-fable-latest': '~anthropic/claude-fable-latest' } }), null)
+  // Finding 17: only a provider prefix may differ; another model under the
+  // public id is refused (the node would pin it, and the receipt verify it).
+  for (const swap of ['qwen/qwen3.8-27b', 'claude-opus-4.5-x', 'xclaude-opus-4.5', 'a/claude-opus-4.5/x', '/claude-opus-4.5x']) {
+    const p = upstreamModelsProblem({ price_list: { 'claude-opus-4.5': rates }, upstream_models: { 'claude-opus-4.5': swap } })
+    assert.match(p ?? '', /names another model/, swap)
+  }
 }
 console.log('offer-check: ok')

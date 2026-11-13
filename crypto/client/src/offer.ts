@@ -41,6 +41,13 @@ export function upstreamModelsProblem(offer: any): string | null {
     if (typeof id !== 'string' || !/^[\x21-\x7e]{1,256}$/.test(id) || /["\\]/.test(id) || id === pub) {
       return `upstream_models[${JSON.stringify(pub)}] is not a provider model id`
     }
+    // Only the provider's prefix may differ (`moonshotai/kimi-k3.1-pro` for
+    // `kimi-k3.1-pro`, §12.1): any other id would let the node pin another
+    // model than the one the client asks and pays for, and the receipt would
+    // verify it.
+    if (!id.endsWith(`/${pub}`)) {
+      return `upstream_models[${JSON.stringify(pub)}] names another model (${JSON.stringify(id)})`
+    }
   }
   return null
 }
