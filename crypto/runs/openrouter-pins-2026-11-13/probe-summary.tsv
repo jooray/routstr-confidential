@@ -1,0 +1,101 @@
+id	model	status	provider	prompt_tokens	completion_tokens	openrouter_usd	token_rate_usd	ratio	search	images	note	error
+b0	mistralai/mistral-nemo	200	Mistral	6	20	3.9e-06	7.74e-07	5.039	None	0	baseline, current offer pins	
+plugins-nopin	mistralai/mistral-nemo	200	DekaLLM	500	8	0.00700924	1.474e-05	475.525	1	0	web plugin, no pin	
+plugins-pin	mistralai/mistral-nemo	200	DekaLLM	20	11	6.9e-07	9.1e-07	0.758	None	0	web plugin, pin plugins []	
+models-nopin	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	fallback list, no pin	
+models-pin	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	fallback list, pin models []	
+route-nopin	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	models + route fallback, no pin	
+prov-nopin	mistralai/mistral-nemo	200	Mistral	6	20	3.9e-06	7.74e-07	5.039	None	0	provider only mistral (5x price), no pin	
+prov-pin-order	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	pin provider {order:[]}	
+prov-pin-only	mistralai/mistral-nemo	404	None	None	None	None	None	None	None	0	pin provider {only:[]}	{"error":{"message":"No allowed providers are specified.","code":404,"metadata":{"routing_funnel":[{"step":"Initial Endp
+prov-pin-nofb	mistralai/mistral-nemo	200	Io Net	6	10	3.15e-07	4.74e-07	0.665	None	0	pin provider {allow_fallbacks:false}	
+tools-nopin	mistralai/mistral-nemo	200	Io Net	460	10	0.0	1.364e-05	None	None	0	server tool web_search, no pin	
+tools-pin	mistralai/mistral-nemo	200	Io Net	20	12	5.9e-07	9.4e-07	0.628	None	0	server tool web_search, pin tools []	
+wso-nemo	mistralai/mistral-nemo	200	DekaLLM	20	11	6.9e-07	9.1e-07	0.758	None	0	web_search_options on a model without native search	
+n-dup	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	n 3 in private, pinned n 1; debug echo	
+preset-nopin	mistralai/mistral-nemo	404	None	None	None	None	None	None	None	0	preset reference, no pin	{"error":{"message":"Preset \"no-such-preset-xyz\" not found for this user.","code":404,"metadata":{"presetErrorCode":"p
+preset-pin	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	preset, pin preset off	
+b0-r2	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	baseline repeat (default routing)	
+b0-r3	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	baseline repeat	
+b0-r4	mistralai/mistral-nemo	200	DekaLLM	6	8	3.48e-07	4.14e-07	0.841	None	0	baseline repeat	
+nofb-r2	mistralai/mistral-nemo	200	Io Net	6	10	3.15e-07	4.74e-07	0.665	None	0	pin provider allow_fallbacks false, repeat	
+nofb-r3	mistralai/mistral-nemo	200	Io Net	6	10	3.15e-07	4.74e-07	0.665	None	0	repeat	
+order-r2	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	client order mistral, pin order []	
+prov-merge-test	mistralai/mistral-nemo	200	Io Net	6	10	3.15e-07	4.74e-07	0.665	None	0	client only mistral; pin allow_fallbacks false: merged would give Mistral	
+tools-gpt-nopin	openai/gpt-oss-20b	200	Darkbloom	3836	612	0.0	0.00019464	None	2	0	server tool web_search (exa) on gpt-oss-20b, no pin	
+tools-gpt-pin	openai/gpt-oss-20b	200	DeepInfra	72	91	1.49e-05	1.399e-05	1.065	None	0	same, pin tools []	
+models-img-nopin	mistralai/mistral-nemo	200	OpenAI	8516	2	0.0012786	0.000247024	5.176	None	0	image to a text-only model with a fallback list, no pin	
+models-img-pin	mistralai/mistral-nemo	404	None	None	None	None	None	None	None	0	same, pin models []	{"error":{"message":"No endpoints found that support image input","code":404,"metadata":{"routing_funnel":[{"step":"Init
+pdf1-nemo	mistralai/mistral-nemo	200	DekaLLM	32	2	0.002000636	9.88e-07	2024.935	None	0	1-page PDF to a text-only model, no plugin	
+pdf3-nemo	mistralai/mistral-nemo	200	DekaLLM	50	2	0.00600096	1.51e-06	3974.146	None	0	3-page PDF to a text-only model, no plugin	
+pdf3-nemo-pin	mistralai/mistral-nemo	200	DekaLLM	50	2	0.00600096	1.51e-06	3974.146	None	0	3-page PDF, pin plugins []	
+pdf3-nemo-cf	mistralai/mistral-nemo	200	DekaLLM	120	7	2.37e-06	3.69e-06	0.642	None	0	3-page PDF, pin file-parser cloudflare-ai (outside the client policy)	
+wso-4omini-nopin	openai/gpt-4o-mini	400	None	None	None	None	None	None	None	0	web_search_options on gpt-4o-mini, no pin	{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\n  \"error\": {\n    \"message\": \"Web se
+wso-4omini-off	openai/gpt-4o-mini	200	OpenAI	25	20	1.575e-05	1.575e-05	1.0	None	0	pin search_context_size off	
+wso-4omini-false	openai/gpt-4o-mini	200	OpenAI	25	7	7.95e-06	7.95e-06	1.0	None	0	pin web_search_options false	
+wso-4omini-empty	openai/gpt-4o-mini	200	OpenAI	25	10	9.75e-06	9.75e-06	1.0	None	0	pin web_search_options []	
+wso-4o-nopin	openai/gpt-4o	400	None	None	None	None	None	None	None	0	web_search_options alone on gpt-4o (native search), no pin	{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\n  \"error\": {\n    \"message\": \"Web se
+wso-4o-false	openai/gpt-4o	200	OpenAI	18	20	0.000245	0.000245	1.0	None	0	same, pin web_search_options false (provider kept: unpinned here)	
+img-pin-modalities	google/gemini-3.1-flash-lite-image	200	Google AI Studio	9	200	0.00030225	0.00030225	1.0	None	0	image output asked in private, pin modalities []	
+reason-effort	openai/gpt-oss-20b	200	DeepInfra	65	20	4.75e-06	4.55e-06	1.044	None	0	reasoning effort high, cap 20	
+reason-budget	openai/gpt-oss-20b	200	Darkbloom	78	20	3.204e-06	4.94e-06	0.649	None	0	reasoning max_tokens 500, cap 20	
+reason-haiku	anthropic/claude-haiku-5.5	200	Claude Platform on AWS	23	20	1.23e-05	1.23e-05	1.0	None	0	haiku reasoning budget 2000, cap 20	
+verbosity	openai/gpt-5-nano	200	OpenAI	9	20	8.45e-06	8.45e-06	1.0	None	0	verbosity high, cap 20	
+prediction	openai/gpt-4o-mini	200	OpenAI	10	25	1.65e-05	1.65e-05	1.0	None	0	prediction 1500 tokens, cap 20	
+tier-priority	openai/gpt-4o-mini	200	Azure	10	9	6.9e-06	6.9e-06	1.0	None	0	service_tier priority, no pin	
+tier-priority-nano	openai/gpt-5-nano	200	OpenAI	9	20	8.45e-06	8.45e-06	1.0	None	0	service_tier priority on gpt-5-nano, no pin	
+tier-pin-false	openai/gpt-5-nano	200	OpenAI	9	20	8.45e-06	8.45e-06	1.0	None	0	pin service_tier false	
+tier-pin-off	openai/gpt-5-nano	200	OpenAI	9	20	8.45e-06	8.45e-06	1.0	None	0	pin service_tier off	
+cache-1h	anthropic/claude-haiku-5.5	200	Claude Platform on AWS	15014	14	0.0030094	0.00188365	1.598	None	0	top-level cache_control ttl 1h, 6k-token system prompt	
+cache-5m	anthropic/claude-haiku-5.5	200	Claude Platform on AWS	15014	20	0.00188665	0.00188665	1.0	None	0	top-level cache_control 5m	
+cache-pin-false	anthropic/claude-haiku-5.5	400	None	None	None	None	None	None	None	0	cache_control 1h, pin false	{"error":{"message":"Invalid top-level cache_control: : Invalid input: expected object, received boolean","code":400,"me
+logprobs	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	logprobs + top_logprobs 20	
+transforms	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	transforms middle-out	
+usage-include	openai/gpt-oss-20b	200	DeepInfra	57	20	4.51e-06	4.31e-06	1.046	None	0	usage include, include_reasoning	
+n-openai	openai/gpt-4o-mini	200	OpenAI	10	9	6.9e-06	6.9e-06	1.0	None	0	n 4 in private on OpenAI, pinned n 1	
+stream-opts	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	stream false and include_usage false in private, pinned true	
+tier-overrides	anthropic/claude-haiku-5.5	200	Claude Platform on AWS	275013	4	0.1375165	0.0275033	5.0	None	0	haiku >100k prompt tokens (pricing override tier)	
+route-default-0	mistralai/mistral-nemo	200	DekaLLM	6	8	3.48e-07	4.14e-07	0.841	None	0	routing: no provider pin	
+route-nofb-0	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	routing: client order mistral + sort throughput, pin provider allow_fallbacks false	
+route-order-0	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: client order mistral, pin provider order []	
+route-default-1	mistralai/mistral-nemo	200	DekaLLM	6	8	3.48e-07	4.14e-07	0.841	None	0	routing: no provider pin	
+route-nofb-1	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	routing: client order mistral + sort throughput, pin provider allow_fallbacks false	
+route-order-1	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: client order mistral, pin provider order []	
+route-default-2	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: no provider pin	
+route-nofb-2	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	routing: client order mistral + sort throughput, pin provider allow_fallbacks false	
+route-order-2	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: client order mistral, pin provider order []	
+route-default-3	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: no provider pin	
+route-nofb-3	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	routing: client order mistral + sort throughput, pin provider allow_fallbacks false	
+route-order-3	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: client order mistral, pin provider order []	
+route-default-4	mistralai/mistral-nemo	200	DekaLLM	6	8	3.48e-07	4.14e-07	0.841	None	0	routing: no provider pin	
+route-nofb-4	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	routing: client order mistral + sort throughput, pin provider allow_fallbacks false	
+route-order-4	mistralai/mistral-nemo	200	DekaLLM	6	8	3.48e-07	4.14e-07	0.841	None	0	routing: client order mistral, pin provider order []	
+route-default-5	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: no provider pin	
+route-nofb-5	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	routing: client order mistral + sort throughput, pin provider allow_fallbacks false	
+route-order-5	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: client order mistral, pin provider order []	
+route-default-6	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: no provider pin	
+route-nofb-6	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	routing: client order mistral + sort throughput, pin provider allow_fallbacks false	
+route-order-6	mistralai/mistral-nemo	200	DekaLLM	6	8	3.48e-07	4.14e-07	0.841	None	0	routing: client order mistral, pin provider order []	
+route-default-7	mistralai/mistral-nemo	200	DekaLLM	6	10	4.08e-07	4.74e-07	0.861	None	0	routing: no provider pin	
+route-nofb-7	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	routing: client order mistral + sort throughput, pin provider allow_fallbacks false	
+route-order-7	mistralai/mistral-nemo	200	DekaLLM	6	8	3.48e-07	4.14e-07	0.841	None	0	routing: client order mistral, pin provider order []	
+svc-priority-nopin	z-ai/glm-5.3-flash	200	Parasail	15	20	1.53125e-05	2.1665e-06	7.068	None	0	service_tier priority on glm-5.3-flash (parasail/fast priority endpoint), no pin	
+svc-priority-off	z-ai/glm-5.3-flash	200	OpenInference	30	20	7.35e-06	2.6165e-06	2.809	None	0	pin service_tier off	
+svc-priority-false	z-ai/glm-5.3-flash	200	Inceptron	15	20	1.2025e-05	2.1665e-06	5.55	None	0	pin service_tier false	
+mtc0	openai/gpt-oss-20b	200	DeepInfra	9906	620	0.0283747	0.00037778	75.109	4	0	server tool web_search, pin max_tool_calls 0 (outside the client policy: an integer)	
+audio-in	google/gemini-3.1-flash-lite	200	Google	82	7	4.975e-05	3.1e-05	1.605	None	0	3 s audio input (catalogue audio rate 2x prompt)	
+img-modalities-2000	google/gemini-3.1-flash-lite-image	200	Google	9	1120	0.03360225	0.00168225	19.975	None	1	image output asked in private, pin modalities [], cap 2000	
+full-honest-mistral-nemo	mistralai/mistral-nemo	200	Io Net	6	10	3.1536e-07	4.74e-07	0.665	None	0	the proposed suffix, honest request	
+full-honest-gpt-oss-20b	openai/gpt-oss-20b	200	Darkbloom	70	20	3.06e-06	4.7e-06	0.651	None	0	the proposed suffix, honest request	
+full-honest-claude-haiku-5.5	anthropic/claude-haiku-5.5	200	Claude Platform on AWS	13	14	8.3e-06	8.3e-06	1.0	None	0	the proposed suffix, honest request	
+full-honest-gpt-4o-mini	openai/gpt-4o-mini	200	OpenAI	10	9	6.9e-06	6.9e-06	1.0	None	0	the proposed suffix, honest request	
+full-honest-glm-5.3-flash	z-ai/glm-5.3-flash	200	Relace	15	20	2.1665e-06	2.1665e-06	1.0	None	0	the proposed suffix, honest request	
+full-honest-gpt-5-nano	openai/gpt-5-nano	200	OpenAI	9	0	4.5e-07	4.5e-07	1.0	None	0	the proposed suffix, honest request	
+full-honest-llama-3.1-8b-instruct	meta-llama/llama-3.1-8b-instruct	200	Groq	38	10	2.7e-06	1.16e-06	2.328	None	0	the proposed suffix, honest request	
+full-attack-mistral-nemo	mistralai/mistral-nemo	200	Io Net	15	13	5.292e-07	8.25e-07	0.641	None	0	the proposed suffix, every attack field at once in the private part	
+full-attack-glm-5.3-flash	z-ai/glm-5.3-flash	200	Relace	24	20	2.5256e-06	2.5256e-06	1.0	None	0	the proposed suffix, every attack field at once in the private part	
+attack-nopin-glm	z-ai/glm-5.3-flash	404	None	None	None	None	None	None	None	0	the same attack fields, current offer pins (control)	{"error":{"message":"Preset \"x\" not found for this user.","code":404,"metadata":{"presetErrorCode":"preset_not_found",
+llama-base	meta-llama/llama-3.1-8b-instruct	200	Cloudflare	14	20	7.868e-06	1.08e-06	7.285	None	0	llama, current pins	
+llama-nofb	meta-llama/llama-3.1-8b-instruct	200	DeepInfra	13	10	6.6e-07	6.6e-07	1.0	None	0	llama, provider pin only	
+llama-full-2	meta-llama/llama-3.1-8b-instruct	200	Groq	38	10	2.7e-06	1.16e-06	2.328	None	0	llama, the proposed suffix (repeat)	
+llama-tier-default-str	meta-llama/llama-3.1-8b-instruct	200	Groq	38	18	3.34e-06	1.48e-06	2.257	None	0	llama, proposed suffix without service_tier	

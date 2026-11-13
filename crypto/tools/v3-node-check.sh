@@ -48,6 +48,11 @@
 #                    the admin API after the node starts, for a provider whose /models
 #                    the node cannot list (Cloudflare Workers AI)
 #   CU_NO_IMAGES     1: skip the two paid image cases
+#   CU_PIN_ATTACKS   1: also run the `p-` cases (cost-raising fields in the private part,
+#                    OpenRouter; docs/providers/OPENROUTER.md), with CU_PIN_PRICEY_PROVIDER
+#                    (a provider slug dearer than the model's catalogue price), CU_PIN_FALLBACK_MODEL,
+#                    and optionally CU_PIN_IMAGE_MODEL / CU_PIN_FILTERED_MODEL (public ids the node
+#                    must not offer)
 #   CU_CASES         optional space-separated subset of case ids ("fb" selects the
 #                    whole fallback group)
 #   CU_SLOW          1: also run setup-timeout (an armed connection left for 600 s)
@@ -481,6 +486,48 @@ run_case h2-k-rst-after-release "attack:2:2:charged:already in flight" "$B" none
 run_case h2-k-ctl-headers      "attack:2:2:abandoned:pi_win failed"   "$B" none -- --http 2 --requests 2 --adv ctl-headers --adv-at 2
 run_case h11-k-extra-record    "attack:1.1:1:charged:exceeds declared length" "$B" none -- --http 1.1 --adv extra-record
 run_case h11-k-pipelined       "error:1.1:1:400" "$B" none -- --http 1.1 --private-extra $'"x":1}\r\n\r\nPOST /api/v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n{'
+
+# --- cost-raising fields in the private part (CU_PIN_ATTACKS=1; OpenRouter) ----
+# The private part asks for something the provider bills outside the token
+# counts (a paid plugin, a server tool, a fallback model, a pricier provider, a
+# preset, native search, a priority tier); the offer's fixed pins come last and
+# win (docs/providers/OPENROUTER.md). Each request settles at its usage, and
+# crypto/runs/openrouter-pins-2026-11-13/tools/orcost.py compares the provider's
+# reported cost with the node's charge. `p-pdf` is the one the offer cannot pin
+# (OCR of a PDF part, billed per page): it settles, and the cost check shows it.
+if [ "${CU_PIN_ATTACKS:-0}" = 1 ]; then
+  SEARCH='Search the web: what is the top news headline today? Answer in five words.'
+  P_PLUGINS='"plugins":[{"id":"web","max_results":1}]'
+  P_TOOLS='"tools":[{"type":"openrouter:web_search","parameters":{"max_results":2}}],"tool_choice":"auto"'
+  P_PROVIDER='"provider":{"only":["'"${CU_PIN_PRICEY_PROVIDER:-mistral}"'"],"allow_fallbacks":true,"sort":"throughput"}'
+  P_IMG='"messages":[{"role":"user","content":[{"type":"text","text":"What colour is this image? One word."},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII="}}]}],"models":["'"${CU_PIN_FALLBACK_MODEL:-openai/gpt-4o-mini}"'"],"route":"fallback"'
+  P_PDF='"messages":[{"role":"user","content":[{"type":"text","text":"What word does the document say? One word."},{"type":"file","file":{"filename":"a.pdf","file_data":"'"$("$PY" -I "$HERE/mkpdf.py" 3)"'"}}]}]'
+  P_ALL="$P_PLUGINS,$P_TOOLS,$P_PROVIDER"',"models":["'"${CU_PIN_FALLBACK_MODEL:-openai/gpt-4o-mini}"'"],"preset":"@preset/x","web_search_options":{"search_context_size":"high"},"service_tier":"priority","n":3,"stream":false,"stream_options":{"include_usage":false}'
+  run_case h2-p-plugins   "settled:2:chat"     "$B" none -- --http 2   --prompt "$SEARCH" --private-extra "$P_PLUGINS"
+  run_case h11-p-plugins  "settled:1.1:chat"   "$B" none -- --http 1.1 --prompt "$SEARCH" --private-extra "$P_PLUGINS"
+  run_case h2-p-tools     "settled:2:chat"     "$B" none -- --http 2   --prompt "$SEARCH" --private-extra "$P_TOOLS"
+  run_case h11-p-tools    "settled:1.1:chat"   "$B" none -- --http 1.1 --prompt "$SEARCH" --private-extra "$P_TOOLS"
+  run_case h2-p-provider  "settled:2:chat"     "$B" none -- --http 2   --private-extra "$P_PROVIDER"
+  run_case h11-p-provider "settled:1.1:chat"   "$B" none -- --http 1.1 --private-extra "$P_PROVIDER"
+  run_case h2-p-preset    "settled:2:chat"     "$B" none -- --http 2   --private-extra '"preset":"@preset/x"'
+  run_case h2-p-wso       "settled:2:chat"     "$B" none -- --http 2   --prompt "$SEARCH" --private-extra '"web_search_options":{"search_context_size":"high"}'
+  run_case h2-p-tier      "settled:2:chat"     "$B" none -- --http 2   --private-extra '"service_tier":"priority"'
+  run_case h2-p-all       "settled:2:chat"     "$B" none -- --http 2   --prompt "$SEARCH" --private-extra "$P_ALL"
+  run_case h11-p-all      "settled:1.1:chat"   "$B" none -- --http 1.1 --prompt "$SEARCH" --private-extra "$P_ALL"
+  # An image to a text-only model with a fallback list: with `models` pinned
+  # off there is no endpoint for it (404), settled as an error head (A).
+  run_case h2-p-models-image  "error:2:1:404"   "$B" none -- --http 2   --private-extra "$P_IMG"
+  run_case h11-p-models-image "error:1.1:1:404" "$B" none -- --http 1.1 --private-extra "$P_IMG"
+  # Models the node keeps out of its chat offer: image output, the operator's filter.
+  if [ -n "${CU_PIN_IMAGE_MODEL:-}" ]; then
+    run_case h2-p-image-model "node-refused:2:1:400:not served confidentially" "$B" none -- --http 2 --models "$CU_PIN_IMAGE_MODEL"
+  fi
+  if [ -n "${CU_PIN_FILTERED_MODEL:-}" ]; then
+    run_case h2-p-filtered "node-refused:2:1:400:not served confidentially" "$B" none -- --http 2 --models "$CU_PIN_FILTERED_MODEL"
+  fi
+  run_case h2-p-pdf  "settled:2:chat"   "$B" none -- --http 2   --private-extra "$P_PDF"
+  run_case h11-p-pdf "settled:1.1:chat" "$B" none -- --http 1.1 --private-extra "$P_PDF"
+fi
 
 # --- the deposit table, versions ---------------------------------------------
 run_case no-funds      "setup-refused:402:insufficient"      0                 none -- --http 2

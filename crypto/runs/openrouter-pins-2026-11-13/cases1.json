@@ -1,0 +1,244 @@
+[
+ {
+  "id": "b0",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "baseline, current offer pins"
+ },
+ {
+  "id": "plugins-nopin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Search the web: what is the top news headline today? Answer in five words.\"}],\"plugins\":[{\"id\":\"web\",\"max_results\":1}]",
+  "note": "web plugin, no pin"
+ },
+ {
+  "id": "plugins-pin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Search the web: what is the top news headline today? Answer in five words.\"}],\"plugins\":[{\"id\":\"web\",\"max_results\":1}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ]
+  ],
+  "note": "web plugin, pin plugins []"
+ },
+ {
+  "id": "models-nopin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"models\":[\"openai/gpt-4o-mini\"]",
+  "note": "fallback list, no pin"
+ },
+ {
+  "id": "models-pin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"models\":[\"openai/gpt-4o-mini\"]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "models",
+    []
+   ]
+  ],
+  "note": "fallback list, pin models []"
+ },
+ {
+  "id": "route-nopin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"models\":[\"openai/gpt-4o-mini\"],\"route\":\"fallback\"",
+  "note": "models + route fallback, no pin"
+ },
+ {
+  "id": "prov-nopin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"only\":[\"mistral\"],\"allow_fallbacks\":false}",
+  "note": "provider only mistral (5x price), no pin"
+ },
+ {
+  "id": "prov-pin-order",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"only\":[\"mistral\"],\"allow_fallbacks\":false}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "pin provider {order:[]}"
+ },
+ {
+  "id": "prov-pin-only",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"only\":[\"mistral\"],\"allow_fallbacks\":false}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "only": []
+    }
+   ]
+  ],
+  "note": "pin provider {only:[]}"
+ },
+ {
+  "id": "prov-pin-nofb",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"only\":[\"mistral\"],\"allow_fallbacks\":true}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "pin provider {allow_fallbacks:false}"
+ },
+ {
+  "id": "tools-nopin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Search the web: what is the top news headline today? Answer in five words.\"}],\"tools\":[{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":1}}]",
+  "note": "server tool web_search, no pin"
+ },
+ {
+  "id": "tools-pin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Search the web: what is the top news headline today? Answer in five words.\"}],\"tools\":[{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":1}}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "tools",
+    []
+   ]
+  ],
+  "note": "server tool web_search, pin tools []"
+ },
+ {
+  "id": "wso-nemo",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Search the web: what is the top news headline today? Answer in five words.\"}],\"web_search_options\":{\"search_context_size\":\"high\"}",
+  "note": "web_search_options on a model without native search"
+ },
+ {
+  "id": "n-dup",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"n\":3,\"debug\":{\"echo_upstream_body\":true}",
+  "note": "n 3 in private, pinned n 1; debug echo"
+ },
+ {
+  "id": "preset-nopin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"preset\":\"@preset/no-such-preset-xyz\"",
+  "note": "preset reference, no pin"
+ },
+ {
+  "id": "preset-pin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"preset\":\"@preset/no-such-preset-xyz\"",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "preset",
+    "off"
+   ]
+  ],
+  "note": "preset, pin preset off"
+ }
+]

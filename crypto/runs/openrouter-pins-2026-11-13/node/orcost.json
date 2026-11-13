@@ -1,0 +1,1327 @@
+[
+ {
+  "case": "h11-decoy",
+  "n": 1,
+  "sid": "86f2732e7871",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529219-lDpouLSWFeHYHBYsHa6A",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 9,
+  "completion_tokens": 4,
+  "openrouter_usd": 2.3544e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529219,
+   "id": "gen-1794529219-lDpouLSWFeHYHBYsHa6A",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 2.3544e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 2.3544e-07,
+     "upstream_inference_prompt_cost": 1.4904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 13
+   }
+  }
+ },
+ {
+  "case": "h11-one",
+  "n": 1,
+  "sid": "52d7842e58ad",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529208-98Fx133rcP9UnsR02nMY",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 9,
+  "completion_tokens": 4,
+  "openrouter_usd": 2.3544e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529208,
+   "id": "gen-1794529208-98Fx133rcP9UnsR02nMY",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 2.3544e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 2.3544e-07,
+     "upstream_inference_prompt_cost": 1.4904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 13
+   }
+  }
+ },
+ {
+  "case": "h11-p-all",
+  "n": 1,
+  "sid": "6c20f46e90a8",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529263-oruj1OXMvuE1Hg6io84D",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 20,
+  "completion_tokens": 11,
+  "openrouter_usd": 4.7664e-07,
+  "node_charge_msat": 3002,
+  "node_usage_msat": 2,
+  "node_charge_usd": 0.002245446122215842,
+  "node_usage_usd": 1.49596677029703e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529263,
+   "id": "gen-1794529263-oruj1OXMvuE1Hg6io84D",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 11,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 4.7664e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 2.376e-07,
+     "upstream_inference_cost": 4.7664e-07,
+     "upstream_inference_prompt_cost": 2.3904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 20,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 16,
+     "video_tokens": 0
+    },
+    "total_tokens": 31
+   }
+  }
+ },
+ {
+  "case": "h11-p-models-image",
+  "n": 1,
+  "sid": "6f7ecf4bf4d1",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": null,
+  "provider": null,
+  "search_results": null,
+  "prompt_tokens": null,
+  "completion_tokens": null,
+  "openrouter_usd": null,
+  "node_charge_msat": 5000,
+  "node_usage_msat": 5000,
+  "node_charge_usd": 0.003739916925742575,
+  "node_usage_usd": 0.003739916925742575,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "-",
+  "receipt_usage": {
+   "choices": [],
+   "error_status": 404
+  }
+ },
+ {
+  "case": "h11-p-pdf",
+  "n": 1,
+  "sid": "46da9f223a1b",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529280-1KyknnzWAu4hCjieEEV2",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 50,
+  "completion_tokens": 2,
+  "openrouter_usd": 0.00600059472,
+  "node_charge_msat": 3003,
+  "node_usage_msat": 3,
+  "node_charge_usd": 0.0022461941056009906,
+  "node_usage_usd": 2.243950155445545e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "LOSS",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529280,
+   "id": "gen-1794529280-1KyknnzWAu4hCjieEEV2",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 2,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 0.00600059472,
+    "cost_details": {
+     "upstream_inference_completions_cost": 4.32e-08,
+     "upstream_inference_cost": 5.9472e-07,
+     "upstream_inference_prompt_cost": 5.5152e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 50,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 48,
+     "video_tokens": 0
+    },
+    "total_tokens": 52
+   }
+  }
+ },
+ {
+  "case": "h11-p-plugins",
+  "n": 1,
+  "sid": "e49993451806",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529232-6Cpctqfly1G5yFeCub1e",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 20,
+  "completion_tokens": 10,
+  "openrouter_usd": 5.472e-07,
+  "node_charge_msat": 3002,
+  "node_usage_msat": 2,
+  "node_charge_usd": 0.002245446122215842,
+  "node_usage_usd": 1.49596677029703e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529232,
+   "id": "gen-1794529232-6Cpctqfly1G5yFeCub1e",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 10,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 5.472e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 2.16e-07,
+     "upstream_inference_cost": 5.472e-07,
+     "upstream_inference_prompt_cost": 3.312e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 20,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 30
+   }
+  }
+ },
+ {
+  "case": "h11-p-provider",
+  "n": 1,
+  "sid": "92cce749170c",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529246-7NOac3FYTDv3ZD3n6lLk",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 9,
+  "completion_tokens": 4,
+  "openrouter_usd": 2.3544e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529246,
+   "id": "gen-1794529246-7NOac3FYTDv3ZD3n6lLk",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 2.3544e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 2.3544e-07,
+     "upstream_inference_prompt_cost": 1.4904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 13
+   }
+  }
+ },
+ {
+  "case": "h11-p-tools",
+  "n": 1,
+  "sid": "4eb372854388",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529239-JggoyuEoP2sjkYgFmjys",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 20,
+  "completion_tokens": 10,
+  "openrouter_usd": 4.5504e-07,
+  "node_charge_msat": 3002,
+  "node_usage_msat": 2,
+  "node_charge_usd": 0.002245446122215842,
+  "node_usage_usd": 1.49596677029703e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529239,
+   "id": "gen-1794529239-JggoyuEoP2sjkYgFmjys",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 10,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 4.5504e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 2.16e-07,
+     "upstream_inference_cost": 4.5504e-07,
+     "upstream_inference_prompt_cost": 2.3904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 20,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 16,
+     "video_tokens": 0
+    },
+    "total_tokens": 30
+   }
+  }
+ },
+ {
+  "case": "h2-c-model-swap",
+  "n": 1,
+  "sid": "9f643dbac050",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529223-bRazn8t2lLN2tZFqdY84",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 14,
+  "completion_tokens": 4,
+  "openrouter_usd": 3.1824e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529223,
+   "id": "gen-1794529223-bRazn8t2lLN2tZFqdY84",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 3.1824e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 3.1824e-07,
+     "upstream_inference_prompt_cost": 2.3184e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 14,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 18
+   }
+  }
+ },
+ {
+  "case": "h2-decoy",
+  "n": 1,
+  "sid": "ecc51ab0fcf6",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529216-txUOB3wPUtkfBVZk1eeU",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 9,
+  "completion_tokens": 4,
+  "openrouter_usd": 2.3544e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529216,
+   "id": "gen-1794529216-txUOB3wPUtkfBVZk1eeU",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 2.3544e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 2.3544e-07,
+     "upstream_inference_prompt_cost": 1.4904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 13
+   }
+  }
+ },
+ {
+  "case": "h2-one",
+  "n": 1,
+  "sid": "0dffbc96cb5f",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529204-pu4Yb6gjP2yjxwRbiXk6",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 9,
+  "completion_tokens": 4,
+  "openrouter_usd": 2.3544e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529204,
+   "id": "gen-1794529204-pu4Yb6gjP2yjxwRbiXk6",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 2.3544e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 2.3544e-07,
+     "upstream_inference_prompt_cost": 1.4904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 13
+   }
+  }
+ },
+ {
+  "case": "h2-p-all",
+  "n": 1,
+  "sid": "47430ff161b7",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529259-BzIL2zhy4tXLrbTOGbCd",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 20,
+  "completion_tokens": 10,
+  "openrouter_usd": 4.5504e-07,
+  "node_charge_msat": 3002,
+  "node_usage_msat": 2,
+  "node_charge_usd": 0.002245446122215842,
+  "node_usage_usd": 1.49596677029703e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529259,
+   "id": "gen-1794529259-BzIL2zhy4tXLrbTOGbCd",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 10,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 4.5504e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 2.16e-07,
+     "upstream_inference_cost": 4.5504e-07,
+     "upstream_inference_prompt_cost": 2.3904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 20,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 16,
+     "video_tokens": 0
+    },
+    "total_tokens": 30
+   }
+  }
+ },
+ {
+  "case": "h2-p-models-image",
+  "n": 1,
+  "sid": "d2debabb18c8",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": null,
+  "provider": null,
+  "search_results": null,
+  "prompt_tokens": null,
+  "completion_tokens": null,
+  "openrouter_usd": null,
+  "node_charge_msat": 5000,
+  "node_usage_msat": 5000,
+  "node_charge_usd": 0.003739916925742575,
+  "node_usage_usd": 0.003739916925742575,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "-",
+  "receipt_usage": {
+   "choices": [],
+   "error_status": 404
+  }
+ },
+ {
+  "case": "h2-p-pdf",
+  "n": 1,
+  "sid": "58e4d6c79fc9",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529276-CRDotoajH09lKNAo0cks",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 50,
+  "completion_tokens": 2,
+  "openrouter_usd": 0.0060008712,
+  "node_charge_msat": 3003,
+  "node_usage_msat": 3,
+  "node_charge_usd": 0.0022461941056009906,
+  "node_usage_usd": 2.243950155445545e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "LOSS",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529276,
+   "id": "gen-1794529276-CRDotoajH09lKNAo0cks",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 2,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 0.0060008712,
+    "cost_details": {
+     "upstream_inference_completions_cost": 4.32e-08,
+     "upstream_inference_cost": 8.712e-07,
+     "upstream_inference_prompt_cost": 8.28e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 50,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 52
+   }
+  }
+ },
+ {
+  "case": "h2-p-plugins",
+  "n": 1,
+  "sid": "543adb0e9d62",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529229-PaAaehH0v0LaoYMas4Vu",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 20,
+  "completion_tokens": 12,
+  "openrouter_usd": 5.904e-07,
+  "node_charge_msat": 3002,
+  "node_usage_msat": 2,
+  "node_charge_usd": 0.002245446122215842,
+  "node_usage_usd": 1.49596677029703e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529229,
+   "id": "gen-1794529229-PaAaehH0v0LaoYMas4Vu",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 12,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 5.904e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 2.592e-07,
+     "upstream_inference_cost": 5.904e-07,
+     "upstream_inference_prompt_cost": 3.312e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 20,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 32
+   }
+  }
+ },
+ {
+  "case": "h2-p-preset",
+  "n": 1,
+  "sid": "f213450fdd24",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529249-PmC3cx9JPkZrUFFT2TnS",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 9,
+  "completion_tokens": 4,
+  "openrouter_usd": 2.3544e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529249,
+   "id": "gen-1794529249-PmC3cx9JPkZrUFFT2TnS",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 2.3544e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 2.3544e-07,
+     "upstream_inference_prompt_cost": 1.4904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 13
+   }
+  }
+ },
+ {
+  "case": "h2-p-provider",
+  "n": 1,
+  "sid": "8d5cc9d88e64",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529242-y83bTZAZgddsoB3CctY5",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 9,
+  "completion_tokens": 4,
+  "openrouter_usd": 2.3544e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529242,
+   "id": "gen-1794529242-y83bTZAZgddsoB3CctY5",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 2.3544e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 2.3544e-07,
+     "upstream_inference_prompt_cost": 1.4904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 13
+   }
+  }
+ },
+ {
+  "case": "h2-p-tier",
+  "n": 1,
+  "sid": "0ee388eb471b",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529255-HnKa18OCUGrzcWAzCQVk",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 9,
+  "completion_tokens": 4,
+  "openrouter_usd": 2.3544e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529255,
+   "id": "gen-1794529255-HnKa18OCUGrzcWAzCQVk",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 2.3544e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 2.3544e-07,
+     "upstream_inference_prompt_cost": 1.4904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 9,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 13
+   }
+  }
+ },
+ {
+  "case": "h2-p-tools",
+  "n": 1,
+  "sid": "fac38f7c365e",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529236-Hn28vLaPXTSphcvJRSnD",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 20,
+  "completion_tokens": 11,
+  "openrouter_usd": 4.7664e-07,
+  "node_charge_msat": 3002,
+  "node_usage_msat": 2,
+  "node_charge_usd": 0.002245446122215842,
+  "node_usage_usd": 1.49596677029703e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529236,
+   "id": "gen-1794529236-Hn28vLaPXTSphcvJRSnD",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 11,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 4.7664e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 2.376e-07,
+     "upstream_inference_cost": 4.7664e-07,
+     "upstream_inference_prompt_cost": 2.3904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 20,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 16,
+     "video_tokens": 0
+    },
+    "total_tokens": 31
+   }
+  }
+ },
+ {
+  "case": "h2-p-wso",
+  "n": 1,
+  "sid": "bf1081041a38",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529252-i0WPKDIM0wtmJ2q93IgF",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 20,
+  "completion_tokens": 10,
+  "openrouter_usd": 4.5504e-07,
+  "node_charge_msat": 3002,
+  "node_usage_msat": 2,
+  "node_charge_usd": 0.002245446122215842,
+  "node_usage_usd": 1.49596677029703e-06,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529252,
+   "id": "gen-1794529252-i0WPKDIM0wtmJ2q93IgF",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 10,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 4.5504e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 2.16e-07,
+     "upstream_inference_cost": 4.5504e-07,
+     "upstream_inference_prompt_cost": 2.3904e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 20,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 16,
+     "video_tokens": 0
+    },
+    "total_tokens": 30
+   }
+  }
+ },
+ {
+  "case": "h2-three",
+  "n": 1,
+  "sid": "2e47ce13929f",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529211-tdktBBGFwTYZKnYOAT0O",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 14,
+  "completion_tokens": 4,
+  "openrouter_usd": 3.1824e-07,
+  "node_charge_msat": 3001,
+  "node_usage_msat": 1,
+  "node_charge_usd": 0.0022446981388306933,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529211,
+   "id": "gen-1794529211-tdktBBGFwTYZKnYOAT0O",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 3.1824e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 3.1824e-07,
+     "upstream_inference_prompt_cost": 2.3184e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 14,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 18
+   }
+  }
+ },
+ {
+  "case": "h2-three",
+  "n": 2,
+  "sid": "2e47ce13929f",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529212-QJuJ2W4tad89gEpqc9bn",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 14,
+  "completion_tokens": 4,
+  "openrouter_usd": 3.1824e-07,
+  "node_charge_msat": 1,
+  "node_usage_msat": 1,
+  "node_charge_usd": 7.47983385148515e-07,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529212,
+   "id": "gen-1794529212-QJuJ2W4tad89gEpqc9bn",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 4,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 3.1824e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 8.64e-08,
+     "upstream_inference_cost": 3.1824e-07,
+     "upstream_inference_prompt_cost": 2.3184e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 14,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 18
+   }
+  }
+ },
+ {
+  "case": "h2-three",
+  "n": 3,
+  "sid": "2e47ce13929f",
+  "model": "mistralai/mistral-nemo",
+  "gen_id": "gen-1794529213-5em0epDXbYLtKhFSSQv4",
+  "provider": "Io Net",
+  "search_results": null,
+  "prompt_tokens": 14,
+  "completion_tokens": 6,
+  "openrouter_usd": 3.6144e-07,
+  "node_charge_msat": 1,
+  "node_usage_msat": 1,
+  "node_charge_usd": 7.47983385148515e-07,
+  "node_usage_usd": 7.47983385148515e-07,
+  "usd_per_msat": 7.47983385148515e-07,
+  "verdict": "OK",
+  "receipt_usage": {
+   "choices": [
+    {
+     "delta": {
+      "content": "",
+      "role": "assistant"
+     },
+     "finish_reason": "stop",
+     "index": 0,
+     "native_finish_reason": "stop"
+    }
+   ],
+   "created": 1794529213,
+   "id": "gen-1794529213-5em0epDXbYLtKhFSSQv4",
+   "model": "mistralai/mistral-nemo",
+   "object": "chat.completion.chunk",
+   "provider": "Io Net",
+   "service_tier": null,
+   "system_fingerprint": "vllm-0.25.1-a653030b",
+   "usage": {
+    "completion_tokens": 6,
+    "completion_tokens_details": {
+     "audio_tokens": 0,
+     "image_tokens": 0,
+     "reasoning_tokens": 0
+    },
+    "cost": 3.6144e-07,
+    "cost_details": {
+     "upstream_inference_completions_cost": 1.296e-07,
+     "upstream_inference_cost": 3.6144e-07,
+     "upstream_inference_prompt_cost": 2.3184e-07
+    },
+    "is_byok": false,
+    "prompt_tokens": 14,
+    "prompt_tokens_details": {
+     "audio_tokens": 0,
+     "cache_write_tokens": 0,
+     "cached_tokens": 0,
+     "video_tokens": 0
+    },
+    "total_tokens": 20
+   }
+  }
+ }
+]

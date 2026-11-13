@@ -1,0 +1,136 @@
+[
+ {
+  "id": "llama-base",
+  "model": "meta-llama/llama-3.1-8b-instruct",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "llama, current pins"
+ },
+ {
+  "id": "llama-nofb",
+  "model": "meta-llama/llama-3.1-8b-instruct",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "llama, provider pin only"
+ },
+ {
+  "id": "llama-full-2",
+  "model": "meta-llama/llama-3.1-8b-instruct",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "llama, the proposed suffix (repeat)"
+ },
+ {
+  "id": "llama-tier-default-str",
+  "model": "meta-llama/llama-3.1-8b-instruct",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ]
+  ],
+  "note": "llama, proposed suffix without service_tier"
+ }
+]

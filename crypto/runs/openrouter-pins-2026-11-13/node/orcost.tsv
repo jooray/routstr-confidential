@@ -1,0 +1,26 @@
+case	n	model	provider	search	pt	ct	openrouter_usd	node_usage_usd	node_charge_usd	node_charge_msat	verdict
+h11-decoy	1	mistralai/mistral-nemo	Io Net	None	9	4	0.000000235	0.000000748	0.002244698	3001	OK
+h11-one	1	mistralai/mistral-nemo	Io Net	None	9	4	0.000000235	0.000000748	0.002244698	3001	OK
+h11-p-all	1	mistralai/mistral-nemo	Io Net	None	20	11	0.000000477	0.000001496	0.002245446	3002	OK
+h11-p-models-image	1	mistralai/mistral-nemo	None	None	None	None	None	0.003739917	0.003739917	5000	-
+h11-p-pdf	1	mistralai/mistral-nemo	Io Net	None	50	2	0.006000595	0.000002244	0.002246194	3003	LOSS
+h11-p-plugins	1	mistralai/mistral-nemo	Io Net	None	20	10	0.000000547	0.000001496	0.002245446	3002	OK
+h11-p-provider	1	mistralai/mistral-nemo	Io Net	None	9	4	0.000000235	0.000000748	0.002244698	3001	OK
+h11-p-tools	1	mistralai/mistral-nemo	Io Net	None	20	10	0.000000455	0.000001496	0.002245446	3002	OK
+h2-c-model-swap	1	mistralai/mistral-nemo	Io Net	None	14	4	0.000000318	0.000000748	0.002244698	3001	OK
+h2-decoy	1	mistralai/mistral-nemo	Io Net	None	9	4	0.000000235	0.000000748	0.002244698	3001	OK
+h2-one	1	mistralai/mistral-nemo	Io Net	None	9	4	0.000000235	0.000000748	0.002244698	3001	OK
+h2-p-all	1	mistralai/mistral-nemo	Io Net	None	20	10	0.000000455	0.000001496	0.002245446	3002	OK
+h2-p-models-image	1	mistralai/mistral-nemo	None	None	None	None	None	0.003739917	0.003739917	5000	-
+h2-p-pdf	1	mistralai/mistral-nemo	Io Net	None	50	2	0.006000871	0.000002244	0.002246194	3003	LOSS
+h2-p-plugins	1	mistralai/mistral-nemo	Io Net	None	20	12	0.000000590	0.000001496	0.002245446	3002	OK
+h2-p-preset	1	mistralai/mistral-nemo	Io Net	None	9	4	0.000000235	0.000000748	0.002244698	3001	OK
+h2-p-provider	1	mistralai/mistral-nemo	Io Net	None	9	4	0.000000235	0.000000748	0.002244698	3001	OK
+h2-p-tier	1	mistralai/mistral-nemo	Io Net	None	9	4	0.000000235	0.000000748	0.002244698	3001	OK
+h2-p-tools	1	mistralai/mistral-nemo	Io Net	None	20	11	0.000000477	0.000001496	0.002245446	3002	OK
+h2-p-wso	1	mistralai/mistral-nemo	Io Net	None	20	10	0.000000455	0.000001496	0.002245446	3002	OK
+h2-three	1	mistralai/mistral-nemo	Io Net	None	14	4	0.000000318	0.000000748	0.002244698	3001	OK
+h2-three	2	mistralai/mistral-nemo	Io Net	None	14	4	0.000000318	0.000000748	0.000000748	1	OK
+h2-three	3	mistralai/mistral-nemo	Io Net	None	14	6	0.000000361	0.000000748	0.000000748	1	OK
+
+OpenRouter total for these requests: $0.012008; usd_per_msat=7.47983385148515e-07

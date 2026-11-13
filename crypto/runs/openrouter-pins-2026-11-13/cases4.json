@@ -1,0 +1,498 @@
+[
+ {
+  "id": "route-default-0",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-0",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-0",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-1",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-1",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-1",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-3",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-3",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-3",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-4",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-4",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-4",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-5",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-5",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-5",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-6",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-6",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-6",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-7",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-7",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-7",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ }
+]

@@ -1,0 +1,355 @@
+[
+ {
+  "id": "b0-r2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "baseline repeat (default routing)"
+ },
+ {
+  "id": "b0-r3",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "baseline repeat"
+ },
+ {
+  "id": "b0-r4",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "baseline repeat"
+ },
+ {
+  "id": "nofb-r2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "pin provider allow_fallbacks false, repeat"
+ },
+ {
+  "id": "nofb-r3",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "repeat"
+ },
+ {
+  "id": "order-r2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "client order mistral, pin order []"
+ },
+ {
+  "id": "prov-merge-test",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"only\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "client only mistral; pin allow_fallbacks false: merged would give Mistral"
+ },
+ {
+  "id": "tools-gpt-nopin",
+  "model": "openai/gpt-oss-20b",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Use the web search tool to find today's top news headline, then answer in five words.\"}],\"tools\":[{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":2,\"engine\":\"exa\"}}],\"tool_choice\":\"auto\"",
+  "max_tokens": 600,
+  "note": "server tool web_search (exa) on gpt-oss-20b, no pin"
+ },
+ {
+  "id": "tools-gpt-pin",
+  "model": "openai/gpt-oss-20b",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Use the web search tool to find today's top news headline, then answer in five words.\"}],\"tools\":[{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":2,\"engine\":\"exa\"}}],\"tool_choice\":\"auto\"",
+  "max_tokens": 600,
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "tools",
+    []
+   ]
+  ],
+  "note": "same, pin tools []"
+ },
+ {
+  "id": "models-img-nopin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What colour is this image? One word.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=\"}}]}],\"models\":[\"openai/gpt-4o-mini\"]",
+  "note": "image to a text-only model with a fallback list, no pin"
+ },
+ {
+  "id": "models-img-pin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What colour is this image? One word.\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=\"}}]}],\"models\":[\"openai/gpt-4o-mini\"]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "models",
+    []
+   ]
+  ],
+  "note": "same, pin models []"
+ },
+ {
+  "id": "pdf1-nemo",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What word does the document say? One word.\"},{\"type\":\"file\",\"file\":{\"filename\":\"a.pdf\",\"file_data\":\"data:application/pdf;base64,JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFs1IDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago0IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAyNCBUZiA3MiA3MDAgVGQgKFBhZ2UgMTogdGhlIHdvcmQgaXMgT0suKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgMyAwIFIgPj4gPj4gPj4KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDE4NSAwMDAwMCBuIAowMDAwMDAwMjg5IDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDE1CiUlRU9GCg==\"}}]}]",
+  "note": "1-page PDF to a text-only model, no plugin"
+ },
+ {
+  "id": "pdf3-nemo",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What word does the document say? One word.\"},{\"type\":\"file\",\"file\":{\"filename\":\"a.pdf\",\"file_data\":\"data:application/pdf;base64,JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFs1IDAgUiA3IDAgUiA5IDAgUl0gL0NvdW50IDMgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago0IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAyNCBUZiA3MiA3MDAgVGQgKFBhZ2UgMTogdGhlIHdvcmQgaXMgT0suKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgMyAwIFIgPj4gPj4gPj4KZW5kb2JqCjYgMCBvYmoKPDwgL0xlbmd0aCA1NCA+PgpzdHJlYW0KQlQgL0YxIDI0IFRmIDcyIDcwMCBUZCAoUGFnZSAyOiB0aGUgd29yZCBpcyBPSy4pIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKNyAwIG9iago8PCAvVHlwZSAvUGFnZSAvUGFyZW50IDIgMCBSIC9NZWRpYUJveCBbMCAwIDYxMiA3OTJdIC9Db250ZW50cyA2IDAgUiAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSAzIDAgUiA+PiA+PiA+PgplbmRvYmoKOCAwIG9iago8PCAvTGVuZ3RoIDU0ID4+CnN0cmVhbQpCVCAvRjEgMjQgVGYgNzIgNzAwIFRkIChQYWdlIDM6IHRoZSB3b3JkIGlzIE9LLikgVGogRVQKZW5kc3RyZWFtCmVuZG9iago5IDAgb2JqCjw8IC9UeXBlIC9QYWdlIC9QYXJlbnQgMiAwIFIgL01lZGlhQm94IFswIDAgNjEyIDc5Ml0gL0NvbnRlbnRzIDggMCBSIC9SZXNvdXJjZXMgPDwgL0ZvbnQgPDwgL0YxIDMgMCBSID4+ID4+ID4+CmVuZG9iagp4cmVmCjAgMTAKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDEyNyAwMDAwMCBuIAowMDAwMDAwMTk3IDAwMDAwIG4gCjAwMDAwMDAzMDEgMDAwMDAgbiAKMDAwMDAwMDQyNyAwMDAwMCBuIAowMDAwMDAwNTMxIDAwMDAwIG4gCjAwMDAwMDA2NTcgMDAwMDAgbiAKMDAwMDAwMDc2MSAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDEwIC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo4ODcKJSVFT0YK\"}}]}]",
+  "note": "3-page PDF to a text-only model, no plugin"
+ },
+ {
+  "id": "pdf3-nemo-pin",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What word does the document say? One word.\"},{\"type\":\"file\",\"file\":{\"filename\":\"a.pdf\",\"file_data\":\"data:application/pdf;base64,JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFs1IDAgUiA3IDAgUiA5IDAgUl0gL0NvdW50IDMgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago0IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAyNCBUZiA3MiA3MDAgVGQgKFBhZ2UgMTogdGhlIHdvcmQgaXMgT0suKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgMyAwIFIgPj4gPj4gPj4KZW5kb2JqCjYgMCBvYmoKPDwgL0xlbmd0aCA1NCA+PgpzdHJlYW0KQlQgL0YxIDI0IFRmIDcyIDcwMCBUZCAoUGFnZSAyOiB0aGUgd29yZCBpcyBPSy4pIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKNyAwIG9iago8PCAvVHlwZSAvUGFnZSAvUGFyZW50IDIgMCBSIC9NZWRpYUJveCBbMCAwIDYxMiA3OTJdIC9Db250ZW50cyA2IDAgUiAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSAzIDAgUiA+PiA+PiA+PgplbmRvYmoKOCAwIG9iago8PCAvTGVuZ3RoIDU0ID4+CnN0cmVhbQpCVCAvRjEgMjQgVGYgNzIgNzAwIFRkIChQYWdlIDM6IHRoZSB3b3JkIGlzIE9LLikgVGogRVQKZW5kc3RyZWFtCmVuZG9iago5IDAgb2JqCjw8IC9UeXBlIC9QYWdlIC9QYXJlbnQgMiAwIFIgL01lZGlhQm94IFswIDAgNjEyIDc5Ml0gL0NvbnRlbnRzIDggMCBSIC9SZXNvdXJjZXMgPDwgL0ZvbnQgPDwgL0YxIDMgMCBSID4+ID4+ID4+CmVuZG9iagp4cmVmCjAgMTAKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDEyNyAwMDAwMCBuIAowMDAwMDAwMTk3IDAwMDAwIG4gCjAwMDAwMDAzMDEgMDAwMDAgbiAKMDAwMDAwMDQyNyAwMDAwMCBuIAowMDAwMDAwNTMxIDAwMDAwIG4gCjAwMDAwMDA2NTcgMDAwMDAgbiAKMDAwMDAwMDc2MSAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDEwIC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo4ODcKJSVFT0YK\"}}]}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ]
+  ],
+  "note": "3-page PDF, pin plugins []"
+ },
+ {
+  "id": "pdf3-nemo-cf",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What word does the document say? One word.\"},{\"type\":\"file\",\"file\":{\"filename\":\"a.pdf\",\"file_data\":\"data:application/pdf;base64,JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFs1IDAgUiA3IDAgUiA5IDAgUl0gL0NvdW50IDMgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago0IDAgb2JqCjw8IC9MZW5ndGggNTQgPj4Kc3RyZWFtCkJUIC9GMSAyNCBUZiA3MiA3MDAgVGQgKFBhZ2UgMTogdGhlIHdvcmQgaXMgT0suKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgMyAwIFIgPj4gPj4gPj4KZW5kb2JqCjYgMCBvYmoKPDwgL0xlbmd0aCA1NCA+PgpzdHJlYW0KQlQgL0YxIDI0IFRmIDcyIDcwMCBUZCAoUGFnZSAyOiB0aGUgd29yZCBpcyBPSy4pIFRqIEVUCmVuZHN0cmVhbQplbmRvYmoKNyAwIG9iago8PCAvVHlwZSAvUGFnZSAvUGFyZW50IDIgMCBSIC9NZWRpYUJveCBbMCAwIDYxMiA3OTJdIC9Db250ZW50cyA2IDAgUiAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSAzIDAgUiA+PiA+PiA+PgplbmRvYmoKOCAwIG9iago8PCAvTGVuZ3RoIDU0ID4+CnN0cmVhbQpCVCAvRjEgMjQgVGYgNzIgNzAwIFRkIChQYWdlIDM6IHRoZSB3b3JkIGlzIE9LLikgVGogRVQKZW5kc3RyZWFtCmVuZG9iago5IDAgb2JqCjw8IC9UeXBlIC9QYWdlIC9QYXJlbnQgMiAwIFIgL01lZGlhQm94IFswIDAgNjEyIDc5Ml0gL0NvbnRlbnRzIDggMCBSIC9SZXNvdXJjZXMgPDwgL0ZvbnQgPDwgL0YxIDMgMCBSID4+ID4+ID4+CmVuZG9iagp4cmVmCjAgMTAKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTggMDAwMDAgbiAKMDAwMDAwMDEyNyAwMDAwMCBuIAowMDAwMDAwMTk3IDAwMDAwIG4gCjAwMDAwMDAzMDEgMDAwMDAgbiAKMDAwMDAwMDQyNyAwMDAwMCBuIAowMDAwMDAwNTMxIDAwMDAwIG4gCjAwMDAwMDA2NTcgMDAwMDAgbiAKMDAwMDAwMDc2MSAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDEwIC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo4ODcKJSVFT0YK\"}}]}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    [
+     {
+      "id": "file-parser",
+      "pdf": {
+       "engine": "cloudflare-ai"
+      }
+     }
+    ]
+   ]
+  ],
+  "note": "3-page PDF, pin file-parser cloudflare-ai (outside the client policy)"
+ },
+ {
+  "id": "wso-4omini-nopin",
+  "model": "openai/gpt-4o-mini",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Use the web search tool to find today's top news headline, then answer in five words.\"}],\"web_search_options\":{\"search_context_size\":\"low\"}",
+  "note": "web_search_options on gpt-4o-mini, no pin"
+ },
+ {
+  "id": "wso-4omini-off",
+  "model": "openai/gpt-4o-mini",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Use the web search tool to find today's top news headline, then answer in five words.\"}],\"web_search_options\":{\"search_context_size\":\"low\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "web_search_options",
+    {
+     "search_context_size": "off"
+    }
+   ]
+  ],
+  "note": "pin search_context_size off"
+ },
+ {
+  "id": "wso-4omini-false",
+  "model": "openai/gpt-4o-mini",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Use the web search tool to find today's top news headline, then answer in five words.\"}],\"web_search_options\":{\"search_context_size\":\"low\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "web_search_options",
+    false
+   ]
+  ],
+  "note": "pin web_search_options false"
+ },
+ {
+  "id": "wso-4omini-empty",
+  "model": "openai/gpt-4o-mini",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Use the web search tool to find today's top news headline, then answer in five words.\"}],\"web_search_options\":{\"search_context_size\":\"low\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "web_search_options",
+    []
+   ]
+  ],
+  "note": "pin web_search_options []"
+ }
+]

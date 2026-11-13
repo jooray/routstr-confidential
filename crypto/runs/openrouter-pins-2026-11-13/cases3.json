@@ -1,0 +1,251 @@
+[
+ {
+  "id": "wso-4o-nopin",
+  "model": "openai/gpt-4o",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"What is the top news headline today? Five words.\"}],\"web_search_options\":{\"search_context_size\":\"low\"},\"provider\":{\"only\":[\"openai\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ]
+  ],
+  "note": "web_search_options alone on gpt-4o (native search), no pin"
+ },
+ {
+  "id": "wso-4o-false",
+  "model": "openai/gpt-4o",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"What is the top news headline today? Five words.\"}],\"web_search_options\":{\"search_context_size\":\"low\"},\"provider\":{\"only\":[\"openai\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "web_search_options",
+    false
+   ]
+  ],
+  "note": "same, pin web_search_options false (provider kept: unpinned here)"
+ },
+ {
+  "id": "img-pin-modalities",
+  "model": "google/gemini-3.1-flash-lite-image",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"A red circle on white. Tiny.\"}],\"modalities\":[\"image\",\"text\"]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "modalities",
+    []
+   ]
+  ],
+  "max_tokens": 200,
+  "note": "image output asked in private, pin modalities []"
+ },
+ {
+  "id": "reason-effort",
+  "model": "openai/gpt-oss-20b",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"How many primes are below 100? Think carefully.\"}],\"reasoning\":{\"effort\":\"high\"}",
+  "note": "reasoning effort high, cap 20"
+ },
+ {
+  "id": "reason-budget",
+  "model": "openai/gpt-oss-20b",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"How many primes are below 100? Think carefully.\"}],\"reasoning\":{\"max_tokens\":500}",
+  "note": "reasoning max_tokens 500, cap 20"
+ },
+ {
+  "id": "reason-haiku",
+  "model": "anthropic/claude-haiku-5.5",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"How many primes are below 100? Think carefully.\"}],\"reasoning\":{\"max_tokens\":2000}",
+  "note": "haiku reasoning budget 2000, cap 20"
+ },
+ {
+  "id": "verbosity",
+  "model": "openai/gpt-5-nano",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"verbosity\":\"high\",\"reasoning\":{\"effort\":\"minimal\"}",
+  "note": "verbosity high, cap 20"
+ },
+ {
+  "id": "prediction",
+  "model": "openai/gpt-4o-mini",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"prediction\":{\"type\":\"content\",\"content\":\"token0 token1 token2 token3 token4 token5 token6 token7 token8 token9 token10 token11 token12 token13 token14 token15 token16 token17 token18 token19 token20 token21 token22 token23 token24 token25 token26 tok...<14013 bytes in all, trimmed for the evidence: a repeated filler text / a base64 3 s 440 Hz WAV; see the note>",
+  "note": "prediction 1500 tokens, cap 20",
+  "trimmed": true
+ },
+ {
+  "id": "tier-priority",
+  "model": "openai/gpt-4o-mini",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"service_tier\":\"priority\"",
+  "note": "service_tier priority, no pin"
+ },
+ {
+  "id": "tier-priority-nano",
+  "model": "openai/gpt-5-nano",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"service_tier\":\"priority\",\"reasoning\":{\"effort\":\"minimal\"}",
+  "note": "service_tier priority on gpt-5-nano, no pin"
+ },
+ {
+  "id": "tier-pin-false",
+  "model": "openai/gpt-5-nano",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"service_tier\":\"priority\",\"reasoning\":{\"effort\":\"minimal\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "service_tier",
+    false
+   ]
+  ],
+  "note": "pin service_tier false"
+ },
+ {
+  "id": "tier-pin-off",
+  "model": "openai/gpt-5-nano",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"service_tier\":\"priority\",\"reasoning\":{\"effort\":\"minimal\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "pin service_tier off"
+ },
+ {
+  "id": "cache-1h",
+  "model": "anthropic/claude-haiku-5.5",
+  "private": "\"messages\":[{\"role\":\"system\",\"content\":\"w0 apple w1 apple w2 apple w3 apple w4 apple w5 apple w6 apple w7 apple w8 apple w9 apple w10 apple w11 apple w12 apple w13 apple w14 apple w15 apple w16 apple w17 apple w18 apple w19 apple w20 apple w21 apple w22 apple w23 apple w24 apple w25 apple w26 apple ...<32778 bytes in all, trimmed for the evidence: a repeated filler text / a base64 3 s 440 Hz WAV; see the note>",
+  "note": "top-level cache_control ttl 1h, 6k-token system prompt",
+  "trimmed": true
+ },
+ {
+  "id": "cache-5m",
+  "model": "anthropic/claude-haiku-5.5",
+  "private": "\"messages\":[{\"role\":\"system\",\"content\":\"w0 applx w1 apple w2 apple w3 apple w4 apple w5 apple w6 apple w7 apple w8 apple w9 apple w10 apple w11 apple w12 apple w13 apple w14 apple w15 apple w16 apple w17 apple w18 apple w19 apple w20 apple w21 apple w22 apple w23 apple w24 apple w25 apple w26 apple ...<32767 bytes in all, trimmed for the evidence: a repeated filler text / a base64 3 s 440 Hz WAV; see the note>",
+  "note": "top-level cache_control 5m",
+  "trimmed": true
+ },
+ {
+  "id": "cache-pin-false",
+  "model": "anthropic/claude-haiku-5.5",
+  "private": "\"messages\":[{\"role\":\"system\",\"content\":\"w0 apply w1 apple w2 apple w3 apple w4 apple w5 apple w6 apple w7 apple w8 apple w9 apple w10 apple w11 apple w12 apple w13 apple w14 apple w15 apple w16 apple w17 apple w18 apple w19 apple w20 apple w21 apple w22 apple w23 apple w24 apple w25 apple w26 apple ...<32778 bytes in all, trimmed for the evidence: a repeated filler text / a base64 3 s 440 Hz WAV; see the note>",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "cache_control",
+    false
+   ]
+  ],
+  "note": "cache_control 1h, pin false",
+  "trimmed": true
+ },
+ {
+  "id": "logprobs",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"logprobs\":true,\"top_logprobs\":20",
+  "note": "logprobs + top_logprobs 20"
+ },
+ {
+  "id": "transforms",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"transforms\":[\"middle-out\"]",
+  "note": "transforms middle-out"
+ },
+ {
+  "id": "usage-include",
+  "model": "openai/gpt-oss-20b",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"usage\":{\"include\":true},\"include_reasoning\":true",
+  "note": "usage include, include_reasoning"
+ },
+ {
+  "id": "n-openai",
+  "model": "openai/gpt-4o-mini",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"n\":4,\"provider\":{\"only\":[\"openai\"]},\"debug\":{\"echo_upstream_body\":true}",
+  "note": "n 4 in private on OpenAI, pinned n 1"
+ },
+ {
+  "id": "stream-opts",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"stream_options\":{\"include_usage\":false},\"stream\":false",
+  "note": "stream false and include_usage false in private, pinned true"
+ },
+ {
+  "id": "tier-overrides",
+  "model": "anthropic/claude-haiku-5.5",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"item0 pear item1 pear item2 pear item3 pear item4 pear item5 pear item6 pear item7 pear item8 pear item9 pear item10 pear item11 pear item12 pear item13 pear item14 pear item15 pear item16 pear item17 pear item18 pear item19 pear item20 pear item21 pear item22 p...<708888 bytes in all, trimmed for the evidence: a repeated filler text / a base64 3 s 440 Hz WAV; see the note>",
+  "max_tokens": 5,
+  "note": "haiku >100k prompt tokens (pricing override tier)",
+  "trimmed": true
+ }
+]

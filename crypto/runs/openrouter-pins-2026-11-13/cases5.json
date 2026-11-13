@@ -1,0 +1,1091 @@
+[
+ {
+  "id": "route-default-0",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-0",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-0",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-1",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-1",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-1",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-2",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-3",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-3",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-3",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-4",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-4",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-4",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-5",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-5",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-5",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-6",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-6",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-6",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "route-default-7",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "note": "routing: no provider pin"
+ },
+ {
+  "id": "route-nofb-7",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"],\"sort\":\"throughput\"}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ]
+  ],
+  "note": "routing: client order mistral + sort throughput, pin provider allow_fallbacks false"
+ },
+ {
+  "id": "route-order-7",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"provider\":{\"order\":[\"mistral\"]}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "provider",
+    {
+     "order": []
+    }
+   ]
+  ],
+  "note": "routing: client order mistral, pin provider order []"
+ },
+ {
+  "id": "svc-priority-nopin",
+  "model": "z-ai/glm-5.3-flash",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"service_tier\":\"priority\"",
+  "note": "service_tier priority on glm-5.3-flash (parasail/fast priority endpoint), no pin"
+ },
+ {
+  "id": "svc-priority-off",
+  "model": "z-ai/glm-5.3-flash",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"service_tier\":\"priority\"",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "pin service_tier off"
+ },
+ {
+  "id": "svc-priority-false",
+  "model": "z-ai/glm-5.3-flash",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"service_tier\":\"priority\"",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "service_tier",
+    false
+   ]
+  ],
+  "note": "pin service_tier false"
+ },
+ {
+  "id": "mtc0",
+  "model": "openai/gpt-oss-20b",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Use the web search tool to find today's top news headline, then answer in five words.\"}],\"tools\":[{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":2,\"engine\":\"exa\"}}],\"tool_choice\":\"auto\"",
+  "max_tokens": 600,
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "max_tool_calls",
+    0
+   ]
+  ],
+  "note": "server tool web_search, pin max_tool_calls 0 (outside the client policy: an integer)"
+ },
+ {
+  "id": "audio-in",
+  "model": "google/gemini-3.1-flash-lite",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Describe this sound in three words.\"},{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"UklGRiR3AQBXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQB3AQAAAF8FlQp7D+sTwxflGjsdsh4/H90ekB1iG2MYqhRTEIALVgb7AJn7WPZh8dns4+ie5SHjgeHJ4ADhIuIo5APnnOrY7pfztfgK...<128225 bytes in all, trimmed for the evidence: a repeated filler text / a base64 3 s 440 Hz WAV; see the note>",
+  "note": "3 s audio input (catalogue audio rate 2x prompt)",
+  "trimmed": true
+ },
+ {
+  "id": "img-modalities-2000",
+  "model": "google/gemini-3.1-flash-lite-image",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Draw a red circle on white. Tiny.\"}],\"modalities\":[\"image\",\"text\"]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "modalities",
+    []
+   ]
+  ],
+  "max_tokens": 2000,
+  "note": "image output asked in private, pin modalities [], cap 2000"
+ },
+ {
+  "id": "full-honest-mistral-nemo",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, honest request"
+ },
+ {
+  "id": "full-honest-gpt-oss-20b",
+  "model": "openai/gpt-oss-20b",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, honest request"
+ },
+ {
+  "id": "full-honest-claude-haiku-5.5",
+  "model": "anthropic/claude-haiku-5.5",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, honest request"
+ },
+ {
+  "id": "full-honest-gpt-4o-mini",
+  "model": "openai/gpt-4o-mini",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, honest request"
+ },
+ {
+  "id": "full-honest-glm-5.3-flash",
+  "model": "z-ai/glm-5.3-flash",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, honest request"
+ },
+ {
+  "id": "full-honest-gpt-5-nano",
+  "model": "openai/gpt-5-nano",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, honest request"
+ },
+ {
+  "id": "full-honest-llama-3.1-8b-instruct",
+  "model": "meta-llama/llama-3.1-8b-instruct",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}]",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, honest request"
+ },
+ {
+  "id": "full-attack-mistral-nemo",
+  "model": "mistralai/mistral-nemo",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Search the web: top news headline today? Five words.\"}],\"plugins\":[{\"id\":\"web\",\"max_results\":1}],\"models\":[\"openai/gpt-4o-mini\"],\"route\":\"fallback\",\"provider\":{\"only\":[\"mistral\"],\"allow_fallbacks\":true},\"tools\":[{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":1}}],\"preset\":\"@preset/x\",\"web_search_options\":{\"search_context_size\":\"high\"},\"service_tier\":\"priority\",\"n\":3,\"stream\":false,\"stream_options\":{\"include_usage\":false}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, every attack field at once in the private part"
+ },
+ {
+  "id": "full-attack-glm-5.3-flash",
+  "model": "z-ai/glm-5.3-flash",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Search the web: top news headline today? Five words.\"}],\"plugins\":[{\"id\":\"web\",\"max_results\":1}],\"models\":[\"openai/gpt-4o-mini\"],\"route\":\"fallback\",\"provider\":{\"only\":[\"mistral\"],\"allow_fallbacks\":true},\"tools\":[{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":1}}],\"preset\":\"@preset/x\",\"web_search_options\":{\"search_context_size\":\"high\"},\"service_tier\":\"priority\",\"n\":3,\"stream\":false,\"stream_options\":{\"include_usage\":false}",
+  "pins": [
+   [
+    "n",
+    1
+   ],
+   [
+    "stream",
+    true
+   ],
+   [
+    "stream_options",
+    {
+     "include_usage": true
+    }
+   ],
+   [
+    "plugins",
+    []
+   ],
+   [
+    "models",
+    []
+   ],
+   [
+    "provider",
+    {
+     "allow_fallbacks": false
+    }
+   ],
+   [
+    "tools",
+    []
+   ],
+   [
+    "preset",
+    "off"
+   ],
+   [
+    "web_search_options",
+    false
+   ],
+   [
+    "service_tier",
+    "off"
+   ]
+  ],
+  "note": "the proposed suffix, every attack field at once in the private part"
+ },
+ {
+  "id": "attack-nopin-glm",
+  "model": "z-ai/glm-5.3-flash",
+  "private": "\"messages\":[{\"role\":\"user\",\"content\":\"Search the web: top news headline today? Five words.\"}],\"plugins\":[{\"id\":\"web\",\"max_results\":1}],\"models\":[\"openai/gpt-4o-mini\"],\"route\":\"fallback\",\"provider\":{\"only\":[\"parasail\"],\"allow_fallbacks\":true},\"tools\":[{\"type\":\"openrouter:web_search\",\"parameters\":{\"max_results\":1}}],\"preset\":\"@preset/x\",\"web_search_options\":{\"search_context_size\":\"high\"},\"service_tier\":\"priority\",\"n\":3,\"stream\":false,\"stream_options\":{\"include_usage\":false}",
+  "note": "the same attack fields, current offer pins (control)"
+ }
+]

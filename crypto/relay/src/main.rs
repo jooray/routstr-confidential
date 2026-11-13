@@ -102,6 +102,14 @@ struct Offer {
     /// image parts as well, so the shipped offer leaves it empty.
     #[serde(default, alias = "text_only_ok", deserialize_with = "de_model_allowlist")]
     model_allowlist: Vec<String>,
+    /// Optional node-side chat model filter (routstr-core
+    /// `confidential.chat_model_filter`): the node does not offer a model whose
+    /// catalogue lists a request parameter in `exclude_if_supports`, or a
+    /// non-zero pricing component in `exclude_if_priced`. The sidecar only
+    /// checks its shape and passes it on in `GET /offer`; the node reads it
+    /// and does not sign it into its own offer. Absent: no such filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chat_model_filter: Option<ChatModelFilter>,
     /// Set from `--node-settles` when served: the sidecar hands the verified
     /// usage to the node instead of signing a stub receipt. A node in front of
     /// a sidecar without it would charge every session its full reservation.
@@ -120,6 +128,29 @@ struct Offer {
     /// index, sequential requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     h2: Option<h2::H2Block>,
+}
+
+/// See `Offer::chat_model_filter`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatModelFilter {
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "de_filter_keys")]
+    exclude_if_supports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "de_filter_keys")]
+    exclude_if_priced: Vec<String>,
+}
+
+/// Identifier names (`^[A-Za-z_][A-Za-z0-9_]*$`), as the node requires.
+fn de_filter_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let v: Vec<String> = Vec::deserialize(d)?;
+    for k in &v {
+        let mut cs = k.chars();
+        let ok = cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && cs.all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ok {
+            return Err(serde::de::Error::custom(format!("chat_model_filter: {k:?} is not an identifier")));
+        }
+    }
+    Ok(v)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1251,6 +1282,7 @@ async fn main() -> Result<()> {
             max_tokens_cap: default_max_tokens_cap(),
             notary_pubkey: String::new(),
             model_allowlist: Vec::new(),
+            chat_model_filter: None,
             node_settles: false,
             endpoints: Endpoints::default(),
             http: Vec::new(),
@@ -3637,6 +3669,21 @@ mod offer_tests {
         let o = parse(r#", "price_list": {"m": {"in": 0.0}}, "text_only_ok": {}"#);
         assert!(o.model_allowlist.is_empty());
         assert!(!serde_json::to_string(&o).unwrap().contains("price_list"));
+    }
+
+    #[test]
+    fn chat_model_filter_passes_through_and_is_checked() {
+        assert!(parse("").chat_model_filter.is_none());
+        assert!(!serde_json::to_string(&parse("")).unwrap().contains("chat_model_filter"));
+        let o = parse(r#", "chat_model_filter": {"exclude_if_supports": ["web_search_options"], "exclude_if_priced": ["overrides"]}"#);
+        let v = serde_json::to_value(&o).unwrap();
+        assert_eq!(v["chat_model_filter"], serde_json::json!({"exclude_if_supports": ["web_search_options"], "exclude_if_priced": ["overrides"]}));
+        for bad in [r#"{"exclude_if_support": []}"#, r#"{"exclude_if_supports": "x"}"#, r#"{"exclude_if_priced": ["a b"]}"#, r#"["web_search_options"]"#] {
+            let text = format!(r#"{{"upstream_host": "h", "chat_model_filter": {bad}}}"#);
+            assert!(serde_json::from_str::<Offer>(&text).is_err(), "{bad}");
+        }
+        let or: Offer = serde_json::from_str(include_str!("../offer.openrouter.json")).unwrap();
+        assert!(or.chat_model_filter.is_some());
     }
 
     #[test]
