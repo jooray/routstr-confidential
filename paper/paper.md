@@ -1288,8 +1288,12 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
     across them by the connection. A kept connection is also longer-lived state: one pair of traffic
     secrets protects all its requests (C may not KeyUpdate under the frame rules), so a live compromise of
     C's process exposes the connection's current and later traffic, and secrets retained after it ends
-    would expose the whole recorded connection. Clients erase them at the close and keep them out of
-    logs; operators keep the request and lifetime limits in proportion. Linkability is by design; the
+    would expose the whole recorded connection. Clients clear the secrets they hold at the close and
+    keep them out of logs, but that is best effort, not cryptographic erasure: the clients are
+    JavaScript, and copies made by the runtime (garbage collection, heap snapshots, swap, core dumps) may
+    remain. The bound is the connection's scope: operators keep the request and lifetime limits in
+    proportion, and a user who needs a secret pair per request uses `reuse: none` or framing "1.1"; a
+    per-request ratchet needs a new anchor protocol. Linkability is by design; the
     scope, `reuse: none` and framing "1.1" are the tools to limit or avoid it.
 17. *$\pi_{WIN}$, the frame rules and the interval rule are new.* The argument above that the rules
     pin U's view of a request, and that the interval rule pins a usage event to its request, is ours

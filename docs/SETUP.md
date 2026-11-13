@@ -179,9 +179,9 @@ Check yours before offering it, with the offer file you will deploy and the vari
 
 ```sh
 T=crypto/tools/provider-profile-check.py
-python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --model <a cheap chat model>            # A1-A13: every item must pass
+python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --model <a cheap chat model>            # A1-A14: every item must pass
 python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --model <...> --h2                      # H1-H8: before you offer HTTP/2
-python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --image-model <...> --images            # I1-I9: before you offer images
+python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --image-model <...> --images            # I1-I10: before you offer images
 ```
 
 **Framings: the `http` list and the `h2` block.** The offer file says how clients talk to your provider.
@@ -377,6 +377,31 @@ of a few minutes). Run the node's server with a long WebSocket ping timeout, e.g
 its way to a client on a slow link, the keepalive waits behind it, and the default 20 s timeout drops the
 connection. uvicorn's `--ws-max-size` (default 16 MiB) bounds each frame a client can send before it is
 authenticated; do not set it below 12 MiB, since a client may send a whole 8 MiB request body in one frame.
+
+**Do not log the query strings of the confidential routes.** `/v1/confidential/zk` carries `session_id`
+and `zk_token` in its query string (a WebSocket upgrade has no other place for them in a browser).
+Together they admit to that live connection's proof channel until the connection ends, so a proxy or CDN
+in front of the node must not write them to its access log. (`/v1/confidential/ws` carries only a
+random `session_id`; treat it the same way.) nginx logs `$request`, which includes the query string, in
+its default format; for these two locations use a format without `$request`, `$request_uri` or `$args`,
+or turn the access log off:
+
+```nginx
+log_format confidential '$remote_addr [$time_local] "$request_method $uri" $status $body_bytes_sent $request_time';
+
+location ~ ^/v1/confidential/(ws|zk)$ {
+    access_log /var/log/nginx/confidential.log confidential;   # or: access_log off;
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 600s;
+}
+```
+
+The same holds for anything else that sees the URL: a CDN's request logs, a WAF, a load balancer, an
+error log that records the request line.
 
 **3. Check it.**
 

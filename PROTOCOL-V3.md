@@ -64,7 +64,9 @@ The operator states what their upstream supports. Nothing is probed or assumed.
 - The sidecar stops offering `"2"` after 5 consecutive HTTP/2 connections failed to open, logs it, and
   offers it again after 10 minutes. The withdrawal is for every client, so a failed open is only what no
   client can cause. It is one of: the provider closed without sending a byte in answer to the ClientHello
-  (which is canonical, §12.5, so its bytes are the offer's up to three opaque values); a verified
+  (which is canonical, §12.5, so its bytes are the offer's up to three opaque values; N relays no other
+  client record before the provider's first byte, and after it at most one ChangeCipherSpec, exactly
+  `14 03 03 00 01 01`, and one application-data record, the Finished); a verified
   handshake did not select `h2`; the provider closed within 10 s of the connection head, with no response
   to a request yet, no client record written to it since the head, and the head written within 15 s of
   the dial (a client that delays `release_head`, or whose own record made the provider close, is not
@@ -175,7 +177,10 @@ hostname, CertificateVerify and both Finished messages), with:
   **reserved**: chat, a full-context prompt plus `max_tokens`; images, `msat_per_image × count`. The named
   offer's connection-level fields (§12.1) MUST equal those of the offer the connection was opened on, else
   the request is refused with `offer_changed` (C opens a new connection, or names the old offer).
-- `N → C  {"type":"request_ok","sid","n","suffix", "stream"? (framing "2"), "head_len"? (framing "1.1")}`.
+- `N → C  {"type":"request_ok","sid","n","suffix", "stream"? (framing "2"), "head_len"? (framing "1.1"),
+  "reserved_msats"?}`. `reserved_msats` (N adds it when relaying; a sidecar alone has none) is what N
+  reserved for the request, the number its receipt names: C holds it as the bound of a charge of the
+  reservation (§8.3) and refuses a receipt naming another `reserved_msats`.
 - **A refused request leaves the connection READY** (`{"type":"request_refused","n","status","reason"}`)
   when C has sent no record for it. C MUST wait for `request_ok` before sending records. (The prototype
   ended the connection; a 402 then cost a handshake.) In framing `"1.1"` a refused request 1 may be
@@ -558,7 +563,9 @@ settlement (`closed`, reason `idle`). The client's pool uses a shorter idle time
   charge for 429/503 and 401/402/403). Once a request was settled, no later request keeps or adds it:
   where v2 says "less the session fee", read "less the session fee if it is still due on this connection".
 - A request's reservation = the usage bound (a full-context prompt plus `max_tokens`, or the image price)
-  + max(session fee if still due, abandon fee).
+  + max(session fee if still due, abandon fee). N announces it in `request_ok.reserved_msats` before C
+  sends a record of the request; an error head with a 5xx other than 503 may charge it, and C bounds that
+  charge by the announced number, not by the receipt's (§12.4).
 - `abandon_fee_msat` per request (kept when an accepted request is dropped before `body_released`), except
   on a connection with no settlement yet: there the deposit is charged instead and the abandon fee is not
   kept on top. So it applies to dropped requests on a connection whose deposit was already released.
@@ -688,7 +695,7 @@ GOAWAY's last-stream-id is released (the request fails before its release and ma
 | 6 | 3 bits per connection instead of 2.8 per request (idealized abort model, §4) | fewer connections than requests; with one request per connection it is slightly more |
 | 7 | A malicious N can write more epoch-0 records than the proven head (π_NK binds the head's content only): HEADERS frames that change the provider's request table, so that index 62 no longer names the proven credential entry, or that change the connection's state | C's own header blocks stay proven; it cannot reveal the prompt or the key, but it can change how C's requests authenticate or make them fail. Inherited from risk 1 of v2, with a new effect |
 | 8 | Receipts and attestations of one connection repeat `sid`, the transcript hashes, `c_commit`, the certificate-chain hash and the request numbers and intervals | anyone shown several of them can link them and see their order and gaps: they are **private documents** of the client. Showing them to third parties unlinkably would need a new signed presentation format; redacting fields of the signed ones breaks their signatures |
-| 9 | Compromise scope: one `c_ap_1`/`s_ap_0` pair protects up to `h2.max_requests` requests (C may not KeyUpdate under π_WIN's rules). A live compromise of C exposes the connection's current and later traffic; a later forensic compromise of retained secrets exposes the whole recorded connection, not one request | clients erase traffic secrets when a connection closes (and keep them out of logs and swap where they can); operators keep `h2.max_requests` and `h2.max_lifetime_s` in proportion. A per-request ratchet needs a new anchor protocol |
+| 9 | Compromise scope: one `c_ap_1`/`s_ap_0` pair protects up to `h2.max_requests` requests (C may not KeyUpdate under π_WIN's rules). A live compromise of C exposes the connection's current and later traffic; a later forensic compromise of retained secrets exposes the whole recorded connection, not one request | best effort only: clients clear the traffic secrets they hold (zero the arrays, drop the references) when a connection closes and keep them out of logs. That is not cryptographic erasure: the clients are JavaScript, and copies the runtime made (garbage-collected buffers, heap snapshots, swap, core dumps) may remain. The levers are the connection's scope: operators keep `h2.max_requests` and `h2.max_lifetime_s` in proportion, and a user who needs one request per secret pair uses `reuse: none` or framing `"1.1"`. A per-request ratchet needs a new anchor protocol |
 | 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
 | 11 | `upstream_models` may map a public id to another provider prefix for the same name (`someorg/claude-opus-4.5` for `claude-opus-4.5`): the rule of §12.1 binds the name, not the publisher | matters only on a provider where anyone can publish models under their own namespace; closing it needs a per-host list of trusted prefixes, or showing the pinned id to the user. the node offers of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro; 970 mappings) and Cloudflare's `@cf/meta/<id>` all have the form `<prefix>/<public id>` |
 
@@ -904,6 +911,10 @@ or `{"type":"request","n":k,"kind":"images","model","variant","count","body_len"
   A chat request may carry `suffix`; it must equal the canonical one.
 - **S** `N → C  {"type":"request_ok","sid","n","suffix":<the canonical suffix>}` plus `"stream": 2k+1`
   (framing `"2"`) or `"head_len"` (framing `"1.1"`: the length of the request head N will write).
+  Optional `"reserved_msats"`: a non-negative integer, what the node reserved for the request (N adds it
+  when relaying, both framings, chat and images; the sidecar never sends it). It is the bound of a charge
+  of the reservation (a 5xx error head, §12.10), and C refuses a receipt whose `reserved_msats` differs
+  from it. A 5xx receipt after a `request_ok` without it may charge at most the session fee if still due.
 - **C MUST NOT send a record of the request (framing `"1.1"`: the ClientHello) before `request_ok`.**
 
 `N → C  {"type":"request_refused","n","status","reason"[,"detail"]}`: the request is not accepted, nothing
@@ -934,7 +945,9 @@ record sent before `request_ok`.
    `0010` ALPN with one protocol: `h2` (framing `"2"`) or `http/1.1` (framing `"1.1"`). No PSK, no
    `psk_key_exchange_modes`, nothing else. (This is what the reference client, the SDK and the browser
    library write; the reason is §2.1.) Framing `"1.1"`: only after `request_ok`. N dials the provider now.
-2. The joint key schedule runs on the 2PC channel; C relays ChangeCipherSpec and its Finished.
+2. The joint key schedule runs on the 2PC channel; C relays ChangeCipherSpec and its Finished. N holds
+   every client record after the ClientHello until the provider's first byte has arrived (§2.1), then
+   relays at most one ChangeCipherSpec (exactly `14 03 03 00 01 01`) and one application-data record.
 3. `N → C  {"type":"hs_verified"}`: N verified chain, hostname, CertificateVerify and both Finished;
    framing `"2"`: EncryptedExtensions selected `h2`, else `error` with `code: "h2_not_selected"`.
 4. `N → C  {"type":"c_commit","params":{"PiNK":…},"c_commit","h1","h2","hk"}`. `params.template` is the head
@@ -1152,7 +1165,7 @@ the frame would be `{"type":"closed","reason":"ended"}`.
 | before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes) | released; the session fee is kept if still due |
 | after `body_released` with no settlement | charged in full |
 | settled 2xx | usage at the frozen rates (chat) or `msat_per_image × count` (images), plus the session fee if still due |
-| settled error head | 429/503 and 401/402/403: the session fee if still due; any other 4xx: the abandon fee; other 5xx: the reservation |
+| settled error head | 429/503 and 401/402/403: the session fee if still due; any other 4xx: the abandon fee; other 5xx: the reservation, at most the `reserved_msats` announced in `request_ok` (none announced: the session fee if still due); images: never more than `msat_per_image × count` + max(session fee if still due, abandon fee) |
 
 The session fee is "still due" until the connection's first settlement.
 
