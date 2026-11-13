@@ -59,6 +59,8 @@ enum WinInflight {
     Records(usize),
     /// The current request's error head (server records under `s_ap_0`).
     ErrorHead,
+    /// A refusal of the current request's stream (`disclose_reset`).
+    Refusal,
 }
 
 /// One request on the connection.
@@ -99,6 +101,8 @@ struct Req {
     /// The proof the settlement waits for.
     settle_on: Option<&'static str>,
     attestation: Option<serde_json::Value>,
+    /// A refusal of its stream was disclosed: nothing more of it is written.
+    refused: bool,
 }
 
 /// Per-connection state of a framing-"2" connection.
@@ -135,6 +139,9 @@ pub(crate) struct H2 {
     /// The first request's response began (told to the offer guard once).
     responded: bool,
     responded_told: bool,
+    /// The provider closed before the request in flight was released: only
+    /// a `disclose_reset` may still settle it, until the session deadline.
+    pub(crate) closed_early: bool,
 }
 
 impl H2 {
@@ -160,6 +167,7 @@ impl H2 {
             settings_seen: false,
             responded: false,
             responded_told: false,
+            closed_early: false,
         }
     }
 
@@ -409,6 +417,7 @@ pub(crate) fn on_request(
         usage: None,
         settle_on: None,
         attestation: None,
+        refused: false,
     });
     // The per-request limit: up to the release, then
     // again from it.
@@ -568,7 +577,8 @@ async fn flush(
         let deadline = st.deadline;
         let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
         let Some(front) = h.queue.front() else { break };
-        if !front.proven {
+        // Nothing goes to a provider that closed the connection.
+        if !front.proven || h.tcp_closed {
             break;
         }
         if front.req_idx > 0 {
@@ -578,7 +588,8 @@ async fn flush(
                 break;
             }
             let q = h.req.as_mut().ok_or_else(|| anyhow!("a request record without its request"))?;
-            if front.req_idx > q.upto {
+            // A refused request (its refusal disclosed) gets nothing more written.
+            if front.req_idx > q.upto || q.refused {
                 break;
             }
             if q.s_k.is_none() {
@@ -723,7 +734,7 @@ pub(crate) async fn proof_done(
             side(st, format!("pi_win verified for {count} client record(s)"));
             pump(shared, to_client, st, log, tcp_tx).await
         }
-        ("pi_win", Some(WinInflight::ErrorHead)) => settle(app, st, to_client, "pi_win", log.recv_len),
+        ("pi_win", Some(WinInflight::ErrorHead | WinInflight::Refusal)) => settle(app, st, to_client, "pi_win", log.recv_len),
         ("pi_c3s", win) => {
             h.win = win;
             settle(app, st, to_client, "pi_c3s", log.recv_len)
@@ -856,6 +867,11 @@ pub(crate) fn on_disclose_head(
     if h.win.is_some() || h.queue.iter().any(|x| !x.proven) {
         bail!("disclose_head while client records are unproven");
     }
+    // A provider that closed before the request was complete: a refusal
+    // (`disclose_reset`) is the only disclosure left (§12.10, row 8).
+    if h.closed_early {
+        bail!("disclose_head after the provider closed before the request was complete");
+    }
     let q = h.req.as_mut().filter(|q| q.n == n).ok_or_else(|| anyhow!("disclose_head names no request in flight"))?;
     let s_k = q.s_k.ok_or_else(|| anyhow!("disclose_head before any of the request reached the upstream"))?;
     if q.usage.is_some() {
@@ -864,38 +880,14 @@ pub(crate) fn on_disclose_head(
     if r.len() > 2 * MAX_DISCLOSE_R {
         bail!("disclosed R is too long");
     }
-    if key_updates > zkbench::statements::MAX_SERVER_KEY_UPDATES || (key_updates == 0) != (epoch_start == 0) {
-        bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
-    }
+    check_epoch(key_updates, epoch_start)?;
     let r = hex::decode(r)?;
     let status = h2::parse_error_head(&r, q.stream)?;
     // Record `record` is in the request's interval and still held.
-    let base = log.server_app_records - log.server_tail.len();
-    if record < s_k || record < base || record >= log.server_app_records || record < hs_records + epoch_start {
-        bail!("server record {record} is outside the request's interval or no longer held");
+    if record < s_k {
+        bail!("server record {record} is outside the request's interval");
     }
-    let mut windows = Vec::new();
-    let mut rest: &[u8] = &r;
-    for (i, rec) in log.server_tail.iter().skip(record - base).enumerate() {
-        if rest.is_empty() {
-            break;
-        }
-        if i >= MAX_HEAD_RECORDS {
-            bail!("the error head spans more than {MAX_HEAD_RECORDS} records");
-        }
-        let content = rec.payload.len().checked_sub(17).filter(|c| *c > 0).ok_or_else(|| anyhow!("a covered record has no content"))?;
-        let (chunk, tail) = rest.split_at(rest.len().min(content));
-        let seq = (record + i - hs_records - epoch_start) as u64;
-        // The frame's bytes from offset 0, and the record's last byte: it
-        // is application data, not a handshake record that could carry them.
-        windows.extend(h2::windows_for(seq, &rec.payload, chunk, &[])?);
-        rest = tail;
-    }
-    if !rest.is_empty() {
-        bail!("the error head extends past the server records received");
-    }
-    let p = zkbench::statements::PiWin { anchor, key_updates, windows };
-    zkbench::statements::check_pi_win(&p)?;
+    let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r)?;
     q.usage = Some(serde_json::json!({ "error_status": status, "choices": [] }));
     q.settle_on = Some("pi_win");
     h.win = Some(WinInflight::ErrorHead);
@@ -906,6 +898,127 @@ pub(crate) fn on_disclose_head(
         serde_json::json!({"type":"zk_params","proof":"pi_win","purpose":"error_head","n":n,"record":record,"params":params}).to_string().into(),
     ));
     Ok(())
+}
+
+/// How long a request whose provider closed before it was released waits for
+/// its refusal to be disclosed and proven (`disclose_reset`).
+pub(crate) const REFUSAL_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `disclose_reset`: the provider refused the request's stream without
+/// processing it (`PROTOCOL-V3.md` §5.4, §12.8): RST_STREAM(REFUSED_STREAM)
+/// on the stream, or GOAWAY(NO_ERROR) with a last-stream-id below it. `R`
+/// runs from byte 0 of server record `record` to the end of the refusing
+/// frame (`h2::parse_refusal`), and `record` is no later than the first
+/// record of the request's interval (`S_k`): every frame the provider sent
+/// since the request's first record was written is walked, so none of them
+/// was a response on the stream. Before any of the request was written only
+/// the GOAWAY form counts (the provider cannot reset a stream it never saw),
+/// and the interval is then fixed, empty, at the disclosure. Settled like a
+/// 429 (§12.10); the connection closes after it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn on_disclose_reset(
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &RelayLog,
+    n: u32,
+    record: usize,
+    r: &str,
+    key_updates: u32,
+    epoch_start: usize,
+) -> Result<()> {
+    let hs_records = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?.server_handshake_records;
+    let anchor = st.ap.as_ref().ok_or_else(|| anyhow!("no 2PC output"))?.h2;
+    let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
+    // One π_WIN at a time. Unproven records of the request may wait: none of
+    // them is written once the refusal is disclosed.
+    if h.win.is_some() {
+        bail!("disclose_reset while a proof of client records is running");
+    }
+    let q = h.req.as_mut().filter(|q| q.n == n).ok_or_else(|| anyhow!("disclose_reset names no request in flight"))?;
+    if q.usage.is_some() {
+        bail!("disclose_reset out of order or repeated");
+    }
+    if r.len() > 2 * MAX_DISCLOSE_R {
+        bail!("disclosed R is too long");
+    }
+    check_epoch(key_updates, epoch_start)?;
+    let r = hex::decode(r)?;
+    let refusal = h2::parse_refusal(&r, q.stream, q.s_k.is_some())?;
+    if q.s_k.is_some_and(|s_k| record > s_k) {
+        bail!("server record {record} is after the start of the request's interval: the walk must cover all of it");
+    }
+    let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r)?;
+    if q.s_k.is_none() {
+        // Nothing of the request reached the provider: its interval is empty,
+        // here, and stays so (a refused request is never written).
+        q.s_k = Some(log.server_app_records);
+    }
+    q.refused = true;
+    q.usage = Some(refusal.usage());
+    q.settle_on = Some("pi_win");
+    h.win = Some(WinInflight::Refusal);
+    if h.closed_early {
+        st.deadline = Some(tokio::time::Instant::now() + REFUSAL_GRACE);
+    }
+    let params = Params::PiWin(p);
+    attest(app, st, to_client)?;
+    side(st, format!("request n={n}: refusal disclosed ({})", refusal.name()));
+    shared.set_params("pi_win", params.clone());
+    let _ = to_client.send(Message::Text(
+        serde_json::json!({"type":"zk_params","proof":"pi_win","purpose":"refusal","n":n,"record":record,"params":params}).to_string().into(),
+    ));
+    Ok(())
+}
+
+fn check_epoch(key_updates: u32, epoch_start: usize) -> Result<()> {
+    if key_updates > zkbench::statements::MAX_SERVER_KEY_UPDATES || (key_updates == 0) != (epoch_start == 0) {
+        bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
+    }
+    Ok(())
+}
+
+/// The π_WIN of a disclosure that starts at byte 0 of server record `record`
+/// (an error head, a refusal): per covered record its bytes from offset 0 and
+/// its last byte (`0x17`: application data, no padding). The record must
+/// still be held and in the key epoch the client names.
+fn record_windows(
+    anchor: [u8; 32],
+    key_updates: u32,
+    log: &RelayLog,
+    hs_records: usize,
+    epoch_start: usize,
+    record: usize,
+    r: &[u8],
+) -> Result<zkbench::statements::PiWin> {
+    let base = log.server_app_records - log.server_tail.len();
+    if record < base || record >= log.server_app_records || record < hs_records + epoch_start {
+        bail!("server record {record} is no longer held, not yet received, or outside the key epoch");
+    }
+    let mut windows = Vec::new();
+    let mut rest: &[u8] = r;
+    for (i, rec) in log.server_tail.iter().skip(record - base).enumerate() {
+        if rest.is_empty() {
+            break;
+        }
+        if i >= MAX_HEAD_RECORDS {
+            bail!("the disclosure spans more than {MAX_HEAD_RECORDS} records");
+        }
+        let content = rec.payload.len().checked_sub(17).filter(|c| *c > 0).ok_or_else(|| anyhow!("a covered record has no content"))?;
+        let (chunk, tail) = rest.split_at(rest.len().min(content));
+        let seq = (record + i - hs_records - epoch_start) as u64;
+        // The frame's bytes from offset 0, and the record's last byte: it
+        // is application data, not a handshake record that could carry them.
+        windows.extend(h2::windows_for(seq, &rec.payload, chunk, &[])?);
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        bail!("the disclosure extends past the server records received");
+    }
+    let p = zkbench::statements::PiWin { anchor, key_updates, windows };
+    zkbench::statements::check_pi_win(&p)?;
+    Ok(p)
 }
 
 /// `accept`: a successful image response (A.13). The price was fixed by the
@@ -992,7 +1105,8 @@ fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
     let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     let q = h.req.take().filter(|q| q.settle_on == Some(proof)).ok_or_else(|| anyhow!("{proof} verified with no disclosure waiting for it"))?;
     let usage = q.usage.clone().ok_or_else(|| anyhow!("no disclosed usage"))?;
-    let error = usage.get("error_status").is_some();
+    // An error head or a refusal: the connection closes after it.
+    let error = usage.get("error_status").is_some() || usage.get("refused").is_some();
     if app.node_settles {
         let mut msg = serde_json::json!({"type":"usage","sid":sid,"http":"2","n":q.n,"model":q.model,"usage":usage});
         if let Some(rm) = usage.get("model").and_then(|m| m.as_str()).filter(|m| *m != q.model) {
@@ -1044,22 +1158,43 @@ fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
 /// The upstream closed the connection. With no request in flight the session
 /// ends in order; a request that never fully reached the upstream ends it
 /// with nothing at stake; a released request may still be disclosed.
+///
+/// A request not yet released: `upstream_closed_early` tells the node how
+/// much the provider sent in its interval. A refusal already disclosed goes
+/// on to its settlement; otherwise the client has `REFUSAL_GRACE` to
+/// disclose one (the provider's GOAWAY usually comes right before its close)
+/// and nothing else, and the session then ends as before (§12.10 rows 8, 9).
 pub(crate) fn tcp_closed(st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) -> Result<()> {
     let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     h.tcp_closed = true;
     match &h.req {
         None => h.closing = Some("upstream_closed"),
         Some(q) if !q.released => {
-            let (n, response_bytes) = (q.n, q.recv_bytes);
+            let (n, response_bytes, refused, disclosed) = (q.n, q.recv_bytes, q.refused, q.usage.is_some());
             let _ = to_client.send(Message::Text(
                 serde_json::json!({"type":"upstream_closed_early","n":n,"response_bytes":response_bytes}).to_string().into(),
             ));
+            if !refused && !disclosed {
+                h.closed_early = true;
+                st.deadline = Some(tokio::time::Instant::now() + REFUSAL_GRACE);
+            }
             side(st, format!("upstream closed early; request n={n}, {response_bytes} response bytes"));
-            bail!("upstream closed the connection before the request was complete (nothing billed)");
+            if disclosed && !refused {
+                bail!("{CLOSED_EARLY}");
+            }
         }
         Some(_) => {}
     }
     Ok(())
+}
+
+/// How a session ends whose provider closed before its request was complete.
+pub(crate) const CLOSED_EARLY: &str = "upstream closed the connection before the request was complete (nothing billed)";
+
+/// The session deadline passed: true when that is the end of a request whose
+/// provider closed early and whose refusal was not disclosed in time.
+pub(crate) fn closed_early_unsettled(st: &Session) -> bool {
+    st.h2.as_ref().is_some_and(|h| h.closed_early && h.req.is_some())
 }
 
 #[cfg(test)]
@@ -1103,6 +1238,7 @@ mod tests {
             usage: None,
             settle_on: None,
             attestation: None,
+            refused: false,
         });
         st.h2 = Some(Box::new(h));
         st
@@ -2111,6 +2247,193 @@ mod tests {
         assert_eq!(st.h2.as_ref().unwrap().closing, Some("error_settled"));
     }
 
+    fn goaway_frame(last: u32, code: u32) -> Vec<u8> {
+        let mut p = last.to_be_bytes().to_vec();
+        p.extend(code.to_be_bytes());
+        h2::frame(h2::GOAWAY, 0, 0, &p)
+    }
+
+    fn rst_frame(stream: u32, code: u32) -> Vec<u8> {
+        h2::frame(h2::RST_STREAM, 0, stream, &code.to_be_bytes())
+    }
+
+    /// A request written in full, then refused (RST_STREAM(REFUSED_STREAM)
+    /// after a WINDOW_UPDATE): `disclose_reset` from the first record of the
+    /// interval; it settles as a refusal and the connection closes. What a
+    /// client could point at instead is refused.
+    #[tokio::test]
+    async fn a_refused_stream_is_disclosed_from_the_start_of_its_interval() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        for c in [&[1u8; 40][..], &[2; 900], &[3; 30]] {
+            feed(&mut st, &mut log, c);
+        }
+        send_request(&mut st, 300);
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().s_k, Some(3));
+        let wu = h2::frame(h2::WINDOW_UPDATE, 0, 3, &[0, 0, 1, 0]);
+        feed(&mut st, &mut log, &wu); // record 3 = S_k
+        feed(&mut st, &mut log, &rst_frame(3, 7)); // record 4
+        texts(&mut rx);
+        let r = [wu.clone(), rst_frame(3, 7)].concat();
+        let go = |st: &mut Session, n: u32, record: usize, r: &[u8]| on_disclose_reset(&app, &sh, &tx, st, &log, n, record, &hex::encode(r), 0, 0);
+        // From a record after S_k: the walk would skip part of the interval.
+        assert!(go(&mut st, 1, 4, &rst_frame(3, 7)).unwrap_err().to_string().contains("interval"));
+        // Before S_k: record 2 is the provider's earlier bytes, not frames.
+        assert!(go(&mut st, 1, 2, &[vec![3u8; 30], r.clone()].concat()).is_err());
+        // Another request, not received, R not ending at the reset.
+        assert!(go(&mut st, 2, 3, &r).is_err());
+        assert!(go(&mut st, 1, 5, &r).is_err());
+        assert!(go(&mut st, 1, 3, &r[..r.len() - 1]).is_err());
+        // The bytes the provider sent must be R: a reset with another code, of
+        // another stream or of the probe stream is not what it sent; and even
+        // if it were, none of them counts.
+        for bad in [rst_frame(3, 8), rst_frame(5, 7), rst_frame(1, 7)] {
+            assert!(go(&mut st, 1, 3, &[wu.clone(), bad].concat()).is_err());
+        }
+        assert!(texts(&mut rx).is_empty());
+        go(&mut st, 1, 3, &r).unwrap();
+        let m = texts(&mut rx);
+        assert_eq!(m.iter().map(|x| x["type"].as_str().unwrap()).collect::<Vec<_>>(), vec!["attestation", "zk_params"]);
+        assert_eq!((m[1]["proof"].as_str(), m[1]["purpose"].as_str(), m[1]["record"].as_u64()), (Some("pi_win"), Some("refusal"), Some(3)));
+        assert_eq!(m[0]["a"]["s_k"], 3);
+        let Params::PiWin(p) = serde_json::from_value(m[1]["params"].clone()).unwrap() else { panic!() };
+        // Anchored on h2 (the server's key); both records in full with their type byte.
+        assert_eq!(p.anchor, [0x22; 32]);
+        assert_eq!(p.windows.iter().map(|w| w.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(p.windows[0].expected, [wu.clone(), vec![0x17]].concat());
+        assert_eq!(p.windows[1].expected, [rst_frame(3, 7), vec![0x17]].concat());
+        // Repeated: refused.
+        assert!(go(&mut st, 1, 3, &r).is_err());
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let m = texts(&mut rx);
+        assert_eq!(m[0]["receipt"]["usage"], serde_json::json!({"refused": "rst_stream", "error_code": 7, "choices": []}));
+        assert_eq!(st.h2.as_ref().unwrap().closing, Some("error_settled"));
+        assert!(st.h2.as_ref().unwrap().req.is_none());
+    }
+
+    /// A response head on the stream before the reset: the provider processed
+    /// the request; no refusal can be disclosed past it, from any record.
+    #[tokio::test]
+    async fn no_refusal_after_a_response_on_the_stream() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        for c in [&[1u8; 40][..], &[2; 900]] {
+            feed(&mut st, &mut log, c);
+        }
+        send_request(&mut st, 300);
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let head = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &[0x88]);
+        let data = h2::frame(h2::DATA, 0, 3, b"data: {}\n\n");
+        feed(&mut st, &mut log, &head); // record 2 = S_k
+        feed(&mut st, &mut log, &data);
+        feed(&mut st, &mut log, &rst_frame(3, 7));
+        texts(&mut rx);
+        for (record, r) in [
+            (2usize, [head.clone(), data.clone(), rst_frame(3, 7)].concat()),
+            (2, [head.clone(), rst_frame(3, 7)].concat()),
+            (3, [data.clone(), rst_frame(3, 7)].concat()),
+            (4, rst_frame(3, 7)),
+        ] {
+            assert!(on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, record, &hex::encode(&r), 0, 0).is_err(), "record {record}");
+        }
+        assert!(texts(&mut rx).is_empty());
+    }
+
+    /// GOAWAY before any of the request was written (the client saw it and
+    /// released nothing): only the GOAWAY form, from the record that holds
+    /// it; the interval is fixed, empty, at the disclosure; the provider's
+    /// close then waits for the proof, and nothing of the request is written.
+    #[tokio::test]
+    async fn a_goaway_before_the_request_was_written_is_disclosed() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, mut up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        for c in [&[1u8; 40][..], &[2; 900]] {
+            feed(&mut st, &mut log, c);
+        }
+        send_request(&mut st, 300);
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let g = goaway_frame(1, 0);
+        feed(&mut st, &mut log, &g); // record 2
+        texts(&mut rx);
+        let go = |st: &mut Session, record: usize, r: &[u8]| on_disclose_reset(&app, &sh, &tx, st, &log, 1, record, &hex::encode(r), 0, 0);
+        assert!(st.h2.as_ref().unwrap().req.as_ref().unwrap().s_k.is_none());
+        // A GOAWAY with an error code: the client's control frames may have caused it.
+        assert!(go(&mut st, 2, &goaway_frame(1, 1)).is_err());
+        go(&mut st, 2, &g).unwrap();
+        // Released now: nothing is written all the same.
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        let m = texts(&mut rx);
+        assert_eq!(m[0]["type"], "attestation");
+        assert_eq!((m[0]["a"]["s_k"].as_u64(), m[0]["a"]["server_records"].as_u64(), m[0]["a"]["client_records"].as_u64()), (Some(3), Some(0), Some(0)));
+        assert_eq!(m[1]["purpose"], "refusal");
+        // The provider closes while the proof runs: the settlement goes on.
+        tcp_closed(&mut st, &tx).unwrap();
+        assert!(!st.h2.as_ref().unwrap().closed_early);
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let m = texts(&mut rx);
+        let u = m.iter().find(|x| x["type"] == "usage").unwrap();
+        assert_eq!(u["usage"], serde_json::json!({"refused": "goaway", "error_code": 0, "last_stream_id": 1, "choices": []}));
+        assert_eq!(st.h2.as_ref().unwrap().closing, Some("error_settled"));
+        assert!(read_some(&mut up).await.is_empty(), "a refused request reached the provider");
+    }
+
+    /// The provider sends GOAWAY and closes before the client could disclose
+    /// it: the session waits for `disclose_reset` alone (an error head is not
+    /// taken then), and settles it.
+    #[tokio::test]
+    async fn a_refusal_is_disclosed_after_the_providers_close() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        for c in [&[1u8; 40][..], &[2; 900]] {
+            feed(&mut st, &mut log, c);
+        }
+        send_request(&mut st, 300);
+        on_release(&mut st, 1, 1).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        // The HEADERS went out (S_k = 2), the body is held by the client's release.
+        assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().s_k, Some(2));
+        let g = goaway_frame(1, 0);
+        feed(&mut st, &mut log, &g);
+        tcp_closed(&mut st, &tx).unwrap();
+        assert!(closed_early_unsettled(&st));
+        let head = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &[0x8c]);
+        assert!(on_disclose_head(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&head), 0, 0).is_err());
+        texts(&mut rx);
+        on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap();
+        // Released further meanwhile: nothing goes to a closed provider.
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let m = texts(&mut rx);
+        assert!(m.iter().any(|x| x["type"] == "usage" && x["usage"]["refused"] == "goaway"));
+        assert!(!closed_early_unsettled(&st));
+        assert_eq!(st.h2.as_ref().unwrap().closing, Some("error_settled"));
+    }
+
     #[test]
     fn requests_are_sequential_and_limited() {
         let app = app_state(false);
@@ -2160,10 +2483,17 @@ mod tests {
         st.h2.as_mut().unwrap().req = None;
         tcp_closed(&mut st, &tx).unwrap();
         assert_eq!(st.h2.as_ref().unwrap().closing, Some("upstream_closed"));
-        // A request not fully released: nothing is at stake.
+        // A request not fully released: nothing is at stake; it waits only
+        // for a refusal to be disclosed, until a short deadline.
         let mut st = open_session(300);
-        assert!(tcp_closed(&mut st, &tx).is_err());
+        tcp_closed(&mut st, &tx).unwrap();
         assert_eq!(texts(&mut rx)[0]["type"], "upstream_closed_early");
+        assert!(st.h2.as_ref().unwrap().closed_early && closed_early_unsettled(&st));
+        assert!(st.deadline.unwrap() <= tokio::time::Instant::now() + REFUSAL_GRACE);
+        // An error head disclosure already running is ended by the close (row 8).
+        let mut st = open_session(300);
+        st.h2.as_mut().unwrap().req.as_mut().unwrap().usage = Some(serde_json::json!({"error_status": 500}));
+        assert!(tcp_closed(&mut st, &tx).is_err());
         // A released one may still be disclosed.
         let mut st = open_session(300);
         st.h2.as_mut().unwrap().req.as_mut().unwrap().released = true;

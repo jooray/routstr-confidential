@@ -430,6 +430,104 @@ pub fn parse_error_head(r: &[u8], stream: u32) -> Result<u16> {
     Ok(status)
 }
 
+/// RST_STREAM's error code for a stream the server did not process (RFC 9113 §8.7).
+pub const REFUSED_STREAM: u32 = 7;
+/// GOAWAY's error code of a graceful end (RFC 9113 §7).
+pub const NO_ERROR: u32 = 0;
+
+/// A provider's refusal of a stream it did not process (`PROTOCOL-V3.md` §5.4,
+/// `disclose_reset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// RST_STREAM(REFUSED_STREAM) on the request's stream.
+    RstStream,
+    /// GOAWAY(NO_ERROR) whose last-stream-id is below the request's stream.
+    GoAway { last_stream_id: u32 },
+}
+
+impl Refusal {
+    pub fn name(self) -> &'static str {
+        match self {
+            Refusal::RstStream => "rst_stream",
+            Refusal::GoAway { .. } => "goaway",
+        }
+    }
+
+    /// The `usage` the settlement carries (§12.8): no usage, the frame's kind.
+    pub fn usage(self) -> serde_json::Value {
+        match self {
+            Refusal::RstStream => serde_json::json!({"refused": "rst_stream", "error_code": REFUSED_STREAM, "choices": []}),
+            Refusal::GoAway { last_stream_id } => {
+                serde_json::json!({"refused": "goaway", "error_code": NO_ERROR, "last_stream_id": last_stream_id, "choices": []})
+            }
+        }
+    }
+}
+
+/// A disclosed refusal (`disclose_reset`, `PROTOCOL-V3.md` §5.4): `R` is the
+/// plaintext from byte 0 of a server record to the end of the frame that
+/// refuses the request's `stream`, walked frame by frame:
+///
+///   * the refusal: RST_STREAM on `stream` with REFUSED_STREAM (7), or GOAWAY
+///     on stream 0 with NO_ERROR whose last-stream-id is below `stream`
+///     (`rst_allowed` false: only the GOAWAY form, for a request none of whose
+///     records reached the provider);
+///   * before it only what the error head allows before a response head:
+///     SETTINGS, PING, WINDOW_UPDATE on stream 0, WINDOW_UPDATE on `stream`,
+///     a frame of the probe stream, and a GOAWAY that does not refuse
+///     `stream` (last-stream-id at least `stream`).
+///
+/// So the walk proves that the provider sent nothing else on the request's
+/// stream (no response HEADERS, no DATA) between the record it starts at and
+/// the refusal; the caller makes sure that record is no later than the first
+/// one of the request's interval. A refusal of another stream, of the probe
+/// stream, a reset with another code, or a GOAWAY with an error (a connection
+/// error the client's own frames may have caused) is refused.
+pub fn parse_refusal(r: &[u8], stream: u32, rst_allowed: bool) -> Result<Refusal> {
+    if stream == PROBE_STREAM || stream == 0 {
+        bail!("refusal R: not a request stream");
+    }
+    let mut p = 0usize;
+    loop {
+        let (len, ty, flags, s) = parse_header(&r[p..]).ok_or_else(|| anyhow!("refusal R: a partial frame header"))?;
+        if len > MAX_FRAME {
+            bail!("refusal R: frame of {len} bytes");
+        }
+        let body = r.get(p + 9..p + 9 + len).ok_or_else(|| anyhow!("refusal R: a frame extends past the disclosed bytes"))?;
+        let end = p + 9 + len == r.len();
+        let goaway_last = (ty == GOAWAY && s == 0 && len >= 8).then(|| u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7fff_ffff);
+        let code = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        let refusal = match (ty, s) {
+            (RST_STREAM, s) if s == stream && len == 4 && code(body) == REFUSED_STREAM && rst_allowed => Some(Refusal::RstStream),
+            (GOAWAY, 0) if goaway_last.is_some_and(|l| l < stream) && code(&body[4..8]) == NO_ERROR => {
+                Some(Refusal::GoAway { last_stream_id: goaway_last.unwrap_or(0) })
+            }
+            _ => None,
+        };
+        if let Some(refusal) = refusal {
+            if !end {
+                bail!("refusal R: must end with the refusing frame");
+            }
+            return Ok(refusal);
+        }
+        let ok = match (ty, s) {
+            (SETTINGS, 0) => len % 6 == 0 && flags & !ACK == 0,
+            (PING, 0) => len == 8,
+            (GOAWAY, 0) => goaway_last.is_some_and(|l| l >= stream),
+            (WINDOW_UPDATE, s) => len == 4 && (s == 0 || s == stream),
+            (ty, PROBE_STREAM) => PROBE_FRAMES.contains(&ty),
+            _ => false,
+        };
+        if !ok {
+            bail!("refusal R: a frame of type {ty} on stream {s} before the refusal (or a refusal that does not count)");
+        }
+        p += 9 + len;
+        if end {
+            bail!("refusal R: no refusal of the request's stream");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +991,108 @@ mod tests {
         r.extend(&head);
         r.extend(frame(DATA, 0, 3, b"{}"));
         assert!(parse_error_head(&r, 3).is_err());
+    }
+
+    fn goaway(last: u32, code: u32) -> Vec<u8> {
+        let mut p = last.to_be_bytes().to_vec();
+        p.extend(code.to_be_bytes());
+        frame(GOAWAY, 0, 0, &p)
+    }
+
+    /// `disclose_reset` (§5.4): RST_STREAM(REFUSED_STREAM) on the request's
+    /// stream or GOAWAY(NO_ERROR) below it, after only frames that carry
+    /// nothing of the client's and nothing of the request's response.
+    #[test]
+    fn refusal_forms() {
+        let rst = |stream: u32, code: u32| frame(RST_STREAM, 0, stream, &code.to_be_bytes());
+        assert_eq!(parse_refusal(&rst(3, 7), 3, true).unwrap(), Refusal::RstStream);
+        assert_eq!(parse_refusal(&goaway(1, 0), 3, true).unwrap(), Refusal::GoAway { last_stream_id: 1 });
+        assert_eq!(parse_refusal(&goaway(1, 0), 3, false).unwrap(), Refusal::GoAway { last_stream_id: 1 });
+        // The reserved bit of the last-stream-id is ignored.
+        assert_eq!(parse_refusal(&goaway(0x8000_0001, 0), 5, true).unwrap(), Refusal::GoAway { last_stream_id: 1 });
+        // GOAWAY with debug data.
+        let mut g = 3u32.to_be_bytes().to_vec();
+        g.extend(0u32.to_be_bytes());
+        g.extend(b"shutting down");
+        assert_eq!(parse_refusal(&frame(GOAWAY, 0, 0, &g), 5, true).unwrap(), Refusal::GoAway { last_stream_id: 3 });
+        let before = [
+            frame(WINDOW_UPDATE, 0, 0, &[0, 0, 1, 0]),
+            frame(WINDOW_UPDATE, 0, 3, &[0, 0, 1, 0]),
+            frame(SETTINGS, 0, 0, &[0, 3, 0, 0, 0, 100]),
+            frame(SETTINGS, ACK, 0, &[]),
+            frame(PING, 0, 0, &[1; 8]),
+            frame(DATA, END_STREAM, PROBE_STREAM, b"{\"data\":[]}"),
+            frame(RST_STREAM, 0, PROBE_STREAM, &[0, 0, 0, 7]),
+            goaway(3, 0),
+            goaway(0x7fff_ffff, 0),
+        ];
+        let mut r: Vec<u8> = before.concat();
+        r.extend(rst(3, 7));
+        assert_eq!(parse_refusal(&r, 3, true).unwrap(), Refusal::RstStream);
+        for (i, f) in before.iter().enumerate() {
+            let mut r = f.clone();
+            r.extend(rst(3, 7));
+            assert_eq!(parse_refusal(&r, 3, true).unwrap(), Refusal::RstStream, "prefix {i}");
+        }
+    }
+
+    /// What a client could point at instead of a refusal of a request the
+    /// provider did not process: each is refused.
+    #[test]
+    fn refusals_that_do_not_count() {
+        let rst = |stream: u32, code: u32| frame(RST_STREAM, 0, stream, &code.to_be_bytes());
+        let block = [0x88];
+        for (what, r, rst_ok) in [
+            ("another reset code (CANCEL)", rst(3, 8), true),
+            ("NO_ERROR reset", rst(3, 0), true),
+            ("a reset of another request stream", rst(5, 7), true),
+            ("a reset of the probe stream", rst(PROBE_STREAM, 7), true),
+            ("a reset before any record was written", rst(3, 7), false),
+            ("GOAWAY that covers the stream", goaway(3, 0), true),
+            ("GOAWAY with a connection error", goaway(1, 1), true),
+            ("GOAWAY ENHANCE_YOUR_CALM", goaway(1, 11), true),
+            ("a short GOAWAY", frame(GOAWAY, 0, 0, &[0, 0, 0, 1]), true),
+            ("GOAWAY on a stream", frame(GOAWAY, 0, 3, &[0, 0, 0, 1, 0, 0, 0, 0]), true),
+            ("a reset with a long payload", frame(RST_STREAM, 0, 3, &[0, 0, 0, 7, 0]), true),
+            ("nothing", Vec::new(), true),
+        ] {
+            assert!(parse_refusal(&r, 3, rst_ok).is_err(), "{what}");
+        }
+        // No refusal of the probe stream's request itself.
+        assert!(parse_refusal(&rst(PROBE_STREAM, 7), PROBE_STREAM, true).is_err());
+        // A response head, DATA or trailers of the stream before the reset:
+        // the provider processed it.
+        for bad in [
+            frame(HEADERS, END_HEADERS, 3, &block),
+            frame(HEADERS, END_HEADERS | END_STREAM, 3, &block),
+            frame(DATA, 0, 3, b"data: {}\n\n"),
+            frame(HEADERS, END_HEADERS, 5, &block),
+            frame(DATA, 0, 5, b"x"),
+            frame(PING, 0, 3, &[0; 8]),
+            frame(5, 0, 0, &[0; 4]),
+            goaway(1, 2),
+        ] {
+            let mut r = bad.clone();
+            r.extend(rst(3, 7));
+            assert!(parse_refusal(&r, 3, true).is_err(), "{bad:?}");
+            let mut r = bad.clone();
+            r.extend(goaway(1, 0));
+            assert!(parse_refusal(&r, 3, true).is_err(), "{bad:?} before GOAWAY");
+        }
+        // The refusal must end R; R must end on a frame boundary.
+        let mut r = rst(3, 7);
+        r.extend(frame(PING, 0, 0, &[0; 8]));
+        assert!(parse_refusal(&r, 3, true).is_err());
+        let r = rst(3, 7);
+        assert!(parse_refusal(&r[..r.len() - 1], 3, true).is_err());
+        let mut r = frame(PING, ACK, 0, &[1; 8]);
+        r[2] = 12; // its length runs into the reset
+        r.extend(rst(3, 7));
+        assert!(parse_refusal(&r, 3, true).is_err());
+        // The reserved bit in the reset's stream id: not the request's stream.
+        let mut r = rst(3, 7);
+        r[5] |= 0x80;
+        assert!(parse_refusal(&r, 3, true).is_err());
     }
 
     // §5.4's usage event rule on framing "2": the shapes the providers send

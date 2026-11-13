@@ -1616,6 +1616,19 @@ enum ClientMsg {
         #[serde(default)]
         epoch_start: usize,
     },
+    /// Framing "2": the provider refused request `n`'s stream without
+    /// processing it (RST_STREAM(REFUSED_STREAM) on it, or GOAWAY(NO_ERROR)
+    /// below it): `r` runs from byte 0 of server application-data record
+    /// `record` to the end of the refusing frame (`PROTOCOL-V3.md` §12.8).
+    DiscloseReset {
+        n: u32,
+        record: usize,
+        r: String,
+        #[serde(default)]
+        key_updates: u32,
+        #[serde(default)]
+        epoch_start: usize,
+    },
     /// The client accepts π_NK (it verified it) and claims the session; N
     /// writes the credential record and the KeyUpdate under K_0.
     ReleaseHead {},
@@ -1874,6 +1887,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         st.deadline = None;
                         deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_TIMEOUT);
                         continue;
+                    }
+                    if h2_session::closed_early_unsettled(&st) {
+                        // No refusal was disclosed after the provider's early close.
+                        bail!("{}", h2_session::CLOSED_EARLY);
                     }
                     bail!("session time limit ({}s) reached", SESSION_TIMEOUT.as_secs())
                 },
@@ -2558,6 +2575,12 @@ async fn handle_control(
             }
             let record = record.ok_or_else(|| anyhow!("framing 2: disclose_head names the server record of the head"))?;
             h2_session::on_disclose_head(app, shared, to_client, st, log, n, record, &r, key_updates, epoch_start)?;
+        }
+        ClientMsg::DiscloseReset { n, record, r, key_updates, epoch_start } => {
+            if st.h2.is_none() {
+                bail!("framing 1.1: no disclose_reset (the provider closes the connection after its answer)");
+            }
+            h2_session::on_disclose_reset(app, shared, to_client, st, log, n, record, &r, key_updates, epoch_start)?;
         }
         ClientMsg::Disclose { r, tail_lens, skip, key_updates, epoch_start, trailing, n, server_records } if st.h2.is_some() => {
             h2_session::on_disclose(app, shared, to_client, st, log, n, &r, &tail_lens, skip, key_updates, epoch_start, trailing, server_records)?;
