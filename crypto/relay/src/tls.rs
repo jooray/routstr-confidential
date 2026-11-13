@@ -87,6 +87,8 @@ pub fn parse_handshake_messages(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
 
 /// Upper bound on the plaintext ServerHello (a TLS 1.3 one is ~100 bytes).
 const MAX_SERVER_HELLO: usize = 1 << 14;
+/// Most records a ServerHello may be fragmented over (one in practice).
+const MAX_SERVER_HELLO_RECORDS: usize = 4;
 
 /// The ServerHello (with its 4-byte header) from the server's plaintext
 /// handshake records. It may span several records (RFC 8446 §5.1 allows a
@@ -98,9 +100,16 @@ pub fn server_hello_message(records: &[Record]) -> Result<Option<Vec<u8>>> {
         bail!("the server sent an alert before its ServerHello");
     }
     let mut buf: Vec<u8> = Vec::new();
-    for r in records.iter().skip_while(|r| r.ctype != CT_HANDSHAKE) {
+    for (i, r) in records.iter().skip_while(|r| r.ctype != CT_HANDSHAKE).enumerate() {
         if r.ctype != CT_HANDSHAKE {
             bail!("ServerHello interrupted by a record of type {}", r.ctype);
+        }
+        // RFC 8446 §5.1: no zero-length Handshake fragments.
+        if r.payload.is_empty() {
+            bail!("a zero-length handshake record before the ServerHello ended");
+        }
+        if i >= MAX_SERVER_HELLO_RECORDS {
+            bail!("ServerHello split over more than {MAX_SERVER_HELLO_RECORDS} records");
         }
         buf.extend_from_slice(&r.payload);
         if buf.len() < 4 {
@@ -568,5 +577,19 @@ mod tests {
         long.push(0);
         assert!(server_hello_message(&[record(CT_HANDSHAKE, &long)]).is_err());
         assert!(server_hello_message(&[record(CT_ALERT, &[2, 40])]).is_err());
+    }
+
+    #[test]
+    fn empty_or_many_server_hello_fragments_are_refused() {
+        let sh = msg(HS_SERVER_HELLO, &[7u8; 90]);
+        // Zero-length handshake records, before or within the message.
+        assert!(server_hello_message(&[record(CT_HANDSHAKE, &[])]).is_err());
+        assert!(server_hello_message(&[record(CT_HANDSHAKE, &sh[..10]), record(CT_HANDSHAKE, &[]), record(CT_HANDSHAKE, &sh[10..])]).is_err());
+        // Four fragments are accepted, five are not.
+        let four: Vec<Record> = [&sh[..1], &sh[1..2], &sh[2..3], &sh[3..]].iter().map(|p| record(CT_HANDSHAKE, p)).collect();
+        assert_eq!(server_hello_message(&four).unwrap().unwrap(), sh);
+        let five: Vec<Record> = [&sh[..1], &sh[1..2], &sh[2..3], &sh[3..4], &sh[4..]].iter().map(|p| record(CT_HANDSHAKE, p)).collect();
+        assert!(server_hello_message(&five).is_err());
+        assert!(server_hello_message(&five[..4]).unwrap().is_none());
     }
 }

@@ -705,6 +705,7 @@ async fn offer_http(State(app): State<Arc<AppState>>) -> impl IntoResponse {
 /// |---|---|
 /// | the ClientHello's bytes | canonical (`tls_v2::canonical_client_hello`): only the random and the session id are the client's, the joint share is a valid point it cannot choose; one record, version `03 03` |
 /// | when the ClientHello is written | the sidecar dials when the checked hello and the joint share are there and writes it at once |
+/// | records after the ClientHello, before the provider answered (a CCS, a "Finished", anything) | held until the provider's first byte has arrived (`handshake_record_step`), so a provider that closes without a byte has seen the hello alone; after it, at most one CCS of exactly `14 03 03 00 01 01` and one application-data record |
 /// | its Finished, π_NK, `release_head` (wrong, late or never) | the provider has sent its flight by then, so bytes were received and the head is not written: "closed during the handshake", not counted |
 /// | leaving | the sidecar closes the connection itself; no provider close is seen |
 /// | a late `release_head`, so that a provider timer fires just after the head | the close after the head counts only when the head was written within `H2_HEAD_PROMPT` of the dial |
@@ -1153,6 +1154,9 @@ impl RelayLog {
         if self.recv_len + data.len() > cap {
             bail!("upstream sent more than {cap} bytes");
         }
+        if !handshake_verified && self.server_raw.len() + data.len() > MAX_PRE_HANDSHAKE_SERVER_BYTES {
+            bail!("upstream sent more than {MAX_PRE_HANDSHAKE_SERVER_BYTES} bytes before the handshake was verified");
+        }
         self.recv_len += data.len();
         self.recv.update(data);
         if !handshake_verified {
@@ -1160,7 +1164,24 @@ impl RelayLog {
         }
         Ok(())
     }
+
+    /// Before the handshake is verified the raw upstream bytes are kept and
+    /// parsed again as records arrive, so their record count is bounded too.
+    fn check_pre_handshake_records(&self, handshake_verified: bool) -> Result<()> {
+        if !handshake_verified && self.server_records > MAX_PRE_HANDSHAKE_SERVER_RECORDS {
+            bail!("upstream sent more than {MAX_PRE_HANDSHAKE_SERVER_RECORDS} records before the handshake was verified");
+        }
+        Ok(())
+    }
 }
+
+/// Upstream bytes kept before the handshake is verified: the ServerHello,
+/// the encrypted flight with the certificate chain (tens of kB at most) and
+/// any early session tickets, with a wide margin. A provider past it ends the
+/// session (`fault: "upstream"`).
+const MAX_PRE_HANDSHAKE_SERVER_BYTES: usize = 256 << 10;
+/// Records in the same span (a real flight has fewer than twenty).
+const MAX_PRE_HANDSHAKE_SERVER_RECORDS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // main
@@ -1390,7 +1411,7 @@ async fn main() -> Result<()> {
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state.clone());
 
-    tokio::spawn(prune_runs_forever(state.runs_dir.clone(), state.runs_keep));
+    tokio::spawn(prune_runs_forever(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, token = state.token_hash.is_some(), "cu-sidecar listening");
@@ -1912,18 +1933,29 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 let Some(ev) = ev else { break };
                 match ev {
                     Ev::ServerBytes(bytes) => {
-                        log.server_bytes(&bytes, st.handshake.is_some())?;
+                        let verified = st.handshake.is_some();
+                        if let Err(e) = log.server_bytes(&bytes, verified) {
+                            if !verified { st.fault = Some("upstream"); }
+                            return Err(e);
+                        }
                         server_pending.extend_from_slice(&bytes);
                         let (recs, used) = parse_records(&server_pending);
                         for r in recs {
                             if let Some(h) = st.h2.as_mut() { h.server_record(&r)?; }
                             log.server_record(r);
                         }
+                        if let Err(e) = log.check_pre_handshake_records(verified) {
+                            st.fault = Some("upstream");
+                            return Err(e);
+                        }
                         if st.h2.as_mut().is_some_and(|h| h.first_response()) {
                             app.h2_guard.opened();
                         }
                         server_pending.drain(..used);
                         if to_client.send(Message::Binary(bytes.into())).is_err() { break; }
+                        // Client records held until the provider's first byte
+                        // (`handshake_record_step`) go out now, in order.
+                        v2_pump_client(&mut st, &mut log, &mut client_pending, &mut tcp_tx).await?;
                         v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
                     }
                     Ev::KeyShare(p) => {
@@ -1951,7 +1983,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         // A failed open (§2.1, `H2Guard`): not a byte in
                         // answer to the canonical ClientHello, or the provider
                         // closing on the connection head alone.
-                        let why = if st.ch_sent && log.recv_len == 0 {
+                        let why = if hello_unanswered(&st, &log) {
                             Some("the provider closed without answering the ClientHello")
                         } else if st.h2.as_ref().is_some_and(|h| h.open_failed()) {
                             Some("the provider closed on the connection head")
@@ -2129,7 +2161,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         if matches!(st.state, SessionState::Handshake | SessionState::AwaitHead) || app.runs_keep.is_zero() {
             remove_run(dir);
         } else {
-            let _ = write_private(&dir.join("sidecar.jsonl"), (st.side_log.join("\n") + "\n").as_bytes());
+            write_run_file(dir, "sidecar.jsonl", (st.side_log.join("\n") + "\n").as_bytes());
         }
     }
     drop(cleanup);
@@ -2197,6 +2229,16 @@ struct Session {
     ch_checked: bool,
     /// The checked ClientHello was relayed to the upstream.
     ch_sent: bool,
+    /// The client's ChangeCipherSpec was relayed (at most one).
+    ccs_sent: bool,
+    /// Client handshake records relayed after the ClientHello (CCS, Finished).
+    post_hello_records: u8,
+    /// The ClientHello and ServerHello messages, once both are in the logs.
+    hellos: Option<(Vec<u8>, Vec<u8>)>,
+    /// (server records, client handshake bytes) when the hellos, and the
+    /// server flight's th_SF, were last looked for and not found.
+    hellos_tried_at: Option<(usize, usize)>,
+    th_sf_tried_at: Option<(usize, usize)>,
     /// When the TCP connection to the provider was up (the ClientHello is
     /// written right after).
     dialed_at: Option<std::time::Instant>,
@@ -2932,19 +2974,24 @@ async fn v2_pump_client(
         if n > MAX_TLS_RECORD {
             bail!("client record of {n} bytes exceeds the TLS 1.3 limit");
         }
-        if !st.ch_sent {
-            // The session dials only after `check_hello` passed.
-            if !st.ch_checked {
-                bail!("the ClientHello was not checked before the dial");
+        match handshake_record_step(st.ch_sent, log.recv_len, st.ccs_sent, r.ctype, &pending[..n])? {
+            HsStep::Hold => return Ok(()),
+            HsStep::Hello => {
+                // The session dials only after `check_hello` passed.
+                if !st.ch_checked {
+                    bail!("the ClientHello was not checked before the dial");
+                }
+                st.ch_sent = true;
             }
-            st.ch_sent = true;
-        } else if r.ctype == tls::CT_CHANGE_CIPHER_SPEC {
-            // relayed as is
-        } else if r.ctype == CT_APPLICATION_DATA {
-            // The client Finished (one encrypted record); then C waits for N.
-            st.state = SessionState::AwaitHead;
-        } else {
-            bail!("unexpected client record type {} during the handshake", r.ctype);
+            HsStep::Ccs => {
+                st.ccs_sent = true;
+                st.post_hello_records += 1;
+            }
+            HsStep::Finished => {
+                // The client Finished (one encrypted record); then C waits for N.
+                st.post_hello_records += 1;
+                st.state = SessionState::AwaitHead;
+            }
         }
         log.client_handshake_record(&pending[..n])?;
         write_upstream(tcp_tx, &pending[..n], st.deadline).await?;
@@ -2955,6 +3002,52 @@ async fn v2_pump_client(
             return Ok(());
         }
     }
+}
+
+/// The middlebox-compatibility ChangeCipherSpec record (RFC 8446 §D.4).
+const CLIENT_CCS: [u8; 6] = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+
+#[derive(Debug, PartialEq)]
+enum HsStep {
+    /// The checked ClientHello: relay it.
+    Hello,
+    /// Keep the record in the buffer: the provider has not answered yet.
+    Hold,
+    /// The one ChangeCipherSpec: relay it.
+    Ccs,
+    /// The client Finished: relay it, then wait for the connection head.
+    Finished,
+}
+
+/// What to do with the next client record of the handshake. Nothing after
+/// the ClientHello reaches the provider before its first byte has arrived:
+/// an honest client has nothing to send before the provider's flight (a
+/// compatibility CCS waits with no harm), and so the provider closing
+/// without a byte can only be its answer to the canonical hello (`H2Guard`).
+/// After the hello: at most one CCS, exactly `14 03 03 00 01 01`, and one
+/// application-data record (the Finished).
+fn handshake_record_step(ch_sent: bool, recv_len: usize, ccs_sent: bool, ctype: u8, raw: &[u8]) -> Result<HsStep> {
+    if !ch_sent {
+        return Ok(HsStep::Hello);
+    }
+    if recv_len == 0 {
+        return Ok(HsStep::Hold);
+    }
+    match ctype {
+        tls::CT_CHANGE_CIPHER_SPEC if ccs_sent => bail!("a second ChangeCipherSpec during the handshake"),
+        tls::CT_CHANGE_CIPHER_SPEC if raw != CLIENT_CCS => bail!("a ChangeCipherSpec record other than 14 03 03 00 01 01"),
+        tls::CT_CHANGE_CIPHER_SPEC => Ok(HsStep::Ccs),
+        CT_APPLICATION_DATA => Ok(HsStep::Finished),
+        t => bail!("unexpected client record type {t} during the handshake"),
+    }
+}
+
+/// A failed open by row 1 of `H2Guard`: the provider closed with not one
+/// byte received, and the only client bytes it had were the canonical
+/// ClientHello (`handshake_record_step` holds everything else until the
+/// provider's first byte).
+fn hello_unanswered(st: &Session, log: &RelayLog) -> bool {
+    st.ch_sent && log.recv_len == 0 && st.post_hello_records == 0
 }
 
 /// Advance the joint handshake as U's messages and the 2PC outputs arrive.
@@ -2970,7 +3063,18 @@ async fn v2_progress(
     if st.assembled.is_some() {
         return Ok(());
     }
-    let Some((ch, sh)) = tls_v2::hellos(&log.client_raw, &log.server_raw)? else { return Ok(()) };
+    // The raw logs are parsed again only when a complete server record (or
+    // a client handshake record) arrived since the last attempt; the hellos
+    // are kept once found.
+    let seen = (log.server_records, log.client_raw.len());
+    if st.hellos.is_none() {
+        if st.hellos_tried_at == Some(seen) {
+            return Ok(());
+        }
+        st.hellos_tried_at = Some(seen);
+        st.hellos = tls_v2::hellos(&log.client_raw, &log.server_raw)?;
+    }
+    let Some((ch, sh)) = st.hellos.clone() else { return Ok(()) };
     if !st.ch_checked {
         return Ok(());
     }
@@ -2983,7 +3087,13 @@ async fn v2_progress(
     }
     let Some(hs) = st.hs_secrets.clone() else { return Ok(()) };
     if st.app_th_sf.is_none() {
-        let Some(th_sf) = tls_v2::th_sf(&ch, &sh, &log.server_raw, &hs.server_hs)? else { return Ok(()) };
+        if st.th_sf_tried_at == Some(seen) {
+            return Ok(());
+        }
+        let Some(th_sf) = tls_v2::th_sf(&ch, &sh, &log.server_raw, &hs.server_hs)? else {
+            st.th_sf_tried_at = Some(seen);
+            return Ok(());
+        };
         cmd.send(TwoPcCmd::App { th_sf }).map_err(|_| anyhow!("2PC task gone"))?;
         st.app_th_sf = Some(th_sf);
     }
@@ -3601,16 +3711,30 @@ fn remove_run(dir: &std::path::Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
+/// When a run directory last changed: the directory itself (files added) or
+/// one of the sidecar's files in it (rewritten in place, which leaves the
+/// directory's own time as it was).
+fn run_last_change(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let m = std::fs::metadata(dir).ok().filter(|m| m.is_dir())?;
+    let files = SIDECAR_RUN_FILES.iter().filter_map(|f| std::fs::metadata(dir.join(f)).and_then(|m| m.modified()).ok());
+    m.modified().ok().into_iter().chain(files).max()
+}
+
 /// Remove the run directories (named by a session id) last changed before
-/// `cutoff`. Returns how many were removed.
-fn prune_runs(root: &std::path::Path, cutoff: std::time::SystemTime) -> usize {
+/// `cutoff`, except those of live sessions (`live`: their sids), whose
+/// connection may last longer than the retention (`h2.max_lifetime_s`).
+/// Returns how many were removed.
+fn prune_runs(root: &std::path::Path, cutoff: std::time::SystemTime, live: &std::collections::HashSet<String>) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else { return 0 };
     let mut removed = 0;
     for e in entries.flatten() {
         let name = e.file_name();
-        let is_sid = name.to_str().is_some_and(|n| n.len() == 64 && n.bytes().all(|b| b.is_ascii_hexdigit()));
-        let old = e.metadata().ok().filter(|m| m.is_dir()).and_then(|m| m.modified().ok()).is_some_and(|t| t < cutoff);
-        if is_sid && old {
+        let Some(name) = name.to_str() else { continue };
+        let is_sid = name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit());
+        if !is_sid || live.contains(name) {
+            continue;
+        }
+        if run_last_change(&e.path()).is_some_and(|t| t < cutoff) {
             remove_run(&e.path());
             removed += usize::from(!e.path().exists());
         }
@@ -3619,16 +3743,18 @@ fn prune_runs(root: &std::path::Path, cutoff: std::time::SystemTime) -> usize {
 }
 
 /// Prune finished runs every ten minutes. A run younger than an hour is never
-/// touched, so a live session (at most `SESSION_TIMEOUT`) keeps its files
+/// touched, and a live session's never, so a live session keeps its files
 /// even with `--runs-keep-hours 0` (which removes them at the session's end).
-async fn prune_runs_forever(root: std::path::PathBuf, keep: std::time::Duration) {
-    let keep = keep.max(std::time::Duration::from_secs(3600));
+async fn prune_runs_forever(app: Arc<AppState>) {
+    let keep = app.runs_keep.max(std::time::Duration::from_secs(3600));
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
     loop {
         tick.tick().await;
-        let root = root.clone();
+        let root = app.runs_dir.clone();
+        let live: std::collections::HashSet<String> =
+            app.sessions.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
         let removed = tokio::task::spawn_blocking(move || {
-            std::time::SystemTime::now().checked_sub(keep).map_or(0, |cutoff| prune_runs(&root, cutoff))
+            std::time::SystemTime::now().checked_sub(keep).map_or(0, |cutoff| prune_runs(&root, cutoff, &live))
         })
         .await
         .unwrap_or(0);
@@ -3638,15 +3764,23 @@ async fn prune_runs_forever(root: std::path::PathBuf, keep: std::time::Duration)
     }
 }
 
+/// Write one of the sidecar's run files; a failure is logged, not fatal
+/// (the node settles from its own records and the client holds its copies).
+fn write_run_file(dir: &std::path::Path, name: &str, contents: &[u8]) {
+    if let Err(e) = write_private(&dir.join(name), contents) {
+        warn!(dir = %dir.display(), file = name, "could not write a run file: {e}");
+    }
+}
+
 fn write_attestation(dir: &Option<std::path::PathBuf>, a: &serde_json::Value) {
     if let Some(dir) = dir {
-        let _ = write_private(&dir.join("attestation.json"), serde_json::to_string_pretty(a).unwrap_or_default().as_bytes());
+        write_run_file(dir, "attestation.json", serde_json::to_string_pretty(a).unwrap_or_default().as_bytes());
     }
 }
 
 fn write_receipt(dir: &Option<std::path::PathBuf>, r: &serde_json::Value) {
     if let Some(dir) = dir {
-        let _ = write_private(&dir.join("receipt.json"), serde_json::to_string_pretty(r).unwrap_or_default().as_bytes());
+        write_run_file(dir, "receipt.json", serde_json::to_string_pretty(r).unwrap_or_default().as_bytes());
     }
 }
 
@@ -3965,6 +4099,54 @@ mod relay_log_tests {
         assert_eq!(log.server_raw, b"hello ");
         assert_eq!(log.recv_len, 11);
         assert_eq!(log.recv.hash(), cu_crypto::transcript::hash(b"hello world"));
+    }
+
+    #[test]
+    fn upstream_bytes_before_the_handshake_are_capped() {
+        use super::{MAX_PRE_HANDSHAKE_SERVER_BYTES, MAX_PRE_HANDSHAKE_SERVER_RECORDS};
+        let mut log = RelayLog { max_server_bytes: Some(1 << 30), ..RelayLog::default() };
+        log.server_bytes(&vec![0; MAX_PRE_HANDSHAKE_SERVER_BYTES], false).unwrap();
+        assert!(log.server_bytes(b"x", false).is_err());
+        assert_eq!(log.server_raw.len(), MAX_PRE_HANDSHAKE_SERVER_BYTES);
+        // Once verified, only the connection's own cap applies.
+        log.server_bytes(&vec![0; MAX_PRE_HANDSHAKE_SERVER_BYTES], true).unwrap();
+        log.server_records = MAX_PRE_HANDSHAKE_SERVER_RECORDS;
+        log.check_pre_handshake_records(false).unwrap();
+        log.server_records += 1;
+        assert!(log.check_pre_handshake_records(false).is_err());
+        log.check_pre_handshake_records(true).unwrap();
+    }
+
+    #[test]
+    fn nothing_after_the_hello_is_relayed_before_the_provider_answers() {
+        use super::{handshake_record_step, hello_unanswered, HsStep, Session, CLIENT_CCS};
+        let fin = [0x17, 3, 3, 0, 1, 0];
+        // Before the hello was written: the hello.
+        assert_eq!(handshake_record_step(false, 0, false, 0x16, &[0x16]).unwrap(), HsStep::Hello);
+        // After it, with no provider byte: every record is held.
+        for (ct, raw) in [(0x14u8, &CLIENT_CCS[..]), (0x17, &fin[..]), (0x15, &[0x15, 3, 3, 0, 0][..])] {
+            assert_eq!(handshake_record_step(true, 0, false, ct, raw).unwrap(), HsStep::Hold);
+        }
+        // After the provider's first byte: one exact CCS, then the Finished.
+        assert_eq!(handshake_record_step(true, 1, false, 0x14, &CLIENT_CCS).unwrap(), HsStep::Ccs);
+        assert!(handshake_record_step(true, 1, true, 0x14, &CLIENT_CCS).is_err());
+        assert!(handshake_record_step(true, 1, false, 0x14, &[0x14, 3, 3, 0, 1, 2]).is_err());
+        assert!(handshake_record_step(true, 1, false, 0x14, &[0x14, 3, 3, 0, 2, 1, 1]).is_err());
+        assert_eq!(handshake_record_step(true, 1, true, 0x17, &fin).unwrap(), HsStep::Finished);
+        assert!(handshake_record_step(true, 1, false, 0x15, &[0x15, 3, 3, 0, 0]).is_err());
+
+        // The zero-response attribution counts only the hello alone.
+        let log = RelayLog::default();
+        let mut st = Session { ch_sent: true, ..Session::default() };
+        assert!(hello_unanswered(&st, &log));
+        st.post_hello_records = 1;
+        assert!(!hello_unanswered(&st, &log));
+        let st = Session { ch_sent: false, ..Session::default() };
+        assert!(!hello_unanswered(&st, &log));
+        let st = Session { ch_sent: true, ..Session::default() };
+        let mut answered = RelayLog::default();
+        answered.server_bytes(b"\x16", false).unwrap();
+        assert!(!hello_unanswered(&st, &answered));
     }
 
     #[test]
@@ -4989,15 +5171,37 @@ mod run_retention_tests {
         std::fs::create_dir_all(root.join("adversarial-images")).unwrap();
         // Nothing is older than an hour ago.
         let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        assert_eq!(prune_runs(&root, hour_ago), 0);
+        let none = std::collections::HashSet::new();
+        assert_eq!(prune_runs(&root, hour_ago, &none), 0);
         assert!(sid('a').exists());
-        // Everything is older than a minute from now.
+        // Everything is older than a minute from now, but a live session's
+        // run is kept whatever its age.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        assert_eq!(prune_runs(&root, later), 1);
+        let live: std::collections::HashSet<String> = ["a".repeat(64)].into_iter().collect();
+        assert_eq!(prune_runs(&root, later, &live), 0);
+        assert!(sid('a').exists());
+        assert_eq!(prune_runs(&root, later, &none), 1);
         assert!(!sid('a').exists());
         let left: Vec<_> = std::fs::read_dir(sid('b')).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left, vec![std::ffi::OsString::from("response.txt")]);
         assert!(root.join("adversarial-images").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_rewritten_in_place_keeps_its_run() {
+        let root = std::env::temp_dir().join(format!("cu-prune-rw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("c".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+        super::write_private(&dir.join("attestation.json"), b"{}").unwrap();
+        // The directory's own time is in the past; the file was just rewritten.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(&dir).unwrap().set_modified(old).unwrap();
+        super::write_private(&dir.join("attestation.json"), b"{\"n\":2}").unwrap();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        assert_eq!(prune_runs(&root, hour_ago, &std::collections::HashSet::new()), 0);
+        assert!(dir.join("attestation.json").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
