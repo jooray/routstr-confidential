@@ -149,6 +149,8 @@ each where that is free.
 
 ### OpenRouter
 
+**Price fields verified live (2026-11-13):** see [providers/OPENROUTER.md](providers/OPENROUTER.md) and the suggested offer `crypto/relay/offer.openrouter.json` with its node filters. Every price attack tested is closed except two: paid PDF OCR (no allowed pin switches it off) and provider price spread (honest requests routed to endpoints 2-7x dearer than the listed rate). Not yet safe to offer until those are settled.
+
 **✓ chat, pin price fields** ([what pin means](#what-pin-means)), **✗ images.**
 FreeLLMAPI key, account with credit.
 
