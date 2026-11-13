@@ -49,9 +49,9 @@ them next to what they mean, for operators who re-run the check.
 |:--|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | **[Venice](#venice-reference)** (reference) | ✓ | ✓ | ✓ | 400 s | ✓ | ✓ | ✓ | ✓ |
 | **[Numes](#numes)** | ✓ | ✓ | ✓ | 600 s | ✓ | ? | ✓ | ✓ |
-| **[xKiro](#xkiro)** | ✓ pin price fields | ✓ [key-echo check partial](#what-key-echo-check-partial-means) | ✓ unknown fields accepted | 400 s | ✓ | ? | ✓ | ✓ |
-| **[OpenRouter](#openrouter)** | ✓ pin price fields | ✓ [key-echo check partial](#what-key-echo-check-partial-means) | ✓ | 400 s | ✓ | ✗ only via chat | ✓ | ✓ |
-| **[Cloudflare Workers AI](#cloudflare-workers-ai)** | ✓ pin price fields | ✓ [key-echo check partial](#what-key-echo-check-partial-means) | ✓ unknown fields accepted | 400 s | ✓ | ? | ✓ | ✓ |
+| **[xKiro](#xkiro)** | ✓ pin price fields | ✓ | ✓ unknown fields accepted | 400 s | ✓ | ? | ✓ | ✓ |
+| **[OpenRouter](#openrouter)** | ✓ pin price fields | ✓ | ✓ | 400 s | ✓ | ✗ only via chat | ✓ | ✓ |
+| **[Cloudflare Workers AI](#cloudflare-workers-ai)** | ✓ pin price fields | ✓ | ✓ unknown fields accepted | 400 s | ✓ | ? | ✓ | ✓ |
 | **[NVIDIA NIM](#nvidia-nim)** | ✗ | ✓ | ✗ first `model` wins | 340 s (TCP close) | ✗ | ? | ✗ decoy runs | – |
 | **[Google AI Studio](#google-ai-studio)** | ✗ | ✗ usage in content | ✗ usage in content | 240 s | ✗ | ? | – | – |
 | **[UnoRouter](#unorouter)** | ✗ | ✗ usage not last | ✗ cap overrun | ? | ✗ | ? | – | – |
@@ -61,9 +61,7 @@ them next to what they mean, for operators who re-run the check.
 ✓ works, ✗ does not, ? not tested or not available, – not run or not
 applicable. "pin price fields" = the provider honours request fields the protocol does not
 fix, so the operator pins the price-changing ones off in the offer
-([below](#what-pin-means)). "Key-echo check partial" = one of the checks that the
-provider never sends the node's API key back could not run
-([below](#what-key-echo-check-partial-means)). "Idle HTTP/2 kept for" = how long the provider
+([below](#what-pin-means)). "Idle HTTP/2 kept for" = how long the provider
 keeps a silent HTTP/2 connection open before it closes it (GOAWAY unless noted);
 the `idle_secs` to offer is in each provider's notes. "E2E" = through our
 sidecar with the reference driver (stub receipts, no node). "Node" = through a
@@ -85,7 +83,7 @@ is a setting of the sidecar's offer file, not a protocol change. Which fields
 need it is to verify per provider, from its documentation and with one request
 each where that is free.
 
-### What "key-echo check partial" means
+### The key-echo check (H7)
 
 The client decrypts every response the provider sends. If the provider ever
 copied the node's API key into a response, for example an error that quotes the
@@ -94,14 +92,16 @@ Before framing "2" is offered, the HTTP/2 check (H7) sends one request of each
 kind and searches every response, headers and body, for the key: the probe GET
 that carries the key into the connection, a normal chat (200), a chat without
 the key (401), a chat naming a model that does not exist (400 or 404), and a
-chat with an unknown field, which should be refused (400).
+chat with a field the provider refuses (400).
 
-xKiro, OpenRouter and Cloudflare accept any field and answer the last request
-with a 200, so that error response never exists and could not be searched.
-Every response that was read, including both errors, was clean. Only an error
-triggered by a bad request field remains unchecked. To close it, the check
-needs a field the provider does refuse, as with Numes, where a bad
-`service_tier` stands in for the unknown field.
+The check uses an unknown field for the last one. Providers that accept any
+field need a field with a bad value instead (`PP_ERROR_FIELD` in
+`crypto/runs/providers-2026-11-12/tools/loader.py`): Numes a bad
+`service_tier`, OpenRouter and Cloudflare `"top_p":2`, xKiro a `messages` that
+is not an array (it accepts every other bad value tried, 17 fields). With those
+fields Venice, Numes, xKiro, OpenRouter and Cloudflare pass H7 and every
+other HTTP/2 item at their suggested `idle_secs` (xKiro, OpenRouter and
+Cloudflare re-run 2026-11-13, `profile/h2final.<provider>.errfield.txt`).
 
 ## Per provider
 
@@ -154,9 +154,9 @@ needs a field the provider does refuse, as with Numes, where a bad
 - HTTP/1.1: the profile holds (A1, A2, A5, A6, A7, A9, A11, A12), but unknown
   fields (A4) and price fields (A10) are accepted silently; even
   `"temperature":"hot"` is a 200.
-- HTTP/2: passes (H1-H6, H8) at 390 s. The check that no response carries
-  the key (H7) is partial ([what that means](#what-key-echo-check-partial-means)): the 401 and 404 responses carry none, but
-  no request field gets a 4xx, so there is no field error to read.
+- HTTP/2: every item passes (H1-H8) at 390 s. The key-echo check (H7) passes with
+  `"messages":"x"` as the refused field ([why](#the-key-echo-check-h7)): no other bad value tried
+  gets a 4xx.
 - Idle: 400 s (GOAWAY). A PING every 120 s holds it. Suggested `idle_secs`: 390.
 - Pin: the same rule as OpenRouter. Since xKiro accepts any field without
   complaint, which ones it honours is to verify per field before a paid
@@ -183,9 +183,8 @@ FreeLLMAPI key, account with credit.
   `native_finish_reason` (it failed before the fix). The SSE framing (A12)
   passes on the re-run: the `: OPENROUTER PROCESSING` comment lines come first
   and are no part of the usage tail. Unknown fields are accepted (A4).
-- HTTP/2: passes (H1-H6, H8) at 390 s; the check that no response carries
-  the key (H7) is partial, since an unknown field is accepted
-  ([what that means](#what-key-echo-check-partial-means)).
+- HTTP/2: every item passes (H1-H8) at 390 s; the key-echo check (H7) passes with
+  `"top_p":2` as the refused field ([why](#the-key-echo-check-h7)).
 - Idle: 400 s (GOAWAY). A PING every 120 s holds it. Suggested `idle_secs`: 390.
 - Pin, to verify per field: `plugins` (e.g. paid web search, which is not in
   the token usage), `models` (fallback routing to another model), `provider`
@@ -217,9 +216,9 @@ offer publishes the account id. FreeLLMAPI key.
   has an empty `delta` and a `finish_reason`; only the last event is disclosed
   (it failed before the fix). Unknown fields (A4) and price fields (A10) are
   accepted.
-- HTTP/2: passes (H1-H6, H8) at 390 s, measured with the probe
-  `/client/v4/user/tokens/verify`. The key-echo check (H7) is partial, since an
-  unknown field is accepted ([what that means](#what-key-echo-check-partial-means)). The clients accept only an API base plus
+- HTTP/2: every item passes (H1-H8) at 390 s, measured with the probe
+  `/client/v4/user/tokens/verify`. The key-echo check (H7) passes with
+  `"top_p":2` as the refused field ([why](#the-key-echo-check-h7)). The clients accept only an API base plus
   `/models` as the probe, so the end-to-end offer uses
   `/client/v4/accounts/<account>/ai/v1/models`: a 405 without the key in it,
   and the probe's answer is discarded (the probe only carries the credential
