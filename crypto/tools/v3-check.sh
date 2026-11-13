@@ -30,6 +30,8 @@
 #   CU_PAUSE        seconds of idle time in the `h2-idle` case (default 0 = skip)
 #   CU_CASE_TIMEOUT per-case limit in seconds (default 180, plus the pause)
 #   CU_V3_OUT       evidence directory (default crypto/runs/v3-check)
+#   CU_HTTP         the framings the offer lists (default "2,1.1"); "1.1" for a provider
+#                   without HTTP/2: only the h11-* cases and legacy-v2 run
 #
 # Cases (machine-checked by v3_eval.py); `h2-` = framing "2", `h11-` = framing "1.1":
 #   h2-one, h11-one       one request: 200, verified receipt (h11: closed `done`)
@@ -142,7 +144,9 @@ else
 fi
 curl -fsS "$SIDECAR/offer" > "$OUT/offer.json" || { echo "no offer from $SIDECAR" >&2; exit 2; }
 offer_http() { curl -fsS "$SIDECAR/offer" | "$PY" -I -c 'import json,sys; print(",".join(json.load(sys.stdin).get("http") or []))'; }
-[ "$(offer_http)" = "2,1.1" ] || { echo "the sidecar at $SIDECAR does not offer http [\"2\", \"1.1\"] (got $(offer_http))" >&2; exit 2; }
+HTTP_LIST="${CU_HTTP:-2,1.1}"
+case "$HTTP_LIST" in 2,1.1|1.1) ;; *) echo "CU_HTTP must be 2,1.1 or 1.1" >&2; exit 2 ;; esac
+[ "$(offer_http)" = "$HTTP_LIST" ] || { echo "the sidecar at $SIDECAR does not offer http $HTTP_LIST (got $(offer_http))" >&2; exit 2; }
 
 # Offline first: the client's HTTP/2 layer against the sidecar's vectors, the
 # parameter checks, the message handling, the TLS fork's hooks and its record
@@ -159,7 +163,11 @@ printf 'case\texpected\tverdict\tevidence\n' > "$SUMMARY"
 failures=0
 ran=0
 
-selected() { [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" $1 "* ]]; }
+selected() {
+  # Without framing "2" in the offer, the h2-* and fallback cases do not apply.
+  if [ "$HTTP_LIST" = 1.1 ]; then case "$1" in h2-*|fb-*) return 1 ;; esac; fi
+  [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" $1 "* ]]
+}
 record() { # id expect verdict evidence
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$SUMMARY"
   echo "   $3"
@@ -256,7 +264,7 @@ run_case h11-h-no-proof      "withheld:1.1:1" 0 none -- --http 1.1 --adv no-proo
 run_case h11-i-own-keyshare  "refused:1.1:0:share" 0 none -- --http 1.1 --adv own-keyshare
 
 # --- forced failure of framing "2": fallback, withdrawal, return -----------------
-if [ "$OWN_SIDECAR" = 1 ] && { [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" fb-"* ]]; }; then
+if [ "$OWN_SIDECAR" = 1 ] && [ "$HTTP_LIST" != 1.1 ] && { [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" fb-"* ]]; }; then
   touch "$FAIL_FILE"
   for i in 1 2 3 4 5; do run_case "fb-$i" "auto:1.1:yes" 0 none -- --http auto; done
   check fb-offer-11 "1.1" offer_http

@@ -41,6 +41,12 @@
 #                    openrouter, … for other providers)
 #   CU_HOST_MATCH    a substring of the provider's base URL: the other provider rows are
 #                    deleted (default venice)
+#   CU_HTTP          the framings the sidecar offer lists (default "2,1.1"); "1.1" for a
+#                    provider without HTTP/2: the h2-* and fallback cases are skipped
+#   CU_NODE_MODELS   a JSON file with a list of model rows (the admin API's ModelCreate:
+#                    id, name, pricing, architecture, …) added to the provider through
+#                    the admin API after the node starts, for a provider whose /models
+#                    the node cannot list (Cloudflare Workers AI)
 #   CU_NO_IMAGES     1: skip the two paid image cases
 #   CU_CASES         optional space-separated subset of case ids ("fb" selects the
 #                    whole fallback group)
@@ -137,6 +143,8 @@ KEY_ENV="${CU_KEY_ENV:-VENICE_API_KEY}"
 SPORT="${CU_V3_PORT:-7461}"
 NPORT="${CU_NODE_PORT:-8431}"
 START_BALANCE=200000000
+HTTP_LIST="${CU_HTTP:-2,1.1}"
+case "$HTTP_LIST" in 2,1.1|1.1) ;; *) echo "CU_HTTP must be 2,1.1 or 1.1" >&2; exit 2 ;; esac
 FEE=3000
 ABANDON=5000
 DEPOSIT=7000
@@ -258,20 +266,28 @@ sqlite3 "$DB" "delete from upstream_providers where base_url not like '%${CU_HOS
 ADMIN_TOKEN="$(openssl rand -hex 24)"
 sqlite3 "$DB" "insert into cli_tokens(id,token,name,created_at) values('v3-node-check','$ADMIN_TOKEN','v3-node-check',strftime('%s','now'));"
 start_node
+if [ -n "${CU_NODE_MODELS:-}" ]; then
+  PROVIDER_ID="$(sqlite3 "$DB" "select id from upstream_providers limit 1;")"
+  "$PY" -I -c 'import json,sys; [print(json.dumps(m)) for m in json.load(open(sys.argv[1]))]' "$CU_NODE_MODELS" | while IFS= read -r row; do
+    curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+      -d "$row" "$NODE/admin/api/upstream-providers/$PROVIDER_ID/models" || { echo "adding a model through the admin API failed" >&2; exit 2; }
+  done
+fi
 fetch_offer() { curl -fsS "$NODE/v1/confidential/offer?v=3"; }
 for _ in $(seq 1 150); do
   fetch_offer > "$OUT/offer.json" 2>/dev/null \
     && "$PY" -I -c 'import json,sys; o=json.load(open(sys.argv[1])); sys.exit(0 if sys.argv[2] in o.get("price_list", {}) else 1)' "$OUT/offer.json" "$MODEL" && break
   sleep 0.4
 done
-"$PY" -I - "$OUT/offer.json" "$MODEL" "$FEE" "$ABANDON" "$DEPOSIT" "$IDLE" "$IMAGE_MODEL" "${CU_NO_IMAGES:-0}" <<'PYEOF' || { echo "the node's offer is not usable; see $OUT/offer.json and $OUT/node.out" >&2; exit 2; }
+"$PY" -I - "$OUT/offer.json" "$MODEL" "$FEE" "$ABANDON" "$DEPOSIT" "$IDLE" "$IMAGE_MODEL" "${CU_NO_IMAGES:-0}" "$HTTP_LIST" <<'PYEOF' || { echo "the node's offer is not usable; see $OUT/offer.json and $OUT/node.out" >&2; exit 2; }
 import json, sys
 o = json.load(open(sys.argv[1]))
 model, fee, abandon, deposit, idle, image_model, no_images = sys.argv[2:9]
 problems = []
 if model not in o.get("price_list", {}): problems.append(f"no price for {model}")
 if o.get("v") != 3 or o.get("twopc") != "split-public-1": problems.append("not a v3 offer")
-if o.get("http") != ["2", "1.1"] or not isinstance(o.get("h2"), dict): problems.append(f"http is {o.get('http')}")
+want_http = sys.argv[9].split(",")
+if o.get("http") != want_http or ("2" in want_http) != isinstance(o.get("h2"), dict): problems.append(f"http is {o.get('http')}")
 if not o.get("sig"): problems.append("unsigned")
 want = {"session_fee_msat": int(fee), "abandon_fee_msat": int(abandon), "connection_deposit_msat": int(deposit), "idle_timeout_s": int(idle)}
 for k, v in want.items():
@@ -297,6 +313,8 @@ failures=0
 ran=0
 
 selected() { # "fb" selects every fb-* case
+  # Without framing "2" in the offer, the h2-* and fallback cases do not apply.
+  if [ "$HTTP_LIST" = 1.1 ]; then case "$1" in h2-*|fb-*) return 1 ;; esac; fi
   [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" $1 "* ]] || { [[ "$1" == fb-* ]] && [[ " $CU_CASES " == *" fb "* ]]; }
 }
 log_lines() { cat "$OUT"/node/logs/*.log 2>/dev/null | wc -l | tr -d ' '; }
@@ -479,7 +497,7 @@ if [ "${CU_SLOW:-0}" = 1 ]; then
 fi
 
 # --- forced failure of framing "2": the deposit, the fallback, the offer ---------
-if [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" fb"* ]]; then
+if [ "$HTTP_LIST" != 1.1 ] && { [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" fb"* ]]; }; then
   touch "$FAIL_FILE"
   run_case fb-h2 "released:provider_unreachable:anyrc" "$B" none -- --http 2
   for i in 1 2 3 4; do run_case "fb-$i" "settled:1.1:chat:fallback" "$B" none -- --http auto; done

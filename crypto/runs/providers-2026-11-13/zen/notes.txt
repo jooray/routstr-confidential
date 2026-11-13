@@ -1,0 +1,22 @@
+OpenCode Zen (https://opencode.ai/zen/v1), key OPENCODE_GO_API_KEY, 2026-11-12 23:36 - 2026-11-13 00:03 UTC
+
+Still rate-limited: every chat request is a 429 FreeUsageLimitError.
+  2026-11-12 23:36:35Z deepseek-v4.1-flash-free -> 429, Retry-After 1405 (the window seemed to end at 00:00 UTC)
+  2026-11-12 23:42-23:48Z the same, Retry-After 1033, 850, 710 (counting down to 00:00 UTC)
+  2026-11-13 00:00:35Z the same -> 429, Retry-After 86364 (the window moved on by a day instead of resetting)
+  2026-11-13 00:00:48-50Z deepseek-v4.1-flash-free, glm-5.3-flash-free, mimo-v2.6-flash-free,
+    nemotron-3.5-lightning-free, each with and without x-opencode-session -> 429, Retry-After ~86350 (zen-0001.txt)
+  Body: {"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached. Free models
+    work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go"}}
+  Reading: the free models are meant for the OpenCode client; through the API this key gets none of the free
+  quota (it has not served a single free request in two days).
+
+a.opencodezen.txt (00:00:55Z): A9 PASS (TLS 1.3, AES-128-GCM, P-256, ALPN http/1.1); every other item
+  INCONCLUSIVE on the 429.
+
+v3.opencodezen.txt (00:02Z): v3-check.sh with CU_HTTP=1.1 and offer.opencodezen.h11.json (http ["1.1"], no h2
+  block, CU_API_BASES=/zen/v1): the protocol runs against Zen. h11-one: handshake, pi_NK, head, body, pi_WIN
+  all fine; the provider's 429 head was disclosed through pi_C3S (error_head mode) and settled, receipt
+  verified, closed error_settled (the gate expects a 200, so it reports DEVIATION). h11-c-model-swap: refused
+  by the sidecar (PASS). The chat items (usage event, decoy, caps) stay untested; no node run (it would only
+  settle the same 429).

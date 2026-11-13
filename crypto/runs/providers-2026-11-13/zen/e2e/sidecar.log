@@ -1,0 +1,40 @@
+[2m2026-11-13T00:03:00.542167Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m loaded upstream API key [3mkey_len[0m[2m=[0m51
+[2m2026-11-13T00:03:00.542296Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m running WITHOUT --node-settles: the stub settlement signs its own receipts; a node in front of this sidecar would charge every request its full reservation
+[2m2026-11-13T00:03:00.542345Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m framings offered, in order of preference [3mhttp[0m[2m=[0m["1.1"]
+[2m2026-11-13T00:03:00.542356Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m TEST HOOKS for framing "2" are active [3mfail_file[0m[2m=[0mSome("/private/tmp/claude-502/-Users-juraj-projects-routstr-confidential/3b41e89e-0a8c-4210-9d84-2b20716c1114/scratchpad/p13/e2e-zen/h2-fail") [3mretry_secs[0m[2m=[0m45
+[2m2026-11-13T00:03:00.542474Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m cu-sidecar listening [3mlisten[0m[2m=[0m127.0.0.1:7493 [3mtoken[0m[2m=[0mfalse
+[2m2026-11-13T00:03:01.905720Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"cefb9d31ecee"
+[2m2026-11-13T00:03:01.906081Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"cefb9d31ecee"
+[2m2026-11-13T00:03:02.176622Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=6ms/0B preprocess=265ms/2958293B
+[2m2026-11-13T00:03:02.333289Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-13T00:03:02.495399Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0403" [3msig_len[0m[2m=[0m70
+[2m2026-11-13T00:03:02.495522Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m100e97a9b3859cd732bab0aee5bf92f8cc789985965fbdee8fd79ce1401a348b
+[2m2026-11-13T00:03:02.520200Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=378.054084ms key_share=44.153959ms ectf=2.019666ms phase_a=32.810417ms phase_b=100.54549999999999ms
+[2m2026-11-13T00:03:02.520353Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m614 [3mok[0m[2m=[0mtrue
+[2m2026-11-13T00:03:02.520354Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-13T00:03:02.555591Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m33
+[2m2026-11-13T00:03:02.555648Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-13T00:03:02.586816Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m257
+[2m2026-11-13T00:03:02.587461Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m final body record held until π_WIN verifies
+[2m2026-11-13T00:03:02.637749Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m49
+[2m2026-11-13T00:03:02.637809Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_win" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-13T00:03:02.637860Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m π_WIN verified; final body record released to the upstream
+[2m2026-11-13T00:03:02.793273Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m upstream closed the connection
+[2m2026-11-13T00:03:02.796041Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m pi_c3s records [3mseqs[0m[2m=[0m[0] [3mlens[0m[2m=[0m[548] [3mr_len[0m[2m=[0m339
+[2m2026-11-13T00:03:02.868700Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m72
+[2m2026-11-13T00:03:02.868762Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_c3s" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-13T00:03:02.869485Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m963 [3mok[0m[2m=[0mtrue
+[2m2026-11-13T00:03:03.755350Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"twopc" [3msid[0m[2m=[0m"54ced4343498"
+[2m2026-11-13T00:03:03.755606Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk start [3mproof[0m[2m=[0m"zkchan" [3msid[0m[2m=[0m"54ced4343498"
+[2m2026-11-13T00:03:03.939512Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan ready [3msteps[0m[2m=[0mhello=2ms/0B preprocess=182ms/2958252B
+[2m2026-11-13T00:03:04.168881Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m ClientHello checked: canonical, one P-256 share, the joint key
+[2m2026-11-13T00:03:04.334467Z[0m [32m INFO[0m [2mcu_sidecar::tls[0m[2m:[0m CertificateVerify [3mscheme[0m[2m=[0m"0x0403" [3msig_len[0m[2m=[0m70
+[2m2026-11-13T00:03:04.334584Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m handshake verified: chain + hostname + CertificateVerify + both Finished [3mth_sh[0m[2m=[0m735e27c8738797eb76b7a8fa2bc4f4ec0e0193c71322f3c927613ae7d4024998
+[2m2026-11-13T00:03:04.359584Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc done [3msteps[0m[2m=[0mpreprocess=360.52770899999996ms key_share=47.246291ms ectf=1.912042ms phase_a=31.741041999999997ms phase_b=123.131125ms
+[2m2026-11-13T00:03:04.359754Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m head record assembled under K_0; π_NK params sent
+[2m2026-11-13T00:03:04.359810Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m 2pc end [3melapsed_ms[0m[2m=[0m604 [3mok[0m[2m=[0mtrue
+[2m2026-11-13T00:03:04.393487Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan proof [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3melapsed_ms[0m[2m=[0m31
+[2m2026-11-13T00:03:04.393559Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zk result [3mproof[0m[2m=[0m"pi_nk" [3mok[0m[2m=[0mtrue [3merr[0m[2m=[0mNone
+[2m2026-11-13T00:03:04.424657Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m credential record + KeyUpdate written to upstream [3mrecord_len[0m[2m=[0m257
+[2m2026-11-13T00:03:04.427057Z[0m [33m WARN[0m [2mcu_sidecar[0m[2m:[0m session ended with error [3merror[0m[2m=[0mthe final body record must be the pinned suffix alone (139 bytes), it carries 133
+[2m2026-11-13T00:03:04.427117Z[0m [32m INFO[0m [2mcu_sidecar[0m[2m:[0m zkchan end [3melapsed_ms[0m[2m=[0m671 [3mok[0m[2m=[0mtrue

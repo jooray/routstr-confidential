@@ -1,0 +1,1 @@
+[{"id": "meta/llama-3.2-1b-instruct", "context_length": 60000, "top_provider": {"context_length": 60000, "max_completion_tokens": 4096, "is_moderated": false}}]

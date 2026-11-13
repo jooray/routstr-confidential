@@ -1,0 +1,18 @@
+case	expected	verdict	evidence
+h2-one	settled:2:1	PASS	rc=0 [2/1:200 cold rel=62ms ttft=259ms rec=2]
+h11-one	settled:1.1:1	PASS	rc=0 [1.1/1:200 cold rel=773ms ttft=867ms rec=2]
+h2-three	settled:2:3	PASS	rc=0 [2/1:200 cold rel=63ms ttft=214ms rec=2] [2/2:200 open rel=216ms ttft=360ms rec=2] [2/3:200 open rel=60ms ttft=186ms rec=2]
+h11-two	settled:1.1:2	PASS	rc=0 [1.1/1:200 cold rel=764ms ttft=861ms rec=2] [1.1/1:200 cold rel=643ms ttft=763ms rec=2]
+h2-big	big:2:13	PASS	rc=0 [2/1:200 cold rel=151ms ttft=399ms rec=14]
+h11-big	big:1.1:13	PASS	rc=0 [1.1/1:200 cold rel=815ms ttft=1267ms rec=14]
+h2-decoy	decoy:2:@cf/meta/llama-3.2-1b-instruct	PASS	rc=0 [2/1:200 cold rel=63ms ttft=1175ms rec=2] reported_model=@cf/meta/llama-3.2-1b-instruct
+h11-decoy	decoy:1.1:@cf/meta/llama-3.2-1b-instruct	PASS	rc=0 [1.1/1:200 cold rel=745ms ttft=897ms rec=2] reported_model=@cf/meta/llama-3.2-1b-instruct
+h2-armed	armed:2	PASS	rc=0 [2/1:200 armed rel=61ms ttft=210ms rec=2] [d46 http=2 armed=true node_settles=false]
+h11-armed	armed:1.1	PASS	rc=0 [1.1/1:200 armed rel=332ms ttft=489ms rec=2] [8 http=1.1 armed=true node_settles=false]
+h2-refused	refusedfirst:2	PASS	rc=0 [2/1:200 cold rel=64ms ttft=214ms rec=2] refused_first={"status": 400, "reason": "max_tokens 4097 exceeds cap 4096"}
+h11-refused	refusedfirst:1.1	PASS	rc=0 [1.1/1:200 cold rel=771ms ttft=859ms rec=2] refused_first={"status": 400, "reason": "max_tokens 4097 exceeds cap 4096"}
+h2-idle	settled:2:2	PASS	rc=0 [2/1:200 cold rel=62ms ttft=219ms rec=2] [2/2:200 open rel=62ms ttft=186ms rec=2]
+h2-c-suffix	refused:2:2:pi_win failed	PASS	rc=0 adv={"mode": "suffix", "http": "2", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [CheckResult { label: \\\"anchor\\\", ok: true, got: \\\"6b73236a4fe29f2120b6670a21a8bb829566c031709ea2635a151915677934a6\\\", first_diff: None }, CheckResult { label: \\\"windows\\\", ok: fa
+h2-c-model-swap	refused:2:1:pi_win failed	PASS	rc=0 adv={"mode": "suffix", "http": "2", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [CheckResult { label: \\\"anchor\\\", ok: true, got: \\\"96fbb203a208964224989b81da456bc14e072a0c79040ac6ec8fe5ec98c4c06d\\\", first_diff: None }, CheckResult { label: \\\"windows\\\", ok: fa
+h11-c-suffix	refused:1.1:1:pi_win failed	PASS	rc=0 adv={"mode": "suffix", "http": "1.1", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [CheckResult { label: \\\"anchor\\\", ok: true, got: \\\"6e5a6742d7c79cafc8482480095f138cbdfa2dbbeb57e82ee9ef78d417ff56a3\\\", first_diff: None }, CheckResult { label: \\\"windows\\\", ok: 
+h11-c-model-swap	refused:1.1:1:.	PASS	rc=0 adv={"mode": "suffix", "http": "1.1", "refused": true, "reason": "proof pi_win failed: Some(\"proof checks failed: [CheckResult { label: \\\"anchor\\\", ok: true, got: \\\"4e150dfbcd6225bf66ab2578645d827dd71e3aa45c6d9a90c56b9131a1cd9e24\\\", first_diff: None }, CheckResult { label: \\\"windows\\\", ok: 
