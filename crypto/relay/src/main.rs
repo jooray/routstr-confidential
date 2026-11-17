@@ -692,6 +692,26 @@ async fn offer_http(State(app): State<Arc<AppState>>) -> impl IntoResponse {
     axum::Json(offer)
 }
 
+/// `GET /healthz`: what this sidecar speaks and serves now, and its session
+/// counts. No key, no session ids, no client data; behind the node's token
+/// like every other route.
+async fn healthz_http(State(app): State<Arc<AppState>>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (withdrawn, left, fails) = app.h2_guard.status();
+    let mut v = version_info();
+    let http: Vec<&String> = app.offer.http.iter().filter(|h| !(withdrawn && *h == "2")).collect();
+    v["http"] = serde_json::json!(http);
+    v["h2_withdrawn"] = withdrawn.into();
+    v["h2_withdrawn_secs_left"] = left.into();
+    v["h2_failed_opens"] = fails.into();
+    v["sessions"] = serde_json::json!({
+        "active": app.stats.active.load(SeqCst),
+        "armed": app.stats.armed.load(SeqCst),
+        "with_provider_connection": app.stats.upstream.load(SeqCst),
+    });
+    axum::Json(v)
+}
+
 /// Run-time guard of framing `"2"` (`PROTOCOL-V3.md` §2.1): after
 /// `H2_FAILS_TO_WITHDRAW` consecutive HTTP/2 connections that failed to open,
 /// `"2"` is withdrawn from the offer (and refused at the setup) for `retry`,
@@ -782,6 +802,19 @@ impl H2Guard {
         }
     }
 
+    /// For `GET /healthz`: whether `"2"` is withdrawn, the seconds left of
+    /// the withdrawal, and the consecutive failed opens.
+    fn status(&self) -> (bool, u64, u32) {
+        let withdrawn = self.withdrawn();
+        let left = self
+            .until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|t| t.saturating_duration_since(std::time::Instant::now()).as_secs())
+            .unwrap_or(0);
+        (withdrawn, left, self.fails.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     /// The first response of an HTTP/2 connection began.
     fn opened(&self) {
         self.fails.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -847,6 +880,33 @@ struct AppState {
     /// it dials), so anyone who reaches it spends the provider key.
     token_hash: Option<[u8; 32]>,
     h2_guard: H2Guard,
+    /// Session counts for `GET /healthz`.
+    stats: SessionStats,
+}
+
+/// How many sessions are connected, armed (the joint key share is ready, no
+/// provider connection yet) and holding a provider connection.
+#[derive(Default)]
+struct SessionStats {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    armed: Arc<std::sync::atomic::AtomicUsize>,
+    upstream: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One unit of a `SessionStats` count, held while it applies.
+struct Gauge(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Gauge {
+    fn new(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Gauge(count.clone())
+    }
+}
+
+impl Drop for Gauge {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// A session must send its `setup` this soon after connecting.
@@ -1230,6 +1290,9 @@ Options:
                           proof-channel versions
   -h, --help              this text
 
+GET /healthz (behind the token like every route) reports the versions above,
+the framings served now, whether framing 2 is withdrawn, and session counts.
+
 Framing 2 (HTTP/2) is offered only when the offer file lists it; check the
 provider first: crypto/tools/provider-profile-check.py --h2 --offer FILE. After
 5 consecutive HTTP/2 connections that failed to open through no client's doing
@@ -1425,6 +1488,7 @@ async fn main() -> Result<()> {
         max_body,
         token_hash,
         h2_guard: H2Guard::new(h2_retry, fail_file.map(std::path::PathBuf::from)),
+        stats: Default::default(),
     });
 
     let app = router(state.clone());
@@ -1468,6 +1532,7 @@ fn version_line() -> String {
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/offer", get(offer_http))
+        .route("/healthz", get(healthz_http))
         .route("/session", get(session_ws))
         .route("/zk", get(zk_ws))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
@@ -1791,6 +1856,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         .clone()
         .try_acquire_owned()
         .map_err(|_| anyhow!("sidecar at capacity; retry later"))?;
+    let _active = Gauge::new(&app.stats.active);
     // Nothing reaches the upstream before a valid setup: an idle or malformed
     // connection costs no provider socket.
     let first = match tokio::time::timeout(SETUP_TIMEOUT, ws_rx.next()).await {
@@ -1823,6 +1889,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         tokio::pin!(prep);
         let armed = tokio::time::sleep_until(session_end);
         tokio::pin!(armed);
+        // Counted as armed from the joint key share to the dial.
+        let mut _armed_gauge: Option<Gauge> = None;
         // Wait for a ClientHello that passes the checks: a client that
         // sends anything else never makes the sidecar dial the provider.
         while !check_hello(&mut st, &client_pending, &app.offer.upstream_host)? {
@@ -1832,6 +1900,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 ev = evt_rx.recv() => match ev {
                     Some(Ev::KeyShare(p)) if st.joint.is_none() => {
                         st.joint = Some(p);
+                        _armed_gauge = Some(Gauge::new(&app.stats.armed));
                         side(&mut st, "2pc key share ready".into());
                     }
                     Some(Ev::ZkDone { proof, err, .. }) => {
@@ -1910,6 +1979,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     st.fault = None;
     st.code = None;
     st.dialed_at = Some(std::time::Instant::now());
+    st.upstream_gauge = Some(Gauge::new(&app.stats.upstream));
     let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
     {
         let evt = evt_tx.clone();
@@ -2087,6 +2157,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         v2_progress(&app, &shared, &to_client, &mut st, &mut log).await?;
                     }
                     Ev::TcpClosed if st.h2.is_some() => {
+                        st.upstream_gauge = None;
                         info!("upstream closed the connection");
                         // A failed open (§2.1, `H2Guard`): not a byte in
                         // answer to the canonical ClientHello, or the provider
@@ -2108,6 +2179,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         h2_session::tcp_closed(&mut st, &to_client)?;
                     }
                     Ev::TcpClosed => {
+                        st.upstream_gauge = None;
                         info!("upstream closed the connection");
                         // Before the final body record was released the upstream
                         // never had a complete request: end the session here, so
@@ -2416,6 +2488,8 @@ struct Session {
     code: Option<&'static str>,
     /// The error frame's HTTP-like `status`, when the failure has one.
     status: Option<u16>,
+    /// Held while the session has a provider connection (`GET /healthz`).
+    upstream_gauge: Option<Gauge>,
     /// Set while a failure would not be the client's doing (reaching the
     /// upstream): the error frame then carries it as `fault`.
     fault: Option<&'static str>,
@@ -4461,6 +4535,7 @@ mod hardening_tests {
             max_body: 1 << 20,
             token_hash: None,
             h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None),
+            stats: Default::default(),
         })
     }
 
@@ -4508,6 +4583,7 @@ mod hardening_tests {
             max_body: 1 << 20,
             token_hash: None,
             h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None),
+            stats: Default::default(),
         })
     }
 
@@ -4701,6 +4777,88 @@ mod hardening_tests {
         assert!(e.get("fault").is_none(), "{e}");
     }
 
+    /// `GET path` on a loopback sidecar; the status and the body.
+    async fn http_get(addr: std::net::SocketAddr, path: &str, token: Option<&str>) -> (u16, String) {
+        use tokio::io::AsyncWriteExt;
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        c.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let status = text[9..12].parse().unwrap();
+        let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn healthz_reports_versions_framings_and_sessions_behind_the_token() {
+        let token = "a-node-token-of-some-length";
+        let app = Arc::new(AppState {
+            token_hash: Some(cu_crypto::transcript::hash(token.as_bytes())),
+            ..Arc::try_unwrap(app_state()).ok().unwrap()
+        });
+        let addr = serve(app.clone()).await;
+        assert_eq!(http_get(addr, "/healthz", None).await.0, 401);
+        assert_eq!(http_get(addr, "/healthz", Some("another-token-of-some-length")).await.0, 401);
+        let (status, body) = http_get(addr, "/healthz", Some(token)).await;
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["protocol"], 3);
+        assert_eq!(v["twopc"], "split-public-1");
+        assert_eq!(v["proof_channel"], zkbench::channel::CHANNEL_VERSION);
+        assert!(v["commit"].is_string());
+        assert_eq!(v["http"], serde_json::json!(["1.1"]));
+        assert_eq!((v["h2_withdrawn"].as_bool(), v["h2_withdrawn_secs_left"].as_u64(), v["h2_failed_opens"].as_u64()), (Some(false), Some(0), Some(0)));
+        assert_eq!(v["sessions"], serde_json::json!({"active": 0, "armed": 0, "with_provider_connection": 0}));
+        // Nothing else: no key, no session ids, no token.
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let mut want = vec!["commit", "h2_failed_opens", "h2_withdrawn", "h2_withdrawn_secs_left", "http", "proof_channel", "protocol", "sessions", "twopc", "version"];
+        want.sort();
+        assert_eq!(keys, want);
+        assert!(!body.contains(token) && !body.contains("kkkk"));
+        // A session that has set up counts as active.
+        use futures::SinkExt;
+        let (mut ws, _) = tokio_tungstenite::connect_async(
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(format!("ws://{addr}/session"))
+                .map(|mut r| {
+                    r.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+                    r
+                })
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(setup("1.1", serde_json::json!({})).to_string().into())).await.unwrap();
+        let mut active = 0;
+        for _ in 0..50 {
+            let v: serde_json::Value = serde_json::from_str(&http_get(addr, "/healthz", Some(token)).await.1).unwrap();
+            active = v["sessions"]["active"].as_u64().unwrap();
+            if active == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(active, 1);
+        drop(ws);
+        // A withdrawn "2" shows, with the failed opens and the time left.
+        let mut offer = (*app.offer).clone();
+        offer.http = vec!["2".into(), "1.1".into()];
+        let h2app = Arc::new(AppState { offer: Arc::new(offer), token_hash: None, ..Arc::try_unwrap(app_state()).ok().unwrap() });
+        let addr = serve(h2app.clone()).await;
+        let v: serde_json::Value = serde_json::from_str(&http_get(addr, "/healthz", None).await.1).unwrap();
+        assert_eq!(v["http"], serde_json::json!(["2", "1.1"]));
+        for _ in 0..H2_FAILS_TO_WITHDRAW {
+            h2app.h2_guard.failed("test");
+        }
+        let v: serde_json::Value = serde_json::from_str(&http_get(addr, "/healthz", None).await.1).unwrap();
+        assert_eq!(v["http"], serde_json::json!(["1.1"]));
+        assert_eq!(v["h2_withdrawn"], true);
+        assert_eq!(v["h2_failed_opens"], H2_FAILS_TO_WITHDRAW);
+        assert!(v["h2_withdrawn_secs_left"].as_u64().unwrap() > H2_WITHDRAW_FOR.as_secs() - 5);
+    }
+
     #[test]
     fn the_version_names_what_the_sidecar_speaks() {
         let v = version_info();
@@ -4768,7 +4926,7 @@ mod hardening_tests {
         // A framing the offer does not list.
         let mut offer = (*app.offer).clone();
         offer.http = vec!["1.1".into()];
-        let only11 = Arc::new(AppState { offer: Arc::new(offer), key: app.key.clone(), host: app.host.clone(), upstream: app.upstream.clone(), signer: app.signer.clone(), runs_dir: app.runs_dir.clone(), runs_keep: app.runs_keep, node_settles: false, sessions: StdMutex::new(HashMap::new()), slots: app.slots.clone(), max_body: app.max_body, token_hash: None, h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None) });
+        let only11 = Arc::new(AppState { offer: Arc::new(offer), key: app.key.clone(), host: app.host.clone(), upstream: app.upstream.clone(), signer: app.signer.clone(), runs_dir: app.runs_dir.clone(), runs_keep: app.runs_keep, node_settles: false, sessions: StdMutex::new(HashMap::new()), slots: app.slots.clone(), max_body: app.max_body, token_hash: None, h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None), stats: Default::default() });
         assert!(run_setup(&only11, setup("2", serde_json::json!({}))).is_err());
         // Withdrawn: refused as the provider's fault.
         for _ in 0..H2_FAILS_TO_WITHDRAW {

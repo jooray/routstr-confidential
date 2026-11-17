@@ -1529,6 +1529,7 @@ mod tests {
             max_body: 1 << 20,
             token_hash: None,
             h2_guard: H2Guard::new(H2_WITHDRAW_FOR, None),
+            stats: Default::default(),
         })
     }
 
