@@ -1,0 +1,50 @@
+# Offline checks: the sidecar, the crypto crates, the reference client, the
+# client root store, the shared vectors and a secret scan. No secrets, no
+# provider; the network is used only to fetch dependencies. The same steps run
+# locally with crypto/tools/ci-offline.sh.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: crypto/client/package-lock.json
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            crypto/zkbench/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('crypto/rust-toolchain.toml', 'crypto/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      # crypto/rust-toolchain.toml pins the toolchain; rustup installs it on the
+      # first cargo call.
+      - name: Offline checks
+        env:
+          CI: "true"
+        run: bash crypto/tools/ci-offline.sh
