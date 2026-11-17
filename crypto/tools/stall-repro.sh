@@ -31,6 +31,8 @@
 # Output: $CU_STALL_OUT/<label>.jsonl (one JSON object per attempt) and
 # per-run stderr in $CU_STALL_OUT/<label>.<i>.err.
 set -euo pipefail
+# the driver trusts no provider host by default: the one this run talks to
+_cu_up="${CU_UPSTREAM:-api.venice.ai:443}"; export CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-${_cu_up%:*}}"
 
 MIN_SUCCESS="${CU_MIN_SUCCESS:-100}"
 POS=()

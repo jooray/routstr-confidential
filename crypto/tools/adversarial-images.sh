@@ -52,6 +52,8 @@
 #                         accept gains at most max(f_s, f_a) - f_s); the gate
 #                         records it and requires exactly the flat charge.
 set -euo pipefail
+# the driver trusts no provider host by default: the one this run talks to
+_cu_up="${CU_UPSTREAM:-api.venice.ai:443}"; export CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-${_cu_up%:*}}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../client"

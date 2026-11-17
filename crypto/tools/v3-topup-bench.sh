@@ -15,6 +15,8 @@
 # CU_REQUESTS (5), CU_PAUSE_MS (3000), CU_MAX_TOKENS (40), CU_BENCH_OUT
 # (crypto/runs/v3-topup-bench), CU_NO_TOPUP=1 (the client asks for no top-up).
 set -euo pipefail
+# the driver trusts no provider host by default: the one this run talks to
+_cu_up="${CU_UPSTREAM:-api.venice.ai:443}"; export CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-${_cu_up%:*}}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CRYPTO="$(cd "$HERE/.." && pwd)"

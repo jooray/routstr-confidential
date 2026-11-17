@@ -12,6 +12,8 @@
 # Environment: CU_SIDECAR | CU_NODE + AUTH, CU_MODEL, CU_FRAMINGS ("2 1.1"),
 # CU_BENCH_OUT (default /tmp/cu-bench), CU_PROVER, CU_2PC.
 set -euo pipefail
+# the driver trusts no provider host by default: the one this run talks to
+_cu_up="${CU_UPSTREAM:-api.venice.ai:443}"; export CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-${_cu_up%:*}}"
 cd "$(dirname "$0")"
 
 N="${1:-5}"
