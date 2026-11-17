@@ -1226,6 +1226,8 @@ Options:
   --max-body BYTES        request body cap (default 8388608)
   --runs-dir DIR          session evidence directory (default crypto/runs)
   --runs-keep-hours N     keep run files N hours (default 24; 0 = remove at the end)
+  --version               crate version, build commit, protocol, 2PC and
+                          proof-channel versions
   -h, --help              this text
 
 Framing 2 (HTTP/2) is offered only when the offer file lists it; check the
@@ -1250,6 +1252,10 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{HELP}");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{}", version_line());
         return Ok(());
     }
     let arg = |flag: &str| {
@@ -1429,6 +1435,33 @@ async fn main() -> Result<()> {
     info!(%listen, token = state.token_hash.is_some(), "cu-sidecar listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// What this binary speaks (`--version`, `GET /healthz`): the crate version,
+/// the commit it was built from (`unknown` outside a checkout, unless
+/// `CU_BUILD_COMMIT` named it at build time), the protocol, the two-party key
+/// schedule and the proof channel's version.
+fn version_info() -> serde_json::Value {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("CU_BUILD_COMMIT"),
+        "protocol": default_protocol(),
+        "twopc": TWOPC_PROTOCOL,
+        "proof_channel": zkbench::channel::CHANNEL_VERSION,
+    })
+}
+
+/// `--version`: one line, `name version key=value...`.
+fn version_line() -> String {
+    let v = version_info();
+    format!(
+        "cu-sidecar {} commit={} protocol={} twopc={} proof_channel={}",
+        v["version"].as_str().unwrap_or(""),
+        v["commit"].as_str().unwrap_or(""),
+        v["protocol"],
+        v["twopc"].as_str().unwrap_or(""),
+        v["proof_channel"]
+    )
 }
 
 /// The sidecar's routes, each behind the node's token when one is set.
@@ -4666,6 +4699,19 @@ mod hardening_tests {
         let e = error_frame(&mut ws).await;
         assert_eq!((e["status"].as_u64(), e["code"].as_str()), (Some(413), Some("frame_too_large")), "{e}");
         assert!(e.get("fault").is_none(), "{e}");
+    }
+
+    #[test]
+    fn the_version_names_what_the_sidecar_speaks() {
+        let v = version_info();
+        assert_eq!(v["protocol"], 3);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert!(!v["commit"].as_str().unwrap().is_empty());
+        // The 2PC name is the one the transport's version tag carries.
+        assert_eq!(twopc::VERSION_TAG, format!("routstr-2pc/{}\n", v["twopc"].as_str().unwrap()).as_bytes());
+        assert_eq!(v["proof_channel"], zkbench::channel::CHANNEL_VERSION);
+        let line = version_line();
+        assert!(line.starts_with("cu-sidecar ") && line.contains(" protocol=3 twopc=split-public-1 proof_channel="), "{line}");
     }
 
     #[test]

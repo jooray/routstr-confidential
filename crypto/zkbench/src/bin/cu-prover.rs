@@ -473,6 +473,18 @@ async fn run_channel(args: &[String]) -> Result<()> {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        // The crate, the commit it was built from (`unknown` outside a
+        // checkout unless CU_BUILD_COMMIT named it), the routstr-confidential
+        // protocol and the proof channel's version (`zkbench::channel`).
+        println!(
+            "cu-prover {} commit={} protocol=3 proof_channel={}",
+            env!("CARGO_PKG_VERSION"),
+            env!("CU_BUILD_COMMIT"),
+            zkbench::channel::CHANNEL_VERSION
+        );
+        std::process::exit(0);
+    }
     let result = if args.iter().any(|a| a == "--channel") {
         run_channel(&args).await
     } else if args.iter().any(|a| a == "--bench") {

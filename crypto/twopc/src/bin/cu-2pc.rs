@@ -147,6 +147,15 @@ async fn run(out: Out, mut ctl: mpsc::UnboundedReceiver<Value>, io: tokio::io::D
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        // The crate, the commit it was built from (`unknown` outside a
+        // checkout unless CU_BUILD_COMMIT named it), the routstr-confidential
+        // protocol and the two-party key schedule of the transport's tag.
+        let tag = String::from_utf8_lossy(twopc::VERSION_TAG);
+        let twopc = tag.trim_end().trim_start_matches("routstr-2pc/");
+        println!("cu-2pc {} commit={} protocol=3 twopc={twopc}", env!("CARGO_PKG_VERSION"), env!("CU_BUILD_COMMIT"));
+        return;
+    }
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<Value>();
     let (party_io, bridge) = tokio::io::duplex(4 << 20);
