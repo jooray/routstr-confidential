@@ -1324,9 +1324,7 @@ async fn main() -> Result<()> {
         bail!("the offer names the key schedule {:?}; this sidecar runs {TWOPC_PROTOCOL:?}", offer.twopc);
     }
     offer.twopc = TWOPC_PROTOCOL.to_string();
-    if offer.upstream_host.is_empty() {
-        offer.upstream_host = host.clone();
-    }
+    check_offer_host(&mut offer, &host)?;
     if offer.head_template.is_empty() {
         offer.head_template = default_head_template_for(&offer.upstream_host, key.len());
     }
@@ -1416,6 +1414,22 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, token = state.token_hash.is_some(), "cu-sidecar listening");
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The provider host the sidecar verifies the certificate against (`--host`,
+/// or the host of `--upstream`) is the one the offer names: an offer without
+/// `upstream_host` takes it, an offer naming another one is refused (its
+/// head template, ClientHello SNI and the certificate check would disagree).
+fn check_offer_host(offer: &mut Offer, host: &str) -> Result<()> {
+    if offer.upstream_host.is_empty() {
+        offer.upstream_host = host.to_string();
+    } else if offer.upstream_host != host {
+        bail!(
+            "the offer names upstream_host {:?} but the sidecar verifies the provider as {host:?} (--host, or the host of --upstream)",
+            offer.upstream_host
+        );
+    }
     Ok(())
 }
 
@@ -4536,6 +4550,25 @@ mod hardening_tests {
         }
         let Some(Message::Text(t)) = out.try_recv().ok() else { bail!("no ready") };
         Ok((st, serde_json::from_str(&t)?))
+    }
+
+    #[test]
+    fn the_offer_host_is_the_verified_host() {
+        let mut offer: Offer = serde_json::from_str(include_str!("../offer.venice.json")).unwrap();
+        let named = offer.upstream_host.clone();
+        assert!(!named.is_empty());
+        check_offer_host(&mut offer, &named).unwrap();
+        assert_eq!(offer.upstream_host, named);
+        // Another host, or the same one spelled with a port: refused, unchanged.
+        for other in ["api.example.com", "127.0.0.1", &format!("{named}:443"), ""] {
+            let mut o = offer.clone();
+            assert!(check_offer_host(&mut o, other).is_err(), "{other}");
+            assert_eq!(o.upstream_host, named);
+        }
+        // An offer without a host takes the verified one.
+        offer.upstream_host.clear();
+        check_offer_host(&mut offer, "api.example.com").unwrap();
+        assert_eq!(offer.upstream_host, "api.example.com");
     }
 
     #[test]
