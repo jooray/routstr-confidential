@@ -182,6 +182,18 @@ export async function takeReceipt(s: any, ctx: Ctx, n: number, attJson: string, 
   return receipt
 }
 
+/**
+ * Why an attestation's `cert_chain_hash` is not the hash of the certificate
+ * chain this client validated in its own handshake (SHA-256 of the DERs in
+ * order), or undefined. Always compared: a client that captured no chain
+ * cannot check the attestation, and fails the request.
+ */
+export function certChainProblem(captured: Uint8Array | undefined, attested: unknown): string | undefined {
+  if (!captured) return 'no certificate chain was captured in the handshake: the attestation cannot be checked'
+  if (attested !== hex(captured)) return 'attestation names a different certificate chain'
+  return undefined
+}
+
 /** The deposit a settled request's receipt releases (node mode): the connection's first settlement, the offer's amount. */
 export function noteDepositRelease(s: any, ctx: Ctx, receipt: any, n: number): void {
   const released = receipt.deposit_released_msat
@@ -213,6 +225,8 @@ export async function advOutcome(s: any, ctx: Ctx, e: unknown, extra: Record<str
     refused: !!pe,
     reason: pe ? String(pe.reason ?? '') : String((e as Error)?.message ?? e),
     code: pe?.code,
+    status: pe?.status,
+    fault: pe?.fault,
     local: String((e as Error)?.message ?? e).slice(0, 200),
     ...extra,
   }

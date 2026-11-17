@@ -1,8 +1,11 @@
 // Offline checks of the receipt rules the reference client holds a node to
 // (`src/receipt-check.ts`), in particular the bound of a 5xx charge: the
-// reservation the node announced in `request_ok`, never the receipt's own.
+// reservation the node announced in `request_ok`, never the receipt's own;
+// and the attestation's certificate chain against the client's own.
 //   node --experimental-strip-types test/receipt-check.ts
 import assert from 'node:assert/strict'
+import { hex } from '../src/advice.ts'
+import { certChainProblem } from '../src/ctx.ts'
 import { announcedReserve, makeReceiptChecker, reservationCeiling, signedContextLength, type ReceiptQuery } from '../src/receipt-check.ts'
 
 const quiet = console.log
@@ -82,6 +85,14 @@ try {
   }
   // An inherited key is not an entry.
   assert.equal(signedContextLength({ context_lengths: Object.create({ m: 5 }) }, 'm'), undefined)
+
+  // The attestation's certificate chain is always compared with the one our handshake validated.
+  const chain = Uint8Array.from([1, 2, 3])
+  assert.equal(certChainProblem(chain, hex(chain)), undefined)
+  assert.match(certChainProblem(chain, hex(Uint8Array.from([1, 2, 4]))) ?? '', /different certificate chain/)
+  assert.match(certChainProblem(chain, undefined) ?? '', /different certificate chain/)
+  assert.match(certChainProblem(undefined, hex(chain)) ?? '', /no certificate chain was captured/)
+  assert.match(certChainProblem(undefined, undefined) ?? '', /no certificate chain was captured/)
 } finally {
   console.log = quiet
 }

@@ -13,7 +13,7 @@ import { usageEventProblem } from './usage-rule.ts'
 import { createHash } from 'node:crypto'
 
 import { concat, hex } from './advice.ts'
-import { advOutcome, noteDepositRelease, openRequest, requestMessage, takeReceipt, type Ctx, type ImageTerms } from './ctx.ts'
+import { advOutcome, certChainProblem, noteDepositRelease, openRequest, requestMessage, takeReceipt, type Ctx, type ImageTerms } from './ctx.ts'
 import {
   errorHeadPrefixProblem, refusalProblem, NO_ERROR, REFUSED_STREAM,
   FLAG, FRAME, FrameReader, chatPath, checkPiWinParams, decodeBlock, frame, frameHeader,
@@ -948,7 +948,8 @@ export class H2Conn {
     if (a.sid !== s.sid || a.http !== '2' || a.n !== cur.n || a.stream !== cur.stream) throw new Error('attestation names another session or request')
     if (a.th_sh !== hex(s.thSH) || a.th_sf !== hex(s.thSF)) throw new Error('attestation names another handshake')
     if (!s.cCommitHex || a.c_commit !== s.cCommitHex) throw new Error('attestation names a different head-record commitment')
-    if (s.certChainHash && a.cert_chain_hash !== hex(s.certChainHash)) throw new Error('attestation names a different certificate chain')
+    const chain = certChainProblem(s.certChainHash, a.cert_chain_hash)
+    if (chain) throw new Error(chain)
     const sK = a.s_k
     const count = a.server_records
     if (!Number.isSafeInteger(sK) || !Number.isSafeInteger(count) || count < 0) throw new Error('attestation interval malformed')

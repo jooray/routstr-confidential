@@ -33,11 +33,15 @@
 //   --offer-at K               (node) request K names the offer as refetched just before it; on
 //                              `offer_changed` it is sent again naming the connection's own offer
 //   --pause-ms N  --linger-ms N  --h2-chunk N  --max-deposit MSAT [100000]  --no-zkchan  --no-topup
-//   --auth CREDENTIAL  --node-pubkey HEX|npub  --trusted-host H  --runs-dir DIR  --no-accept-fee
+//   --auth CREDENTIAL  --node-pubkey HEX|npub  --runs-dir DIR  --no-accept-fee
+//   --trusted-host H           required (repeatable; or CU_TRUSTED_HOSTS, comma-separated): the provider
+//                              hosts the offer's upstream_host may name; there is no built-in host
 //   --legacy-v2-socket [--legacy-no-v]   open a protocol-v2 socket and print the peer's answer (LEGACY_JSON)
 //   --adv MODE [--adv-at N]    an attack on request N (also --adv-h2):
 //       both framings: suffix (another suffix: --adv-suffix-model M = model swap, --adv-body-max-tokens N =
-//                      cap swap, --adv-image-count N), padding, early-record, no-proof, own-keyshare, twopc-tag
+//                      cap swap, --adv-image-count N), padding, early-record, no-proof, own-keyshare, twopc-tag,
+//                      big-frame (one 9 MiB binary message after `ready`: an `error` 413 frame_too_large
+//                      without `fault`, the client's doing)
 //       framing "2":   hidden-headers, path [--adv-h2-path P], replay-usage
 //       framing "1.1": not-alone (the suffix is not alone in the final record)
 //       cancel-and-reuse (a later request that refers to the credential unbilled):
@@ -55,7 +59,8 @@
 //     --adv-accept-any (accept an image response whatever its status), --decoy-model M (neutralised)
 //
 // Output: `E2E_JSON {…}` (every request with its bytes each way and times), one `BENCH {…}` line per
-// request (cold / armed / open), `ADV {…}` for an attack. Exit: 0 every request settled (or the attack
+// request (cold / armed / open), `ADV {…}` for an attack, `DEPOSIT_DEVIATION {…}` for a deposit outcome
+// that deviates from the signed terms (§12.10; the gates fail on it). Exit: 0 every request settled (or the attack
 // was refused), 1 failure, 2 usage, 3 a receipt was not verified, 4 the offer is refused, 5 an attack
 // was not refused, 6 node_protocol_outdated, 7 upgrade_required (the peer refused our protocol version).
 
@@ -80,11 +85,13 @@ import { Bus, waitMsg } from './bus.ts'
 import { RequestRefused, advOutcome, type Ctx, type Framing, type ImageTerms, type ReqBody } from './ctx.ts'
 import { H11 } from './driver-h11.ts'
 import { H2Conn, runHttp2 } from './driver-h2.ts'
-import { MAX_DATA_IN_RECORD, chatPath, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
-import { chatBlockProblem, checkImagesBlock, padBody, pinnedModel, renderChatSuffix, renderImagesSuffix, upstreamModelsProblem, contextLengthsProblem } from './offer.ts'
-import { checkHeadTemplate, checkPiNKParams, type ServerPostRecord } from './params.ts'
+import { MAX_DATA_IN_RECORD, chatPath, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
+import { OfferRefused, PROTO, checkOffer as checkOfferTerms, imagesBlock, trustedHosts } from './check-offer.ts'
+import { padBody, pinnedModel, renderChatSuffix, renderImagesSuffix } from './offer.ts'
+import { checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { makeReceiptChecker } from './receipt-check.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
+import { depositProblems } from './deposit-check.ts'
 import { errText, shown, termSafe } from './term.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
 import { runZk } from './zkbridge.ts'
@@ -95,10 +102,6 @@ export { chatBlockProblem, checkImagesBlock, refusedPinKey, renderChatSuffix, re
 
 setCryptoImplementation(webcryptoCrypto)
 
-/** The protocol version, and the key-schedule protocol this client implements (§4). */
-const PROTO = 3
-const TWOPC = 'split-public-1'
-
 /** The protocol sid: a 32-byte digest in lowercase hex. */
 export const SID_RE = /^[0-9a-f]{64}$/
 
@@ -107,6 +110,15 @@ export const SID_RE = /^[0-9a-f]{64}$/
 const writePrivate = (path: string, data: string | Uint8Array) => writeFileSync(path, data, { mode: 0o600, flag: 'wx' })
 /** The files a local sidecar writes into the same run directory (`crypto/runs/<sid>` by default). */
 const SIDECAR_RUN_FILES = new Set(['sidecar.jsonl', 'attestation.json', 'receipt.json'])
+
+/** This module is the process's entry point (not imported). */
+function isEntryPoint(): boolean {
+  try {
+    return !!argv[1] && realpathSync(argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    return false
+  }
+}
 
 function arg(name: string, dflt?: string): string | undefined {
   const i = argv.indexOf(name)
@@ -166,6 +178,8 @@ const RETRY_REFUSED_MS = Number(arg('--retry-refused-ms', '0'))
 const OFFER_AT = Number(arg('--offer-at', '0'))
 /** Every `request_refused` the hooks above saw. */
 const REFUSALS: any[] = []
+/** Every deposit outcome that deviates from the signed terms (§12.10). */
+const DEPOSIT_DEVIATIONS: any[] = []
 // Behave like a client that does not echo the offer's fees.
 const NO_ACCEPT_FEE = argv.includes('--no-accept-fee')
 // Proofs run over the connection's pre-warmed proof channel; `--no-zkchan`
@@ -194,10 +208,14 @@ const ADV_MODES: Record<string, Framing[]> = {
   // A refusal (`disclose_reset`) claimed for a request the provider answered:
   'refusal-fake': ['2'], 'refusal-after-head': ['2'], 'refusal-probe': ['2'], 'refusal-later': ['2'],
   'extra-record': ['1.1'],
+  // One binary message larger than the sidecar's client buffer, right after `ready`.
+  'big-frame': ['2', '1.1'],
 }
 if (ADV_MODE !== undefined && !ADV_MODES[ADV_MODE]) usage(`--adv ${ADV_MODE}: one of ${Object.keys(ADV_MODES).join(', ')}`)
 const ADV_AT = Number(arg('--adv-at', ADV_MODE === 'replay-usage' ? '2' : '1'))
 const ADV_PATH = arg('--adv-h2-path', '/api/v1/api_keys/abcdefg')
+/** `--adv big-frame`: above the sidecar's client buffer (about 8.1 MiB), below the node's 16 MiB message limit. */
+const BIG_FRAME_BYTES = 9 << 20
 // The node credential: an sk- key or a Cashu token (--escrow-token is an alias).
 const AUTH = (arg('--auth') ?? arg('--escrow-token') ?? '').trim()
 // Skipping the offer signature check is for tests against a throwaway node
@@ -215,16 +233,14 @@ const NODE_PUBKEY_RAW = arg('--node-pubkey') ?? (process.env.CU_NODE_PUBKEY || u
 const NODE_PUBKEY = NODE_PUBKEY_RAW === undefined ? undefined : pubkeyHex(NODE_PUBKEY_RAW)
 if (NODE_PUBKEY_RAW !== undefined && NODE_PUBKEY === null) usage(`--node-pubkey ${shown(NODE_PUBKEY_RAW)} is neither a 64-hex key nor an npub`)
 // Provider hosts this client will run a TLS session with: the offer's
-// upstream_host must be one of them (as the SDK's trusted hosts). The default
-// is the case-study provider; extend with --trusted-host (repeatable) or
-// CU_TRUSTED_HOSTS (comma-separated).
-const TRUSTED_HOSTS = [
-  'api.venice.ai',
-  ...(process.env.CU_TRUSTED_HOSTS ?? '').split(','),
-  ...argv.flatMap((a, i) => (a === '--trusted-host' && argv[i + 1] !== undefined ? [argv[i + 1]!] : [])),
-]
-  .map((h) => h.trim().toLowerCase())
-  .filter((h) => h !== '')
+// upstream_host must be one of them (as the SDK's trusted hosts). There is no
+// built-in host: --trusted-host (repeatable) or CU_TRUSTED_HOSTS (comma-separated).
+const TRUSTED_HOSTS = trustedHosts(process.env.CU_TRUSTED_HOSTS, argv)
+if (TRUSTED_HOSTS.length === 0 && !argv.includes('--legacy-v2-socket') && isEntryPoint()) {
+  usage('no trusted provider host: pass --trusted-host H (the offer\'s upstream_host) or set CU_TRUSTED_HOSTS')
+}
+/** The trusted API bases: a route is one of them plus the endpoint (CU_API_BASES, comma-separated). */
+const API_BASES = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
 if (NODE) {
   let url: URL | undefined
   try {
@@ -248,8 +264,6 @@ if (NODE) {
     process.exit(2)
   }
 }
-/** The trusted API bases: a route is one of them plus the endpoint (CU_API_BASES, comma-separated). */
-const API_BASES = (process.env.CU_API_BASES ?? '/v1,/api/v1').split(',')
 
 let OFFER_PUBKEY: string | undefined
 let OFFER: any = null
@@ -274,46 +288,18 @@ function offerRefused(what: string, code = 4): never {
   process.exit(code)
 }
 
-/** Everything the client holds an offer to before a `setup`. */
+/** Everything the client holds an offer to before a `setup` (`check-offer.ts`). */
 function checkOffer(offer: any): void {
-  if (!offer || typeof offer !== 'object') offerRefused('no offer')
-  // An older node: not used for confidential requests (§11).
-  if (offer.v === undefined || (typeof offer.v === 'number' && offer.v < PROTO)) {
-    offerRefused(`node_protocol_outdated: the offer is for protocol v${shown(offer.v ?? 'unknown')}; this client speaks only v${PROTO} (the node needs an update)`, 6)
-  }
-  if (offer.v !== PROTO) offerRefused(`offer_unsupported_version: the offer is for protocol v${shown(offer.v)}; this client speaks only v${PROTO}`)
-  if (offer.twopc !== TWOPC) offerRefused(`offer_unsupported_twopc: the offer names the key-schedule protocol ${shown(offer.twopc)}; this client implements ${TWOPC}`)
-  const http = offer.http === undefined ? ['1.1'] : offer.http
-  if (!Array.isArray(http) || http.length === 0 || new Set(http).size !== http.length || !http.every((h: unknown) => h === '2' || h === '1.1')) {
-    offerRefused(`offer_malformed: http ${shown(offer.http)} is not a list of "2" and "1.1"`)
-  }
-  OFFER_HTTP = [...http]
-  const host = typeof offer.upstream_host === 'string' ? offer.upstream_host.toLowerCase() : ''
-  if (!TRUSTED_HOSTS.includes(host)) {
-    offerRefused(`the offer's upstream_host ${shown(offer.upstream_host)} is not trusted (${TRUSTED_HOSTS.join(', ')}; --trusted-host or CU_TRUSTED_HOSTS to add one)`)
-  }
-  const problem = chatBlockProblem(offer)
-  if (problem) offerRefused(`the offer's chat block is refused: ${termSafe(problem)}`)
-  const upstream = upstreamModelsProblem(offer)
-  if (upstream) offerRefused(`offer_malformed: ${termSafe(upstream)}`)
-  const contexts = contextLengthsProblem(offer)
-  if (contexts) offerRefused(`offer_malformed: ${termSafe(contexts)}`)
+  let c
   try {
-    // The head template is held to its syntax before any setup (π_NK checks it again in framing "1.1").
-    checkHeadTemplate(offer.head_template ?? '', offer.upstream_host ?? '', 'chat')
-    if (OFFER_HTTP.includes('2')) H2_BLOCK = checkH2Offer(offer, API_BASES)
-    else H2_BLOCK = undefined
+    c = checkOfferTerms(offer, { trustedHosts: TRUSTED_HOSTS, apiBases: API_BASES, nodeMode: NODE_MODE, maxDeposit: MAX_DEPOSIT })
   } catch (e) {
-    offerRefused(`the offer is refused: ${errText(e)}`)
+    if (e instanceof OfferRefused) offerRefused(e.message, e.code)
+    throw e
   }
-  if (NODE_MODE) {
-    const d = offer.connection_deposit_msat
-    if (!(Number.isSafeInteger(d) && d >= 0)) offerRefused('offer_malformed: connection_deposit_msat')
-    if (d > MAX_DEPOSIT) offerRefused(`the node's connection deposit of ${d} msat exceeds --max-deposit ${MAX_DEPOSIT}`)
-    DEPOSIT = d
-    const idle = offer.idle_timeout_s
-    if (!(Number.isSafeInteger(idle) && idle >= 10 && (!H2_BLOCK || idle <= H2_BLOCK.idle_secs))) offerRefused('offer_malformed: idle_timeout_s')
-  }
+  OFFER_HTTP = c.http
+  H2_BLOCK = c.h2
+  DEPOSIT = c.deposit
 }
 
 /** The provider host of the TLS session: the offer's `upstream_host`, which `checkOffer` held to the trusted list. */
@@ -391,13 +377,9 @@ function userContent(text: string): unknown {
   return [{ type: 'text', text }, { type: 'image_url', image_url: { url } }]
 }
 
-/** The offer's images block: the node's signed one, or the sidecar's endpoint. */
+/** The offer's images block: the node's signed one, or the sidecar's endpoint (its route on a trusted API base). */
 function imagesOffer(): any {
-  const im = OFFER?.images ?? OFFER?.endpoints?.images
-  if (!im) throw new Error('offer_no_images: the offer has no images endpoint')
-  checkImagesBlock(im)
-  checkHeadTemplate(im.head_template ?? '', OFFER.upstream_host ?? '', 'images')
-  return im
+  return imagesBlock(OFFER, API_BASES)
 }
 
 const kindOf = (g: number): 'chat' | 'images' => ((KINDS[g - 1] ?? (IMAGE ? 'images' : 'chat')) === 'images' ? 'images' : 'chat')
@@ -634,22 +616,34 @@ class Session {
       this.closedReason = String(m.reason ?? '')
       console.log(`[client ${this.label}] closed: reason=${shown(m.reason)}`)
     }
-    if (m.deposit === undefined) return
+    if (m.deposit === undefined || m.deposit === null) return
     const json: string = typeof m.deposit_json === 'string' ? m.deposit_json : JSON.stringify(m.deposit)
     let signed = false
     let d: any
     try {
       d = JSON.parse(json)
-      // Before `ready` (a setup the node could not serve) the key is the signed offer's.
-      signed = verifySig(json, m.deposit_sig, this.ready?.pubkey ?? OFFER_PUBKEY, m.sig_scheme) && (d.sid === this.sid || d.sid === null)
+      if (d === null || typeof d !== 'object') d = {}
+      // Before `ready` (a setup the node could not serve) the key is the signed
+      // offer's, and only then may the outcome name no connection.
+      signed = verifySig(json, m.deposit_sig, this.ready?.pubkey ?? OFFER_PUBKEY, m.sig_scheme) && (d.sid === this.sid || (d.sid === null && this.sid === ''))
     } catch {
       d = {}
     }
+    const releasedByReceipt = this.deposit?.outcome === 'released'
     this.deposit = { msat: Number(d.msat), outcome: String(d.outcome), reason: String(d.reason), signed }
     console.log(
       `[client ${this.label}] deposit: outcome=${shown(d.outcome)} reason=${shown(d.reason)} msat=${shown(d.msat)} ` +
         `balance_msats=${shown(d.balance_msats)} signed=${signed}`,
     )
+    if (!NODE_MODE) return
+    // The node's own word against its signed terms (§12.10): a deviation is
+    // printed on a line of its own, which the gates' evaluators fail on.
+    const problems = depositProblems(m, d, { sid: this.sid, depositMsat: DEPOSIT, releasedByReceipt })
+    if (problems.length) {
+      const dev = { sid: this.sid || null, frame: m.type, outcome: shown(d.outcome), reason: shown(d.reason), signed, problems: problems.map((p) => termSafe(p)) }
+      DEPOSIT_DEVIATIONS.push(dev)
+      console.log('DEPOSIT_DEVIATION ' + JSON.stringify(dev))
+    }
   }
 
   trackServerRecords(bytes: Uint8Array): void {
@@ -728,6 +722,13 @@ class Session {
     // itself may exist, holding a local sidecar's own files.
     const earlier = readdirSync(this.runDir).filter((f) => !SIDECAR_RUN_FILES.has(f))
     if (earlier.length > 0) throw new Error(`the run directory of sid ${this.sid} already holds a client's evidence (${shown(earlier.slice(0, 3).join(', '))}): a repeated sid`)
+  }
+
+  /** `--adv big-frame`: one binary message of 9 MiB right after `ready`; the peer must end the connection with an `error`. */
+  async bigFrame(): Promise<never> {
+    this.sendBytes(new Uint8Array(BIG_FRAME_BYTES))
+    await this.waitT('error', 60000)
+    throw new Error('the peer answered an oversized client message with no error')
   }
 
   /** 2PC preprocessing, the joint key share and the proof channel: an armed connection stops here. */
@@ -1030,6 +1031,7 @@ async function openConnection(framing: Framing, label: string, arm: boolean, ctx
   ctx.log = s.log
   await s.connect()
   await s.setup(arm)
+  if (ctx.adv?.mode === 'big-frame') await s.bigFrame()
   const earlyAdv = ctx.adv && ['twopc-tag', 'own-keyshare'].includes(ctx.adv.mode) ? ctx.adv.mode : undefined
   const keyShare = await s.prewarm(earlyAdv)
   let tClaim = s.tStart
@@ -1254,6 +1256,7 @@ async function main() {
     fallback,
     refusals: REFUSALS.length ? REFUSALS : undefined,
     deposit: last?.deposit,
+    deposit_deviations: DEPOSIT_DEVIATIONS.length ? DEPOSIT_DEVIATIONS : undefined,
     closed: lastClosed,
     phases: last?.phases,
     setup_bytes: last?.setup_bytes,
@@ -1272,14 +1275,7 @@ async function main() {
 }
 
 // Run only as the entry point, so the checks above can be imported offline.
-const isEntry = (() => {
-  try {
-    return !!argv[1] && realpathSync(argv[1]) === realpathSync(fileURLToPath(import.meta.url))
-  } catch {
-    return false
-  }
-})()
-if (isEntry) {
+if (isEntryPoint()) {
   main().catch(async (e) => {
     const pe = current?.peerError
     if (e instanceof RequestRefused) console.error(`[client] REFUSED: ${errText(e)}`)

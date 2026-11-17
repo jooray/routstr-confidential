@@ -7,7 +7,12 @@
 // supported_groups = [secp256r1], one suite, TLS 1.3 only, no PSK /
 // early_data / psk_key_exchange_modes); HelloRetryRequest and a non-P-256
 // server share are rejected before any hook runs; bad options are refused;
-// the fork's default (non-external) ClientHello is unchanged in shape.
+// the fork's default (non-external) ClientHello is unchanged in shape; the
+// ClientHello the driver writes is byte for byte the canonical one of the
+// shared vectors (test/fixtures/client-hello-vectors.json, a copy of
+// crypto/conformance/client-hello-vectors.json), its session id masked.
+
+import { existsSync, readFileSync } from 'node:fs'
 
 import { p256 } from '@noble/curves/p256'
 
@@ -98,6 +103,12 @@ function newExternal(keyShare: Uint8Array, opts: Record<string, unknown> = {}) {
     ...opts,
   } as any)
   return { tls, writes, calls }
+}
+
+/** Where two hex strings first differ (for a failed comparison). */
+function firstDiff(a: string, b: string): string {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) if (a[i] !== b[i]) return `first difference at byte ${i >> 1}`
+  return ''
 }
 
 async function rejects(p: Promise<unknown>, re: RegExp): Promise<string> {
@@ -236,6 +247,64 @@ async function main() {
     const { tls } = newExternal(keyShare)
     const err = await rejects(tls.startHandshake({ psk: {} as any }), /PSK/)
     check('external: PSK refused', !err, err)
+  }
+
+  // 7. the canonical ClientHello (both framings), with the driver's options
+  {
+    const fixture = new URL('../test/fixtures/client-hello-vectors.json', import.meta.url)
+    const shared = new URL('../../conformance/client-hello-vectors.json', import.meta.url)
+    const raw = readFileSync(fixture)
+    // The copy must not drift from the shared file (when this checkout has it).
+    if (existsSync(shared)) check('ClientHello vectors: the fixture is a byte-identical copy of the shared file', raw.equals(readFileSync(shared)))
+    const { vectors } = JSON.parse(raw.toString('utf8'))
+    check('ClientHello vectors: one per framing', vectors.length === 2 && vectors.map((v: any) => v.framing).sort().join() === '1.1,2')
+    for (const v of vectors) {
+      const writes: Uint8Array[] = []
+      const tls = makeTLSClient({
+        host: v.inputs.host,
+        cipherSuites: ['TLS_AES_128_GCM_SHA256'],
+        supportedProtocolVersions: ['TLS1_3'],
+        namedCurves: ['SECP256R1'],
+        applicationLayerProtocols: [v.framing === '2' ? 'h2' : 'http/1.1'],
+        logger: quiet,
+        write: ({ header, content }: any) => {
+          writes.push(concat(header, content))
+        },
+        external: {
+          keyShare: Buffer.from(v.inputs.key_share_hex, 'hex'),
+          async onServerHello() {
+            throw new Error('unreachable')
+          },
+          async onServerFinished() {
+            throw new Error('unreachable')
+          },
+        },
+      } as any)
+      // The random can be fixed through the fork's option; the session id cannot, so it is masked.
+      await tls.startHandshake({ random: Buffer.from(v.inputs.random_hex, 'hex') } as any)
+      const rec = writes[0]!
+      const got = rec.slice(5)
+      const want = Buffer.from(v.client_hello_hex, 'hex')
+      const sidRange = v.free_ranges.find((r: any) => r.field === 'session_id')
+      const masked = (b: Uint8Array) => {
+        const c = Uint8Array.from(b)
+        c.fill(0, sidRange.start, sidRange.end)
+        return hex(c)
+      }
+      check(
+        `ClientHello framing "${v.framing}": record header`,
+        hex(rec.slice(0, 5)) === `160301${(want.length >> 8).toString(16).padStart(2, '0')}${(want.length & 0xff).toString(16).padStart(2, '0')}` ||
+          hex(rec.slice(0, 5)) === `160303${(want.length >> 8).toString(16).padStart(2, '0')}${(want.length & 0xff).toString(16).padStart(2, '0')}`,
+        hex(rec.slice(0, 5)),
+      )
+      check(`ClientHello framing "${v.framing}": length ${v.client_hello_len}`, got.length === v.client_hello_len && want.length === v.client_hello_len, String(got.length))
+      check(
+        `ClientHello framing "${v.framing}": every byte but the session id is the canonical one`,
+        got.length === want.length && masked(got) === masked(want),
+        firstDiff(masked(got), masked(want)),
+      )
+      check(`ClientHello framing "${v.framing}": a fresh 32-byte session id`, got[sidRange.start - 1] === 32 && sidRange.end - sidRange.start === 32)
+    }
   }
 
   console.log(failures ? `${failures} FAILED` : 'all checks passed')

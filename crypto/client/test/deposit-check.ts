@@ -1,0 +1,52 @@
+// Offline checks of the deposit-outcome rules the reference client holds a
+// node to (`src/deposit-check.ts`, PROTOCOL-V3.md §12.9, §12.10).
+//   node --experimental-strip-types test/deposit-check.ts
+import assert from 'node:assert/strict'
+import { DEPOSIT_RELEASED_REASONS, depositProblems } from '../src/deposit-check.ts'
+
+const SID = 'ab'.repeat(32)
+const ctx = { sid: SID, depositMsat: 7000, releasedByReceipt: false }
+const closed = { type: 'closed' }
+const d = (o: Record<string, unknown>) => ({ sid: SID, msat: 7000, outcome: 'charged', reason: 'unused', ...o })
+
+// Honest outcomes.
+assert.deepEqual(depositProblems(closed, d({}), ctx), [])
+assert.deepEqual(depositProblems(closed, d({ reason: 'idle' }), ctx), [])
+assert.deepEqual(depositProblems({ type: 'error', code: 'frame_too_large', status: 413 }, d({}), ctx), [])
+assert.deepEqual(depositProblems({ type: 'error' }, d({ reason: 'request_abandoned' }), ctx), [])
+for (const reason of DEPOSIT_RELEASED_REASONS) assert.deepEqual(depositProblems(closed, d({ outcome: 'released', reason }), ctx), [], reason)
+// Released after a receipt released it: the same word twice, no deviation.
+assert.deepEqual(depositProblems(closed, d({ outcome: 'released', reason: 'request_settled' }), { ...ctx, releasedByReceipt: true }), [])
+
+// The amount is the signed offer's.
+assert.match(depositProblems(closed, d({ msat: 7001 }), ctx).join(), /7001 msat, the signed offer's is 7000/)
+assert.match(depositProblems(closed, d({ msat: '7000' }), ctx).join(), /signed offer's is 7000/)
+assert.match(depositProblems(closed, d({ outcome: 'released', reason: 'request_settled', msat: 0 }), ctx).join(), /signed offer's/)
+
+// Charged though a receipt of this connection released it.
+assert.match(depositProblems(closed, d({ reason: 'idle' }), { ...ctx, releasedByReceipt: true }).join(), /receipt of this connection released it/)
+
+// Charged with the last frame carrying a fault of the node or the provider.
+assert.match(depositProblems({ type: 'error', fault: 'upstream' }, d({}), ctx).join(), /fault of the provider/)
+assert.match(depositProblems({ type: 'error', fault: 'node' }, d({}), ctx).join(), /fault of the node/)
+// A `closed` frame does not carry a fault; another fault value is not a rule.
+assert.deepEqual(depositProblems({ type: 'closed', fault: 'upstream' }, d({}), ctx), [])
+
+// Charged with a reason that releases it.
+for (const reason of DEPOSIT_RELEASED_REASONS) {
+  assert.match(depositProblems(closed, d({ reason }), ctx).join(), /which releases it/, reason)
+}
+
+// `sid: null` only before `ready`; another sid never.
+assert.deepEqual(depositProblems(closed, d({ sid: null }), { ...ctx, sid: '' }), [])
+assert.match(depositProblems(closed, d({ sid: null }), ctx).join(), /names connection null/)
+assert.match(depositProblems(closed, d({ sid: 'cd'.repeat(32) }), ctx).join(), /names connection/)
+assert.match(depositProblems(closed, d({ sid: SID }), { ...ctx, sid: '' }).join(), /before ready/)
+
+// An outcome that is neither word.
+assert.match(depositProblems(closed, d({ outcome: 'kept' }), ctx).join(), /an outcome "kept"/)
+
+// Several rules at once: each is named.
+assert.equal(depositProblems({ type: 'error', fault: 'node' }, d({ msat: 1, reason: 'node_failure' }), { ...ctx, releasedByReceipt: true }).length, 4)
+
+console.log('deposit-check: ok')

@@ -11,7 +11,7 @@
 // is the driver's `Session`.
 
 import { concat, hex } from './advice.ts'
-import { noteDepositRelease, openRequest, takeReceipt, type Ctx, type ReqBody } from './ctx.ts'
+import { certChainProblem, noteDepositRelease, openRequest, takeReceipt, type Ctx, type ReqBody } from './ctx.ts'
 import { checkPiWinFinalRecord } from './h2.ts'
 import { extractR, finalHeadOffset, responseBody } from './http1.ts'
 import { checkPiC3SParams, serverTailEpoch } from './params.ts'
@@ -236,7 +236,8 @@ export class H11 {
     if (a?.sid !== s.sid || a.http !== '1.1' || a.n !== 1 || (m.n !== undefined && m.n !== 1)) throw new Error('attestation names another connection, framing or request')
     if (a.th_sh !== hex(s.thSH) || a.th_sf !== hex(s.thSF)) throw new Error('attestation names another handshake')
     if (!s.cCommitHex || a.c_commit !== s.cCommitHex) throw new Error('attestation names a different head-record commitment')
-    if (s.certChainHash && a.cert_chain_hash !== hex(s.certChainHash)) throw new Error('attestation names a different certificate chain')
+    const chain = certChainProblem(s.certChainHash, a.cert_chain_hash)
+    if (chain) throw new Error(chain)
     // Records may still be on their way to us when the attestation arrives.
     for (let i = 0; i < 1000 && s.recvRecords < a.server_records; i++) await sleep(5)
     if (a.server_records !== s.recvRecords) throw new Error(`attestation counts ${ctx.shown(a.server_records)} upstream records, we received ${s.recvRecords}`)
