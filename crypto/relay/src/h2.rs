@@ -400,7 +400,7 @@ pub fn parse_error_head(r: &[u8], stream: u32) -> Result<u16> {
             (SETTINGS, 0) => len % 6 == 0 && flags & !ACK == 0,
             (PING, 0) => len == 8,
             (GOAWAY, 0) => len >= 8,
-            (WINDOW_UPDATE, s) => len == 4 && (s == 0 || s == stream),
+            (WINDOW_UPDATE, s) if len == 4 && (s == 0 || s == stream) => true,
             (ty, PROBE_STREAM) => PROBE_FRAMES.contains(&ty) && stream != PROBE_STREAM,
             _ => false,
         };
@@ -514,7 +514,7 @@ pub fn parse_refusal(r: &[u8], stream: u32, rst_allowed: bool) -> Result<Refusal
             (SETTINGS, 0) => len % 6 == 0 && flags & !ACK == 0,
             (PING, 0) => len == 8,
             (GOAWAY, 0) => goaway_last.is_some_and(|l| l >= stream),
-            (WINDOW_UPDATE, s) => len == 4 && (s == 0 || s == stream),
+            (WINDOW_UPDATE, s) if len == 4 && (s == 0 || s == stream) => true,
             (ty, PROBE_STREAM) => PROBE_FRAMES.contains(&ty),
             _ => false,
         };
@@ -951,6 +951,7 @@ mod tests {
         let before = [
             frame(WINDOW_UPDATE, 0, 0, &[0, 0, 1, 0]),
             frame(WINDOW_UPDATE, 0, 3, &[0, 0, 1, 0]),
+            frame(WINDOW_UPDATE, 0, PROBE_STREAM, &[0, 0, 1, 0]),
             frame(SETTINGS, ACK, 0, &[]),
             frame(PING, ACK, 0, &[1; 8]),
             frame(DATA, END_STREAM, PROBE_STREAM, b"{\"data\":[]}"),
@@ -976,6 +977,9 @@ mod tests {
             frame(RST_STREAM, 0, 3, &[0; 4]),
             frame(PING, 0, 3, &[0; 8]),
             frame(5, 0, 0, &[0; 4]),
+            frame(WINDOW_UPDATE, 0, 5, &[0, 0, 1, 0]),
+            frame(WINDOW_UPDATE, 0, 3, &[0, 0, 1, 0, 0]),
+            frame(WINDOW_UPDATE, 0, 0, &[0, 0, 1]),
         ] {
             let mut r = bad.clone();
             r.extend(&head);
@@ -1018,6 +1022,7 @@ mod tests {
         let before = [
             frame(WINDOW_UPDATE, 0, 0, &[0, 0, 1, 0]),
             frame(WINDOW_UPDATE, 0, 3, &[0, 0, 1, 0]),
+            frame(WINDOW_UPDATE, 0, PROBE_STREAM, &[0, 0, 1, 0]),
             frame(SETTINGS, 0, 0, &[0, 3, 0, 0, 0, 100]),
             frame(SETTINGS, ACK, 0, &[]),
             frame(PING, 0, 0, &[1; 8]),
@@ -1071,6 +1076,9 @@ mod tests {
             frame(PING, 0, 3, &[0; 8]),
             frame(5, 0, 0, &[0; 4]),
             goaway(1, 2),
+            frame(WINDOW_UPDATE, 0, 5, &[0, 0, 1, 0]),
+            frame(WINDOW_UPDATE, 0, 3, &[0, 0, 1, 0, 0]),
+            frame(WINDOW_UPDATE, 0, 0, &[0, 0, 1]),
         ] {
             let mut r = bad.clone();
             r.extend(rst(3, 7));
