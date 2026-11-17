@@ -909,6 +909,25 @@ fn client_buffer_cap(body_len: usize) -> usize {
     body_len + body_len / 256 + 4 * MAX_TLS_RECORD
 }
 
+/// The WebSocket read limit of `/session`: above the largest message the
+/// node forwards (16 MiB), so every message it relays reaches
+/// `client_message_size`.
+const MAX_WS_MESSAGE: usize = 17 << 20;
+
+/// A client message larger than a whole buffered body is no honest client's:
+/// the session ends with `error` 413 `frame_too_large`, the client's doing
+/// (no `fault`).
+fn client_message_size(st: &mut Session, len: usize, max_body: usize) -> Result<()> {
+    let cap = client_buffer_cap(max_body);
+    if len > cap {
+        st.status = Some(413);
+        st.code = Some("frame_too_large");
+        st.fault = None;
+        bail!("a client message of {len} bytes (limit {cap})");
+    }
+    Ok(())
+}
+
 /// Append client bytes to a pre-relay buffer, failing once it exceeds the cap.
 fn buffer_client(buf: &mut Vec<u8>, data: &[u8], body_len: usize) -> Result<()> {
     if buf.len() + data.len() > client_buffer_cap(body_len) {
@@ -1402,12 +1421,7 @@ async fn main() -> Result<()> {
         h2_guard: H2Guard::new(h2_retry, fail_file.map(std::path::PathBuf::from)),
     });
 
-    let app = Router::new()
-        .route("/offer", get(offer_http))
-        .route("/session", get(session_ws))
-        .route("/zk", get(zk_ws))
-        .layer(middleware::from_fn_with_state(state.clone(), require_token))
-        .with_state(state.clone());
+    let app = router(state.clone());
 
     tokio::spawn(prune_runs_forever(state.clone()));
 
@@ -1415,6 +1429,16 @@ async fn main() -> Result<()> {
     info!(%listen, token = state.token_hash.is_some(), "cu-sidecar listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// The sidecar's routes, each behind the node's token when one is set.
+fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/offer", get(offer_http))
+        .route("/session", get(session_ws))
+        .route("/zk", get(zk_ws))
+        .layer(middleware::from_fn_with_state(state.clone(), require_token))
+        .with_state(state)
 }
 
 /// The provider host the sidecar verifies the certificate against (`--host`,
@@ -1498,9 +1522,12 @@ fn os_random_32() -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 async fn session_ws(ws: WebSocketUpgrade, State(app): State<Arc<AppState>>) -> impl IntoResponse {
-    // No honest message is larger than a whole buffered body: refuse bigger
-    // ones before they are read into memory.
-    let max = client_buffer_cap(app.max_body);
+    // No honest message is larger than a whole buffered body.
+    // The read limit is above anything the node forwards (`MAX_WS_MESSAGE`),
+    // so a larger message than the sidecar buffers is read and answered as
+    // the client's error (`client_message_size`) instead of failing the read,
+    // which would look like a lost sidecar.
+    let max = MAX_WS_MESSAGE.max(client_buffer_cap(app.max_body) + 1);
     ws.max_message_size(max)
         .max_frame_size(max)
         .on_upgrade(move |socket| session_handler(socket, app))
@@ -1734,7 +1761,14 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
     // Nothing reaches the upstream before a valid setup: an idle or malformed
     // connection costs no provider socket.
     let first = match tokio::time::timeout(SETUP_TIMEOUT, ws_rx.next()).await {
-        Ok(Some(Ok(Message::Text(t)))) => t,
+        Ok(Some(Ok(Message::Text(t)))) => {
+            client_message_size(&mut st, t.len(), app.max_body)?;
+            t
+        }
+        Ok(Some(Ok(Message::Binary(b)))) => {
+            client_message_size(&mut st, b.len(), app.max_body)?;
+            bail!("expected a setup frame")
+        }
         Ok(_) => bail!("expected a setup frame"),
         Err(_) => bail!("no setup within {}s", SETUP_TIMEOUT.as_secs()),
     };
@@ -1778,6 +1812,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 },
                 msg = ws_rx.next() => match msg {
                     Some(Ok(Message::Binary(data))) => {
+                        client_message_size(&mut st, data.len(), app.max_body)?;
                         if st.framing11 && !st.req1 {
                             bail!("framing 1.1: a record before request_ok (request 1 precedes the ClientHello)");
                         }
@@ -1787,6 +1822,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                     // Framing "1.1": request 1 comes before the ClientHello,
                     // because the head N commits to names its path and length.
                     Some(Ok(Message::Text(t))) if st.framing11 => {
+                        client_message_size(&mut st, t.len(), app.max_body)?;
                         if t.len() > MAX_CONTROL_TEXT {
                             bail!("control message of {} bytes (limit {MAX_CONTROL_TEXT})", t.len());
                         }
@@ -1806,7 +1842,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                             _ => bail!("framing 1.1: only request 1 may precede the ClientHello"),
                         }
                     }
-                    Some(Ok(Message::Text(_))) => bail!("unexpected control message during 2PC preprocessing"),
+                    Some(Ok(Message::Text(t))) => {
+                        client_message_size(&mut st, t.len(), app.max_body)?;
+                        bail!("unexpected control message during 2PC preprocessing")
+                    }
                     _ => {}
                 },
             }
@@ -1910,6 +1949,11 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 },
                 msg = ws_rx.next() => {
                     let Some(Ok(msg)) = msg else { break };
+                    match &msg {
+                        Message::Text(t) => client_message_size(&mut st, t.len(), app.max_body)?,
+                        Message::Binary(b) => client_message_size(&mut st, b.len(), app.max_body)?,
+                        _ => {}
+                    }
                     match msg {
                         Message::Text(t) => {
                             if t.len() > MAX_CONTROL_TEXT {
@@ -2183,6 +2227,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
         if let Some(code) = st.code {
             frame["code"] = code.into();
         }
+        if let Some(status) = st.status {
+            frame["status"] = status.into();
+        }
         let _ = to_client.send(Message::Text(frame.to_string().into()));
     }
     if let Some(dir) = &st.run_dir {
@@ -2334,6 +2381,8 @@ struct Session {
     closing11: Option<&'static str>,
     /// The machine-readable `code` of the error frame, when the failure has one.
     code: Option<&'static str>,
+    /// The error frame's HTTP-like `status`, when the failure has one.
+    status: Option<u16>,
     /// Set while a failure would not be the client's doing (reaching the
     /// upstream): the error frame then carries it as `fault`.
     fault: Option<&'static str>,
@@ -4550,6 +4599,73 @@ mod hardening_tests {
         }
         let Some(Message::Text(t)) = out.try_recv().ok() else { bail!("no ready") };
         Ok((st, serde_json::from_str(&t)?))
+    }
+
+    /// A sidecar on a loopback port, serving `app`.
+    async fn serve(app: Arc<AppState>) -> std::net::SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, router(app)).await.unwrap() });
+        addr
+    }
+
+    /// The `error` frame a session ends with (other frames before it are skipped).
+    async fn error_frame<S>(ws: &mut S) -> serde_json::Value
+    where
+        S: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        use futures::StreamExt;
+        loop {
+            let m = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next()).await.expect("no error frame in time");
+            match m {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    if v["type"] == "error" {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("the session ended without an error frame: {other:?}"),
+            }
+        }
+    }
+
+    /// A client message larger than the sidecar buffers (but within what the
+    /// node forwards) is the client's doing: an `error` frame with 413 and
+    /// `frame_too_large`, without `fault`, before and after the setup.
+    #[tokio::test]
+    async fn an_oversized_client_message_is_the_clients_error() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as M;
+        let app = Arc::new(AppState {
+            max_body: 8 << 20,
+            slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            ..Arc::try_unwrap(app_state()).ok().unwrap()
+        });
+        let addr = serve(app.clone()).await;
+        let url = format!("ws://{addr}/session");
+        let big = vec![0x17u8; 9 << 20];
+        assert!(big.len() > client_buffer_cap(app.max_body));
+        // After the setup, while the 2PC runs.
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(M::Text(setup("1.1", serde_json::json!({})).to_string().into())).await.unwrap();
+        ws.send(M::Binary(big.clone().into())).await.unwrap();
+        let e = error_frame(&mut ws).await;
+        assert_eq!((e["status"].as_u64(), e["code"].as_str()), (Some(413), Some("frame_too_large")), "{e}");
+        assert!(e.get("fault").is_none(), "{e}");
+        // Before the setup.
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(M::Binary(big.clone().into())).await.unwrap();
+        let e = error_frame(&mut ws).await;
+        assert_eq!((e["status"].as_u64(), e["code"].as_str()), (Some(413), Some("frame_too_large")), "{e}");
+        assert!(e.get("fault").is_none(), "{e}");
+        // An oversized text frame after the setup.
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        ws.send(M::Text(setup("1.1", serde_json::json!({})).to_string().into())).await.unwrap();
+        ws.send(M::Text(" ".repeat(9 << 20).into())).await.unwrap();
+        let e = error_frame(&mut ws).await;
+        assert_eq!((e["status"].as_u64(), e["code"].as_str()), (Some(413), Some("frame_too_large")), "{e}");
+        assert!(e.get("fault").is_none(), "{e}");
     }
 
     #[test]

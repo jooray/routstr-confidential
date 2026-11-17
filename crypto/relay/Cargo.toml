@@ -30,3 +30,6 @@ rustls-webpki = { version = "0.103", features = ["aws-lc-rs", "alloc", "std"] }
 rustls-pki-types = "1"
 webpki-roots = "1"
 ed25519-dalek = "2"
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"
