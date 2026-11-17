@@ -69,7 +69,7 @@ when it sees everything. On a provider error it sees only the status and headers
   the session fee for a 429, 503 or 401-403, the abandon fee for any other 4xx. If the provider got your
   request but no usage report comes back (another 5xx, a cut stream), the node charges that request's
   whole reservation; you cannot prove who cut it.
-- **Providers:** chat and images; tested with one provider, Venice (others need checking). If this mode
+- **Providers:** chat and images; five providers tested end to end, Venice in production (others fail the checks). If this mode
   is unavailable, a confidential request is refused, never sent openly. routstrd does not use a node that
   still runs the older v2, and says so.
 - **Not covered:** the provider still sees your prompt, and can tell that requests on one connection come

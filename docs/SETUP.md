@@ -189,12 +189,15 @@ Nothing is probed or assumed: you state it.
 
 ```json
 "http": ["2", "1.1"],
-"h2": {"probe_path": "/api/v1/models", "max_requests": 100, "max_lifetime_s": 3600, "idle_secs": 300, "kinds": ["chat", "images"]}
+"h2": {"probe_path": "/api/v1/models", "max_requests": 100, "max_lifetime_s": 3600, "idle_secs": 390, "kinds": ["chat", "images"]}
 ```
+
+(The shipped offer files, `crypto/relay/offer.venice.json` and `offer.openrouter.json`, set `idle_secs` to 390:
+both providers close a silent HTTP/2 connection after 400 s, `docs/PROVIDERS.md`.)
 
 | Field | Range, default | Meaning |
 |---|---|---|
-| `http` | `"2"` and/or `"1.1"`, in your order of preference; default `["1.1"]` | `"1.1"`: one request per connection (works with every provider that passes A1-A13). `"2"`: an HTTP/2 connection that carries many requests; needs the `h2` block and a provider that passes `--h2` |
+| `http` | `"2"` and/or `"1.1"`, in your order of preference; default `["1.1"]` | `"1.1"`: one request per connection (works with every provider that passes A1-A14). `"2"`: an HTTP/2 connection that carries many requests; needs the `h2` block and a provider that passes `--h2` |
 | `h2.probe_path` | a path under 127 bytes | a cheap authenticated `GET` of the provider (its models list). The sidecar sends it once per connection: it is the request that stores the API key in the provider's header table |
 | `h2.max_requests` | 1..1000, 100 | requests per connection |
 | `h2.max_lifetime_s` | 60..86400, 3600 | a connection is closed at the first settlement after this long |
@@ -208,7 +211,7 @@ name the API key by its header-table index) and checks the eight things framing 
 and the key in it, also after the idle time; it honours a zero-size table for response headers; a body of
 the sidecar's `--max-body` passes flow control; no response reflects the key; the usage event ends the
 stream as the proof parses it. It idles one connection for `--h2-idle` seconds (default: the file's
-`h2.idle_secs`, so 5 minutes), sends one body of `--h2-body-bytes` (default 8 MiB, mostly whitespace) and,
+`h2.idle_secs`: 390 s for the shipped Venice file), sends one body of `--h2-body-bytes` (default 8 MiB, mostly whitespace) and,
 when `h2.kinds` lists images, generates one image. It ends with a verdict:
 
 ```
@@ -226,7 +229,15 @@ open, it logs `framing "2" withdrawn from the offer`, stops listing `"2"` in its
 for it for 10 minutes, then offers it again (`framing "2" is offered again`). Clients use `"1.1"`
 meanwhile. Only failures that no client can cause count (the provider closing on the ClientHello, not
 selecting `h2`, or closing on the connection head), so a client cannot switch HTTP/2 off for others. If
-you see the withdrawal repeat, run `--h2` and, if it fails, remove `"2"` from the file.
+you see the withdrawal repeat, run `--h2` and, if it fails, remove `"2"` from the file. Connections that are
+already open when `"2"` is withdrawn keep working; the node logs a warning naming the old and the new list
+of framings when the list it serves changes.
+
+**A stream the provider refuses.** Under load a provider may refuse a request's HTTP/2 stream without
+processing it (`RST_STREAM(REFUSED_STREAM)`, or a GOAWAY below the stream). The client proves that from the
+provider's own frames (`disclose_reset`); the node settles it like a 429 (the session fee if still due,
+which also releases the deposit), the connection closes, and the client runs the request again on a new
+connection. Nothing to configure; it shows in the node's log as a settled refusal.
 
 The sidecar ships with an offer for Venice (`crypto/relay/offer.venice.json`: host, request-head template,
 the `chat` block that describes the pinned suffix); adapt it for another OpenAI-compatible provider. The
@@ -303,7 +314,12 @@ unused connections. A connection counts as unused from the moment its deposit is
 its first request is released to the provider (or the connection ends). Armed connections count. Connections that have not reserved yet (waiting for
 the setup frame, which must come within 10 s and be at most 256 KiB, or with the reservation in progress) are a
 separate pending pool: at most 4 per address (IPv6 grouped by /64) and 1024 in all; when either is full, the
-oldest connection still waiting for its setup is evicted. The limit is
+oldest connection still waiting for its setup is evicted. Beyond the unused ones, an address may hold at
+most `CONFIDENTIAL_MAX_ACTIVE_PER_IP` (default 16) connections in all, and the node at most 32: when the
+address or the node is full, the node first closes the connection of that address (or, for a full node, of
+any address) that has idled longest after a settled request (`closed`, reason `evicted`; its deposit was
+already released by that settlement, so its client loses only a handshake), and refuses the setup only when
+there is none. The limits are
 only as good as the node's idea of the client address, which depends on how the node is reached:
 
 | Deployment | What to set | Result |
@@ -353,7 +369,17 @@ A connection has 600 s from its socket's accept (armed time included) until the 
 written; a request has 600 s from `request_ok` until its last record is released to the provider, and a
 fresh 600 s from there for the response and the disclosure. The node's limits match. Client bytes held
 before a proof covers them are capped at about the declared body length, and a client cannot raise the
-proof channel's preallocation above the sidecar's own.
+proof channel's preallocation above the sidecar's own. A single client WebSocket message larger than a
+connection may buffer (about the body limit plus four TLS records) ends the connection as the client's own
+error (`error` 413 `frame_too_large`, no `fault`), so its deposit is charged.
+
+**Versions and health.** `cu-sidecar --version`, `cu-prover --version` and `cu-2pc --version` print the crate
+version, the git commit they were built from (`unknown` outside a checkout; a container build without `.git`
+passes it as `CU_BUILD_COMMIT`), protocol `3`, the 2PC tag `split-public-1` and the proof-channel version.
+`GET /healthz` on the sidecar (the same token rule as its other routes) returns JSON with the same version
+fields, `http` as served now, the state of framing `"2"` (`h2_withdrawn`, seconds left, consecutive failed
+opens) and the number of active, armed and provider-connected sessions; no secrets and no session ids. Use it
+for monitoring from the node's host; the port stays unpublished.
 
 **2. The node**: build routstr-core from the `confidential-2pc` branch of jooray/routstr-core (its `Dockerfile` is the upstream one)
 and set
@@ -403,6 +429,10 @@ location ~ ^/v1/confidential/(ws|zk)$ {
 The same holds for anything else that sees the URL: a CDN's request logs, a WAF, a load balancer, an
 error log that records the request line.
 
+WebSocket compression (`permessage-deflate`) on the proxy gains nothing: the session socket carries TLS
+records and the 2PC and proof channels carry garbled tables and correlations, all of which look random and
+do not compress. Leave it off.
+
 **3. Check it.**
 
 ```sh
@@ -425,8 +455,9 @@ request is a connection. Normal (non-confidential) requests are unaffected.
 
 `crypto/client/src/driver.ts` is a self-contained client that opens connections to a node and prints every
 check (`node --experimental-strip-types src/driver.ts --node https://<node> --node-pubkey <hex or npub>
---model <m> --max-tokens 40 --http auto --requests 2 --auth <sk-… or cashu…>`; `--http 2` or `--http 1.1`
-forces a framing); see `AGENTS.md` for running the whole stack locally, the gates and the measurements.
+--trusted-host <the offer's upstream_host> --model <m> --max-tokens 40 --http auto --requests 2
+--auth <sk-… or cashu…>`; `--http 2` or `--http 1.1` forces a framing; `--trusted-host`, or
+`CU_TRUSTED_HOSTS`, is required: the driver has no built-in provider host); see `AGENTS.md` for running the whole stack locally, the gates and the measurements.
 
 ## Upgrading from v2
 

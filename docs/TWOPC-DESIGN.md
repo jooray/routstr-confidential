@@ -146,6 +146,13 @@ authenticated by a hash of its labels.
   bits are the correct function of C's input, N's effective input and the digests C computed itself: C's
   input labels and the digest labels are pinned by pointer checks against opened, MAC-checked masks, and C
   decodes with such masks. Soundness is about 2^-60 per session (five checks).
+- *Soundness is statistical, per connection, and adds up.* The 2^-60.6 bound (five stages at ≤ 2^-63 each,
+  `TWOPC-NODE-GARBLING.md` §4) is the chance that one connection's wrong evaluation passes. Every connection
+  draws a fresh Δ_B, χ and salt, so a node that cheats on every connection succeeds somewhere with
+  probability at most k·2^-60.6 over k connections: about 2^-40.6 after a million connections (2^20),
+  2^-30.6 after a billion. Each failed attempt is an abort the client sees. The bound covers what is
+  committed in preprocessing; the labels N chooses online are argued separately and heuristically
+  (`TWOPC-NODE-GARBLING.md` §5).
 - *Digest labels.* N sends them, and N knows `IS_k`. A label for another digest bit fails the pointer check
   whatever C's secrets are, because C computed the digest itself. A value that is not a label of the wire
   fails the consistency check or a label-check pair (`TWOPC-NODE-GARBLING.md` §5). So the stage runs on the
@@ -172,6 +179,17 @@ authenticated by a hash of its labels.
   outcomes. What a full proof must still enumerate: every externally distinguishable result of a malicious
   ECtF, OT and preprocessing, of every stage, of N's own report checks, of the TLS verification, timeouts and
   error messages; the tests compare selected cheats at two stages (`abort_looks_the_same_whatever_failed`).
+- *Why 3 bits per connection is harmless.* The values N can aim a selective failure at are C's ECDHE share
+  `x_C` and the secrets of the schedule (HS, MS, c_hs, s_hs, c_ap_1, s_ap_0): each is a fresh, uniformly
+  distributed (or pseudorandom) value of 256 bits, drawn for this connection and used on no other. No prompt,
+  no response, no credential and no other low-entropy or long-lived value enters the circuit: C encrypts its
+  records outside the 2PC with keys derived from c_ap_1, and N writes the credential under `K_0` outside it.
+  A leak with at most 8 outcomes lowers the (average) min-entropy of a secret by at most log2 8 = 3 bits
+  (the standard bound of Dodis, Ostrovsky, Reyzin and Smith: H̃∞(X | L) ≥ H∞(X) − log2 |L| for a leak L with |L| outcomes), so it multiplies the success probability of any guess
+  by at most 8: a 256-bit secret keeps at least 253 bits, and the AES-128 keys derived from c_ap_1 and s_ap_0
+  stay at most 8 times easier to guess than without the leak (≤ 2^-125). The bits do not accumulate across
+  connections, since no secret is used twice; within a connection they cover every request it carries
+  (§10 of `PROTOCOL-V3.md`, risk 6), which is why the bound is per connection.
 - *Why an abort is one outcome per stage.* C's three checks of a stage (input pointer bits, consistency
   check, label-check pairs) end in the same single byte, sent after C evaluated the whole stage
   (`abort_looks_the_same_whatever_failed`). There is no "N rejected C's labels" outcome: the label-check
@@ -268,10 +286,32 @@ as row wires. Why the anchors are still SHA-256 in the circuit: `TWOPC-NODE-GARB
 
 ### ECtF
 
-mpz2's OLE-based A2M/M2A, proven secure against semi-honest parties only. We do not argue that it stays
-private against a malicious N; the leakage bound is conditional on that. Under that assumption a deviation
-either shifts the result (a wrong ECDHE secret, which the TLS handshake detects: the server Finished under
-s_hs fails) or trips C's degenerate-share check, and N can make either depend on C's share: outcomes 1 and 5.
+mpz2's OLE-based A2M/M2A, proven secure against semi-honest parties only. The roles
+(`crypto/twopc/src/ectf.rs`, `lib.rs`): **C is the OLE sender** (`ShareConversionSender`, a KOS COT sender,
+Chou–Orlandi receiver for its base OTs), **N is the OLE receiver** (`ShareConversionReceiver`). C inputs
+`[−y1, −x1]`, N `[y2, x2]`, the coordinates of each party's `a·S`, where S is the provider's share of this
+handshake and `a_C`, `a_N` are fresh scalars of this connection. Both parties check their own multiplicative
+share for zero (`ectf: degenerate share`) and abort.
+
+*Against a malicious N* (protecting C's `x_C`). We do not argue that the conversion stays private against a
+malicious N; the leakage bound above is conditional on that. Under that assumption a deviation either shifts
+the result (a wrong ECDHE secret, which the TLS handshake detects: the server Finished under s_hs fails) or
+trips C's degenerate-share check, and N can make either depend on C's share: outcomes 1 and 5.
+
+*Against a malicious C* (protecting N's `x_N`, and with it the ECDHE secret, `K_0` and the credential). As
+the OLE sender, C chooses the correlations behind N's outputs. In a COT-based OLE a sender that deviates can
+at most make the receiver's output wrong as a function of the receiver's choice bits (a selective failure),
+which here is a function of N's input `(x2, y2)`; it cannot read N's input. This is the general shape of such
+attacks, not an analysis of mpz2's code: we have not shown that mpz2's A2M/M2A give a malicious sender no
+more than that. Under that assumption a wrong output shows only as an outcome C observes: N's
+degenerate-share abort (`ectf`), a handshake that fails (the shares no longer add up to the ECDHE secret, so
+the provider's Finished does not verify, for N and C alike), or success: at most log2 3 ≈ 1.6 bits per
+connection about `a_N·S`. That value is fresh and single-use (a new `a_N` and a new S per connection), at
+least 256 bits, and not the input of anything else, so the argument of "Why 3 bits per connection is
+harmless" above applies with 1.6 bits. A wrong ECDHE secret gives C nothing either: N writes the credential
+only after it verified the provider's Finished under its own handshake secrets, and `K_0` is an output of
+the 2PC that only N decodes.
+
 Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 
 ### What is proven, what is argued, what is assumed
@@ -279,17 +319,19 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 | part | status |
 |---|---|
 | QuickSilver product check, IT-MAC openings | standard (QuickSilver/Wolverine soundness), GF(2^128) |
-| three-halves garbling privacy and authenticity | Rosulek–Roy proof, under their hash assumption (instantiated, as in mpz2, with fixed-key-AES TCCR); the matrices need comparing with the paper |
+| three-halves garbling privacy and authenticity | **assumed, not a cited proof**: Rosulek–Roy prove it for their scheme under their hash assumption; this code was rebuilt without the paper, its evaluator matrices come from a reimplementation and are not yet compared with the paper's figure, and the hash is instantiated, as in mpz2, with fixed-key-AES TCCR, whose fit to that assumption is itself to be reviewed (`TWOPC-NODE-GARBLING.md` §6) |
 | AND-gate consistency check with garbler-held masks, 64-bit projection, salt | argued; **no published proof** for this garbler-only variant |
 | the check run per stage, crossing wires as row wires | argued (`TWOPC-NODE-GARBLING.md` §2, §4); new in v3 |
 | label-check pairs | argued (`TWOPC-NODE-GARBLING.md` §7); new in v3 |
 | public `IS_k`, digest labels from N pinned by pointer checks | argued above; assumptions 1 and 2; new in v3 |
 | leakage bound (≤ 3 bits per connection) | counting argument in the idealized abort model above, conditional on ECtF and the garbling argument; not a full enumeration of a malicious N's observations |
+| harmlessness of the leak | argued above: every value it can concern is a fresh secret of 256 bits, used for one connection; min-entropy loss ≤ log2 of the outcomes |
+| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection for the committed parts, k·2^-60.6 over k connections (above) |
 | distinct inner digests under one key (assumption 3) | assumed: compression-function collision resistance under a known chaining value |
 | the chained multi-output composition with public `IS_k` | **not written** (hybrids over both directions and every value revealed together) |
 | soundness of online digest labels N chooses after the salt is known | argued heuristically (`TWOPC-NODE-GARBLING.md` §5), not for arbitrary online labels |
 | Ferret/KOS against a malicious receiver (N for the MAC COTs under Δ_B; C for the 256 COTs under Δ_A), KOS consistency-check leakage of a few Δ bits with negligible probability | assumed from mpz2 |
-| ECtF | semi-honest only; no argument for a malicious N |
+| ECtF | semi-honest only. Against a malicious N: no argument. Against a malicious C (the OLE sender): argued above, assuming a deviating sender gets at most a selective failure on N's choice bits (≤ log2 3 bits per connection); not shown for mpz2's code |
 | external review | **none yet** |
 
 ## Review as an adversary (2026-11-11)

@@ -24,8 +24,9 @@ abstract: |
   provider's own report for that request. Where HTTP/2 is not available the same lifecycle carries one
   HTTP/1.1 request per connection. A split of HMAC at the compression function shrinks the garbled key
   schedule from 31 to 22 SHA-256 compressions, at the cost of making inner hash states public. A
-  handshake moves 16.4 MB from the node to the client and 1.1 MB back, about 7 s on a home link with a
-  2 Mbit/s uplink. Against a live provider, a later request on an open connection moved 0.5 to 1.0 MB
+  handshake moves 16.4 MB from the node to the client and 1.1 MB back, about 7 s of two-party computation
+  on a home link with a 2 Mbit/s uplink; a cold request's first token arrives after about 12 s on a
+  2/50 Mbit/s link, handshake and proofs included. Against a live provider, a later request on an open connection moved 0.5 to 1.0 MB
   and was released to the provider about 60 ms after it was sent. The new parts (the frame rules, the
   window proof, the split key schedule) have had no external review.
 ---
@@ -1570,8 +1571,9 @@ refused before the provider received a request it would bill wrongly:
 
 An honest control and a v2-socket control run in the same gates.
 
-**Scope.** One provider was tested. The HTTP/2 behaviours above are properties of that provider's
-front end on the day of the test.
+**Scope.** The measurements above are for the case-study provider. Four more providers ran end to end
+through a node on 2026-11-12 and 2026-11-13 (`docs/PROVIDERS.md`); others failed the profile. The HTTP/2
+behaviours above are properties of each provider's front end on the day of the test.
 
 ## 6.6 The dual-execution version
 
@@ -1880,8 +1882,9 @@ epoch and the client every other one, a credential that the node writes once per
 later HTTP/2 requests name by a header-table index, a window proof that keeps the client's records to
 the frames and the public suffix they must be, and a proven usage disclosure for settlement.
 
-The two-party handshake costs 16.4 MB to the client and 1.1 MB back, and about 7 s on a home link with
-a 2 Mbit/s uplink. In the previous version every request paid it. Now a connection pays it once: in
+The two-party handshake costs 16.4 MB to the client and 1.1 MB back, and about 7 s of two-party
+computation on a home link with a 2 Mbit/s uplink (the first token of a cold request, with the TLS
+handshake and the proofs, after about 12 s on a 2/50 Mbit/s link). In the previous version every request paid it. Now a connection pays it once: in
 our runs against a live provider, a later request on an open HTTP/2 connection moved 0.5 to 1.0 MB and
 was released to the provider about 60 ms after it was sent. Where a provider or a client cannot use
 HTTP/2, the same lifecycle carries one HTTP/1.1 request per connection at the cost of the handshake.
@@ -1889,8 +1892,8 @@ HTTP/2, the same lifecycle carries one HTTP/1.1 request per connection at the co
 The price is a larger argument. The key schedule exposes the inner HMAC states to both parties and
 rests on two compression-function assumptions; a cheating node can learn at most 3 bits per connection
 about values that are never reused; and the HTTP/2 frame rules, the window proof and the read-back
-argument for the header table are new. None of these has had external review, one provider has been
-tested, and that is the work that remains.
+argument for the header table are new. None of these has had external review (`docs/SECURITY-CLAIMS.md` lists
+what is proven, argued and assumed, and the order of review), and that is the work that remains.
 
 ---
 

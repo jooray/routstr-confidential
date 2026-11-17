@@ -18,9 +18,9 @@ The protocol is **v3** ([`PROTOCOL-V3.md`](PROTOCOL-V3.md), the normative specif
 - Two framings, listed by the operator in the node's signed offer in order of preference. **`"2"` (HTTP/2):** the node writes its API key once, in the connection's opening; it then sits in the provider's HPACK table and each later request, written by the client, names it by a one-byte index. Requests are sequential on a connection, and the client keeps connections in a pool. **`"1.1"` (HTTP/1.1):** one request per connection, v2's flow. A client falls back from `"2"` to `"1.1"` on the same node when an HTTP/2 connection fails before a body was released.
 - A smaller two-party key schedule (`split-public-1`): 16.4 MB node→client instead of 22.1 MB.
 - One client statement, **π_WIN**, replaces π_C2S: the node holds every client record until it verifies.
-- Money: a connection deposit at the setup, a reservation per request, the session fee once per connection.
+- Money: a connection deposit at the setup, a reservation per request, the session fee once per connection. A stream the provider refuses unprocessed (`RST_STREAM(REFUSED_STREAM)`, or a GOAWAY below it) is proven by the client from the provider's own frames and settled like a 429; the client retries on a new connection.
 - **v3 only.** A v3 node answers a v2 client with `upgrade_required`; a v3 client reports `node_protocol_outdated` for a v2-only node. v2 (one handshake per request) is retired and archived on the branch `v2` here and `confidential-v2` in routstr-core, routstr-sdk and routstrd; v1 (no two-party computation) on `v1-poc`.
-- Limits: π_WIN, the HTTP/2 frame rules and the key schedule have had no external review; one provider (Venice) was tested; requests on one HTTP/2 connection are linkable for the provider.
+- Limits: π_WIN, the HTTP/2 frame rules and the key schedule have had no external review ([`docs/SECURITY-CLAIMS.md`](docs/SECURITY-CLAIMS.md) lists what is proven, argued and assumed); five providers ran end to end ([`docs/PROVIDERS.md`](docs/PROVIDERS.md)); requests on one HTTP/2 connection are linkable for the provider.
 
 What changed and how to upgrade: [`docs/V2-V3-ONE-PAGER.md`](docs/V2-V3-ONE-PAGER.md). The reasoning: [`PROTOCOL-V3-DRAFT.md`](PROTOCOL-V3-DRAFT.md). The paper describes the guarantees and the two-party handshake.
 
@@ -75,6 +75,8 @@ cd crypto
 cargo build --release -p cu-sidecar -p zkbench   # cu-sidecar + cu-prover in zkbench/target/release/
 cargo test --release -p cu-crypto -p zkbench
 ```
+
+The offline checks CI runs on every push: `crypto/tools/ci-offline.sh`.
 
 Running a node with the sidecar, routstrd setup and the test scripts: [`AGENTS.md`](AGENTS.md) and [`crypto/PROGRESS-CONFIDENTIAL.md`](crypto/PROGRESS-CONFIDENTIAL.md).
 

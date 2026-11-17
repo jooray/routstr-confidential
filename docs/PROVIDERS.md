@@ -10,7 +10,7 @@ checks before you rely on a row. Raw outputs (keys never present) are in
 length, the `chat` block with the generic pins `n`, `stream`,
 `stream_options.include_usage`, an `h2` block with the provider's `/models` as
 `probe_path`), then the steps below. The checks of `provider-profile-check.py`
-are numbered A1–A13 (HTTP/1.1) and H1–H8 (HTTP/2); the per-provider notes name
+are numbered A1–A14 (HTTP/1.1; these runs predate A14) and H1–H8 (HTTP/2); the per-provider notes name
 them next to what they mean, for operators who re-run the check.
 
 1. `provider-profile-check.py` HTTP/1.1 items A1, A2, A4, A5, A6, A7, A9, A10,

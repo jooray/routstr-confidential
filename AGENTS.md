@@ -51,6 +51,7 @@ README note. Do not rebase or update them.
 | `docs/SETUP.md` | how to try it and how to run a node (operator settings: `http`, `h2`, deposit, idle time) |
 | `docs/TWOPC-DESIGN.md` | the two-party handshake, epochs, the 2PC security model |
 | `docs/CHAT-SUFFIX.md` | the offer-driven chat suffix: the `chat` block, byte-exact rendering, the client policy, the caller-conflict rule |
+| `docs/SECURITY-CLAIMS.md` | for an outside reviewer: each security claim, whether proven, argued or assumed, the test that exercises it, the order of review |
 | `docs/TWOPC-NODE-GARBLING.md` | the node-only authenticated garbling: construction, security argument, the download cuts (64-bit salted rows, three-halves; why h1/h2/hk stay SHA-256) |
 | `docs/V1-V2-ONE-PAGER.md` / `.pdf` | v1 vs v2 trade-offs (data, speed, security); historical, v1 is retired |
 | `docs/original/*` | **local only, not published** (git-ignored). The rows below describe what is in it |
@@ -67,7 +68,7 @@ README note. Do not rebase or update them.
 app ──OpenAI API──► routstrd ──routeRequests(confidential)──► SDK RoutstrClient
                                                                 │ _makeRequest: transport branch
                                                                 ▼
-             client/confidential/transport.ts → h2pool/h2conn (framing "2") | session.ts (framing "1.1")
+             client/confidential/transport.ts → pool.ts → connection.ts (both framings)
                                    │           (TLS fork + cu-2pc + cu-prover)
                                    │ WebSocket /v1/confidential/ws?v=3 (+ /zk: 2PC, proof channel)
                                    ▼
@@ -220,7 +221,7 @@ operators and users.
 | node offer (v3 fields, `pin_offer`, `check_request_offer`), model→provider candidate, billing glue (deposit, session fee once per connection; images: `images_offer_block`, `reserve_image`, `settle_flat`) | `routstr-core/routstr/confidential.py` |
 | node relay + interception (one path for both framings: setup and deposit, each `request` reserved and settled, the deposit outcome) | `routstr-core/routstr/confidential_ws.py` (`_run_h2_session`) |
 | node hooks | `core/main.py` (routes), `core/settings.py` (`CONFIDENTIAL_SIDECAR_URL`, `CONFIDENTIAL_SIDECAR_TOKEN`, `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT`, `CONFIDENTIAL_IDLE_TIMEOUT_S`), `payment/models.py` (`confidential_upstream` field) |
-| SDK transport + connections | `routstr-sdk/client/confidential/{transport,h2,h2conn,h2pool,session,offer,suffix,receipt,hosts,prewarm}.ts`, vendored TLS fork in `tls-fork/` (MIT, see `FORK-NOTES.md`) |
+| SDK transport + connections | `routstr-sdk/client/confidential/{transport,pool,connection,h2,wire,twopc,zkchan,prover,offer,suffix,receipt,hosts}.ts` (`pool.ts` keeps open and pre-warmed connections, `connection.ts` is one connection of either framing, `wire.ts` the messages, `twopc.ts`/`zkchan.ts` the 2PC and proof channel), vendored TLS fork in `tls-fork/` (MIT, see `FORK-NOTES.md`) |
 | SDK hooks | `client/RoutstrClient.ts` (`confidential` param, transport branch, `finalize` awaits settlement, `setConfidentialTransport` registry on `globalThis`), `client/resolveRequestContext.ts` (`requireConfidential` filter), `core/types.ts`, `bun.ts`/`node.ts` (register the transport) |
 | routstrd hooks | `src/utils/config.ts` (`confidentialUpstream`, with `http2`), `src/daemon/index.ts`, `src/daemon/http/index.ts` (opt-in header → `routeRequests`) |
 
@@ -238,10 +239,13 @@ cd $P/crypto && cargo build --release -p cu-sidecar -p zkbench -p twopc
 #   (limits: --max-sessions 32, --max-body 8388608; 15 s setup, 180 s 2PC, 600 s to head_written,
 #    600 s per request phase; run files kept --runs-keep-hours 24, 0 = removed at the end)
 cd $P/crypto/client && export CU_PROVER=../zkbench/target/release/cu-prover CU_2PC=../zkbench/target/release/cu-2pc
-node --experimental-strip-types src/driver.ts --sidecar http://127.0.0.1:7444 \
+node --experimental-strip-types src/driver.ts --sidecar http://127.0.0.1:7444 --trusted-host api.venice.ai \
   --model mistral-small-3-2-24b-instruct --max-tokens 40 --http 2 --requests 3     # or --http 1.1 | auto
 #   more: --arm (armed, then "go" on stdin), --image --image-model z-image-turbo, --body-bytes N,
 #   --refuse-first, --adv MODE (the attacks of v3-check.sh), --legacy-v2-socket
+#   --trusted-host (repeatable; or CU_TRUSTED_HOSTS, comma-separated) is required: the driver has no
+#   built-in provider host and exits 2 without one. The gate and bench scripts set CU_TRUSTED_HOSTS to
+#   the host of CU_UPSTREAM unless it is set.
 ```
 
 **With a node** (money: deposit, reservations, receipts). The node agent's
@@ -274,7 +278,7 @@ sqlite3 /tmp/node.db "insert into api_keys(hashed_key,balance,total_spent,total_
 # reference client (credential: sk- key from /v1/balance/create, or a Cashu token);
 # take a model from `curl -s 'http://127.0.0.1:8010/v1/confidential/offer?v=3'` (price_list)
 cd $P/crypto/client && node --experimental-strip-types src/driver.ts --node http://127.0.0.1:8010 \
-  --model <model from price_list> --max-tokens 40 --http auto --requests 2 --auth <sk-…|cashu…>
+  --trusted-host api.venice.ai --model <model from price_list> --max-tokens 40 --http auto --requests 2 --auth <sk-…|cashu…>
 ```
 
 For routstrd, use a scratch `ROUTSTRD_DIR` and add a `confidentialUpstream`
@@ -284,11 +288,12 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 **Checks.**
 - `crypto/tools/v3-check.sh` (**the sidecar + reference client gate**; real
   provider, no node; `CU_V3_PORT` picks the sidecar port): the offline
-  self-checks, then 53 cases (51 without the two paid images), both framings: honest (one, several, error
+  self-checks, then 54 cases (52 without the two paid images), both framings: honest (one, several, error
   head, 200 kB body, decoy model, armed, refused-then-good, image), a v2
   socket, every attack (hidden HEADERS, TLS padding, suffix/model/cap swap,
   path, usage replay, image suffix, early record, no proof, own key share,
-  2PC version tag, forged refusals `h2-r-refusal-*`), and the forced failure of "2" (fallback, withdrawal,
+  2PC version tag, forged refusals `h2-r-refusal-*`, a 9 MiB client message
+  `h2-l-big-frame`: `error` 413 `frame_too_large` without `fault`), and the forced failure of "2" (fallback, withdrawal,
   return). `v3_eval.py` judges each case from the driver's output and the
   sidecar's own run files; exit ≠ 0 on any deviation. Two paid images
   (`CU_NO_IMAGES=1` skips them).
@@ -298,7 +303,8 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   reservation, fees) in the node's database. Includes the cancel-and-reuse
   attacks (`h2-k-rst-reuse`, `-rst-reuse-same`, `-rst-before-final`,
   `-rst-after-release`, `-ctl-headers`, `h11-k-extra-record`,
-  `h11-k-pipelined`; driver `--adv rst-*|ctl-headers|extra-record`).
+  `h11-k-pipelined`; driver `--adv rst-*|ctl-headers|extra-record`) and
+  `h2-l-big-frame` (the oversized client message: deposit charged, `unused`).
 - `crypto/tools/v3-routstrd-check.sh`: sidecar, node, stub mint and a
   scratch routstrd; curl through the local API (sequential, burst, forced
   "1.1"). Needs the SDK and routstrd checkouts built.
@@ -321,6 +327,10 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 - `crypto/tools/adversarial-images.sh`, `stall-repro.sh` (repeated
   connections, fails below a success rate): ported to the v3 driver.
 - `crypto/tools/regression-modality.py`: image/data-URI rejection per model (only relevant if you restrict models with the sidecar offer's `model_allowlist`; the shipped offer leaves it empty, since the node reserves a full-context prompt). Vision models are served and FAIL it by design: chat with image input works (`driver.ts --attach`, the PWA's Image button).
+- `crypto/tools/ci-offline.sh` (what `.github/workflows/ci.yml` runs on every push and pull request; no
+  provider, no secrets): the Rust unit tests, `provider-profile-check.py --self-test`, the reference client's
+  offline checks, the client root store against `gen-client-roots.py`, every copy of a vector of
+  `crypto/conformance/` byte-identical, a secret scan. `CU_CI_SKIP_CARGO=1` skips the Rust tests.
 - Unit tests:
   - `crypto`: `cargo test --release -p cu-sidecar` (120), `-p zkbench`, `-p twopc`
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
@@ -445,7 +455,7 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   - The sidecar's guard does not see a provider that fails only once a
     request's records arrive (the body is the client's); the profile check
     and the client's fallback cover that.
-  - Pre-warming (SDK `client/confidential/prewarm.ts`, routstrd
+  - Pre-warming (SDK `client/confidential/pool.ts`, the `prewarm` option; routstrd
     `confidentialUpstream.prewarm`): an armed connection is bound to the
     credential only, with one pre-warmed proof channel
     (`/zk?proof=zkchan`, `cu-prover --channel`, `zkbench/src/channel.rs`)

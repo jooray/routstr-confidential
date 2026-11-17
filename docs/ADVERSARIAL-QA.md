@@ -85,12 +85,15 @@ authors' working documents and are not published:
 >   record), so the node cannot aim them at other plaintext. On an upstream
 >   error the client discloses only the response head.
 > - **Not reviewed.** π_WIN, the HTTP/2 frame rules and the key schedule
->   `split-public-1` have had no external review. One provider (Venice) was
->   tested.
+>   `split-public-1` have had no external review (`docs/SECURITY-CLAIMS.md` lists
+>   what is proven, argued and assumed). Venice is the deployed provider;
+>   Numes, xKiro, OpenRouter and Cloudflare Workers AI also ran end to end,
+>   through a node (`docs/PROVIDERS.md`).
 >
 > The provider assumptions are re-checked live by
-> `crypto/tools/provider-profile-check.py` (A1–A13, 13/13 for Venice on
-> 2026-10-28; `--h2` checks H1–H8 for framing `"2"`). "Escrow" in SPEC and in
+> `crypto/tools/provider-profile-check.py` (A1–A14; the last recorded run
+> for Venice, 2026-10-28, passed A1–A13, 13/13, before A14 existed; `--h2`
+> checks H1–H8 for framing `"2"`, `--images` I1–I10). "Escrow" in SPEC and in
 > Appendix C means what is now the node's reservation.
 
 ---
@@ -807,7 +810,7 @@ abandon fee for an unused session. v3:
 | The provider closed the open, idle connection before any request | released (`provider_closed`) | the node |
 | The same, but the client had control frames written on it first (`after_client_frames`) | **charged** (`unused`): the close may be the client's doing | the client |
 | The connection was evicted (a newer setup needed its slot; only idle connections that already settled a request) | already released by that settlement | nobody |
-| The node refused a request with a 5xx, or a billing write failed | released (`node_failure`) | the node |
+| The node refused a request with a 5xx and accepted none of the connection's requests after it, or a billing write failed (a 5xx refusal followed by an accepted request that is then abandoned is the abandoned row) | released (`node_failure`) | the node |
 | A request was written in full and never settled | released; that request's reservation is charged | the client, through the reservation |
 | The provider answered a request and closed before its body was complete | released; the request keeps the session fee | the client, through the session fee |
 

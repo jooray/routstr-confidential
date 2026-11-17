@@ -101,6 +101,9 @@ iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   lsb Δ_B fixed to 1 the image of the admissible Δ_B is all of GF(2)^64 (2^-64) or, for the ~2^-64 fraction
   of E whose kernel lies in lsb = 0, a 63-dimensional coset (2^-63). So ≤ 2^-63 per stage, ≤ 2^-60.6 for the
   five stages, and nothing to grind: N learns nothing about Δ_B and the first failure ends the session.
+  The bound is statistical and per connection. Across connections it adds up: Δ_B, χ and the salt are fresh
+  each time, so a node that tries on every connection passes somewhere with probability at most
+  k·2^-60.6 after k connections (about 2^-40.6 after 2^20), each failed try being an abort the client sees.
 - **The salt.** H is TCCR with the tweak (salt, stage, row index); the salt comes from C's seed. With E = 0,
   a label that is not one of the wire's two labels but has the right pointer bit changes only the hash term of
   the sum, and a 64-bit hash matches with probability 2^-64. A garbler that reuses Δ_A and its keys across
@@ -181,6 +184,10 @@ garbler 6, with tweaks (gate, slot) disjoint from the check tweaks (bit 127).
   Rp) come from a public C++ reimplementation, read as reference only; the garbler is derived independently
   and checked exhaustively. **The external review must compare the matrices with RR21's figure.**
   Correctness does not depend on them, but the privacy argument does.
+- Status: privacy and authenticity of these tables are an **assumption to be reviewed, not a cited proof**.
+  RR21's theorem is about their scheme under their hash assumption; it covers this code only once the
+  matrices match and once the instantiation of H (fixed-key-AES TCCR with the (gate, slot) tweaks above, as
+  in mpz2) is shown to meet that assumption.
 
 ## 7. Label-check pairs
 

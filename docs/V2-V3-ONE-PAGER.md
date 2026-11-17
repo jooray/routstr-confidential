@@ -44,7 +44,7 @@ request per connection, inside the same lifecycle.
 **Money.** At the setup the node holds a **connection deposit** instead of a full-context reservation. It
 is released with the first settled request, and charged when a connection is opened and wasted (no request
 settled, and the failure was not the node's or the provider's). Each request has its own reservation, sized
-as v2's, and its own receipt. The node closes an idle connection after `idle_timeout_s`.
+as v2's, and its own receipt. The node closes an idle connection after `idle_timeout_s`. A stream the provider refused unprocessed is proven and settled like a 429.
 
 **Security.** Unchanged: the trust model, the roles, the joint key share, the garbling construction, π_NK,
 π_C3S, the suffix, the attestation and the receipt. New or changed:
@@ -57,7 +57,7 @@ as v2's, and its own receipt. The node closes an idle connection after `idle_tim
 - *The key schedule makes the inner HMAC states public* and adds label-check pairs; two more assumptions.
 - *Linkability.* Requests on one HTTP/2 connection are linkable for the provider. The client's `reuseScope`
   separates what must not be linked; routstrd separates by local API key by default.
-- *Not reviewed.* π_WIN, the frame rules and the key schedule: no external review. One provider tested.
+- *Not reviewed.* π_WIN, the frame rules and the key schedule: no external review. Five providers tested.
 
 **Upgrading.** v3 only: a v3 node answers a v2 client with `upgrade_required`, a v3 client reports
 `node_protocol_outdated` for a v2-only node. Neither falls back.
