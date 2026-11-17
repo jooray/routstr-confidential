@@ -80,7 +80,9 @@ The operator states what their upstream supports. Nothing is probed or assumed.
 
 ### 2.2 Node offer (signed)
 
-`GET /v1/confidential/offer` returns the signed offer with:
+`GET /v1/confidential/offer` returns the signed offer. An offer is served while it equals the offer the node
+would sign now (fetched or not); a request may name an older one for 10 minutes after it stopped being the
+current one, and a framing withdrawn meanwhile does not end a live connection (§3.3). The offer has:
 
 - `v: 3` (exactly; no list).
 - `http`, `h2`: copied from the sidecar.
@@ -187,18 +189,26 @@ hostname, CertificateVerify and both Finished messages), with:
   when C has sent no record for it. C MUST wait for `request_ok` before sending records. (The prototype
   ended the connection; a 402 then cost a handshake.) In framing `"1.1"` a refused request 1 may be
   followed by another `request` 1 while the connection is still ARMED.
-- The node remembers a signed offer for 10 minutes after it last served it **or while a connection opened
-  on it is alive** (for the comparison of connection-level fields). Rates are frozen per request from the
-  offer the request names, and a request may name an offer only **while the node serves it or for 10
-  minutes after it stopped** (else `offer_expired`): old prices never outlive a price change by more than
-  that, whatever the connection's lifetime. C refetches the offer on `offer_expired` (and SHOULD every 10
-  minutes) and names the newest; a price-only change keeps the connection.
-- **Security-relevant changes retire live connections.** Once the node serves an offer whose `v`, `twopc`,
-  `upstream_host`, `head_template`, `chat`, `h2` or `images` block (prices aside) differs from the offer a
-  connection was opened on, that connection takes no further request (`offer_changed`, whichever offer the
-  request names): a changed suffix or head is in force for every request from then on. A changed
-  `connection_deposit_msat` or `idle_timeout_s` applies to new connections only; framing `"2"` withdrawn
-  (§2.1) does not end live connections. Rotating the provider credential means restarting the sidecar,
+- **Which offers are served.** An offer is served while it equals the offer the node would sign now. A
+  quiet node does not need a fetch to know that: when the offer a `setup` or `request` names was not served
+  in the last 60 s, the node first builds its current offer (the path of `GET /v1/confidential/offer`, with
+  its caches) and then judges the named one against it. The node remembers a signed offer for 10 minutes
+  after it was last the current one **or while a connection opened on it is alive** (for the comparison of
+  connection-level fields). Rates are frozen per request from the offer the request names, and a request
+  may name an offer only **while it is the current one or for 10 minutes after it stopped being so** (else
+  `offer_expired`): old prices never outlive a price change by more than that, whatever the connection's
+  lifetime, and an unchanged offer never expires on a node nobody fetched it from. C refetches the offer on
+  `offer_expired` (and SHOULD every 10 minutes) and names the newest; a price-only change keeps the
+  connection.
+- **Security-relevant changes retire live connections.** Once the node's current offer (built as above,
+  so no fetch is needed) has a `v`, `twopc`, `upstream_host`, `head_template`, `chat`, `h2` or `images`
+  block (prices aside) that differs from the offer a connection was opened on, that connection takes no
+  further request (`offer_changed`, whichever offer the request names): a changed suffix or head is in force
+  for every request from then on. A changed `connection_deposit_msat` or `idle_timeout_s` applies to new
+  connections only. Framing `"2"` withdrawn (§2.1) does not end live connections: for a connection that is
+  already open the node does not test whether the named or the current offer still lists its framing (a
+  request on a live `"2"` connection that names the new offer, without `"2"` in `http` and without the `h2`
+  block, is accepted); a new `setup` for the withdrawn framing is refused. Rotating the provider credential means restarting the sidecar,
   which ends every live connection (`fault`, deposits released, §12.10 row 4).
 
 ### 3.4 Records, proof, release
@@ -606,6 +616,18 @@ equality; the verifier learns one bit. N takes every `ct` from its own relay buf
 64 KiB of ciphertext per proof. C checks before proving that every window lies in a range that is public
 for that record (§5.1) and that every record of the batch is named.
 
+**The server's key epoch is C's claim.** A KeyUpdate of the provider is encrypted, so N cannot see where a
+server key epoch starts. In a disclosure of server records (π_C3S, and π_WIN under `s_ap_0` for an error
+head or a refusal) C names `key_updates` (at most 16) and `epoch_start` (the index of the epoch's first
+record; both 0 or both above 0), the circuit derives the key and IV from the anchored secret after that many
+updates, and the sequence numbers count from `epoch_start`. N checks only the bounds and that every covered
+record lies in the claimed epoch. A wrong claim cannot help C: the circuit then decrypts N's own ciphertext
+under a key or nonce the provider did not use, which gives pseudorandom bytes, and those must equal the
+public bytes C disclosed. C knows the secret and can compute that plaintext for each claim, but the number
+of claims is bounded (17 counts, one start per record N holds) and each must parse as the strict grammar of
+a usage tail, an error head or a refusing frame (many fixed bytes, §5.4); a pseudorandom string that does
+is negligible. The anchors bind the secret, so C cannot pick another one.
+
 Cost: 7 SHA-256 compressions plus one AES block per distinct 16-byte block touched (about 160 k
 correlations + 6.4 k per block).
 
@@ -783,6 +805,16 @@ the `request_ok.reserved_msats` of its request (§12.4).
 v2's residual risks carry over unchanged (π_NK does not bind other epoch-0 records; provider reflection;
 ECtF semi-honest; no proof of the garbler-only construction).
 
+**Further epoch-0 records: the framings differ.** π_NK binds the content of the head record only, in both
+framings, so a malicious N can write more records under `K_0` before its KeyUpdate. What such records can do
+is narrower in framing `"2"`. There every request of C is its own HEADERS frame, proven whole by π_WIN, and
+DATA frames on its own stream, and it names the credential by one entry of the provider's table (index 62):
+N's records can add frames on other streams or change the table (risk 7), but they cannot become bytes of
+C's request. In framing `"1.1"` the byte stream has no frames: whatever N writes after the proven head is
+read by the provider as part of the request that head opened (the start of the body whose length it fixed),
+so N's records and C's body share one message. Neither form reveals the prompt or the key (C's records stay
+under `c_ap_1`, which N does not hold).
+
 ### 10.1 Decided (2026-11-13): a stream the provider did not process (`REFUSED_STREAM`, GOAWAY)
 
 A provider may answer a request's stream with `RST_STREAM(REFUSED_STREAM)` (code 7), or send a GOAWAY
@@ -868,9 +900,29 @@ offer. Fields: `v: 3`; `http`, `h2` (the sidecar's; `kinds` lists `images` only 
 `images` block; `h2` only when `http` lists `"2"`); `twopc`; `connection_deposit_msat` (integer ≥ 0);
 `idle_timeout_s` (integer ≥ 10, at most `h2.idle_secs` when `"2"` is offered; node setting
 `CONFIDENTIAL_IDLE_TIMEOUT_S`, default 120; the deposit's default is max(abandon fee, session fee,
-1000 msat), 0 settable, a value above 0 at least the node's minimum request); and everything the v2 offer had
-(`upstream_host`, `head_template`, `chat`, `images`, `capabilities`, `price_list`, `session_fee_msat`,
-`abandon_fee_msat`, `max_tokens_cap`, `node_pubkey`, `sig`, …), unchanged in meaning.
+1000 msat), 0 settable, a value above 0 at least the node's minimum request); and everything the v2 offer had,
+unchanged in meaning:
+
+| Field | Meaning |
+|---|---|
+| `upstream_host` | the provider's host (the ClientHello's `server_name`, §12.5) |
+| `ws` | the node's session socket URL (`wss://…/v1/confidential/ws`) |
+| `notary_pubkey`, `notary_pubkey_curve` | the node's signing key (x-only, hex) and `"secp256k1-schnorr"`: the key of `sig`, attestations, receipts and deposit outcomes |
+| `max_tokens_cap` | the largest `max_tokens` a chat request may pin |
+| `key_length`, `key_alphabet` | the provider credential's length and alphabet (what π_NK's key positions may hold) |
+| `head_template` | framing `"1.1"`: the request head of a chat request, `{LEN}` for the body length |
+| `suffix_keys` | the JSON keys the chat suffix pins (the keys of the `chat` block, which the sidecar checks against each other at startup) |
+| `chat` | the chat suffix block (docs/CHAT-SUFFIX.md), when the sidecar's offer has one |
+| `price_list` | the chat models served confidentially, by public id, with their rates (msat per 1000 tokens) |
+| `mints` | the Cashu mints the node accepts |
+| `session_fee_msat`, `abandon_fee_msat`, `rate_surcharge_pct` | each only when above 0 (§8.3) |
+| `reserve_margin_tokens` | completion tokens reserved beyond `max_tokens` (§12.10), only when above 0 (node setting `CONFIDENTIAL_RESERVE_MARGIN_TOKENS`, default 16) |
+| `upstream_models`, `context_lengths` | below |
+| `capabilities`, `images` | `["chat","images"]` and the images block, only when images are offered (docs/CONFIDENTIAL-IMAGES.md) |
+| `sig_payload` | the canonical JSON of every field above (keys sorted, no whitespace): the text the node signed |
+| `sig` | the node's BIP-340 signature over SHA-256 of `sig_payload` |
+
+A node without a signing key serves the offer without `sig_payload` and `sig`; clients refuse it (the reference driver accepts it only with `--no-verify-offer` and `ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`).
 
 Client checks before a `setup` (§2.3): `v == 3`; `twopc == "split-public-1"`; `http` non-empty, known
 values, the chosen framing listed; for `"2"` the `h2` block in range and `probe_path` a trusted API base
@@ -914,8 +966,10 @@ models are keyed by the provider's id in `images.price_list` already and are not
 
 **Connection-level fields** of an offer: `v`, `twopc`, `upstream_host`, `head_template`, `chat`, `h2`,
 `connection_deposit_msat`, `idle_timeout_s`, and the `images` block without its `price_list`. A `request`
-that names an offer in which one of these differs from the offer of the `setup`, or whose `http` no longer
-lists the connection's framing, is refused with `offer_changed` (12.4).
+that names an offer in which one of these differs from the offer of the `setup` is refused with
+`offer_changed` (12.4). A withdrawn framing ends no live connection (§3.3): whether the named offer's `http`
+still lists the connection's framing is not tested, and an `h2` block that is absent because `"2"` is
+withdrawn is not a difference (one that is present and differs is).
 
 ### 12.2 Sockets
 
@@ -1223,12 +1277,20 @@ After a settled 2xx a framing-`"2"` connection is READY again. Otherwise the con
 | `max_requests`, `max_lifetime`, `max_bytes` | framing `"2"`: at the settlement that reached `h2.max_requests`, `h2.max_lifetime_s`, or 1 GiB received |
 | `upstream_closed` | the provider closed an open connection with no request in flight; `"after_client_frames": true` when C had control frames written on a connection that carried no request (the close may be C's doing: not row 5 of 12.10) |
 | `evicted` | node only: a newer setup took the slot of this idle, used connection (§8.4) |
-| `ended` | node only: neither side had a last word |
+| `ended` | node only: neither side had a last word (the sidecar's socket ended or was closed by the node without a `closed` or `error`); sent with or without a deposit outcome |
 
 `N → C  {"type":"error","reason"[,"status"][,"code"][,"fault"]}` and the socket closes: every protocol
 violation and failed proof. `fault` is `"upstream"` (the provider could not be reached or did not behave as
 the framing needs) or `"node"` (the sidecar failed). `code`, when present: `upgrade_required`,
-`twopc_version_mismatch`, `upstream_unreachable`, `h2_not_selected`, `h2_withdrawn`, `h2_table_size`.
+`twopc_version_mismatch`, `upstream_unreachable`, `h2_not_selected`, `h2_withdrawn`, `h2_table_size`,
+`frame_too_large`.
+
+**An oversized client message is the client's doing.** The sidecar reads WebSocket messages up to 17 MiB,
+above anything a node forwards (a client message reaches the node only up to its server's WebSocket limit, uvicorn's `--ws-max-size`, 16 MiB by default), and enforces its own bound: a client message larger than the
+connection may buffer (`client_buffer_cap(max_body)`: the body limit, 1/256 of it, and four TLS records)
+gets `{"type":"error","status":413,"code":"frame_too_large"}` **without `fault`**, before or after the
+handshake, and the connection ends as after any client protocol error (§12.10: row 12, or row 9 with a
+request accepted and not released).
 `{"type":"upstream_closed_early","n","response_bytes"}` precedes the `error` when the provider closed before
 the request was fully written (N relays it). Framing `"2"`: N then keeps the request for 60 s, for a
 `disclose_reset` alone (§12.8); without one the `error` follows.
@@ -1237,18 +1299,24 @@ the request was fully written (N relays it). Framing `"2"`: N then keeps the req
 refused setup (12.3; the socket then closes), a protocol error in a `request` (12.4), a time limit (408),
 and its own failures, which carry `fault: "node"`: the sidecar's socket ending without a last frame (502),
 a `usage` without an attestation (502), a settlement that could not be written (500; `detail.error` is
-`{"type":"settlement_failed","outcome"}`). The sidecar's `closed` or `error` is held back until the node
+`{"type":"settlement_failed","outcome"}`; the request is charged its reservation, with no receipt, and the
+connection ends). The sidecar's `closed` or `error` is held back until the node
 has finalized what the connection still holds, and is then sent as the connection's last frame.
 
 **N** adds to the connection's last frame (`closed` or `error`) the signed deposit outcome when a deposit
 was reserved and not released by a settlement (12.10). That includes the `error` of a setup the node
 refused after it reserved the deposit (no session slot, the sidecar unreachable: row 2); a setup refused
-earlier (row 1) reserved nothing and carries none. When neither side had a last word (the client left),
-the frame would be `{"type":"closed","reason":"ended"}`.
+earlier (row 1) reserved nothing and carries none. When neither side had a last word, the node sends
+`{"type":"closed","reason":"ended"}`, with the deposit outcome when there is one and without it otherwise
+(a client that already left receives nothing; the outcome is decided and recorded all the same).
 
 | Limit | Value |
 |---|---|
 | setup frame after the socket opens | 15 s (S), 10 s (N) |
+| provider connect; each write to the provider | 10 s; 30 s (S) |
+| a proof (`/zk`): waiting for the connection's proof lock, then running | 30 s each (S) |
+| provider bytes before the handshake is verified | 256 KiB or 64 records (S); past it the connection ends with `fault: "upstream"` |
+| CertificateVerify signature schemes (S) | ECDSA P-256/SHA-256, P-384/SHA-384, P-521/SHA-512; RSA-PSS (rsaEncryption keys) with SHA-256/384/512; Ed25519. RSASSA-PKCS1-v1_5 is refused (RFC 8446 §4.4.3). The canonical ClientHello offers `0403`, `0503`, `0804` for CertificateVerify |
 | 2PC preprocessing and key share | 180 s |
 | socket accept to `head_written` (armed time included) | 600 s |
 | `request_ok` to `body_released`; `body_released` to settlement | 600 s each |
@@ -1258,7 +1326,12 @@ the frame would be `{"type":"closed","reason":"ended"}`.
 | π_WIN | 2 200 windows, 64 KiB ciphertext |
 | π_C3S | `r` ≤ 16 KiB; the limits of `zkbench::statements` |
 | control message | 256 KiB |
+| client WebSocket message (S) | read up to 17 MiB; above `client_buffer_cap(max_body)`: `error` 413 `frame_too_large`, no `fault` |
 | sessions | 32 per process (S and N); per address: `CONFIDENTIAL_MAX_UNUSED_PER_IP` (12) unused, counted until the first `body_released`, and `CONFIDENTIAL_MAX_ACTIVE_PER_IP` (16) in all; a full node or address evicts its longest-idle used connection first (§8.4) |
+| pending connections (N) | a socket whose setup is not reserved yet is pending and takes no session slot: 1024 per process, 4 per address; a full pool or address share evicts the oldest connection still waiting for its setup frame, else 429 (address) or 503 (pool) |
+| client address (N) | the peer, or, when the peer is listed in `CONFIDENTIAL_TRUSTED_PROXIES` (`self` adds the host's own addresses), the header `CONFIDENTIAL_CLIENT_IP_HEADER` (default `x-forwarded-for`, its rightmost entry over all lines; another header: its last line). IPv6 addresses count by their /64 |
+| wallet lock (N) | a setup or request waits at most 10 s for the wallet lock before a first-use Cashu token is redeemed; past it 503 with `detail.error = {"type":"wallet_busy","retry_after_s":1}` (a setup: `error`; a request: `request_refused`, §12.10 row 6) |
+| completion margin (N) | `CONFIDENTIAL_RESERVE_MARGIN_TOKENS` (default 16) tokens beyond `max_tokens` in every chat reservation (§12.10) |
 | refused requests | 8 in a row per connection; the ninth ends it (`error` 429) |
 | `/zk` sockets per connection | 6 |
 
@@ -1274,6 +1347,9 @@ the frame would be `{"type":"closed","reason":"ended"}`.
 | before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes) | released; the session fee is kept if still due |
 | after `body_released` with no settlement | charged in full |
 | settled 2xx | usage at the frozen rates (chat) or `msat_per_image × count` (images), plus the session fee if still due |
+| settled chat 2xx whose usage event lacks `prompt_tokens` or `completion_tokens` as non-negative integers | charged its reservation |
+| settled with a settlement of the wrong kind for the request (a flat image settlement of a chat request or for another model; token usage on an image request) | charged its reservation |
+| the settlement could not be written (the node's billing write failed) | charged its reservation; no receipt; the connection ends with the node's `error` (500, `settlement_failed`, `fault: "node"`, §12.9) and the deposit row 6 |
 | settled refusal (`disclose_reset`, framing `"2"`; before or after `body_released`) | the session fee if still due, the rest released; never more |
 | settled error head | 429/503 and 401/402/403: the session fee if still due; any other 4xx: the abandon fee; other 5xx: the reservation, at most the `reserved_msats` announced in `request_ok` (none announced: the session fee if still due); images: never more than `msat_per_image × count` + max(session fee if still due, abandon fee) |
 
@@ -1302,7 +1378,7 @@ settled request, first matching row:
 | 3 | the sidecar reported `fault: "upstream"` (the provider unreachable, `h2` not selected, framing `"2"` withdrawn) | released | `provider_unreachable` |
 | 4 | the sidecar reported `fault: "node"`, or its socket ended without `error` or `closed` | released | `sidecar_failure` |
 | 5 | the provider closed the open, idle connection before any request (`closed`, `upstream_closed`, without `after_client_frames`) | released | `provider_closed` |
-| 6 | the node refused a request of this connection with a 5xx, or a settlement's billing write failed | released | `node_failure` |
+| 6 | the node refused a request of this connection with a 5xx **and accepted none after it**, or a settlement's billing write failed | released | `node_failure` |
 | 7 | a request was written in full (`body_released`) and never settled | released (the reservation is charged) | `request_received` |
 | 8 | the provider answered a request and closed before its body was complete (response bytes in the request's interval) | released (the request keeps the session fee) | `provider_refused` |
 | 9 | a request was accepted and the connection ended before its `body_released` for any other reason (N cannot see a GOAWAY: undisclosed, it lands here when the provider sent nothing in the interval) | **charged**; the reservation is released in full | `request_abandoned` |
@@ -1311,7 +1387,12 @@ settled request, first matching row:
 | 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake or after the client's control frames (`after_client_frames`), only refused requests | **charged** | `unused` |
 
 A refused request (4xx) by itself costs nothing; the connection stays, and the deposit follows how the
-connection ends.
+connection ends. A 5xx refusal (the node could not reserve, `wallet_busy`) marks the connection for row 6;
+a later request of the connection that the node accepts (`request_ok`) clears the mark, so a client cannot
+make a connection free of deposit risk by provoking one refusal: a request accepted after it and then
+abandoned is row 9. Rows 3 and 4 come before row 6: a fault the sidecar reports (`"upstream"`, `"node"`) or
+its lost socket decides both the open request (released in full) and the deposit's reason, whatever node
+refusal came earlier on the connection.
 
 **A provider refusal is a settlement.** A request whose stream the provider refused unprocessed
 (`RST_STREAM(REFUSED_STREAM)`, or GOAWAY with `NO_ERROR` below it), disclosed by C (`disclose_reset`,
@@ -1394,8 +1475,15 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | the usage event: `choices` may hold one choice with no content (allow-list), the argument, usage on every chunk, Google unsupported | §5.4 |
 | `upstream_models`: org/-prefixed models offered under their public id, the suffix pins the provider's id; receipt `upstream_model` | §2.2, §12.1, §12.4, §12.8 |
 | the proof channel's top-up between requests (channel version 2: `topup`, `TopupGrant`, step, bounds, a request waits for it); chain cp's mux cap 512 MiB | §8.5, §9.2, §12.2 |
-| `upstream_models` values must be `<prefix>/` + the public id (clients refuse anything else, N never signs it); the other-prefix gap is residual risk 11 (SDK review finding 17) | §2.2, §12.1, §10 |
+| `upstream_models` values must be `<prefix>/` + the public id (clients refuse anything else, N never signs it); the other-prefix gap is residual risk 11 | §2.2, §12.1, §10 |
 | a provider `HEADER_TABLE_SIZE` below 4096 ends the connection (`h2_table_size`), not only one below the credential entry | §5.6, §12.6 |
-| an error head followed by a reset is disclosed (finding 18); C's checks of the provider's frames (16 KiB, initial window, GOAWAY); `REFUSED_STREAM` as an open question | §9.4, §10.1, §12.8 |
+| an error head followed by a reset is disclosed; C's checks of the provider's frames (16 KiB, initial window, GOAWAY); `REFUSED_STREAM` as an open question | §9.4, §10.1, §12.8 |
 | `context_lengths`: the prompt limit each chat reservation is sized by, signed and frozen with the offer's terms; a client bounds `reserved_msats` only with it (the `/v1/models` row may be another upstream's) | §2.2, §12.1, §12.10 |
 | a refused stream is proven (`disclose_reset`: `RST_STREAM(REFUSED_STREAM)`, GOAWAY(`NO_ERROR`) below the stream) and settled like a 429; a disclosed GOAWAY before `body_released` releases the deposit; with nothing of the request written only within the GOAWAY window `min(30 s, h2.idle_secs/4)` after `request_ok`; N waits 60 s after the provider's early close; every receipt's `reserved_msats` equals `request_ok`'s; residual risk 12 | §3.5, §5.4.1, §9.4, §10.1, §12.8–§12.10 |
+| the node's offer fields named in full (`notary_pubkey`, `notary_pubkey_curve`, `ws`, `key_length`, `key_alphabet`, `suffix_keys`, `mints`, `reserve_margin_tokens`, `sig_payload`), not `node_pubkey` | §12.1 |
+| row 6 holds only while no request was accepted after the 5xx refusal; a sidecar fault or lost socket decides the open request and the deposit whatever came before | §12.10 |
+| per-request rows: a 2xx usage without integer token counts, a settlement of the wrong kind, a failed settlement write: each charges the reservation | §12.10 |
+| an offer is served while it equals the one the node would sign now (no fetch needed); the security comparison runs against that current offer; a withdrawn framing does not end live connections | §2.2, §3.3, §12.1 |
+| limits the table lacked: provider connect and write, proof time, provider bytes before the handshake verifies, CertificateVerify schemes, the pending pool, the client address behind a proxy, `wallet_busy`, the completion margin; an oversized client message is `error` 413 `frame_too_large` without `fault`; `closed` `ended` with or without a deposit outcome | §12.9 |
+| the server's key epoch (`key_updates`, `epoch_start`) is C's claim, and why a wrong claim gains nothing | §7.1 |
+| further epoch-0 records of a malicious N: what they can do in each framing | §10 |
