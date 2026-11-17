@@ -706,7 +706,7 @@ async fn offer_http(State(app): State<Arc<AppState>>) -> impl IntoResponse {
 /// | the ClientHello's bytes | canonical (`tls_v2::canonical_client_hello`): only the random and the session id are the client's, the joint share is a valid point it cannot choose; one record, version `03 03` |
 /// | when the ClientHello is written | the sidecar dials when the checked hello and the joint share are there and writes it at once |
 /// | records after the ClientHello, before the provider answered (a CCS, a "Finished", anything) | held until the provider's first byte has arrived (`handshake_record_step`), so a provider that closes without a byte has seen the hello alone; after it, at most one CCS of exactly `14 03 03 00 01 01` and one application-data record |
-/// | its Finished, π_NK, `release_head` (wrong, late or never) | the provider has sent its flight by then, so bytes were received and the head is not written: "closed during the handshake", not counted |
+/// | its Finished, π_NK, `release_head` (wrong, late or never; a handshake record holding anything besides the one Finished, which `verify_handshake` refuses without `fault`) | the provider has sent its flight by then, so bytes were received and the head is not written: "closed during the handshake", not counted |
 /// | leaving | the sidecar closes the connection itself; no provider close is seen |
 /// | a late `release_head`, so that a provider timer fires just after the head | the close after the head counts only when the head was written within `H2_HEAD_PROMPT` of the dial |
 /// | records after the head (control frames with free payloads, e.g. a WINDOW_UPDATE of 0; a request body) | the close after the head counts only while **no client record** was written to the provider |

@@ -319,35 +319,10 @@ pub fn verify_handshake(
     verify_certificate_verify(&end_entity, &cv[4..], &th_certs)?;
 
     // --- client Finished -------------------------------------------------
-    let ck = c_hs.key();
-    let civ = c_hs.iv();
-    let mut client_seq: u64 = 0;
-    let mut client_handshake_plain: Vec<u8> = Vec::new();
-    for r in &client_records {
-        if r.ctype == CT_HANDSHAKE || r.ctype == CT_CHANGE_CIPHER_SPEC {
-            continue;
-        }
-        if r.ctype == CT_APPLICATION_DATA {
-            if parse_handshake_messages(&client_handshake_plain)
-                .iter()
-                .any(|(t, _)| *t == HS_FINISHED)
-            {
-                break;
-            }
-            let pt = aesgcm::gcm_open(&ck, &civ, client_seq, &r.header, &r.payload)
-                .ok_or_else(|| anyhow!("client handshake record {client_seq}: bad GCM tag"))?;
-            client_seq += 1;
-            client_handshake_plain.extend_from_slice(handshake_inner(&pt)?);
-        }
-    }
-    let cmsgs = parse_handshake_messages(&client_handshake_plain);
-    let cfin = cmsgs
-        .iter()
-        .find(|(t, _)| *t == HS_FINISHED)
-        .ok_or_else(|| anyhow!("no client Finished"))?;
+    let cfin = client_finished(&client_records, &c_hs)?;
     let cf_key = hkdf::finished_key(c_hs.as_bytes());
     let expect = hkdf::verify_data(&cf_key, &th_sf);
-    if !ct_eq(&cfin.1[4..], &expect) {
+    if !ct_eq(&cfin[4..], &expect) {
         bail!("client Finished verify_data mismatch");
     }
 
@@ -363,6 +338,26 @@ pub fn verify_handshake(
         server_handshake_records: server_seq as usize,
         alpn: selected_alpn(&ee)?,
     })
+}
+
+/// The client's Finished message (with its 4-byte header) from the relayed
+/// client records: the first application-data record, under `c_hs` at
+/// sequence 0, after the plaintext ClientHello and the optional CCS. That
+/// record must hold exactly one handshake message, the Finished, and nothing
+/// else (a client sends no other message in this epoch; a record carrying
+/// more would put bytes before the provider that no check here covers).
+pub fn client_finished(client_records: &[Record], c_hs: &Secret) -> Result<Vec<u8>> {
+    let r = client_records
+        .iter()
+        .find(|r| r.ctype == CT_APPLICATION_DATA)
+        .ok_or_else(|| anyhow!("no client Finished"))?;
+    let pt = aesgcm::gcm_open(&c_hs.key(), &c_hs.iv(), 0, &r.header, &r.payload)
+        .ok_or_else(|| anyhow!("client handshake record 0: bad GCM tag"))?;
+    let plain = handshake_inner(&pt)?;
+    match parse_handshake_messages(plain).as_slice() {
+        [(HS_FINISHED, fin)] if fin.len() == plain.len() => Ok(fin.clone()),
+        _ => bail!("the client's handshake record is not exactly one Finished message"),
+    }
 }
 
 /// The protocol an EncryptedExtensions message (with its 4-byte header)
@@ -591,5 +586,49 @@ mod tests {
         let five: Vec<Record> = [&sh[..1], &sh[1..2], &sh[2..3], &sh[3..4], &sh[4..]].iter().map(|p| record(CT_HANDSHAKE, p)).collect();
         assert!(server_hello_message(&five).is_err());
         assert!(server_hello_message(&five[..4]).unwrap().is_none());
+    }
+    fn sealed(c_hs: &Secret, seq: u64, inner: &[u8]) -> Record {
+        let n = (inner.len() + 16) as u16;
+        let header = [CT_APPLICATION_DATA, 3, 3, (n >> 8) as u8, n as u8];
+        Record { ctype: CT_APPLICATION_DATA, header, payload: aesgcm::gcm_seal(&c_hs.key(), &c_hs.iv(), seq, &header, inner) }
+    }
+
+    /// The client's handshake record holds its Finished and nothing else.
+    #[test]
+    fn the_client_handshake_record_is_exactly_one_finished() {
+        let c_hs = Secret::new([9; 32]);
+        let fin = msg(HS_FINISHED, &[5; 32]);
+        let ch = record(CT_HANDSHAKE, &msg(HS_CLIENT_HELLO, b"hello"));
+        let ccs = record(CT_CHANGE_CIPHER_SPEC, &[1]);
+        let with = |inner: &[u8]| {
+            let mut pt = inner.to_vec();
+            pt.push(CT_HANDSHAKE);
+            vec![ch.clone(), ccs.clone(), sealed(&c_hs, 0, &pt)]
+        };
+        // Honest: the Finished alone, with or without padding, with or without the CCS.
+        assert_eq!(client_finished(&with(&fin), &c_hs).unwrap(), fin);
+        let mut padded = fin.clone();
+        padded.extend([CT_HANDSHAKE, 0, 0, 0]);
+        assert_eq!(client_finished(&[ch.clone(), sealed(&c_hs, 0, &padded)], &c_hs).unwrap(), fin);
+        // A second handshake message in the record, before or after it.
+        let ku = msg(HS_KEY_UPDATE, &[0]);
+        assert!(client_finished(&with(&[fin.clone(), ku.clone()].concat()), &c_hs).is_err());
+        assert!(client_finished(&with(&[ku.clone(), fin.clone()].concat()), &c_hs).is_err());
+        assert!(client_finished(&with(&[msg(HS_CERTIFICATE, b"c"), fin.clone()].concat()), &c_hs).is_err());
+        // Trailing bytes after it, a truncated one, no Finished at all.
+        assert!(client_finished(&with(&[fin.clone(), vec![HS_FINISHED, 0]].concat()), &c_hs).is_err());
+        assert!(client_finished(&with(&fin[..20]), &c_hs).is_err());
+        assert!(client_finished(&with(&ku), &c_hs).is_err());
+        // The Finished split over two records.
+        let mut a = fin[..10].to_vec();
+        a.push(CT_HANDSHAKE);
+        let mut b = fin[10..].to_vec();
+        b.push(CT_HANDSHAKE);
+        assert!(client_finished(&[ch.clone(), sealed(&c_hs, 0, &a), sealed(&c_hs, 1, &b)], &c_hs).is_err());
+        // A record that is not handshake content, or under another key.
+        let mut app = fin.clone();
+        app.push(CT_APPLICATION_DATA);
+        assert!(client_finished(&[ch.clone(), sealed(&c_hs, 0, &app)], &c_hs).is_err());
+        assert!(client_finished(&[ch.clone(), sealed(&Secret::new([8; 32]), 0, &[fin.clone(), vec![CT_HANDSHAKE]].concat())], &c_hs).is_err());
     }
 }
