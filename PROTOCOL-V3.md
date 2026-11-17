@@ -487,9 +487,12 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   provoked by holding an accepted request unwritten. W is far above what an honest client needs between
   `request_ok` and its first release (its records' π_WIN, under a second to a few seconds); 30 s bounds
   it when the idle time is long, and a quarter of `idle_secs` keeps it clear of short ones (2.5 s at the
-  smallest, 10 s). W follows from the signed offer's `h2.idle_secs`; it is not a field of its own. Once a
-  record of the request was written the window does not apply: the provider then refused a stream it
-  had seen.
+  smallest, 10 s). W follows from the signed offer's `h2.idle_secs`; it is not a field of its own. The
+  window judges every GOAWAY that reached N **before the request's first record was written**, also when
+  C released records after it (while the provider had not yet closed the TCP connection, `S_k` is then
+  set and lies after the GOAWAY): the provider decided to close before it saw the stream. A GOAWAY that
+  arrived after a record of the request was written is not judged by the window: the provider then
+  refused a stream it had seen.
 - **The refusing frame.** `RST_STREAM` must be on the request's stream (the probe stream 1, another
   request's stream, or stream 0 do not count) with payload length 4 and code 7; any other code (`CANCEL`,
   `NO_ERROR`, `INTERNAL_ERROR`, …) is no statement that nothing was processed. GOAWAY must carry
@@ -806,8 +809,8 @@ request, which is a provider-caused end, so it no longer falls in §12.10 row 9 
 after the provider closed: N waits 60 s for the disclosure). C runs the request again on a new
 connection. An `RST_STREAM` with any other code, a GOAWAY with an error code, and a reset after a
 response head stay as they were: the provider may have processed the request, or C may have caused the
-end. A GOAWAY before any record of the request was written counts only within the GOAWAY window after
-`request_ok` (§5.4.1), so a client cannot wait for the provider's idle close to end a request cheaply.
+end. A GOAWAY that arrived before any record of the request was written (also when records were written
+after it) counts only within the GOAWAY window after `request_ok` (§5.4.1), so a client cannot wait for the provider's idle close to end a request cheaply.
 Residual: risk 12.
 
 ## 11. Versions and upgrade
@@ -1121,7 +1124,8 @@ connection began (handshake flight included).
   records running (unproven records of the request may wait: none of them is written any more); `r` walks
   as §5.4 says, ending exactly with `RST_STREAM(REFUSED_STREAM)` on the request's stream (only once a
   record of the request was written) or GOAWAY(`NO_ERROR`, last-stream-id < stream); `i ≤ S_k` when `S_k`
-  is set, else any record N holds, and the record ending the GOAWAY arrived within the GOAWAY window
+  is set, else any record N holds; a GOAWAY whose last record arrived before the request's first record was
+  written (always so when `S_k` is unset) arrived within the GOAWAY window
   (§5.4.1: `min(30 s, h2.idle_secs / 4)` after `request_ok`, and under `h2.idle_secs` after N's last write
   to the provider) (then `S_k` := the server records received so far, the interval stays empty); `i` is held, received and in the named key epoch. Then `attestation` (as for any request; with
   no record written, `server_records` and `client_records` are 0), then
@@ -1288,8 +1292,8 @@ connection ends.
 with its receipt (`deposit_released_msat`), so such a connection is in none of the rows above: in
 particular a GOAWAY that ends the connection **before `body_released`** is a provider-caused end and no
 longer costs the deposit (row 9) once C discloses it, also after the provider closed the TCP connection
-(N waits 60 s). When nothing of the request was written, that GOAWAY must have reached N within the
-GOAWAY window (§5.4.1); a later one (an idle close the client may have waited for) stays in row 9. A GOAWAY C cannot disclose (an error code, which C's own frames may have caused; frames
+(N waits 60 s). When it reached N before any record of the request was written, that GOAWAY must have
+reached N within the GOAWAY window (§5.4.1); a later one (an idle close the client may have waited for) stays in row 9. A GOAWAY C cannot disclose (an error code, which C's own frames may have caused; frames
 it cannot walk) stays in rows 8 and 9.
 
 ```

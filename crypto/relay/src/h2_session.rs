@@ -107,8 +107,9 @@ struct Req {
     ok_at: std::time::Instant,
     /// The index (as `RelayLog::server_app_records`) of the first server
     /// record that arrived after the GOAWAY window closed (`goaway_window`):
-    /// a GOAWAY in it or later does not refuse a request none of whose
-    /// records was written (it may be the provider's idle close).
+    /// a GOAWAY in it or later that arrived before the request's first
+    /// record was written does not refuse it (it may be the provider's idle
+    /// close).
     late_from: Option<usize>,
 }
 
@@ -998,15 +999,19 @@ pub(crate) fn on_disclose_reset(
         bail!("server record {record} is after the start of the request's interval: the walk must cover all of it");
     }
     let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r)?;
-    if q.s_k.is_none() {
-        // A GOAWAY before any record of the request was written counts only
-        // when it arrived within the window after `request_ok` (N's own clock;
-        // the record holding its last byte is the last one R covers).
+    if let h2::Refusal::GoAway { .. } = refusal {
+        // A GOAWAY that arrived before any record of the request was written
+        // counts only when it arrived within the window after `request_ok`
+        // (N's own clock; the record holding its last byte is the last one R
+        // covers). That holds also when the client released records after
+        // the GOAWAY arrived, while the provider still read (S_k set later):
+        // the provider never saw the stream when it decided to close.
         let covered = p.windows.iter().map(|w| w.seq).collect::<std::collections::BTreeSet<_>>().len();
         let goaway_record = record + covered - 1;
-        if q.late_from.is_some_and(|late| goaway_record >= late) {
+        let before_write = q.s_k.is_none_or(|s_k| goaway_record < s_k);
+        if before_write && q.late_from.is_some_and(|late| goaway_record >= late) {
             bail!(
-                "a GOAWAY that arrived more than {:?} after request_ok (or as long after the last write as an idle close) does not refuse a request none of whose records was written",
+                "a GOAWAY that arrived more than {:?} after request_ok (or as long after the last write as an idle close), before any record of the request was written, does not refuse it",
                 window
             );
         }
@@ -2463,7 +2468,9 @@ mod tests {
     /// provider's idle timer sends GOAWAY. A GOAWAY that arrived after the
     /// window (`goaway_window` after `request_ok`, or `h2.idle_secs` after
     /// N's last write) does not refuse a request none of whose records was
-    /// written; once a record was written (S_k set) the window does not apply.
+    /// written before it arrived, also when a record was written after it
+    /// (S_k set later); a GOAWAY that arrived after a record was written is
+    /// not judged by the window.
     #[tokio::test]
     async fn a_goaway_after_the_window_does_not_refuse_an_unwritten_request() {
         let app = app_state(true);
@@ -2497,6 +2504,29 @@ mod tests {
             let err = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap_err();
             assert!(err.to_string().contains("does not refuse"), "{what}: {err}");
             assert!(texts(&mut rx).is_empty(), "{what}: nothing attested");
+        }
+        // The bypass: the late GOAWAY arrives first (record 2), then the client
+        // releases a record while the TCP connection is still open (S_k = 3).
+        // R from record 2 is no later than S_k, but the GOAWAY precedes the
+        // first write: refused.
+        {
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            for c in [&[1u8; 40][..], &[2; 900]] {
+                feed(&mut st, &mut log, c);
+            }
+            send_request(&mut st, 300);
+            st.h2.as_mut().unwrap().req.as_mut().unwrap().ok_at = past(goaway_window(idle) + std::time::Duration::from_secs(1));
+            let g = goaway_frame(1, 0);
+            feed(&mut st, &mut log, &g); // record 2, late
+            on_release(&mut st, 1, 1).unwrap();
+            pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+            prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+            assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().s_k, Some(3));
+            texts(&mut rx);
+            let err = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap_err();
+            assert!(err.to_string().contains("does not refuse"), "write after a late GOAWAY: {err}");
+            assert!(texts(&mut rx).is_empty(), "write after a late GOAWAY: nothing attested");
         }
         // The same late GOAWAY after the request's HEADERS was written (S_k set): it counts.
         let mut log = RelayLog::default();
