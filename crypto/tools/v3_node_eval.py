@@ -44,7 +44,9 @@ the arithmetic. `expect` is one of (H is the framing, "2" or "1.1"):
                                              full; with n > 1 the abandon fee A is kept
                                   charged    after `body_released` (the settlement is refused): the
                                              reservation is charged in full
-                                  unused     the connection itself (n = 0): the deposit is charged
+                                  unused     the connection itself (n = 0): the deposit is charged,
+                                             and the `error` frame carries no `fault`
+                                <regex> is matched against the error's reason and code.
   unused:<reason>[:anyrc]       a connection is opened and ends without a request: the deposit is
                                 charged for that reason (`unused`, `idle`, `setup_timeout`)
   released:<reason>[:anyrc]     a connection that could not be used through no fault of the client:
@@ -55,7 +57,8 @@ the arithmetic. `expect` is one of (H is the framing, "2" or "1.1"):
   setup-refused:<status>:<regex>  the setup is refused before the sidecar is dialed: nothing reserved
   legacy                        a protocol-v2 socket gets `error` 426 `upgrade_required`
 In every case the key's balance must equal its start (plus any top-up) minus
-exactly the charges named above, with nothing left reserved.
+exactly the charges named above, with nothing left reserved, and the driver
+must print no DEPOSIT_DEVIATION line (a deposit outcome off the signed terms).
 """
 import json
 import math
@@ -548,8 +551,10 @@ else:  # attack
         dev.append("CRASH or attack not refused (driver exit != 0 or no ADV line)")
     elif adv.get("refused") is not True:
         dev.append("the attack was NOT refused")
-    elif not re.search(reason, adv.get("reason", ""), re.I):
+    elif not re.search(reason, f"{adv.get('reason', '')} {adv.get('code') or ''}", re.I):
         dev.append(f"refused for the wrong reason (want /{reason}/)")
+    if how == "unused" and adv and adv.get("fault"):
+        dev.append(f"the attack on the connection ended with fault {adv.get('fault')!r} (it is the client's doing)")
     if len(reqs) != max(n - 1, 0):
         dev.append(f"expected {max(n - 1, 0)} honest request(s) before the attack")
     for r in reqs:
@@ -583,6 +588,11 @@ else:  # attack
             if n == 1 and deposit_of(sid) != [("released", "request_received", DEP)]:
                 dev.append(f"the deposit was not released for /request_received/ (node: {deposits})")
             charges.append(res[-1] if res else 0)
+
+# The driver held the node's deposit outcome to the signed terms (§12.10).
+deviations = [l[len("DEPOSIT_DEVIATION "):] for l in out.splitlines() if l.startswith("DEPOSIT_DEVIATION ")]
+if deviations:
+    dev.append(f"the driver reports a deposit outcome off the signed terms: {deviations[0][:200]}")
 
 # The money outcome: the key paid exactly the charges above.
 row = key_row()

@@ -22,6 +22,7 @@
 #   CU_V3_OFFER     offer file (default relay/offer.venice.json)
 #   CU_KEY_ENV      variable holding the provider key (default VENICE_API_KEY)
 #   CU_UPSTREAM     provider host:port (default api.venice.ai:443)
+#   CU_TRUSTED_HOSTS the driver's trusted provider hosts, comma-separated (default the host of CU_UPSTREAM)
 #   CU_MODEL        chat model (default mistral-small-3-2-24b-instruct)
 #   CU_SWAP_MODEL   the model of the model-swap attacks (default deepseek-v4-pro)
 #   CU_IMAGE_MODEL  image model (default z-image-turbo; one image, the default variant)
@@ -75,6 +76,8 @@
 #   h2-h-no-proof         the records are never proven: held, the provider answers nothing
 #   h2-i-own-keyshare     the client's own key share instead of the joint one
 #   h2-j-twopc-tag        a 2PC peer of another version (twopc_version_mismatch)
+#   h2-l-big-frame        one 9 MiB binary message right after `ready`, above the sidecar's client
+#                         buffer: `error` 413 frame_too_large, without `fault` (the client's doing)
 #   h11-c-suffix          the final record is another model's suffix of the same length (π_WIN fails)
 #   h11-c-model-swap      … the suffix of a pricier model (another length: not the suffix alone)
 #   h11-c-cap-swap        … a suffix with a larger max_tokens of the same length (π_WIN fails)
@@ -105,6 +108,9 @@ IMAGE_MODEL="${CU_IMAGE_MODEL:-z-image-turbo}"
 PAUSE="${CU_PAUSE:-0}"
 CASE_TIMEOUT="${CU_CASE_TIMEOUT:-180}"
 KEY_ENV="${CU_KEY_ENV:-VENICE_API_KEY}"
+UPSTREAM="${CU_UPSTREAM:-api.venice.ai:443}"
+# The driver has no built-in trusted host: the provider's own, unless set.
+export CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-${UPSTREAM%:*}}"
 # How long the started sidecar keeps framing "2" withdrawn (its test hook). The
 # cases that must run inside the withdrawal (the end of fb-5, fb-offer-11,
 # fb-auto-11, fb-http2-refused) take about 10 s, more on a busy machine.
@@ -137,7 +143,7 @@ else
   RUNS="$OUT/sidecar-runs"
   mkdir -p "$RUNS"
   CU_TEST_H2_FAIL_FILE="$FAIL_FILE" CU_TEST_H2_RETRY_SECS="$RETRY_SECS" \
-    "$BIN" --listen "127.0.0.1:$PORT" --upstream "${CU_UPSTREAM:-api.venice.ai:443}" --key-env "$KEY_ENV" \
+    "$BIN" --listen "127.0.0.1:$PORT" --upstream "$UPSTREAM" --key-env "$KEY_ENV" \
     --offer "${CU_V3_OFFER:-$CRYPTO/relay/offer.venice.json}" --runs-dir "$RUNS" > "$OUT/sidecar.log" 2>&1 &
   SIDECAR_PID=$!
   OWN_SIDECAR=1
@@ -158,11 +164,13 @@ case "$HTTP_LIST" in 2,1.1|1.1) ;; *) echo "CU_HTTP must be 2,1.1 or 1.1" >&2; e
 # parameter checks, the message handling, the TLS fork's hooks and its record
 # rules (no application data before the handshake is done, no plaintext
 # handshake or alert record under record protection) and the offer rules
-# (the receipt bound, the image count key).
+# (the receipt bound, the image count key, the request routes), the deposit
+# outcome rules and the canonical ClientHello.
 (cd "$CRYPTO/client" && node --experimental-strip-types src/h2-selfcheck.ts && node --experimental-strip-types src/h2-conn-test.ts \
   && node --experimental-strip-types src/fork-selfcheck.ts > /dev/null \
   && node --experimental-strip-types test/tls-fork-records-check.ts > /dev/null \
-  && node --experimental-strip-types test/offer-check.ts > /dev/null && node --experimental-strip-types test/receipt-check.ts > /dev/null) || { echo "offline self-checks failed" >&2; exit 1; }
+  && node --experimental-strip-types test/offer-check.ts > /dev/null && node --experimental-strip-types test/receipt-check.ts > /dev/null \
+  && node --experimental-strip-types test/deposit-check.ts > /dev/null) || { echo "offline self-checks failed" >&2; exit 1; }
 
 SUMMARY="$OUT/summary.tsv"
 printf 'case\texpected\tverdict\tevidence\n' > "$SUMMARY"
@@ -261,6 +269,7 @@ run_case h2-g-early-record   "refused:2:0:." 0 none -- --http 2 --adv early-reco
 run_case h2-h-no-proof       "withheld:2:1" 0 none -- --http 2 --adv no-proof
 run_case h2-i-own-keyshare   "refused:2:0:share" 0 none -- --http 2 --adv own-keyshare
 run_case h2-j-twopc-tag      "refused:2:0:twopc_version_mismatch" 0 none -- --http 2 --adv twopc-tag
+run_case h2-l-big-frame      "refused:2:0:frame_too_large" 0 none -- --http 2 --adv big-frame
 
 # --- attacks, framing "1.1" ----------------------------------------------------
 run_case h11-c-suffix        "refused:1.1:1:pi_win failed" 0 none -- --http 1.1 --adv suffix

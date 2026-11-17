@@ -32,6 +32,7 @@
 #   CU_V3_OFFER      sidecar offer file (default relay/offer.venice.json)
 #   CU_KEY_ENV       variable holding the provider key (default VENICE_API_KEY)
 #   CU_UPSTREAM      provider host:port (default api.venice.ai:443)
+#   CU_TRUSTED_HOSTS the driver's trusted provider hosts, comma-separated (default the host of CU_UPSTREAM)
 #   CU_UPSTREAM_BASE the provider's API base for the node (default https://api.venice.ai/api/v1)
 #   CU_MODEL         chat model (default mistral-small-3-2-24b-instruct)
 #   CU_SWAP_MODEL    the model of the model-swap attacks (default deepseek-v4-pro)
@@ -101,6 +102,9 @@
 #                           in full, the deposit released (`request_received`), no refusal settlement
 #   h2-g-early-record, h2-i-own-keyshare
 #                           the connection itself: D charged (`unused`)
+#   h2-l-big-frame          one 9 MiB binary message right after `ready` (above the sidecar's
+#                           client buffer, below the node's limit): `error` 413 frame_too_large
+#                           without `fault`, the client's doing: D charged (`unused`)
 #  cancel and reuse (a force-stopped request whose credential reference a later one rides on)
 #   h2-k-rst-reuse, h2-k-rst-reuse-same   request 2 released, RST_STREAM, then a HEADERS record for
 #                           the next / the same stream with no `request`: refused before it is queued
@@ -240,6 +244,8 @@ UPSTREAM_BASE="${CU_UPSTREAM_BASE:-https://api.venice.ai/api/v1}"
 # The node lists models at its base URL with the provider key: it must be the sidecar's provider host.
 UP_HOST="${CU_UPSTREAM:-api.venice.ai:443}"; UP_HOST="${UP_HOST%:*}"
 case "$UPSTREAM_BASE" in "https://$UP_HOST/"*|"https://$UP_HOST") ;; *) echo "CU_UPSTREAM_BASE ($UPSTREAM_BASE) is not on $UP_HOST" >&2; exit 2 ;; esac
+# The driver has no built-in trusted host: the provider's own, unless set.
+export CU_TRUSTED_HOSTS="${CU_TRUSTED_HOSTS:-$UP_HOST}"
 start_node() {
   (
     cd "$OUT/node"
@@ -482,6 +488,7 @@ run_case h2-r-refusal-after-head "attack:2:1:charged:before the refusal" "$B" no
 run_case h2-f-image-suffix   "attack:2:2:abandoned:pi_win failed" "$B" none -- --http 2 --requests 2 --kinds chat,images "${IMG[@]}" --adv suffix --adv-at 2
 run_case h2-g-early-record   "attack:2:0:unused:."                "$B" none -- --http 2 --adv early-record
 run_case h2-i-own-keyshare   "attack:2:0:unused:share"            "$B" none -- --http 2 --adv own-keyshare
+run_case h2-l-big-frame      "attack:2:0:unused:frame_too_large"  "$B" none -- --http 2 --adv big-frame
 run_case h11-c-suffix        "attack:1.1:1:abandoned:pi_win failed" "$B" none -- --http 1.1 --adv suffix
 run_case h11-c-model-swap    "attack:1.1:1:abandoned:."             "$B" none -- --http 1.1 --adv suffix --adv-suffix-model "$SWAP_MODEL"
 run_case h11-b-padding       "attack:1.1:1:abandoned:pi_win failed" "$B" none -- --http 1.1 --adv padding

@@ -19,7 +19,8 @@ Arguments: case expect driver_rc driver_out driver_err sidecar_runs_dir
   nohttp2                `--http 2` is refused before any setup: the offer no longer lists "2"
   refused:H:<n>:<regex>  the attack on request n is refused by the sidecar (an `error` frame) for
                          that reason; the attacked request never reaches the provider complete
-                         (n = 0: the attack is on the connection, before any request)
+                         (n = 0: the attack is on the connection, before any request; the `error`
+                         frame carries no `fault`: the end is the client's doing)
   withheld:H:<n>         the client never proves its records: the sidecar holds them, the provider
                          answers nothing
   replay:<n>:<regex>     (framing "2") the stale disclosure for request n is refused for that
@@ -28,6 +29,8 @@ Arguments: case expect driver_rc driver_out driver_err sidecar_runs_dir
                          which the provider answered, is refused for that reason (by the frame
                          rules, or by a failed π_WIN); request n was released and is never settled
   legacy                 a protocol-v2 setup is answered with `upgrade_required`
+In every case the driver must print no DEPOSIT_DEVIATION line (a deposit outcome that
+deviates from the signed terms, PROTOCOL-V3.md §12.10).
 """
 import json
 import os
@@ -208,6 +211,8 @@ elif kind in ("refused", "withheld"):
         dev.append(f"the attack did not run on framing {http}")
     elif kind == "refused" and not re.search(reason, f"{adv.get('reason', '')} {adv.get('code') or ''}", re.I):
         dev.append(f"refused for the wrong reason (want /{reason}/)")
+    elif kind == "refused" and n == 0 and adv.get("fault"):
+        dev.append(f"an attack on the connection ended with fault {adv.get('fault')!r} (it is the client's doing)")
     if http == "2" and n > 0 and e2e and len(reqs) != n - 1:
         dev.append(f"expected {n - 1} honest request(s) before the attack")
     if evs is None:
@@ -267,4 +272,7 @@ elif kind == "forged":
             dev.append(f"request {n} was never released (the claim did not follow a real response)")
 else:
     dev.append(f"unknown expectation {expect}")
+deviations = [l[len("DEPOSIT_DEVIATION "):] for l in out.splitlines() if l.startswith("DEPOSIT_DEVIATION ")]
+if deviations:
+    dev.append(f"the driver reports a deposit outcome off the signed terms: {deviations[0][:200]}")
 print(("PASS" if not dev else "DEVIATION: " + "; ".join(dev)) + "\t" + evidence)
