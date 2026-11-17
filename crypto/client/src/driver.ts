@@ -81,7 +81,7 @@ import { RequestRefused, advOutcome, type Ctx, type Framing, type ImageTerms, ty
 import { H11 } from './driver-h11.ts'
 import { H2Conn, runHttp2 } from './driver-h2.ts'
 import { MAX_DATA_IN_RECORD, chatPath, checkH2Offer, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
-import { chatBlockProblem, checkImagesBlock, padBody, pinnedModel, renderChatSuffix, renderImagesSuffix, upstreamModelsProblem } from './offer.ts'
+import { chatBlockProblem, checkImagesBlock, padBody, pinnedModel, renderChatSuffix, renderImagesSuffix, upstreamModelsProblem, contextLengthsProblem } from './offer.ts'
 import { checkHeadTemplate, checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { makeReceiptChecker } from './receipt-check.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
@@ -296,6 +296,8 @@ function checkOffer(offer: any): void {
   if (problem) offerRefused(`the offer's chat block is refused: ${termSafe(problem)}`)
   const upstream = upstreamModelsProblem(offer)
   if (upstream) offerRefused(`offer_malformed: ${termSafe(upstream)}`)
+  const contexts = contextLengthsProblem(offer)
+  if (contexts) offerRefused(`offer_malformed: ${termSafe(contexts)}`)
   try {
     // The head template is held to its syntax before any setup (π_NK checks it again in framing "1.1").
     checkHeadTemplate(offer.head_template ?? '', offer.upstream_host ?? '', 'chat')

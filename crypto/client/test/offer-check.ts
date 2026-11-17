@@ -2,7 +2,7 @@
 // (`src/offer.ts`): the receipt's upper bound and the image count key.
 //   node --experimental-strip-types test/offer-check.ts
 import assert from 'node:assert/strict'
-import { MAX_BODY_LEN, checkImagesBlock, imageCountKeyForRoute, maxUsageCharge, padBody, paddedBodyLength, pinnedModel, renderChatSuffix, upstreamModelsProblem } from '../src/offer.ts'
+import { MAX_BODY_LEN, checkImagesBlock, imageCountKeyForRoute, maxUsageCharge, padBody, paddedBodyLength, pinnedModel, renderChatSuffix, upstreamModelsProblem, contextLengthsProblem } from '../src/offer.ts'
 
 // The bound is the node's own formula: a usage with cached reads is bounded
 // at the cached price, never at the uncached one.
@@ -81,3 +81,13 @@ assert.throws(() => paddedBodyLength(10, 3), /bucket/)
   }
 }
 console.log('offer-check: ok')
+
+{
+  const pl = { a: {}, b: {} }
+  assert.equal(contextLengthsProblem({ price_list: pl }), null)
+  assert.equal(contextLengthsProblem({ price_list: pl, context_lengths: { a: 8192 } }), null)
+  for (const bad of [null, [], 'x', { c: 8192 }, { a: 0 }, { a: -1 }, { a: 1.5 }, { a: '8192' }, { a: 2 ** 60 }]) {
+    assert.notEqual(contextLengthsProblem({ price_list: pl, context_lengths: bad }), null, JSON.stringify(bad))
+  }
+  console.log('context_lengths checks ok')
+}

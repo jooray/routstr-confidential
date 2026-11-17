@@ -902,9 +902,10 @@ model on this offer reserves for (§12.10). It is the row of the provider behind
 length). Absent for a model without a known context length, and absent altogether when no model has one.
 N MUST size every chat reservation on this offer by the signed number while it names one. C MUST use only
 this number when it computes a ceiling for `request_ok.reserved_msats` (§12.10); without an entry for the
-model, C sets no ceiling (N then reserves the model's maximum cost, which C cannot recompute). C ignores
-the field when it is not an object of positive integers, keyed by models of `price_list`; extra keys
-do not make an offer invalid.
+model, C sets no ceiling (N then reserves the model's maximum cost, which C cannot recompute). C refuses
+an offer whose field is not an object of positive integers keyed by models of `price_list`, as for
+`upstream_models` (N signs it, so a malformed one is N's fault); an older client that does not know the
+field ignores it.
 
 The chat suffix of a request for model `m` pins `upstream_models[m]` when present, else `m`
 (docs/CHAT-SUFFIX.md); the client renders it from the offer its request names and compares it with

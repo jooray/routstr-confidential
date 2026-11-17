@@ -52,6 +52,18 @@ export function upstreamModelsProblem(offer: any): string | null {
   return null
 }
 
+/** Why the offer's `context_lengths` is refused, or null (absent is fine). */
+export function contextLengthsProblem(offer: any): string | null {
+  const m = offer?.context_lengths
+  if (m === undefined) return null
+  if (m === null || typeof m !== 'object' || Array.isArray(m)) return 'context_lengths is not an object'
+  for (const [pub, n] of Object.entries(m)) {
+    if (!Object.hasOwn(offer.price_list ?? {}, pub)) return `context_lengths names ${JSON.stringify(pub)}, which price_list does not`
+    if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) return `context_lengths[${JSON.stringify(pub)}] is not a positive integer`
+  }
+  return null
+}
+
 const CAP_KEYS = ['max_tokens', 'max_completion_tokens', 'max_output_tokens']
 const PIN_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
 const pinValueOk = (v: unknown): boolean =>
