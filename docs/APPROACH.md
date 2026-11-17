@@ -128,7 +128,7 @@ Billing is the node's ordinary reservation and settlement path. The client's cre
 | Item | When | Amount |
 |---|---|---|
 | Connection deposit | reserved at the `setup` | `connection_deposit_msat` from the signed offer (node setting; default the abandon fee, at least the session fee and at least 1 sat) |
-| Request reservation | at each `request` | chat: `max(min_request_msat, ⌈(prompt_limit·max(in, cache_write) + (max_tokens + margin)·out)/1000⌉)` with `prompt_limit` the model's full context; images: `msat_per_image × count` |
+| Request reservation | at each `request` | chat: `max(min_request_msat, ⌈(prompt_limit·max(in, cache_write) + (max_tokens + margin)·out)/1000⌉)` with `prompt_limit` the model's full context, signed per model in the offer's `context_lengths` (the only number a client bounds the reservation with); images: `msat_per_image × count` |
 | Session fee | once per connection, with the settlement of request 1 | `session_fee_msat`; requests 2… pay usage only |
 | Abandon fee | per request dropped after its reservation and before `body_released`, unless the deposit is charged for it | `abandon_fee_msat` |
 | Usage | per settled chat request | the π_C3S-verified usage at the rates of the offer the request named, capped at the reservation |

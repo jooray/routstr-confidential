@@ -4,7 +4,7 @@
 
 import { hex, sha256 } from './advice.ts'
 import type { H2OfferBlock } from './h2.ts'
-import { announcedReserve, type ReceiptQuery } from './receipt-check.ts'
+import { announcedReserve, reservationCeiling, type ReceiptQuery } from './receipt-check.ts'
 
 export type Framing = '2' | '1.1'
 
@@ -35,6 +35,8 @@ export interface ReqBody {
 
 export interface Ctx {
   offer: any
+  /** Node mode: the signature of `offer` (the offer the setup named). */
+  offerSig?: string
   /** The offer's checked `h2` block (framing "2"). */
   h2?: H2OfferBlock
   nodeMode: boolean
@@ -144,6 +146,15 @@ export async function openRequest(
   // a charge of the reservation (a 5xx), checked against the receipt.
   const reserved = announcedReserve(m)
   if (ctx.nodeMode) console.log(`[client ${s.label}] request ${n} accepted: announced reserved_msats=${reserved ?? 'none'}`)
+  // A chat reservation above what an honest node reserves by the signed
+  // offer (its `context_lengths`, rates and fees, §12.10) is refused before
+  // any record of the request is sent. Only for the offer we verified.
+  if (ctx.nodeMode && !b.image && reserved !== undefined && ctx.offerSig !== undefined && ctx.requestExtras.offer_sig === ctx.offerSig) {
+    const ceiling = reservationCeiling(ctx.offer, b.model, b.maxTokens, ctx.depositMsat)
+    if (ceiling !== undefined && reserved > ceiling) {
+      throw new Error(`request ${n}: the node reserved ${reserved} msat, more than the ${ceiling} msat the signed offer allows`)
+    }
+  }
   return { ok: m, refused, reserved }
 }
 

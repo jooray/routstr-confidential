@@ -3,7 +3,7 @@
 // reservation the node announced in `request_ok`, never the receipt's own.
 //   node --experimental-strip-types test/receipt-check.ts
 import assert from 'node:assert/strict'
-import { announcedReserve, makeReceiptChecker, type ReceiptQuery } from '../src/receipt-check.ts'
+import { announcedReserve, makeReceiptChecker, reservationCeiling, signedContextLength, type ReceiptQuery } from '../src/receipt-check.ts'
 
 const quiet = console.log
 console.log = () => {}
@@ -57,6 +57,31 @@ try {
   assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 4000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000 })), /announced 5000/)
   // An accepted image is the flat price exactly.
   check(ir({ cost_msats: 2100, usage: { flat: true }, msat_per_image: 1000 }), q({ status: 200, image }))
+
+  // The reservation ceiling: the node's formula from the signed offer only
+  // (`context_lengths`, never the listing's row), as routstr-core's reserve().
+  const rates = { in: 1000, cached_in: 500, out: 2000 }
+  const signed = { price_list: { m: rates }, context_lengths: { m: 40_000 } }
+  assert.equal(signedContextLength(signed, 'm'), 40_000)
+  // 40000*1 + 8*2 msat (the node's test of the signed limit reserves exactly this)
+  assert.equal(reservationCeiling(signed, 'm', 8, 1000), 40_016)
+  // The dearer of in and cache_write, the margin and the larger fee.
+  const dear = { price_list: { m: { ...rates, cache_write: 1500 } }, context_lengths: { m: 1000 }, reserve_margin_tokens: 16, session_fee_msat: 100, abandon_fee_msat: 300 }
+  assert.equal(reservationCeiling(dear, 'm', 8, 1000), 1500 + 48 + 300)
+  // Never below the deposit (plus the fee): the node's min_request_msat is not signed.
+  assert.equal(reservationCeiling({ ...signed, context_lengths: { m: 10 } }, 'm', 8, 1000), 1000)
+  // No ceiling: no entry, no deposit, a model the offer does not price, a bad entry.
+  for (const [o, mid, dep] of [
+    [{ price_list: { m: rates } }, 'm', 1000],
+    [signed, 'm', 0],
+    [{ ...signed, context_lengths: { x: 5 } }, 'x', 1000],
+    ...[0, -1, 1.5, '40000', null, 2 ** 60].map((v) => [{ ...signed, context_lengths: { m: v } }, 'm', 1000]),
+    [{ ...signed, context_lengths: [40_000] }, 'm', 1000],
+  ] as [any, string, number][]) {
+    assert.equal(reservationCeiling(o, mid, 8, dep), undefined, JSON.stringify(o))
+  }
+  // An inherited key is not an entry.
+  assert.equal(signedContextLength({ context_lengths: Object.create({ m: 5 }) }, 'm'), undefined)
 } finally {
   console.log = quiet
 }

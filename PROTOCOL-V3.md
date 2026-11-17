@@ -93,6 +93,8 @@ The operator states what their upstream supports. Nothing is probed or assumed.
   public id; the chat suffix pins the provider's id. **Only a provider prefix may differ:** each provider id
   ends with `"/"` + its public id. C refuses an offer that maps a public id to anything else, and N leaves
   such a model out of its offer (else a node could pin a cheaper model under the id C pays for).
+- `context_lengths` (optional): public id → the prompt limit in tokens each chat reservation for it is
+  sized by (§12.1, §12.10). C bounds a request's `reserved_msats` only with this number.
 
 ### 2.3 Client choice
 
@@ -892,6 +894,18 @@ of `price_list` (and logs it). Without the rule a node could sign `claude-opus-4
 `qwen/qwen3.8-27b`: C would be charged Opus rates, the suffix would make the provider run Qwen, and the
 receipt (`upstream_model`) would verify. The rule leaves another prefix for the same name open (§10,
 risk 11).
+**`context_lengths`** (N, optional): `{"<public id>": <tokens>, …}`, for the chat models of `price_list`
+whose context length the node knows: the prompt limit (a positive integer) that a chat request for that
+model on this offer reserves for (§12.10). It is the row of the provider behind the sidecar
+(`upstream_host`) when the offer was signed, which need not be the row `GET /v1/models` lists for the id
+(a node with several upstreams for one id lists its best-ranked one, which may have another context
+length). Absent for a model without a known context length, and absent altogether when no model has one.
+N MUST size every chat reservation on this offer by the signed number while it names one. C MUST use only
+this number when it computes a ceiling for `request_ok.reserved_msats` (§12.10); without an entry for the
+model, C sets no ceiling (N then reserves the model's maximum cost, which C cannot recompute). C ignores
+the field when it is not an object of positive integers, keyed by models of `price_list`; extra keys
+do not make an offer invalid.
+
 The chat suffix of a request for model `m` pins `upstream_models[m]` when present, else `m`
 (docs/CHAT-SUFFIX.md); the client renders it from the offer its request names and compares it with
 `request_ok.suffix`. The sidecar's `model_allowlist` names provider ids (what the sidecar sees). Image
@@ -1264,6 +1278,18 @@ the frame would be `{"type":"closed","reason":"ended"}`.
 
 The session fee is "still due" until the connection's first settlement.
 
+**Size of a chat reservation.** With `L` the named offer's `context_lengths[model]`, the frozen rates of
+its `price_list` entry (`in`, `cache_write`, `out`, msat per 1000 tokens), `max_tokens` the pinned cap and
+`margin` the offer's `reserve_margin_tokens`:
+`max(min_request_msat, ⌈(L · max(in, cache_write) + (max_tokens + margin) · out) / 1000⌉)` + max(session
+fee if still due, abandon fee). `L` is the signed number, frozen with the rates: a later change of the
+node's catalogue does not move a reservation on that offer. Without an entry the node uses its catalogue's
+context length, or, with none, the model's maximum cost. A client that bounds `reserved_msats` (refusing
+before any record of the request is sent) computes the bound from the signed `L` only, never from
+`/v1/models`, and only where the offer has an entry for the model. It allows for `min_request_msat` (not
+in the offer) by never bounding below the connection deposit plus that fee: a deposit above 0 is at least
+the node's minimum request (§12.1). With a deposit of 0 it sets no ceiling.
+
 **Connection deposit.** Reserved at the `setup` from its credential (`ready.deposit_msat`), released by the
 connection's first settlement (`deposit_released_msat` in that receipt). A connection that ends with no
 settled request, first matching row:
@@ -1370,4 +1396,5 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | `upstream_models` values must be `<prefix>/` + the public id (clients refuse anything else, N never signs it); the other-prefix gap is residual risk 11 (SDK review finding 17) | §2.2, §12.1, §10 |
 | a provider `HEADER_TABLE_SIZE` below 4096 ends the connection (`h2_table_size`), not only one below the credential entry | §5.6, §12.6 |
 | an error head followed by a reset is disclosed (finding 18); C's checks of the provider's frames (16 KiB, initial window, GOAWAY); `REFUSED_STREAM` as an open question | §9.4, §10.1, §12.8 |
+| `context_lengths`: the prompt limit each chat reservation is sized by, signed and frozen with the offer's terms; a client bounds `reserved_msats` only with it (the `/v1/models` row may be another upstream's) | §2.2, §12.1, §12.10 |
 | a refused stream is proven (`disclose_reset`: `RST_STREAM(REFUSED_STREAM)`, GOAWAY(`NO_ERROR`) below the stream) and settled like a 429; a disclosed GOAWAY before `body_released` releases the deposit; with nothing of the request written only within the GOAWAY window `min(30 s, h2.idle_secs/4)` after `request_ok`; N waits 60 s after the provider's early close; every receipt's `reserved_msats` equals `request_ok`'s; residual risk 12 | §3.5, §5.4.1, §9.4, §10.1, §12.8–§12.10 |

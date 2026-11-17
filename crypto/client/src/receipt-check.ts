@@ -37,6 +37,42 @@ export function announcedReserve(m: any): number | undefined {
 }
 
 /**
+ * The prompt limit the signed offer names for `model` (`context_lengths`,
+ * PROTOCOL-V3.md §12.1): the number the node sizes a chat reservation by.
+ * Undefined when the offer names none (or no positive integer).
+ */
+export function signedContextLength(offer: any, model: string): number | undefined {
+  const m = offer?.context_lengths
+  const v = m && typeof m === 'object' && !Array.isArray(m) && Object.hasOwn(m, model) ? m[model] : undefined
+  return Number.isSafeInteger(v) && v > 0 ? v : undefined
+}
+
+/**
+ * The most an honest node reserves for a chat request on this offer (msat),
+ * by its formula (§12.10) from signed numbers only: the offer's
+ * `context_lengths` entry (never the `/v1/models` row, which may be another
+ * upstream's), its rates, `reserve_margin_tokens` and fees. The node's
+ * `min_request_msat` is not in the offer, so the bound is never below the
+ * connection deposit plus the fee (a deposit above 0 is at least the minimum
+ * request). Undefined, i.e. no ceiling: no entry for the model, no usable
+ * rates, or no deposit.
+ */
+export function reservationCeiling(offer: any, model: string, maxTokens: number, depositMsat: number): number | undefined {
+  const rates = offer?.price_list && Object.hasOwn(offer.price_list, model) ? offer.price_list[model] : undefined
+  const limit = signedContextLength(offer, model)
+  if (!rates || limit === undefined || !(depositMsat > 0)) return undefined
+  const rate = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0)
+  const inRate = Math.max(rate(rates.in), rate(rates.cache_write))
+  const outRate = rate(rates.out)
+  if (!inRate || !outRate || !(maxTokens > 0)) return undefined
+  const count = (v: unknown) => (Number.isSafeInteger(v) && (v as number) > 0 ? (v as number) : 0)
+  const margin = count(offer.reserve_margin_tokens)
+  const fee = Math.max(count(offer.session_fee_msat), count(offer.abandon_fee_msat))
+  const usage = Math.ceil((limit * inRate + (maxTokens + margin) * outRate) / 1000)
+  return Math.max(usage, depositMsat) + fee
+}
+
+/**
  * A receipt never names larger fees than the offer; the session fee is
  * charged with the connection's first settlement only; the charge is at most
  * what the usage at the signed rates (or the error status) allows, and

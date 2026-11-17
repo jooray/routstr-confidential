@@ -975,6 +975,7 @@ function makeCtx(label: string): Ctx {
   }
   return {
     offer: OFFER,
+    offerSig: OFFER_SIG,
     h2: H2_BLOCK,
     nodeMode: NODE_MODE,
     depositMsat: DEPOSIT,

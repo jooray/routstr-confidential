@@ -70,7 +70,7 @@ authors' working documents and are not published:
 >   rates and reserves `max(min_request_msat, ⌈(prompt_limit·max(in,
 >   cache_write) + (max_tokens + margin)·out)/1000⌉)`, where `prompt_limit`
 >   is the model's full context length (the opaque prompt is never
->   discounted) and `margin` is the signed `reserve_margin_tokens` (16 by
+>   discounted), signed per model in the offer's `context_lengths`, and `margin` is the signed `reserve_margin_tokens` (16 by
 >   default). It charges exactly the frozen-rate cost of the π_C3S-verified
 >   usage, capped at the reservation, plus the session fee f_s once per
 >   connection (with request 1). It releases the reservation if the provider
@@ -576,6 +576,15 @@ The prompt is opaque to the node, so the reservation never discounts it
   msats for a session of 63, predates the full-context reservation.) When the
   catalogue gives a model two context lengths (its own and a top provider's),
   the larger is reserved.
+- **The client's ceiling.** The node signs the `prompt_limit` it reserves for
+  in the offer (`context_lengths`, PROTOCOL-V3 §12.1) and uses that number,
+  frozen with the rates, for every request naming the offer. A client bounds
+  `request_ok.reserved_msats` by the formula with only that number: the
+  `/v1/models` row is the node's best-ranked upstream for the id, which need
+  not be the provider behind the sidecar, and its context length can differ
+  (an honest node would then be refused). Without an entry for the model the
+  client sets no ceiling: the node then reserves the model's maximum cost,
+  which the client cannot recompute.
 - **Completion side:** exactly bounded. The suffix pins `max_tokens` **and**
   `max_completion_tokens` to `T ≤ max_tokens_cap` (the cap is checked by the
   node and in `handle_setup`; the dual pin exists because Venice otherwise lets
