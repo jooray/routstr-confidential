@@ -429,21 +429,61 @@ mod tests {
     /// The bytes the three client stacks write (captured from the reference
     /// driver's fork, the SDK's fork and the browser library's fork with the
     /// options their sessions pass; random = aa.., session id = bb.., the
-    /// share = the P-256 generator, host api.venice.ai). All three agree.
-    const STACK_H2: &str = "010000df0303aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0002130101000094ff0100010000000012001000000d6170692e76656e6963652e6169000a00040002001700230000002b0003020304000d000e000c04030503080404010501060100330047004500170041046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5001000050003026832";
-    const STACK_H11: &str = "010000e50303aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb000213010100009aff0100010000000012001000000d6170692e76656e6963652e6169000a00040002001700230000002b0003020304000d000e000c04030503080404010501060100330047004500170041046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f50010000b000908687474702f312e31";
+    /// share = the P-256 generator). All three agree. The vectors live in
+    /// `crypto/conformance/client-hello-vectors.json`, which the client
+    /// stacks copy into their own tests.
+    const VECTORS: &str = include_str!("../../conformance/client-hello-vectors.json");
+
+    fn unhex<const N: usize>(v: &serde_json::Value) -> [u8; N] {
+        hex::decode(v.as_str().unwrap()).unwrap().try_into().unwrap()
+    }
 
     #[test]
     fn the_client_stacks_write_the_canonical_hello() {
-        let g: [u8; 65] = hex::decode("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5").unwrap().try_into().unwrap();
-        for (h2, stack) in [(true, STACK_H2), (false, STACK_H11)] {
-            let msg = hex::decode(stack).unwrap();
-            assert_eq!(canonical_client_hello(&[0xaa; 32], &[0xbb; 32], "api.venice.ai", &g, h2).unwrap(), msg);
-            check_client_hello(&msg, &g, "api.venice.ai", h2).unwrap();
+        let all: serde_json::Value = serde_json::from_str(VECTORS).unwrap();
+        let vectors = all["vectors"].as_array().unwrap();
+        let mut framings: Vec<&str> = vectors.iter().map(|v| v["framing"].as_str().unwrap()).collect();
+        framings.sort();
+        assert_eq!(framings, ["1.1", "2"], "one vector per framing");
+        for v in vectors {
+            let h2 = match v["framing"].as_str().unwrap() {
+                "2" => true,
+                "1.1" => false,
+                f => panic!("unknown framing {f}"),
+            };
+            let inp = &v["inputs"];
+            let host = inp["host"].as_str().unwrap();
+            assert_eq!(inp["alpn"].as_str().unwrap().as_bytes(), if h2 { ALPN_H2 } else { ALPN_HTTP11 });
+            let random: [u8; 32] = unhex(&inp["random_hex"]);
+            let sid: [u8; 32] = unhex(&inp["session_id_hex"]);
+            let g: [u8; 65] = unhex(&inp["key_share_hex"]);
+            let msg = hex::decode(v["client_hello_hex"].as_str().unwrap()).unwrap();
+            assert_eq!(v["client_hello_len"].as_u64().unwrap() as usize, msg.len());
+            assert_eq!(canonical_client_hello(&random, &sid, host, &g, h2).unwrap(), msg);
+            check_client_hello(&msg, &g, host, h2).unwrap();
             // The other framing, host or share: refused.
-            assert!(check_client_hello(&msg, &g, "api.venice.ai", !h2).is_err());
-            assert!(check_client_hello(&msg, &g, "api.venice.ai.example", h2).is_err());
-            assert!(check_client_hello(&msg, &joint(), "api.venice.ai", h2).is_err());
+            assert!(check_client_hello(&msg, &g, host, !h2).is_err());
+            assert!(check_client_hello(&msg, &g, &format!("{host}.example"), h2).is_err());
+            assert!(check_client_hello(&msg, &joint(), host, h2).is_err());
+            // The free ranges are where the three inputs sit, and nothing else is free.
+            let ranges = v["free_ranges"].as_array().unwrap();
+            let range = |field: &str| {
+                let r = ranges.iter().find(|r| r["field"] == field).unwrap();
+                r["start"].as_u64().unwrap() as usize..r["end"].as_u64().unwrap() as usize
+            };
+            assert_eq!(ranges.len(), 3);
+            assert_eq!(range("random"), CH_RANDOM);
+            assert_eq!(range("session_id"), CH_SESSION_ID);
+            assert_eq!(&msg[range("random")], &random);
+            assert_eq!(&msg[range("session_id")], &sid);
+            assert_eq!(&msg[range("key_share")], &g);
+            // Fresh values in the three ranges give the canonical hello for them.
+            let (r2, s2) = ([0x11u8; 32], [0x22u8; 32]);
+            let mut masked = msg.clone();
+            masked[range("random")].copy_from_slice(&r2);
+            masked[range("session_id")].copy_from_slice(&s2);
+            masked[range("key_share")].copy_from_slice(&joint());
+            assert_eq!(canonical_client_hello(&r2, &s2, host, &joint(), h2).unwrap(), masked);
         }
     }
 
