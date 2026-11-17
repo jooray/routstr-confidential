@@ -72,20 +72,21 @@ fn ghash_padded(h: &[u8; 16], data: &[u8]) -> [u8; 16] {
 }
 
 /// Carry-less multiplication in GF(2^128) with the GCM bit order.
+///
+/// Constant time: no branch and no memory access depends on the hash key or
+/// the state. Each conditional XOR is a mask (all ones or all zeros) derived
+/// from the bit.
 fn gfmul(x: u128, y: u128) -> u128 {
     // Bit-reflected GF(2^128) multiply as used by GCM.
+    const R: u128 = 0xe1000000000000000000000000000000;
     let mut z: u128 = 0;
     let mut v = x;
     for i in 0..128 {
-        // bit (127 - i) of y (MSB-first)
-        if (y >> (127 - i)) & 1 == 1 {
-            z ^= v;
-        }
-        let lsb = v & 1;
-        v >>= 1;
-        if lsb == 1 {
-            v ^= 0xe1000000000000000000000000000000;
-        }
+        // bit (127 - i) of y (MSB-first), as a mask
+        let take = 0u128.wrapping_sub((y >> (127 - i)) & 1);
+        z ^= v & take;
+        let reduce = 0u128.wrapping_sub(v & 1);
+        v = (v >> 1) ^ (R & reduce);
     }
     z
 }
@@ -178,6 +179,47 @@ pub fn record_header(ct_len: usize) -> [u8; 5] {
 mod tests {
     use super::*;
     use crate::hex;
+
+    /// The textbook bit-serial multiply (SP 800-38D Algorithm 1), with branches.
+    fn gfmul_reference(x: u128, y: u128) -> u128 {
+        let mut z: u128 = 0;
+        let mut v = x;
+        for i in 0..128 {
+            if (y >> (127 - i)) & 1 == 1 {
+                z ^= v;
+            }
+            let lsb = v & 1;
+            v >>= 1;
+            if lsb == 1 {
+                v ^= 0xe1000000000000000000000000000000;
+            }
+        }
+        z
+    }
+
+    #[test]
+    fn the_masked_multiply_equals_the_reference() {
+        let mut s: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+        let mut next = || {
+            // xorshift128
+            s ^= s << 35;
+            s ^= s >> 31;
+            s ^= s << 17;
+            s
+        };
+        let edges = [0u128, 1, 1 << 127, u128::MAX, 0xe1 << 120, 0x8000_0000_0000_0000_0000_0000_0000_0001];
+        for &a in &edges {
+            for &b in &edges {
+                assert_eq!(gfmul(a, b), gfmul_reference(a, b), "{a:x} {b:x}");
+            }
+        }
+        for _ in 0..2000 {
+            let (a, b) = (next(), next());
+            assert_eq!(gfmul(a, b), gfmul_reference(a, b), "{a:x} {b:x}");
+        }
+        // 1 in GCM's bit order is the identity.
+        assert_eq!(gfmul(0x66e94bd4ef8a2c3b884cfa59ca342b2e, 1 << 127), 0x66e94bd4ef8a2c3b884cfa59ca342b2e);
+    }
 
     #[test]
     fn record_header_refuses_oversized_records() {
