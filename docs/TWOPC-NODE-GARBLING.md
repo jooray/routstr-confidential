@@ -179,11 +179,19 @@ garbler 6, with tweaks (gate, slot) disjoint from the check tweaks (bit 127).
 - Tests: `three_halves_gate_all_cases` (every permute pair, dicing pair and colour pair),
   `three_halves_control_bits_hide_permute_bits`, `garble_evaluate_matches_plaintext`, `tables_roundtrip`,
   `corrupt_control_bits_detected_by_evaluator`, `corrupt_garbled_table_detected_by_evaluator`.
-- Caveat: the paper (eprint 2021/749) could not be fetched when this was built. The scheme was rebuilt from
-  its structure, V_st = [[1,0,s,0,s⊕t],[0,1,0,t,s⊕t]] and dicing randomness. The evaluator matrices (S1, S2,
-  Rp) come from a public C++ reimplementation, read as reference only; the garbler is derived independently
-  and checked exhaustively. **The external review must compare the matrices with RR21's figure.**
-  Correctness does not depend on them, but the privacy argument does.
+- Compared with the paper (eprint 2021/749) on 2026-11-21. `S1`, `S2` are the basis matrices of its Figure 3
+  and `Rp` the marginal views of `R_p` in Figure 4 (rows `R_00..R_11`, columns `A_L, A_R, B_L, B_R`), bit for
+  bit. The evaluator's equations are Figure 6 with the `V` of section 5.1 (`V_01 = [[1,0,0,0,1],[0,1,0,1,1]]`,
+  `V_10 = [[1,0,1,0,1],[0,1,0,0,1]]`, `V_11 = [[1,0,1,0,0],[0,1,0,1,0]]`), the hash part `[[1,0,1],[0,1,1]]`
+  and `DecodeR` for an odd-parity gate. The garbler's control bits equal the paper's distribution
+  `R = R_p + a R_a + b R_b + R_$` with `a = not pa`, `b = not pb`: `r0 = d0 + a t + b (s+t)`,
+  `r1 = d1 + a (s+t) + b s` over GF(2), which is what `and_garble3` computes. Two differences remain. The
+  colour bit is in the half we call R (the paper puts it in the first half), a relabelling. The hash is
+  not the paper's recommended one: we use mpz's fixed-key `pi(pi(x) + i) + pi(x)` (GKWY20) truncated to 64
+  bits plus one bit, where the paper asks for an RTCCR family for the four functions `a Delta_L + b Delta_R`
+  (its Definition 2) and recommends `AES_k(X + U(tau)) + sigma(X + U(tau))` with a random key. A TCCR for
+  `{0, Delta}` does not give that by definition (a hash half is masked with the *other* half of Delta too),
+  so this instantiation is argued in the ideal-permutation model, not covered by a cited theorem.
 - Status: privacy and authenticity of these tables are an **assumption to be reviewed, not a cited proof**.
   RR21's theorem is about their scheme under their hash assumption; it covers this code only once the
   matrices match and once the instantiation of H (fixed-key-AES TCCR with the (gate, slot) tweaks above, as

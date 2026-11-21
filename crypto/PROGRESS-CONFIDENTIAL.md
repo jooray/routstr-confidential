@@ -668,3 +668,45 @@ python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8, 5 minutes 
 python3 -I crypto/tools/shape-proxy.py --listen 127.0.0.1:7445 --target 127.0.0.1:7444 --up-mbit 2 --down-mbit 50 --delay-ms 40 &
 (cd crypto/client && CU_SIDECAR=http://127.0.0.1:7445 ./bench.sh 3)
 ```
+
+## π_NK (HTTP/2 head) and π_WIN with per-proof setup (2026-11-21)
+
+Apple M2 Max, release build, real OT. Loopback sidecar against the live provider, reference client with
+`--no-zkchan` (every proof on its own socket, its own OT setup). `ms` is the driver's wall time around the
+proof (`Session.proof`: cu-prover spawn, WebSocket, setup, proof), `bytes_sent` / `bytes_recv` are the
+client's side of the socket. Five runs of one cold framing-"2" chat request, all status 200.
+
+```bash
+cd crypto && cargo build --release -p cu-sidecar -p zkbench -p twopc
+./zkbench/target/release/cu-sidecar --listen 127.0.0.1:7481 --upstream api.venice.ai:443 \
+  --key-env VENICE_API_KEY --offer relay/offer.venice.json &
+cd client && export CU_PROVER=../zkbench/target/release/cu-prover CU_2PC=../zkbench/target/release/cu-2pc
+node --experimental-strip-types src/driver.ts --sidecar http://127.0.0.1:7481 --trusted-host api.venice.ai \
+  --model mistral-small-3-2-24b-instruct --max-tokens 20 --http 2 --requests 1 --no-zkchan   # x5
+```
+
+| proof | ms, 5 runs | median | client sends | client receives | total | SHA-256 compr. | AES blocks |
+|---|---|---|---|---|---|---|---|
+| π_NK, HTTP/2 head, 170 bytes (client verifies) | 107, 107, 108, 109, 110 | 108 | 484 184 | 473 073 | 957 257 (0.96 MB) | 4 | 11 |
+| π_WIN, one small request (client proves) | 144, 145, 145, 149, 151 | 145 | 490 677 | 964 240 | 1 454 917 (1.45 MB) | 7 | 22 |
+
+Byte counts were identical in all five runs.
+
+Circuit sizes. π_NK: `zkbench::proofs::stats` gives AES blocks = ceil((head_len + 1) / 16) = ceil(171 / 16) = 11
+and SHA-256 compressions = 1 + sha256_blocks(5 + head_len + 1) = 1 + 3 = 4 (the 228-byte HTTP/1.1 head gives
+15 and 5, as in BENCH-v2.md). head_len = 170 is `head_len` in the π_NK parameters (the HTTP/2 preface,
+SETTINGS, WINDOW_UPDATE, probe GET with the 42-byte credential, RST_STREAM); the head's content was not
+printed. π_WIN: compressions are fixed at 7; AES blocks are the distinct (seq, block) pairs of the windows
+(`pi_win_blocks`), counted from the parameters the driver sent (copied through a wrapper script around
+`cu-prover`, params only): 4 windows over records 0..2, 339 ciphertext bytes (seq 0: 10 B, seq 1: 73 B,
+seq 2: 16 B at offset 0 and 240 B at offset 64), 1 + 5 + 1 + 15 = 22 blocks.
+
+π_NK moves 0.96 MB here against 1.45 MB for the 228-byte head in `cu-prover --bench`. The 11-block head needs
+fewer correlations and, consistent with the chunking note in BENCH-v2.md (Ferret extends in fixed
+chunks), stays within one chunk; this was not isolated with a separate run.
+
+Offline `cu-prover --bench` (3 runs, local, emulated transport; its π_NK is the 228-byte HTTP/1.1 head and its
+π_WIN the whole-suffix record, so it gives neither shape above): π_NK 158.3 / 163.9 / 170.4 ms, 481.3 kB P→V,
+964.2 kB V→P, 5 compr., 15 blocks; π_WIN (suffix) 161.9 / 162.6 / 163.9 ms, 484.6 kB / 964.2 kB, 7 / 15;
+π_C3S 200.3 / 201.0 / 205.1 ms, 504.0 kB / 964.2 kB, 7 / 38. At 25 ms one way, 100 Mbit/s: π_NK 1219-1238 ms,
+π_WIN 1203-1270 ms, π_C3S 1261-1301 ms.

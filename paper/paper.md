@@ -245,6 +245,18 @@ per-image price book with resolution and quality tiers, WebP output, and one of 
 shapes the clients parse) is a new offer entry; a provider priced per megapixel, keyed on other tier
 parameters, or answering in another shape still needs code in the node and the clients.
 
+**Two classes of provider.** Live tests of ten providers (2026-11-12 and 2026-11-13) showed two
+kinds. *Strict-schema providers* (the case-study provider, Numes) reject unknown fields, so the
+pinned suffix determines the billed request as item 5 demands. *Permissive providers (aggregators,
+gateways)* such as OpenRouter, xKiro and Cloudflare Workers AI accept or forward fields the protocol
+does not fix. There item 5 holds only for the fields the operator pins in the offer: the suffix is a
+list of known price-changing fields pinned off, complete only as far as the operator knows the
+provider's parameters, and a new provider-side parameter that changes the price needs a new pin. An
+operator who offers a permissive provider is responsible for these pins, and C can read them in the
+signed offer. For OpenRouter every price attack tried was closed except two that remain open (paid
+PDF OCR, and honest requests routed to dearer endpoints). The per-provider results are in section 6,
+Scope.
+
 **What framing "2" needs.** An operator offers HTTP/2 only when all of these hold for the upstream;
 `provider-profile-check.py --h2` checks them:
 
@@ -1421,15 +1433,20 @@ round-trip time the handshake stages take 0.32 s and the application stages 0.22
 | Proof | Local | Data | SHA-256 compr. | AES blocks |
 |---|---|---|---|---|
 | $\pi_{NK}$ (connection head; benchmark: a 228-byte HTTP/1.1 head) | 0.16 s | 1.45 MB | 5 | 15 |
+| $\pi_{NK}$ (connection head, framing "2": a 170-byte HTTP/2 head) | 0.11 s | 0.96 MB | 4 | 11 |
 | $\pi_{C3S}$ (usage; one 596-byte server record) | 0.20 s | 1.47 MB | 7 | 38 |
+| $\pi_{WIN}$ (one small chat request: 4 windows over 3 records, 339 ciphertext bytes), per-proof setup | 0.14-0.15 s | 1.45 MB | 7 | 22 |
 | $\pi_{WIN}$ (a request's windows), over a pre-warmed proof channel | 39-66 ms | about 610 kB down per request together with $\pi_{C3S}$, moved off the request path by the top-up | 7 | 1 per 16-byte block touched |
 
 The first two rows include the proof's own OT setup; over a pre-warmed proof channel $\pi_{NK}$ took
 0.06 s and $\pi_{C3S}$ 0.04 s in v2's live runs. $\pi_{WIN}$ needs about 160 k correlations plus 6.4 k
 per AES block: 308 k for a small chat body and 457 k for a 200 kB body in 13 DATA records, whose
 windows touch more blocks. $\pi_{C3S}$ adds 4 compressions per server KeyUpdate it steps through (at
-most 16). $\pi_{NK}$ for the HTTP/2 head and $\pi_{WIN}$ with per-proof setup have not been benchmarked
-separately: `[TO MEASURE]`.
+most 16). The two added rows were measured on 2026-11-21 on an Apple M2 Max, with the reference client and a
+sidecar on loopback against the live provider, each proof on its own socket with its own OT setup (five runs of
+one cold framing-"2" chat request: $\pi_{NK}$ 107-110 ms, $\pi_{WIN}$ 144-151 ms wall, bytes identical in every run).
+$\pi_{NK}$ for the shorter HTTP/2 head moved 0.96 MB against 1.45 MB for the 228-byte head (it needs fewer
+correlations; we did not isolate the cause further).
 
 ## 6.3 End to end
 
@@ -1574,7 +1591,8 @@ refused before the provider received a request it would bill wrongly:
 An honest control and a v2-socket control run in the same gates.
 
 **Scope.** The measurements above are for the case-study provider. Four more providers ran end to end
-through a node on 2026-11-12 and 2026-11-13 (`docs/PROVIDERS.md`); others failed the profile. The HTTP/2
+through a node on 2026-11-12 and 2026-11-13; others failed the profile. The per-provider results are
+kept current at <https://github.com/jooray/routstr-confidential/blob/main/docs/PROVIDERS.md>. The HTTP/2
 behaviours above are properties of each provider's front end on the day of the test.
 
 ## 6.6 The dual-execution version
