@@ -11,6 +11,13 @@
 //! carries model output. Google's usage, merged into the last content
 //! chunk, is refused by design.
 //!
+//! The top level is an allow-list too: `choices`, `usage`, the labels `id`,
+//! `object`, `model`, `provider`, `service_tier`, `system_fingerprint` (null or
+//! at most 128 characters of `[A-Za-z0-9 ._:/@+-]`) and `created` (an unsigned
+//! integer). `cost` (Venice) may be null, a number or a numeric object. `usage` may hold only numbers, booleans, nulls and nested objects
+//! of such (keys `[A-Za-z0-9_]{1,64}`, at most 3 levels counting `usage`). Any
+//! other field could carry prompt- or output-derived data to the node.
+//!
 //! The vectors in `usage-event-vectors.json` are the conformance test for
 //! every implementation (sidecar, reference driver, SDK, browser library).
 
@@ -24,6 +31,30 @@ const EMPTY_TEXT_FIELDS: &[&str] = &["content", "reasoning", "reasoning_content"
 
 fn is_identifier(s: &str) -> bool {
     (1..=32).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')
+}
+
+const LABEL_FIELDS: &[&str] = &["id", "object", "model", "provider", "service_tier", "system_fingerprint"];
+
+fn is_label(v: &Value) -> bool {
+    v.is_null()
+        || v.as_str().is_some_and(|s| {
+            s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b" ._:/@+-".contains(&b))
+        })
+}
+
+/// `depth` counts `usage` itself as 1; at most 3.
+fn numeric_object(v: &Value, depth: u32) -> bool {
+    let Some(o) = v.as_object() else { return false };
+    depth <= 3
+        && o.iter().all(|(k, x)| {
+            (1..=64).contains(&k.len())
+                && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && match x {
+                    Value::Null | Value::Bool(_) | Value::Number(_) => true,
+                    Value::Object(_) => numeric_object(x, depth + 1),
+                    _ => false,
+                }
+        })
 }
 
 fn empty_text(v: &Value) -> bool {
@@ -58,6 +89,20 @@ fn check_choice(c: &Value) -> Result<()> {
 
 /// Ok when `v` is a usage event as §5.4 defines it.
 pub fn check_usage_event(v: &Value) -> Result<()> {
+    if let Some(obj) = v.as_object() {
+        for (k, x) in obj {
+            let ok = match k.as_str() {
+                "choices" | "usage" => true,
+                "created" => x.as_u64().is_some(),
+                "cost" => x.is_null() || x.is_number() || numeric_object(x, 1),
+                f if LABEL_FIELDS.contains(&f) => is_label(x),
+                _ => false,
+            };
+            if !ok {
+                bail!("R: the usage event carries the top-level field {k:?} (not on the allow-list, or its value is not a plain label or number)");
+            }
+        }
+    }
     let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
         bail!("R: usage event has no choices array");
     };
@@ -71,6 +116,9 @@ pub fn check_usage_event(v: &Value) -> Result<()> {
         || v.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).is_none()
     {
         bail!("R: usage event missing token counts");
+    }
+    if !numeric_object(&v["usage"], 1) {
+        bail!("R: the usage object carries something other than numbers");
     }
     Ok(())
 }

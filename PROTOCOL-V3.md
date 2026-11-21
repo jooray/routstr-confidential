@@ -413,9 +413,16 @@ every case above with exact money (`h2-k-*`, `h11-k-extra-record`, `h11-k-pipeli
     `reasoning_content`, `refusal` (each `null` or `""`) and `tool_calls` (`null` or `[]`).
 
   Anything else refuses the event: a non-empty content, reasoning or refusal string, a tool call, `audio`,
-  `logprobs` with tokens, a field not on this list (at any level of the choice), a second choice. The
-  members outside `choices` are unconstrained, as before (the provider's own fields: `id`, `model`,
-  `usage`, `provider`, …). Measured shapes (2026-11-12): Venice, Numes, xKiro, NVIDIA send `choices: []`;
+  `logprobs` with tokens, a field not on this list (at any level of the choice), a second choice.
+
+  The top level of the event is an allow-list too. Its members are only `choices`; `usage`; the labels
+  `id`, `object`, `model`, `provider`, `service_tier`, `system_fingerprint` (each `null` or a string of at
+  most 128 characters from `[A-Za-z0-9 ._:/@+-]`, the empty string included); `created` (a non-negative
+  integer); and `cost` (`null`, a number or a numeric object, as `usage`: Venice sends `{"usd","diem"}`). `usage` holds only numbers, booleans, `null` and nested objects of these: keys `[A-Za-z0-9_]{1,64}`,
+  at most 3 levels of object counting `usage` itself, no strings, no arrays. A provider field outside the
+  list (`citations`, search results, moderation or debug data) could carry prompt- or
+  output-derived data to N, so an event with one is not disclosed and the request is charged as a missing
+  disclosure. Measured shapes (2026-11-12): Venice, Numes, xKiro, NVIDIA send `choices: []`;
   OpenRouter `[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"length",
   "native_finish_reason":"length"}]`; Cloudflare `[{"index":0,"delta":{},"finish_reason":"stop"}]`.
   Conformance vectors: `crypto/relay/usage-event-vectors.json` (the sidecar, the reference driver, the SDK
@@ -505,6 +512,10 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   set and lies after the GOAWAY): the provider decided to close before it saw the stream. A GOAWAY that
   arrived after a record of the request was written is not judged by the window: the provider then
   refused a stream it had seen.
+  A GOAWAY that arrived after a record of the request was written is also refused when that first record
+  was written `h2.idle_secs` or more after N's last write of the connection head or of a request record
+  (control records do not count: C can have them written at will, and a provider need not count them as
+  activity): C may have held the request unwritten until the provider's idle close was in flight.
 - **The refusing frame.** `RST_STREAM` must be on the request's stream (the probe stream 1, another
   request's stream, or stream 0 do not count) with payload length 4 and code 7; any other code (`CANCEL`,
   `NO_ERROR`, `INTERNAL_ERROR`, …) is no statement that nothing was processed. GOAWAY must carry
@@ -1196,7 +1207,9 @@ connection began (handshake flight included).
   is set, else any record N holds; a GOAWAY whose last record arrived before the request's first record was
   written (always so when `S_k` is unset) arrived within the GOAWAY window
   (§5.4.1: `min(30 s, h2.idle_secs / 4)` after `request_ok`, and under `h2.idle_secs` after N's last write
-  to the provider) (then `S_k` := the server records received so far, the interval stays empty); `i` is held, received and in the named key epoch. Then `attestation` (as for any request; with
+  to the provider) (then `S_k` := the server records received so far, the interval stays empty), and a GOAWAY
+  after the first write is refused when that write came `h2.idle_secs` or more after N's last write of the head
+  or of a request record (§5.4.1); `i` is held, received and in the named key epoch. Then `attestation` (as for any request; with
   no record written, `server_records` and `client_records` are 0), then
   `{"type":"zk_params","proof":"pi_win","purpose":"refusal","n","record","params"}` (`anchor = h2`; per
   covered record its bytes from offset 0 and its last byte = `17`, as for an error head). C checks the

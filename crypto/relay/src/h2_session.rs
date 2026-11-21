@@ -32,6 +32,10 @@ pub(crate) const H2_CONN_MAX_BYTES: usize = H2_CONN_SOFT_BYTES + 2 * MAX_SERVER_
 const MAX_QUEUED_CTL: usize = 16;
 /// Most records an error head may span (a response head is about 1 kB).
 const MAX_HEAD_RECORDS: usize = 8;
+/// Server records kept from the start of a request's interval, beyond the
+/// rolling tail of `RelayLog`: an error head or refusal near its start can
+/// still be disclosed after a long response body pushed it out of the tail.
+const PINNED_RECORDS: usize = 2 * MAX_HEAD_RECORDS;
 
 #[derive(Debug, Clone, Copy)]
 enum RecKind {
@@ -109,8 +113,19 @@ struct Req {
     /// record that arrived after the GOAWAY window closed (`goaway_window`):
     /// a GOAWAY in it or later that arrived before the request's first
     /// record was written does not refuse it (it may be the provider's idle
-    /// close).
+    /// close). A GOAWAY after the first write is also refused when that write
+    /// came `h2.idle_secs` or more after N's last write of the connection head
+    /// or of a request record (`late_write`).
     late_from: Option<usize>,
+    /// N wrote the request's first record no sooner than `h2.idle_secs` after
+    /// its last write of the head or of a request record (`last_req_write`):
+    /// the provider's idle timer may have run out, so a GOAWAY then is not a
+    /// refusal. Control records do not count as activity, since a client can
+    /// have them written at will and a provider need not count them.
+    late_write: bool,
+    /// The first `PINNED_RECORDS` server application-data records of the
+    /// interval (indices `s_k`, `s_k + 1`, ...), for `record_windows`.
+    pinned: Vec<Record>,
 }
 
 /// Per-connection state of a framing-"2" connection.
@@ -154,6 +169,9 @@ pub(crate) struct H2 {
     app_records: usize,
     /// When N last wrote to the provider (the head, a client record).
     last_write: Option<std::time::Instant>,
+    /// When N last wrote the connection head or a record of a request (not a
+    /// control record): what a provider's idle timer certainly counts.
+    last_req_write: Option<std::time::Instant>,
 }
 
 impl H2 {
@@ -182,6 +200,7 @@ impl H2 {
             closed_early: false,
             app_records: 0,
             last_write: None,
+            last_req_write: None,
         }
     }
 
@@ -255,6 +274,11 @@ impl H2 {
             q.recv.update(&r.payload);
             q.recv_records += 1;
             q.recv_bytes += 5 + r.payload.len();
+            // The interval opens before any record of it is received, so the
+            // first one seen is `s_k`, and `index` counts as `RelayLog` does.
+            if q.pinned.len() < PINNED_RECORDS {
+                q.pinned.push(r.clone());
+            }
             self.responded = true;
             if q.recv_bytes > q.cap {
                 bail!("the response to request {} exceeds {} bytes", q.n, q.cap);
@@ -341,6 +365,7 @@ pub(crate) fn head_written(st: &mut Session) {
     h.conn_end = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(h.cfg.max_lifetime_s));
     h.head_at = Some(std::time::Instant::now());
     h.last_write = h.head_at;
+    h.last_req_write = h.head_at;
     h.head_prompt = st.dialed_at.is_some_and(|t| t.elapsed() < H2_HEAD_PROMPT);
     st.deadline = Some(h.idle_deadline());
 }
@@ -450,6 +475,8 @@ pub(crate) fn on_request(
         refused: false,
         ok_at: std::time::Instant::now(),
         late_from: None,
+        late_write: false,
+        pinned: Vec::new(),
     });
     // The per-request limit: up to the release, then
     // again from it.
@@ -608,6 +635,8 @@ async fn flush(
     loop {
         let deadline = st.deadline;
         let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
+        let (last_req_write, idle) = (h.last_req_write, std::time::Duration::from_secs(h.cfg.idle_secs));
+        let now = std::time::Instant::now();
         let Some(front) = h.queue.front() else { break };
         // Nothing goes to a provider that closed the connection.
         if !front.proven || h.tcp_closed {
@@ -627,6 +656,7 @@ async fn flush(
             if q.s_k.is_none() {
                 // The interval starts before the first byte of the request
                 // can reach the upstream.
+                q.late_write = last_req_write.is_some_and(|w| now >= w + idle);
                 q.s_k = Some(log.server_app_records);
                 q.interval_open = true;
             }
@@ -635,6 +665,9 @@ async fn flush(
         h.held -= rec.bytes.len();
         h.client_written = true;
         h.last_write = Some(std::time::Instant::now());
+        if rec.req_idx > 0 {
+            h.last_req_write = h.last_write;
+        }
         write_upstream(tcp_tx, &rec.bytes, deadline).await?;
         st.sent.update(&rec.bytes);
         if rec.req_idx == 0 {
@@ -920,7 +953,7 @@ pub(crate) fn on_disclose_head(
     if record < s_k {
         bail!("server record {record} is outside the request's interval");
     }
-    let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r)?;
+    let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r, Some((s_k, &q.pinned)))?;
     q.usage = Some(serde_json::json!({ "error_status": status, "choices": [] }));
     q.settle_on = Some("pi_win");
     h.win = Some(WinInflight::ErrorHead);
@@ -948,6 +981,11 @@ pub(crate) const REFUSAL_GRACE: std::time::Duration = std::time::Duration::from_
 /// in well under a second to a few seconds) and is the bound when the
 /// provider's idle time is long; a quarter of `idle_secs` keeps the window
 /// clear of short idle times (at the smallest, 10 s, it is 2.5 s).
+/// The window does not judge a GOAWAY after the first write; there a request
+/// whose first record was written `h2.idle_secs` or more after N's last write
+/// of the head or of a request record (`Req::late_write`) is not refused by
+/// it either. Control records do not count: a provider may not count them as
+/// activity, and a client can have them written at will.
 pub(crate) fn goaway_window(idle_secs: u64) -> std::time::Duration {
     std::time::Duration::from_millis((idle_secs * 1000 / 4).min(30_000))
 }
@@ -961,7 +999,12 @@ pub(crate) fn goaway_window(idle_secs: u64) -> std::time::Duration {
 /// since the request's first record was written is walked, so none of them
 /// was a response on the stream. Before any of the request was written only
 /// the GOAWAY form counts (the provider cannot reset a stream it never saw),
-/// and the interval is then fixed, empty, at the disclosure. Settled like a
+/// and the interval is then fixed, empty, at the disclosure. A GOAWAY also
+/// does not refuse a request whose first record N wrote `h2.idle_secs` or
+/// more after its last write of the head or of a request record
+/// (`Req::late_write`): the provider's idle close may already have been on
+/// its way. Control records do not count as activity: a client can have them
+/// written at will, and a provider need not count them. Settled like a
 /// 429 (§12.10); the connection closes after it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_disclose_reset(
@@ -998,7 +1041,8 @@ pub(crate) fn on_disclose_reset(
     if q.s_k.is_some_and(|s_k| record > s_k) {
         bail!("server record {record} is after the start of the request's interval: the walk must cover all of it");
     }
-    let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r)?;
+    let pinned = q.s_k.map(|s_k| (s_k, q.pinned.as_slice()));
+    let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r, pinned)?;
     if let h2::Refusal::GoAway { .. } = refusal {
         // A GOAWAY that arrived before any record of the request was written
         // counts only when it arrived within the window after `request_ok`
@@ -1014,6 +1058,9 @@ pub(crate) fn on_disclose_reset(
                 "a GOAWAY that arrived more than {:?} after request_ok (or as long after the last write as an idle close), before any record of the request was written, does not refuse it",
                 window
             );
+        }
+        if !before_write && q.late_write {
+            bail!("a GOAWAY after a request whose first record was written no sooner than the provider's idle time after the last request activity does not refuse it");
         }
     }
     if q.s_k.is_none() {
@@ -1048,7 +1095,10 @@ fn check_epoch(key_updates: u32, epoch_start: usize) -> Result<()> {
 /// The π_WIN of a disclosure that starts at byte 0 of server record `record`
 /// (an error head, a refusal): per covered record its bytes from offset 0 and
 /// its last byte (`0x17`: application data, no padding). The record must
-/// still be held and in the key epoch the client names.
+/// still be held, in `log`'s rolling tail or among the request's pinned first
+/// records (`pinned` = `S_k` and those records), and in the key epoch the
+/// client names.
+#[allow(clippy::too_many_arguments)]
 fn record_windows(
     anchor: [u8; 32],
     key_updates: u32,
@@ -1057,20 +1107,32 @@ fn record_windows(
     epoch_start: usize,
     record: usize,
     r: &[u8],
+    pinned: Option<(usize, &[Record])>,
 ) -> Result<zkbench::statements::PiWin> {
     let base = log.server_app_records - log.server_tail.len();
-    if record < base || record >= log.server_app_records || record < hs_records + epoch_start {
+    // Record `j` is in the tail, or among the pinned ones.
+    let held = |j: usize| -> Option<&Record> {
+        if j >= log.server_app_records {
+            None
+        } else if j >= base {
+            log.server_tail.get(j - base)
+        } else {
+            pinned.and_then(|(s_k, p)| j.checked_sub(s_k).and_then(|k| p.get(k)))
+        }
+    };
+    if record >= log.server_app_records || record < hs_records + epoch_start || held(record).is_none() {
         bail!("server record {record} is no longer held, not yet received, or outside the key epoch");
     }
     let mut windows = Vec::new();
     let mut rest: &[u8] = r;
-    for (i, rec) in log.server_tail.iter().skip(record - base).enumerate() {
+    for i in 0.. {
         if rest.is_empty() {
             break;
         }
         if i >= MAX_HEAD_RECORDS {
             bail!("the disclosure spans more than {MAX_HEAD_RECORDS} records");
         }
+        let Some(rec) = held(record + i) else { break };
         let content = rec.payload.len().checked_sub(17).filter(|c| *c > 0).ok_or_else(|| anyhow!("a covered record has no content"))?;
         let (chunk, tail) = rest.split_at(rest.len().min(content));
         let seq = (record + i - hs_records - epoch_start) as u64;
@@ -1307,6 +1369,8 @@ mod tests {
             refused: false,
             ok_at: std::time::Instant::now(),
             late_from: None,
+            late_write: false,
+            pinned: Vec::new(),
         });
         st.h2 = Some(Box::new(h));
         st
@@ -2544,6 +2608,107 @@ mod tests {
         let g = goaway_frame(1, 0);
         feed(&mut st, &mut log, &g);
         on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap();
+    }
+
+    /// The idle stall with a late first write: the client holds its proven
+    /// request unwritten until just before the provider's idle timer fires,
+    /// releases one record, and the provider's GOAWAY (already in flight)
+    /// arrives after that write. It does not refuse the request when the first
+    /// record was written `h2.idle_secs` or more after N's last write of the
+    /// head or of a request record; a fresh last write is accepted, and a
+    /// control record does not count as that activity.
+    #[tokio::test]
+    async fn a_goaway_after_a_late_first_write_does_not_refuse_the_request() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let idle = st_idle_secs(&open_session(300));
+        let past = |d: std::time::Duration| std::time::Instant::now().checked_sub(d).unwrap();
+        for (what, stale) in [("late first write", true), ("fresh last write", false)] {
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            for c in [&[1u8; 40][..], &[2; 900]] {
+                feed(&mut st, &mut log, c);
+            }
+            send_request(&mut st, 300);
+            st.h2.as_mut().unwrap().last_req_write =
+                Some(if stale { past(std::time::Duration::from_secs(idle + 1)) } else { std::time::Instant::now() });
+            on_release(&mut st, 1, 1).unwrap();
+            pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+            prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+            let q = st.h2.as_ref().unwrap().req.as_ref().unwrap();
+            assert_eq!((q.s_k, q.late_write), (Some(2), stale), "{what}");
+            // The GOAWAY arrives after the write (record index >= S_k).
+            let g = goaway_frame(1, 0);
+            feed(&mut st, &mut log, &g);
+            texts(&mut rx);
+            let res = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0);
+            if stale {
+                let err = res.unwrap_err();
+                assert!(err.to_string().contains("does not refuse"), "{what}: {err}");
+                assert!(texts(&mut rx).is_empty(), "{what}: nothing attested");
+            } else {
+                res.unwrap();
+            }
+        }
+        // A control record written just before the request's first record
+        // leaves `last_req_write` alone (so the write is still late); a request
+        // record sets it.
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        for c in [&[1u8; 40][..], &[2; 900]] {
+            feed(&mut st, &mut log, c);
+        }
+        let old = past(std::time::Duration::from_secs(idle + 1));
+        st.h2.as_mut().unwrap().last_req_write = Some(old);
+        on_ctl(&mut st, "ping_ack").unwrap();
+        client_bytes(&mut st, &record(18)).unwrap();
+        send_request(&mut st, 300);
+        on_release(&mut st, 1, 1).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let h = st.h2.as_ref().unwrap();
+        assert!(h.req.as_ref().unwrap().late_write, "the control record did not refresh the activity");
+        assert!(h.last_req_write.unwrap() > old, "a request record sets it");
+    }
+
+    /// An error head near the start of a response that outgrew the rolling
+    /// tail is still disclosed, from the records pinned at the interval's
+    /// start; a record before both is not held.
+    #[tokio::test]
+    async fn an_error_head_evicted_from_the_tail_is_disclosed_from_the_pinned_records() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        for c in [&[1u8; 40][..], &[2; 900], &[3; 30]] {
+            feed(&mut st, &mut log, c);
+        }
+        send_request(&mut st, 300);
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let block = [0x20, 0x8d, 0x00, 0x04, b'd', b'a', b't', b'e', 0x03, b'x', b'y', b'z'];
+        let head = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &block);
+        feed(&mut st, &mut log, &head); // record 3 = S_k
+        for _ in 0..100 {
+            feed(&mut st, &mut log, &[0; 20]);
+        }
+        texts(&mut rx);
+        let base = log.server_app_records - log.server_tail.len();
+        assert!(base > 3 + PINNED_RECORDS, "the head and the pinned range left the tail");
+        let go = |st: &mut Session, record: usize, r: &[u8]| on_disclose_head(&app, &sh, &tx, st, &log, 1, record, &hex::encode(r), 0, 0);
+        // Neither in the tail nor pinned (the first record past the pinned ones).
+        assert!(go(&mut st, 3 + PINNED_RECORDS, &head).unwrap_err().to_string().contains("no longer held"));
+        assert!(texts(&mut rx).is_empty());
+        go(&mut st, 3, &head).unwrap();
+        let m = texts(&mut rx);
+        assert_eq!(m.iter().map(|x| x["type"].as_str().unwrap()).collect::<Vec<_>>(), vec!["attestation", "zk_params"]);
+        let Params::PiWin(p) = serde_json::from_value(m[1]["params"].clone()).unwrap() else { panic!() };
+        assert_eq!(p.windows.iter().map(|w| w.seq).collect::<Vec<_>>(), vec![1]);
     }
 
     fn st_idle_secs(st: &Session) -> u64 {

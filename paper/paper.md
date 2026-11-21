@@ -725,8 +725,9 @@ stream that N does not bill. The rules are:
 4. **Allowed frames.** For a request: one HEADERS frame with END_HEADERS, whose whole record is
    proven equal to a public block, and DATA frames, with END_STREAM only on the last, whose tail is
    proven equal to the suffix. Between and around them: SETTINGS acknowledgements, PING
-   acknowledgements, WINDOW_UPDATE on stream 0, and RST_STREAM on the current request's stream, each
-   announced on the control channel and proven in full. Anything else ends the connection.
+   acknowledgements, and RST_STREAM on the current request's stream, each announced on the control
+   channel and proven in full. C sends no WINDOW_UPDATE: the connection head opens the provider's
+   windows fully. Anything else ends the connection.
 5. C never sends a KeyUpdate, a header block that adds a dynamic-table entry, a table size update, or
    a second stream while one is open.
 
@@ -1375,8 +1376,9 @@ The implementation consists of:
   connection pool, used by the client daemon, and a WebSocket route in the node that relays to the
   sidecar and bills through the node's ordinary accounts.
 
-At the time of writing the HTTP/2 path is a prototype that runs end to end through the node, the SDK
-and the daemon against the live provider; the browser library does not have it yet.
+At the time of writing the HTTP/2 path is a prototype that runs end to end through the node, the SDK,
+the daemon and a browser library (the client side of the two-party computation and the proofs compiled
+to WebAssembly) against the live provider.
 
 C's TLS stack is a fork of an MIT-licensed TLS 1.3 client with two hooks: an external key share, and
 traffic secrets injected from the 2PC instead of computed locally. It accepts only the version, suite and

@@ -1175,7 +1175,9 @@ struct RelayLog {
     server_records: usize,
     /// Server application-data records received (the encrypted handshake
     /// flight included), and the last `SERVER_TAIL_RECORDS` of them: a
-    /// disclosure covers only records at the end of the response.
+    /// disclosure covers only records at the end of the response (a framing-2
+    /// request also pins the first records of its interval,
+    /// `h2_session::Req::pinned`, for an error head or a refusal near its start).
     server_app_records: usize,
     server_tail: std::collections::VecDeque<Record>,
 }

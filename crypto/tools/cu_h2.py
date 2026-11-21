@@ -14,6 +14,8 @@ nothing is left), ``key_update()`` and ``now()``.
 from __future__ import annotations
 
 import json
+import math
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Callable
@@ -528,6 +530,26 @@ def _uint(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
+_LABEL_FIELDS = ("id", "object", "model", "provider", "service_tier", "system_fingerprint")
+_LABEL_RE = re.compile(r"[A-Za-z0-9 ._:/@+-]{0,128}")
+_USAGE_KEY_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _numeric_object(v, depth: int) -> bool:
+    """Numbers, booleans, null and nested objects of these; ``depth`` counts the
+    top object as 1, at most 3."""
+    if not isinstance(v, dict) or depth > 3:
+        return False
+    return all(
+        isinstance(k, str) and _USAGE_KEY_RE.fullmatch(k)
+        and (x is None or isinstance(x, bool) or _number(x) or _numeric_object(x, depth + 1))
+        for k, x in v.items())
+
+
 def usage_event_problem(ev) -> str | None:
     """PROTOCOL-V3.md §5.4: why ``ev`` is not a usage event, or None.
 
@@ -536,10 +558,27 @@ def usage_event_problem(ev) -> str | None:
     ``native_finish_reason`` (an identifier or null), ``logprobs: null``, and a
     ``delta`` holding at most ``role: "assistant"``, empty or null
     ``content``/``reasoning``/``reasoning_content``/``refusal`` and an empty
-    ``tool_calls``. The sidecar's ``usage_rule.rs``; vectors in
+    ``tool_calls``. The top level is an allow-list: ``choices``, ``usage``, the
+    labels ``id``/``object``/``model``/``provider``/``service_tier``/
+    ``system_fingerprint``, ``created`` (an unsigned integer) and ``cost`` (null,
+    a number or a numeric object); ``usage`` holds only numbers, booleans, nulls
+    and nested objects of such (3 levels at most). The sidecar's ``usage_rule.rs``; vectors in
     ``crypto/relay/usage-event-vectors.json``."""
     if not isinstance(ev, dict):
         return "not an object"
+    for k, x in ev.items():
+        if k in ("choices", "usage"):
+            ok = True
+        elif k == "created":
+            ok = _uint(x)
+        elif k == "cost":
+            ok = x is None or _number(x) or _numeric_object(x, 1)
+        elif k in _LABEL_FIELDS:
+            ok = x is None or (isinstance(x, str) and _LABEL_RE.fullmatch(x) is not None)
+        else:
+            ok = False
+        if not ok:
+            return f"the event carries the top-level field {k!r}"
     choices = ev.get("choices")
     if not isinstance(choices, list):
         return "no choices array"
@@ -571,6 +610,8 @@ def usage_event_problem(ev) -> str | None:
     u = ev.get("usage")
     if not isinstance(u, dict) or not _uint(u.get("prompt_tokens")) or not _uint(u.get("completion_tokens")):
         return "no token counts"
+    if not _numeric_object(u, 1):
+        return "usage carries something other than numbers"
     return None
 
 

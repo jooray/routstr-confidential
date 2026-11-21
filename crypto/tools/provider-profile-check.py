@@ -1850,6 +1850,13 @@ def self_test() -> int:
     RETRIES, BACKOFF = 1, [0.0]
     KEY = KEY or "sk-selftest-not-a-key"
     saved = dict(TRANSPORT)
+    # the shared usage event vectors against cu_h2.usage_event_problem
+    vec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relay", "usage-event-vectors.json")
+    with open(vec_path) as fh:
+        vec_bad = [t["name"] for t in json.load(fh)["vectors"] if (h2.usage_event_problem(t["event"]) is None) != t["ok"]]
+    if vec_bad:
+        print(f"self-test FAILED: usage event vectors disagree: {vec_bad}")
+        return 1
     # (name, provider, predicate over {check: verdict}, what it proves)
     def verdicts() -> dict:
         return {name.split()[0]: v for name, v, _ in RESULTS}
