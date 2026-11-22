@@ -711,7 +711,7 @@ Offline `cu-prover --bench` (3 runs, local, emulated transport; its π_NK is the
 π_C3S 200.3 / 201.0 / 205.1 ms, 504.0 kB / 964.2 kB, 7 / 38. At 25 ms one way, 100 Mbit/s: π_NK 1219-1238 ms,
 π_WIN 1203-1270 ms, π_C3S 1261-1301 ms.
 
-## `split-public-2` (2026-11-22, branch `split-public-2`, not deployed)
+## `split-public-2` (2026-11-22, deployed the same day)
 
 The two-party key schedule moved from `split-public-1` to `split-public-2` (hard switch; tag
 `routstr-2pc/split-public-2\n`, offer `twopc: "split-public-2"`). Same circuit and stages. Changes: the
@@ -741,6 +741,8 @@ commitments, deviations of N and of C in ECtF) and 4 of the `cu-2pc` binary. `v3
 without images, the new one `h2-j-twopc-tag-old` (a `split-public-1` peer is refused with
 `twopc_version_mismatch`).
 
-Not done: the browser library (re-vendor `crypto/twopc`, run the vectors in the wasm build) and the PWA, the
-SDK and routstrd expected `twopc` value and their PR branches, deployment. The cold end-to-end numbers above
-in this file are `split-public-1`'s.
+Rolled out the same day: the SDK and node PR branches, the browser library (vendored `crypto/twopc` at
+71cce77, the vectors run in its native and wasm32 tests, `wasm/pkg` from CI) and PWA 0.2.9, and the sidecar
+on routstr.cypherpunk.today (`v3-1049965`). The client TLS stacks (SDK, reference client, browser library)
+accept one server flight per signature (fork patches TLS-17 to TLS-19). The cold end-to-end numbers above in
+this file are `split-public-1`'s.

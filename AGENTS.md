@@ -22,7 +22,7 @@ Each has `origin` = Routstr upstream and `fork` = `jooray/<repo>`.
 | `routstr-core/` | **`confidential-2pc`** on `fork` (v3: the open upstream PR #855, and what routstr.cypherpunk.today runs; the local checkout's branch is `confidential-v3`, pushed as `confidential-2pc`); `confidential-v2` (v2 archive); `confidential-upstream` (retired v1, unmaintained) | the node (Python/FastAPI) |
 | `routstr-sdk/` | **`confidential-2pc`** on `fork` (v3: the open PR #112; local branch `confidential-v3`, pushed as `confidential-2pc`); `confidential-v2` (v2 archive); `confidential-upstream` (retired v1, unmaintained) | client SDK (TypeScript) |
 | `routstrd/` | **`confidential-upstream`** on `fork` (v3: the open PR #155; local branch `confidential-v3`, pushed as `confidential-upstream`); `confidential-v2` (v2 archive) | client daemon (TypeScript/Bun) |
-| `crypto/` | this repo, branch **`main`** (v3, the default branch; `v2` is the v2 archive, the same as the old `twopc-v2`, which stays as it was; `v1-poc` is v1) | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (the two-party key schedule `split-public-2` on the branch `split-public-2`, `split-public-1` on `main` + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK statements π_NK, π_WIN, π_C3S; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (gates, the provider profile check, `shape-proxy.py`), `runs/` (evidence) |
+| `crypto/` | this repo, branch **`main`** (v3, the default branch; `v2` is the v2 archive, the same as the old `twopc-v2`, which stays as it was; `v1-poc` is v1) | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (the two-party key schedule `split-public-2` on the branch `split-public-2` + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK statements π_NK, π_WIN, π_C3S; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (gates, the provider profile check, `shape-proxy.py`), `runs/` (evidence) |
 | `paper/` | — | the paper (`paper.md` → `build.sh` → `paper.pdf`) |
 | `docs/` | — | engineering docs and research (below) |
 | `PROTOCOL-V3.md` | — | the v3 specification; `PROTOCOL-V3-DRAFT.md` has the reasoning |
@@ -349,14 +349,14 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 
 | Part | State |
 |---|---|
-| `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-1` with the version tag (on `main`, deployed). `split-public-2` is implemented on the branch `split-public-2` (2026-11-22: new garbling hash and row hash, N's input a mask fixed before the seed, input-label commitments; 51 unit tests; `v3-check.sh` 53 cases without images) and is **not deployed**: production runs `split-public-1`, the browser library and the PWA are not ported, the PR branches of the sub-repos are not updated |
+| `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-2` with the version tag (2026-11-22: new garbling hash and row hash, N's input a mask fixed before the seed, input-label commitments; 51 unit tests; `v3-check.sh` 53 cases without images); it replaced `split-public-1` on 2026-11-22 |
 | `crypto/relay` (sidecar) | done; 120 unit tests; `v3-check.sh` clean in one run (51 cases without images, 2026-11-13). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause; a provider refusal of a stream is proven (`disclose_reset`) |
 | `crypto/client` (reference driver) | done for both framings; run live against the sidecar by `v3-check.sh` and against a node by the node gate |
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
 | measurements | loopback and shaped links (2/50, 2/10 Mbit/s, 40 ms one way) with `bench.sh` + `shape-proxy.py`: `crypto/PROGRESS-CONFIDENTIAL.md` |
 | `routstr-core` (node), `routstr-sdk`, `routstrd` | published on the forks (`confidential-2pc` in routstr-core and routstr-sdk, `confidential-upstream` in routstrd; PRs #855, #112, #155); their state and commands: `routstr-core/docs/confidential-upstream.md`, `routstrd/docs/confidential-upstream.md` |
-| browser library, PWA | ported to v3: library `main`, pinned by the PWA at `1336b1f` (wasm built by CI); PWA 0.2.1 deployed |
-| deployment | routstr.cypherpunk.today runs v3 since 2026-11-12 11:43 UTC; since 2026-11-20 00:15 UTC node 0.5.1+g65495c4 (rebased on upstream 56b1de91), since 2026-11-21 sidecar from `main` b819d46, offer `http: ["2","1.1"]`, deposit 2000 msat |
+| browser library, PWA | v3 with `split-public-2`: library `main`, pinned by the PWA at `9954581` (wasm built by CI); PWA 0.2.9 deployed |
+| deployment | routstr.cypherpunk.today runs v3 since 2026-11-12 11:43 UTC; since 2026-11-20 00:15 UTC node 0.5.1+g65495c4 (rebased on upstream 56b1de91), since 2026-11-22 sidecar from `main` 1049965 (`split-public-2`), offer `http: ["2","1.1"]`, deposit 2000 msat |
 
 Notes that outlive the port: the client needs `cu-2pc` next to `cu-prover`
 (or `CU_2PC`). The sidecar dials the provider only when the ClientHello
@@ -376,7 +376,7 @@ confidential mode when it detects more than one.
 GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the library by commit:
 `node scripts/pin-lib.mjs <sha>`). Changes to `crypto/twopc` or `zkbench` here must be re-vendored there.
 Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA pins library `main` at
-`1336b1f` with the wasm built by CI; PWA 0.2.1 is deployed, with a testing guide at `/testing/`.
+`9954581` with the wasm built by CI; PWA 0.2.9 is deployed, with a testing guide at `/testing/`.
 
 ## Gotchas
 
@@ -463,11 +463,11 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
     `split-public-2` fixes it. The garbler-only construction, π_WIN and the
     frame rules have no published proof and need external review
     (`PROTOCOL-V3.md` §4, §10; `docs/SECURITY-CLAIMS.md`).
-  - `split-public-2` rollout (not done): re-vendor `crypto/twopc` into the
-    browser library (and run the conformance vectors in its wasm build),
-    pin the PWA, update the SDK's and routstrd's expected `twopc` value and
-    the PR branches, deploy sidecar, node and clients together (a hard
-    switch: old and new peers refuse each other).
+  - `split-public-2` is rolled out (2026-11-22): sidecar on
+    routstr.cypherpunk.today, SDK and node PR branches, browser library
+    (the conformance vectors run in its native and wasm32 tests) and PWA.
+    A change to `crypto/twopc` that alters wire bytes needs a new tag and
+    the same joint rollout (old and new peers refuse each other).
   - The sidecar's guard does not see a provider that fails only once a
     request's records arrive (the body is the client's); the profile check
     and the client's fallback cover that.
@@ -483,8 +483,8 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
     meanwhile waits for it); measure with `crypto/tools/v3-topup-bench.sh`
     (`CU_NO_TOPUP=1` for the old behaviour). An old client (channel version 1)
     falls back to one socket per proof.
-  - The browser library and the PWA are on v3 (`main`; PWA 0.2.1 deployed,
-    pinning library `1336b1f`, whose `wasm/pkg` is the CI build).
+  - The browser library and the PWA are on v3 (`main`; PWA 0.2.9 deployed,
+    pinning library `9954581`, whose `wasm/pkg` is the CI build).
   - v3 is published (2026-11-12) and in the upstream PRs (core #855, SDK #112,
     routstrd #155); routstr.cypherpunk.today runs it. The SDK release and
     routstrd's `@routstr/sdk` bump are the maintainers' step.
