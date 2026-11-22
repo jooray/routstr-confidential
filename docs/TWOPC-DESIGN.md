@@ -110,7 +110,9 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
    commitments, evaluates, checks, and reports; N answers with the next stage's digest labels. Both hold
    c_hs and s_hs after A2 and `IS_MS` after A3.
 7. C decrypts the server flight with s_hs, verifies the certificate chain, CertificateVerify and the server
-   Finished, and sends its Finished. N verifies the same with c_hs and s_hs.
+   Finished, and sends its Finished. N verifies the same with c_hs and s_hs. C accepts only a flight that
+   U's signature fixes (no message besides the four, nothing after the signature, one encoding of it):
+   N holds s_hs and could otherwise choose `th_SF` (`TWOPC-NODE-GARBLING.md` §4).
 8. **`application(th_SF)`: stages B1, B2.** N sends the B1 digest labels at once (it has `IS_MS`). After B2,
    C holds s_ap_0 and c_ap_1, N holds K_0 and IV_0, both hold h1, h2, hk.
 9. The proofs π_NK, π_C2S, π_C3S (and π_WIN) run over the anchors, as `PROTOCOL-V3.md` §7 describes.
@@ -165,8 +167,9 @@ pairs for the outputs C reports; C's report authenticated by a hash of its label
   hash, and with all gates consistent the decoded values are right whatever labels carried them. For
   "passes ⇒ all gates consistent" N must not be able to adapt the pointer bits to the challenge. It cannot:
   its own input labels (of ρ) and commitments to all other input labels precede the challenge, and after it
-  N only sends δ, which shifts C's input, and that input stays uniform from N's view (`TWOPC-NODE-GARBLING.md`
-  §4 has the argument, its assumptions and the remaining influence of N on the transcript hashes).
+  N only sends δ, which shifts C's input, and that input stays hidden from N under DDH in P-256
+  (`TWOPC-NODE-GARBLING.md` §4 has the argument, its assumptions and the remaining influence of N on the
+  transcript hashes).
   Soundness is about 2^-60 per connection (five checks), for a connection whose server share N did not
   choose. **Argued**, no review.
 - *Soundness is statistical, per connection, and adds up.* The 2^-60.6 bound (five stages at ≤ 2^-63 each,
@@ -421,7 +424,7 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 | public `IS_k`, digest labels from N pinned by pointer checks | argued above; assumptions 1 and 2; new in v3 |
 | leakage bound (≤ 3 bits per connection) | counting argument in the idealized abort model above, conditional on ECtF and the garbling argument; not a full enumeration of a malicious N's observations |
 | harmlessness of the leak | argued above: every value it can concern is a fresh secret of 256 bits, used for one connection; min-entropy loss ≤ log2 of the outcomes |
-| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection, k·2^-60.6 over k connections, for a connection whose server share N did not choose; argued, under DDH in P-256 (when N feeds 0 into ECtF) and the random-function behaviour of `f` for the transcript hash N relays before stage A2 (`TWOPC-NODE-GARBLING.md` §4). In `split-public-1` stage A1 had only about 2^-23 against a prepared node, with a failed handshake as the outcome |
+| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection, k·2^-60.6 over k connections, for a connection whose server share N did not choose; argued, under DDH in P-256 (C's share is hidden from N only computationally), a client TLS stack that accepts at most two server flights per signature of U, and the random-function behaviour of `f` for the transcript hash N relays before stage A2 (`TWOPC-NODE-GARBLING.md` §4). In `split-public-1` stage A1 had only about 2^-23 against a prepared node, with a failed handshake as the outcome |
 | distinct inner digests under one key (assumption 3) | assumed: compression-function collision resistance under a known chaining value |
 | the chained multi-output composition with public `IS_k` | **not written** (hybrids over both directions and every value revealed together) |
 | N's input is fixed before the challenge, the other input labels are committed before it | argued (`TWOPC-NODE-GARBLING.md` §4, §5); new in `split-public-2`; in `split-public-1` neither held |

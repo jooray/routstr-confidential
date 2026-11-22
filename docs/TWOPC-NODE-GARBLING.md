@@ -123,23 +123,42 @@ accepts iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
 - **N has no choice after the challenge.** The seed is sent in preprocessing. Before it N has sent the
   tables, the hash parameters, the masks, the labels of its own garbled input and commitments to both labels
   of every other input wire (§5). Its garbled input is a random mask ρ < p; in the handshake it sends
-  `δ = x_N − ρ mod p` in the clear and C adds δ to its own share, which stays uniform from N's view. C
+  `δ = x_N − ρ mod p` in the clear and C adds δ to its own share, which N cannot predict (below). C
   checks every input label it receives against the commitments. So C's evaluation, and with it Λ and E, is a
   function of what N sent before the seed, of C's input `x_C + δ` and of the digests C computes itself. What
   N sends after the seed (rows, Y_N, openings, pairs, corrections, digest labels) enters R and the abort
-  conditions, and nothing else. Two places remain where N acts with χ known. (1) δ: it only shifts C's input,
-  which is uniform and independent of N's view in the ROT-hybrid model of ECtF whenever N's input to the
-  M2A is not 0; when it is 0, C's input is `κ − x(a_C·S)` for a κ N knows, and gaining from δ then means
-  distinguishing `a_C·S` from a random point given `a_C·G` and S (DDH in P-256, assumed; for a server share
-  N chose itself no claim is made, and that connection ends at CertificateVerify). (2) The transcript
-  hashes: N relays the ServerHello and the server flight and so can influence `th_SH` and, among the few
-  flights C accepts, `th_SF`. `th_SF` gives a factor of a few on stage B1's term. `th_SH` is fixed before
-  stage A1 runs, when N does not know `IS_HS`; that a choice of `th_SH` with χ known does not raise stage
-  A2's term noticeably is **assumed** (it holds if `f` keyed by its chaining input behaves as a random
-  function). Under these assumptions the bound per connection is
-  `Σ_s (2^-63 + n_s·2^-128) + ε_QS ≤ 2^-60.6` for a connection whose server share N did not choose
-  (ε_QS: the product check's error). **Argued**, new in `split-public-2`, no review. Tests:
-  `adder_switch_attack_caught`, `gl_precedes_seed`, `in_com_precedes_seed`, `delta_out_of_range_rejected`.
+  conditions, and nothing else. Two places remain where N acts with χ known.
+  (1) *δ and N's inputs to ECtF.* They change C's input only through C's point `Q_C = a_C·S`: C's share is
+  `x_C = k·λ'^2 − x1 − d'` for values `k, d'` and a point `(x2', y2')` of N's choice
+  (`TWOPC-DESIGN.md`, ECtF), so `x_C + δ` is a function of N's view and of `Q_C`. It is therefore not
+  uniform given N's view, whatever N feeds into the conversion (N holds `a_C·G` and S, which determine
+  `Q_C`); it is hidden only computationally. As a function of `Q_C` on the curve the map has degree ≤ 6,
+  so each value has at most 6 preimages. For a uniform point independent of N's view, C's input would hit
+  the set of inputs on which a prepared violation passes with probability at most `6·n_0/2^128`, averaged
+  over χ_0 and for every choice N makes with χ_0 known. That the real `Q_C` gives N no more is
+  **assumed**: DDH in P-256, for every N (not only one that feeds 0 into the conversion). Before stage A1
+  ends N also holds U's flight, encrypted under keys derived from Z; that it does not help is the
+  oracle-model step of the ECtF argument. The reduction is not written out. For a server share N chose
+  itself no claim is made, and that connection ends at CertificateVerify.
+  (2) *The transcript hashes.* N relays the ServerHello and the server flight and so can influence `th_SH`
+  and `th_SF`. N holds `s_hs`: it can open U's flight, change it, seal it again and recompute the
+  Finished, with χ and `IS_MS` known. What C accepts is then N's choice of `th_SF`, so C must accept only
+  what U's signature fixes. The signature covers the transcript up to Certificate. C's TLS stack requires
+  that CertificateVerify ends with its signature, that an ECDSA signature is the DER encoding of `(r, s)`,
+  that the Finished follows directly, and that no other message type appears (the three client stacks:
+  `FORK-NOTES.md`, TLS-17). An ECDSA signature `(r, s)` also verifies as `(r, n − s)`, so N has at most two
+  values of `th_SF`: a factor 2 on stage B1's term. A stack that accepts q flights per signature gives
+  `q·n_3/2^128` there; the stacks released with `split-public-1` accepted any number (among others,
+  bytes after the signature were ignored), which made that term a bound on N's work (at most about
+  2^-111 per flight tried) and not a statistical one. `th_SH`
+  is fixed before stage A1 runs, when N does not know `IS_HS`, and a flight of U that N has not opened yet
+  is fixed with it; that a choice of `th_SH` with χ known does not raise the later terms noticeably is
+  **assumed** (it holds if `f` keyed by its chaining input behaves as a random function). Under these
+  assumptions the bound per connection is
+  `5·2^-63 + (6·n_0 + n_1 + n_2 + 2·n_3 + n_4)·2^-128 + ε_QS ≤ 2^-60.6` for a connection whose server
+  share N did not choose (ε_QS: the product check's error). **Argued**, new in `split-public-2`, no
+  review. Tests: `adder_switch_attack_caught`, `gl_precedes_seed`, `in_com_precedes_seed`,
+  `delta_out_of_range_rejected`; for the flights C accepts, the TLS-17 tests of the three client stacks.
 - **`split-public-1` did not have this (found 2026-11-22).** There N sent the labels of its input `x_N` in
   the handshake, after the seed, so with χ known. Garbling every second gate of the adder as `(¬A)∧B` makes
   that gate's `e_k` equal to a bit of `x_N` whenever the carry into it is 0; N then solves 128 linear
@@ -218,8 +237,9 @@ sent before the seed:
   opened input masks, `com(w, 0, P_{w,0}) ‖ com(w, 1, P_{w,1})` with
   `com(w, p, L) = SHA256("routstr-twopc-ag input label" ‖ in_salt ‖ w_be32 ‖ p ‖ L)[0..16]`: w the wire's
   feed id as 4 big-endian bytes, p the label's pointer bit as one byte, L the 16 label bytes, `in_salt` the
-  16 bytes C sent first. For each label L it obtains later, C checks
-  `com(w, lsb(L), L) == in_com[w][lsb(L)]`, in addition to the pointer bit. A mismatch counts as a failed
+  16 bytes C sent first. For each label L it obtains later, C checks `com(w, lsb(L), L)` against the
+  entry for `lsb(L)` of w's pair in `in_com` (the pair's position in that order, not w: the feed ids of N's
+  own input wires lie between C's and the digest wires'), in addition to the pointer bit. A mismatch counts as a failed
   input check: C evaluates the stage and aborts with the same single byte as for any other failed check.
 - After the seed, the label C holds on such a wire is the unique label with the right pointer bit that
   opens the commitment, unless N found two labels with one commitment: a collision of a 128-bit hash under

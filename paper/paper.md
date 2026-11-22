@@ -1160,14 +1160,20 @@ seed N has sent the tables, the labels of its own input $\rho$ and commitments t
 other input wire, and C checks each label it receives against them. So the pointer bits are a function
 of what N sent before the seed, of C's input $x_C' = x_C + \delta$ and of the digests C computes. N's
 messages after the seed enter only the right-hand side of the check and the abort conditions. N still
-acts with $\chi$ known in two places. It chooses $\delta$, but that only shifts C's input, which is
-uniform and independent of N's view in the hybrid model of ECtF when N's conversion input is not zero;
-when it is zero, C's input is a known shift of the x-coordinate of $a_C S$, and gaining from $\delta$
-means breaking DDH in P-256. And it relays the ServerHello and the server flight, which enter the digests
-through $th_{SH}$ and $th_{SF}$: a flight C accepts is fixed by U's signature up to a few encodings, and
-$th_{SH}$ is fixed before the first stage runs, when N does not know $IS_{HS}$; that a choice of $th_{SH}$
-made with $\chi$ known does not raise the second stage's error noticeably is an assumption (it holds if
-$f$ keyed by its chaining input behaves as a random function). Under these assumptions a wrong evaluation passes the
+acts with $\chi$ known in two places. It chooses $\delta$ and its inputs to ECtF. C's share is a
+function of N's view and of C's point $a_C S$, with at most 6 points per value, so it is not uniform
+given N's view and is hidden only computationally. For a uniform point, C's input meets the inputs on
+which a prepared violation passes with probability at most $6n/2^{128}$; that the real point gives N no
+more is an assumption, DDH in P-256, for every N. And it relays the ServerHello and the server flight,
+which enter the digests through $th_{SH}$ and $th_{SF}$. N holds $s_{hs}$, so it can open the flight,
+change it and recompute the Finished: C must accept only what U's signature fixes. C's TLS stack
+therefore accepts no message besides the four of the flight, nothing after the signature in
+CertificateVerify and one encoding of the signature, which leaves N two values of $th_{SF}$ for an ECDSA
+signature (s and its negation). The stacks released with `split-public-1` ignored bytes after the
+signature, and N's choice of $th_{SF}$ was unbounded: the fourth stage's error was then a bound on N's
+work, at most about $2^{-111}$ per flight tried, and not a statistical one. $th_{SH}$ is fixed before the first stage runs, when N does not know $IS_{HS}$; that a
+choice of $th_{SH}$ made with $\chi$ known does not raise the later stages' error noticeably is an
+assumption (it holds if $f$ keyed by its chaining input behaves as a random function). Under these assumptions a wrong evaluation passes the
 checks of the five stages with probability at most about $2^{-60.6}$ per connection whose server share
 N did not choose. This argument is ours, new in `split-public-2`, and has had no
 review. A server share N chose itself gives N every value of that connection, which then ends at C's
@@ -1461,7 +1467,8 @@ to WebAssembly) against the live provider.
 C's TLS stack is a fork of an MIT-licensed TLS 1.3 client with two hooks: an external key share, and
 traffic secrets injected from the 2PC instead of computed locally. It accepts only the version, suite and
 group it offered, requires the server's flight in RFC 8446 order with each message once and a
-CertificateVerify over the validated chain before it accepts the Finished, validates certificate paths
+CertificateVerify over the validated chain before it accepts the Finished, accepts no other message in
+the flight, nothing after the signature and one encoding of it, validates certificate paths
 per RFC 5280 and hostnames per RFC 6125 against the same Mozilla root set as N's relay (generated from
 the relay's pinned copy), and uses the full 64-bit sequence number in the nonce.
 

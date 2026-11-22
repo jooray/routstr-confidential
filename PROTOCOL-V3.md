@@ -307,9 +307,11 @@ Security statement (informal; no proof, external review outstanding, as for v2):
 - Soundness against a cheating node: a wrong evaluation passes the five per-stage checks with
   probability ≤ 2^-60.6 per connection whose server share N did not choose. The argument needs that N
   fixes everything that determines C's pointer bits before C's challenge seed (§4.1), that C's share is
-  hidden from N (ECtF; DDH in P-256 when N feeds 0 into its conversion) and, for `th_SH`, which N relays
-  before stage A2, that `f` keyed by its chaining input behaves as a random function. Argued, no proof, no
-  review (`docs/TWOPC-NODE-GARBLING.md` §4). In `split-public-1` N sent its input labels after the
+  hidden from N (DDH in P-256: the share is a function of N's view and of C's Diffie-Hellman point, so it
+  is hidden only computationally, whatever N feeds into the conversion), that C accepts at most two
+  server flights per signature of U (§9.4; N holds `s_hs` and chooses `th_SF` among the flights C
+  accepts) and, for `th_SH`, which N relays before stage A2, that `f` keyed by its chaining input behaves
+  as a random function. Argued, no proof, no review (`docs/TWOPC-NODE-GARBLING.md` §4). In `split-public-1` N sent its input labels after the
   challenge, and a prepared N passed stage A1 with a wrong sum with probability about 2^-23 per connection
   (the handshake then failed; no use against a traffic secret is known).
 - Garbling privacy against a cheating client: proven by Rosulek and Roy's Theorem 3 (CRYPTO 2021) with the
@@ -371,8 +373,8 @@ w is the wire's feed id, 0..2815) and each pointer bit p, with `P_{w,p}` the lab
 
 N sends `in_com` = `com(w, 0, P_{w,0}) ‖ com(w, 1, P_{w,1})` for every such wire (2 560 × 32 = 81 920
 bytes) after `gl` and before it reads the seed. For every label L C receives on such a wire (its own input
-after the corrections, the digest labels of each stage) it checks `com(w, lsb(L), L)` against
-`in_com[w][lsb(L)]` besides the pointer bit. A mismatch is a failed input check of the stage: C evaluates
+after the corrections, the digest labels of each stage) it checks `com(w, lsb(L), L)` against the entry
+for `lsb(L)` of w's pair in `in_com` (the pair's position in the order above, not w) besides the pointer bit. A mismatch is a failed input check of the stage: C evaluates
 the stage and sends the stage's single abort byte. N's own input wires have no commitment and no pointer
 check (their masks are not opened).
 
@@ -871,7 +873,11 @@ links measured. A client that cares about passive observers turns it on.
 
 Everything v2 checks (`params.ts`), with: π_WIN parameters (§7.1); the receipt's and attestation's `n`,
 `stream`, `s_k`; the connection head template per framing; U's certificate chain, hostname and handshake
-by its own TLS stack. Framing `"2"`, the provider's frames as RFC 9113 has them: a frame above 16 KiB
+by its own TLS stack. That stack MUST accept only what U's signature fixes, because N holds `s_hs` and
+could otherwise choose `th_SF` (§4): the server flight is EncryptedExtensions, Certificate,
+CertificateVerify, Finished and no other message; CertificateVerify ends with its signature; an ECDSA
+signature is the DER encoding of `(r, s)`; handshake lengths are read as 24 bits; the record of the
+Finished ends with it. Framing `"2"`, the provider's frames as RFC 9113 has them: a frame above 16 KiB
 (the head never raises `SETTINGS_MAX_FRAME_SIZE`) ends the connection; a change of
 `SETTINGS_INITIAL_WINDOW_SIZE` applies to the open request's stream too; no record of a stream above a
 GOAWAY's last-stream-id is released. A refusal of the request's stream (`RST_STREAM(REFUSED_STREAM)`, or
