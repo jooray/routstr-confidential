@@ -223,6 +223,43 @@ Live, through a loopback sidecar against the real provider (`driver.ts --sidecar
 (`split-public-1`: 16 384 987 / 1 134 397); cu-2pc preprocess 432 ms, ECtF 0.4 ms, `handshake` stages 25 ms,
 `application` stages 22 ms.
 
+## The key-share proof (`split-public-2`, changed in place 2026-11-22/23)
+
+N's key-share message is `P_N ‖ e ‖ s` (129 bytes) instead of `P_N` (65): a Schnorr proof of knowledge of
+N's scalar, which C verifies before it opens its commitment (`PROTOCOL-V3.md` §4.1). The numbers in the
+sections above are from before this change. Apple M2 Max, 2026-11-22, `examples/bench.rs --runs 3` from the
+commit before and from this one, one after the other.
+
+| | before | after | |
+|---|---|---|---|
+| payload N→C (`message_sizes()`) | 15 989 746 | 15 989 810 | +64 |
+| payload C→N | 690 | 690 | |
+| frames | | | none added (the proof is in the frame of `P_N`) |
+| C received per session (transport) | 16 466 993 | 16 467 057 | +64 |
+| C sent per session (transport) | 1 134 246 | 1 134 246 | |
+| C received in the key share | 74 | 138 | +64 |
+
+Key-share step, C's view, ms (N's view in brackets; N's step also waits for C to finish receiving the rows,
+see "Wall time per step and side"):
+
+| link | before | after |
+|---|---|---|
+| local | 2.5 (45.8) | 2.8 (46.7) |
+| 40 ms one-way, 2 up / 50 down | 83.9 (830.8) | 85.5 (832.6) |
+| 40 ms one-way, 7 up / 50 down | 83.8 (809.1) | 84.6 (824.1) |
+| 25 ms one-way, 100 symmetric | 53.9 (450.2) | 55.0 (456.0) |
+| 40 ms one-way, 2 up / 10 down | 85.1 (3 358.0) | 84.9 (3 350.3) |
+
+The step is one round trip before and after (commitment, N's message, then the opening without waiting for
+an answer): 80 ms on the 40 ms links, 50 ms on the 25 ms link. The proof adds no round trip. It costs N two
+fixed-base multiplications instead of one and C one double multiplication, about 0.3 ms at C locally. Cold
+session, before → after: local 0.46 → 0.45 s, 2/50 7.06 → 7.03 s, 7/50 4.72 → 4.69 s, 100 symmetric
+2.71 → 2.69 s, 2/10 15.69 → 15.81 s (noise).
+
+Live, through a loopback sidecar against the real provider (the runs of `v3-check.sh`, 2026-11-22, both
+framings): `twopc_recv` 16 467 057 (16 467 062 where the multiplexer cut one chunk more), `twopc_sent`
+1 134 417 or 1 134 422; before the change 16 466 998 and 1 134 422.
+
 ## Live (real provider, sidecar and reference driver on one host, 2026-11-11)
 
 `driver.ts --sidecar` against this branch's `cu-sidecar` on loopback (stub settlement, no node), model

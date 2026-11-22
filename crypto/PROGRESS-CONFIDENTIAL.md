@@ -746,3 +746,34 @@ Rolled out the same day: the SDK and node PR branches, the browser library (vend
 on routstr.cypherpunk.today (`v3-1049965`). The client TLS stacks (SDK, reference client, browser library)
 accept one server flight per signature (fork patches TLS-17 to TLS-19). The cold end-to-end numbers above in
 this file are `split-public-1`'s.
+
+## `split-public-2`: proof of knowledge in the key share (2026-11-22, changed in place)
+
+N's key-share message is now `P_N ‖ e ‖ s` (129 bytes, before 65): a Schnorr proof of knowledge of N's
+key-share scalar, non-interactive with SHA-256 over the tag `routstr-twopc-split key-share proof`, the row
+parameters, C's commitment, `P_N` and the proof's commitment R. C verifies it before it opens its
+commitment (`PROTOCOL-V3.md` §4.1). Why: the sketch of the soundness reduction needs the discrete logarithm
+of N's point for every stage after A1; it was an assumption and is now extracted from the proof (random
+oracle, rewinding; `docs/TWOPC-NODE-GARBLING.md` §4). C gives no proof.
+
+**The tag and the offer value are unchanged.** `split-public-2` changed in place on 2026-11-22/23, because
+everything is redeployed together. A build from before this commit does not interoperate with one after
+it: the pair fails at the key share with a message-length error. The browser library needs the new
+`crypto/twopc` and `crypto/conformance/twopc-hash-vectors.json` (new entry `key_share`: C's commitment, N's
+message with a fixed-nonce proof, the 229 bytes hashed for the challenge, C's opening, the joint share;
+checked against an independent pure-Python computation).
+
+Measured (Apple M2 Max, `twopc/examples/bench.rs --runs 3`, the commit before and this one):
+
+- payload N→C 15 989 746 → 15 989 810 B (+64), C→N 690 B, no frame added;
+- transport per session: C received 16 466 993 → 16 467 057 B, sent 1 134 246 B;
+- key-share step at C: 83.9 → 85.5 ms on the 40 ms link (one round trip of 80 ms before and after), 2.5 →
+  2.8 ms locally: no added round trip;
+- live (`v3-check.sh`): `twopc_recv` 16 467 057.
+
+Tests: `cargo test --release -p twopc` 55 unit tests (new: `key_share_proof_refused_before_the_opening`,
+`key_share_proof_checks`, `key_share_proof_vector`, `message_sizes_count_the_key_share_proof`) and 4 of the
+`cu-2pc` binary; `-p cu-sidecar` 128; `ci-offline.sh`; `v3-check.sh` 53 cases without images;
+`v3-routstrd-check.sh` 11 cases. The patch of the browser library applies to the changed crate and
+`client-wasm` passes `cargo check --target wasm32-unknown-unknown` with it (in a scratch copy; the library
+itself is not updated here).

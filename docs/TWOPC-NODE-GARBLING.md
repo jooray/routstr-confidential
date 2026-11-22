@@ -140,23 +140,28 @@ accepts iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   factor 6 on the term of every stage. That the real `Q_C` gives N no more is
   **assumed**: DDH in P-256, for every N (not only one that feeds 0 into the conversion). For a server
   share N chose itself no claim is made, and that connection ends at CertificateVerify.
-  The reduction is **not written out**. What a sketch of it uses, and where it stops:
-  - *U's flight.* Before stage A1 ends N holds U's flight, encrypted under keys derived from
-    `Z = x(s·(P_C + P_N))`. With HKDF-Extract as a random oracle, N can tell these keys from random ones
-    only by a query at Z, which gives the point `s·(P_C + P_N)` up to the sign of y: 2 candidates. That
-    is a Diffie-Hellman value for the joint share, not `Q_C`. N sends `P_N` after C's commitment to `P_C`
-    and does not prove that it knows its discrete logarithm, so a reduction to strong DH (CDH with a DDH
-    oracle) has to put its challenge into the joint share: it opens C's commitment to `A − P_N` for its
-    challenge A, which needs SHA-256 in the key-share commitment as a programmable random oracle.
-  - *Which stages it covers.* A reduction that works this way does not know `Q_C`. It can produce C's
-    messages up to C's d bits of stage A1 (the simulator of the ECtF argument), but not C's report of
-    stage A1 or anything later. So the sketch covers stage A1. For stages A2 to B2 it needs in addition
-    that N knows the discrete logarithm `a_N` of `P_N`: then one reduction from DDH computes U's key as
-    `x(Q + a_N·S)` from its challenge point Q and runs every stage. The protocol does not make N prove
-    this knowledge (a proof of knowledge of `a_N` in the key share would; it would add bytes to the
-    wire). **Assumed.** An N that cannot compute `s·P_N` cannot supply its honest input to the conversion,
-    so C's Z differs from U's and the connection ends at U's flight, before stage B1: in that case the
-    stages the sketch does not reach protect no traffic secret.
+  The reduction is **not written out**. What a sketch of it uses:
+  - *N's key-share scalar.* The reduction gets a DDH challenge `(A, S, Q)`. It plays C with the point A,
+    whose discrete logarithm it does not know, and U with the share S. To compute U's key it needs the
+    discrete logarithm `a_N` of N's point: the key is `x(s·(A + P_N)) = x(Q + a_N·S)` when Q is the
+    Diffie-Hellman value of A and S. N proves that it knows `a_N`: with `P_N` it sends a Schnorr proof,
+    and C opens its commitment only after the proof verified (`PROTOCOL-V3.md` §4.1). The proof's
+    challenge is a SHA-256 hash that contains C's commitment, a value N cannot predict. With that hash
+    as a random oracle, the reduction runs N again from its query for this challenge with fresh oracle
+    answers and computes `a_N` from two valid proofs (forking lemma). C sends nothing between its
+    commitment and the proof, so the second run needs no message of C or U. This is extraction by
+    rewinding, for one connection at a time. It is not straight-line, and the sketch says nothing about
+    an N that interleaves many key shares so that one extraction would be nested in another.
+  - *All stages.* With `a_N` the reduction runs C on the point Q and U under the key `x(Q + a_N·S)`,
+    through all five stages. For a uniform Q, and with HKDF-Extract as a random oracle, N can tell U's
+    keys from random ones only by a query at that x-coordinate (probability at most 2·q/#E for q
+    queries), and C's messages up to N's choice of δ are simulatable without Q (`TWOPC-DESIGN.md`,
+    ECtF), so the count above applies. Until 2026-11-22 N gave no such proof: the sketch then covered
+    stage A1 by another route (strong DH and a programmed key-share commitment) and **assumed** N's
+    knowledge of `a_N` for the later stages.
+  - *What the proof does not show.* That N feeds its honest point into the conversion (it need not; the
+    ECtF argument covers that), or that the node C talks to did not get point and proof from another
+    party: then both together know the scalar.
   - *N's masks.* To decide whether a violation is present the reduction needs N's masks λ. N is the
     receiver of the COTs under Δ_B. Its choice bits are fixed by the seeds it sends as sender of the
     base OTs and by its corrections. mpz2's base OT (Chou-Orlandi) has no proof of knowledge of the
@@ -437,4 +442,6 @@ a malicious N, be checkable in QuickSilver, and leak nothing usable to the other
   the challenge (§4: a prepared N passed stage A1 with a wrong sum with probability about 2^-23 per
   connection), and the input labels of C and of the digests not committed (§5). 16.38 MB down, 1.13 MB up.
   `split-public-2` (2026-11-22) changes these four points, adds 81 984 B to the download and 16 B to the
-  upload, and no round trip.
+  upload, and no round trip. On 2026-11-22/23 it changed in place: N sends a proof of knowledge of its
+  key-share scalar with its point (64 B more in the download, no round trip; §4). A build from before
+  that change does not interoperate with one after it, although the tag is the same.

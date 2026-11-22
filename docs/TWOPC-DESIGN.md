@@ -4,10 +4,13 @@ Status (2026-11-22): implemented in `crypto/twopc` on the branch `split-public-2
 schedule of protocol v3 (`PROTOCOL-V3.md` §4 is the normative text). It replaces `split-public-1` (deployed
 from 2026-11-12) with a hard switch; the circuit and the stages are the same, the garbling hash, the check-row
 hash and the handling of the input labels are new ("Changes from `split-public-1`", below). Tested against the
-reference key schedule and against a cheating party on either side (`cargo test --release -p twopc`: 51 unit
+reference key schedule and against a cheating party on either side (`cargo test --release -p twopc`: 55 unit
 tests, 4 tests of the `cu-2pc` binary), and run end to end through a loopback sidecar against api.venice.ai.
 The construction has no published proof and has had no external review. It is not compatible with v2 or with
 `split-public-1` on purpose: the first bytes on the 2PC channel are a version tag, and such a peer is refused.
+`split-public-2` changed in place on 2026-11-22/23: N's key-share message gained a proof of knowledge of its
+scalar (step 3 below). A build from before that change does not interoperate with one after it, although the
+tag is the same.
 Construction details: `docs/TWOPC-NODE-GARBLING.md`. Measurements:
 `crypto/twopc/BENCH.md`. Framings, proofs and money: `PROTOCOL-V3.md`.
 
@@ -97,9 +100,16 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
    digest wires); only then does C send its challenge seed. N proves the products, opens the masks C will
    need (its input wires, the digest input wires, the outputs C decodes), sends the check rows per stage and
    the label-check pairs. KOS gives C the COTs for its 256 input bits; ECtF prepares its OLEs.
-3. **Joint key share.** C commits to `P_C = a_C·G` (SHA-256 of the SEC1 point and a 32-byte nonce), N sends
-   `P_N = a_N·G`, C opens. Both compute `P = P_C + P_N`. Committing first prevents `P_C = T − P_N`. A
-   pre-warmed session stops here.
+3. **Joint key share.** C commits to `P_C = a_C·G` (SHA-256 of the SEC1 point and a 32-byte nonce). N sends
+   `P_N = a_N·G` with a proof that it knows `a_N`. C verifies the proof and only then opens. Both compute
+   `P = P_C + P_N`. Committing first prevents `P_C = T − P_N`. The proof is a Schnorr proof made
+   non-interactive with SHA-256: `R = k·G`, `e = SHA256(tag ‖ rparams ‖ com ‖ P_N ‖ R)`,
+   `s = k + e·a_N mod n`, sent as `e ‖ s` (64 bytes). `com` is C's commitment and `rparams` the row
+   parameters of this preprocessing, so a proof from another key share does not verify here. C refuses a
+   point that is not a canonical uncompressed encoding of a curve point, an `s ≥ n`, and a proof whose
+   recomputed challenge differs; it then stops without opening, and N learns nothing from that, because
+   it could have run the check itself. `PROTOCOL-V3.md` §4.1 has the bytes. C gives no proof for `a_C`
+   ("Malicious C" below). A pre-warmed session stops here.
 4. **ClientHello.** C builds it with exactly one key share, group secp256r1, value P, and one cipher suite,
    TLS_AES_128_GCM_SHA256; no PSK, no early data. N parses and enforces this before relaying (otherwise C
    could add a share of its own). N takes the server share S from the ServerHello.
@@ -130,7 +140,7 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
 | preprocess | N→C | labels of ρ on N's 256 input wires; commitments to both labels of the other 2 560 input wires | 4 096; 81 920 |
 | preprocess | C→N | challenge seed, after all of the above arrived | 32 |
 | preprocess | N→C | product check (U, V); opened masks and one MAC hash; per stage check rows and Y_N; label-check pairs | 32; 0.7 kB; 3.86 MB; 81 kB |
-| key share | C→N, N→C, C→N | commitment; P_N; opening | 32; 65; 97 |
+| key share | C→N, N→C, C→N | commitment; `P_N` with the proof `e ‖ s`; opening (after the proof verified) | 32; 129; 97 |
 | A1 | N→C | `δ = x_N − ρ mod p` | 32 |
 | A1 | C→N | `d = x_C' ⊕ b` | 32 |
 | A1 | N→C | corrections for x_C' | 4 096 |
@@ -140,8 +150,8 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
 The report of a stage is C's only message in that stage. N sends the next stage's labels only after the
 report's label hash verified.
 
-Payload per session (`twopc::message_sizes`, without OT traffic and the tag): N→C 15 989 746 B, C→N 690 B.
-On the wire with the OT traffic and the multiplexer: C receives 16 466 993 B and sends 1 134 246 B
+Payload per session (`twopc::message_sizes`, without OT traffic and the tag): N→C 15 989 810 B, C→N 690 B.
+On the wire with the OT traffic and the multiplexer: C receives 16 467 057 B and sends 1 134 246 B
 (`crypto/twopc/BENCH.md`).
 
 ## Security model
@@ -252,6 +262,15 @@ and Y_N, which C can compute itself. The mask of `K_0 ‖ IV_0` is never opened.
   (`evaluating_with_another_digest_rejected`, `different_transcript_hash_detected`).
 - C's own input is free, as in any 2PC. C learns each stage's outputs before N does and can stop there. It
   then holds public values, or secrets of a connection on which N never writes the credential.
+- C does not prove knowledge of its key-share scalar, and nothing here needs it. Its commitment fixes
+  `P_C` before it sees `P_N`, so it cannot choose the joint share
+  (`rogue_key_share_aborts`). With the commitment hash as a random oracle a reduction reads `P_C` from C's
+  query, without rewinding, and can make the joint share any point it wants by its choice of `P_N`. A C
+  that does not know `a_C` cannot compute its input to ECtF: the handshake fails, and N has written
+  nothing.
+- N's proof of knowledge gives C nothing about `a_N`: with a uniform nonce it can be simulated without
+  `a_N` by programming the challenge hash (zero knowledge in the random-oracle model). `a_N` and the
+  nonce are used for one connection.
 
 ### Assumptions: both parties see `IS_k`
 
@@ -424,11 +443,12 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 | public `IS_k`, digest labels from N pinned by pointer checks | argued above; assumptions 1 and 2; new in v3 |
 | leakage bound (≤ 3 bits per connection) | counting argument in the idealized abort model above, conditional on ECtF and the garbling argument; not a full enumeration of a malicious N's observations |
 | harmlessness of the leak | argued above: every value it can concern is a fresh secret of 256 bits, used for one connection; min-entropy loss ≤ log2 of the outcomes |
-| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection, k·2^-60.6 over k connections, for a connection whose server share N did not choose; argued, under DDH in P-256 (C's share is hidden from N only computationally; the reduction is not written out, and a sketch of it needs random oracles, strong DH and, beyond stage A1, that N knows the discrete logarithm of its key share), a client TLS stack that accepts at most two server flights per signature of U, and the random-function behaviour of `f` for the transcript hash N relays before stage A2 (`TWOPC-NODE-GARBLING.md` §4). In `split-public-1` stage A1 had only about 2^-23 against a prepared node, with a failed handshake as the outcome |
+| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection, k·2^-60.6 over k connections, for a connection whose server share N did not choose; argued, under DDH in P-256 (C's share is hidden from N only computationally; the reduction is not written out; a sketch of it extracts the discrete logarithm of N's key share from N's proof of knowledge by rewinding and needs SHA-256 in that proof, HKDF-Extract and the hash of mpz2's base OT as random oracles), a client TLS stack that accepts at most two server flights per signature of U, and the random-function behaviour of `f` for the transcript hash N relays before stage A2 (`TWOPC-NODE-GARBLING.md` §4). In `split-public-1` stage A1 had only about 2^-23 against a prepared node, with a failed handshake as the outcome |
 | distinct inner digests under one key (assumption 3) | assumed: compression-function collision resistance under a known chaining value |
 | the chained multi-output composition with public `IS_k` | **not written** (hybrids over both directions and every value revealed together) |
 | N's input is fixed before the challenge, the other input labels are committed before it | argued (`TWOPC-NODE-GARBLING.md` §4, §5); new in `split-public-2`; in `split-public-1` neither held |
 | Ferret/KOS against a malicious receiver (N for the MAC COTs under Δ_B; C for the 256 COTs under Δ_A), KOS consistency-check leakage of a few Δ bits with negligible probability | assumed from mpz2 |
+| N's proof of knowledge of its key-share scalar | Schnorr with the Fiat–Shamir transform: a proof of knowledge in the random-oracle model, extraction by rewinding (forking lemma), zero knowledge with a programmed oracle; standard results, applied here to one connection at a time. No statement for interleaved key shares, no straight-line extraction. Tests: `key_share_proof_refused_before_the_opening`, `key_share_proof_checks`, `key_share_proof_vector` |
 | ECtF | mpz2 documents it as semi-honest. Malicious N: limited to input substitution, view simulatable, every effective deviation ends the handshake before B1 (argued above, ROT-hybrid model, HKDF-Extract as a random oracle, strong DH in P-256). Malicious C: 3 outcomes, ≤ log2 3 bits per connection (argued above, by enumeration of this code's error paths; base-OT security assumed) |
 | the KOS Δ of the ECtF instance (confidentiality of a recorded connection against N rests on it) | assumed from mpz2, with KOS's selective leakage of a few bits |
 | the anchors are public while the same secrets are keys (assumption 4) | assumed (holds with SHA-256 as a random oracle) |
@@ -458,8 +478,8 @@ fixes N's input before the challenge.
 
 `crypto/twopc/BENCH.md` has the tables. Per connection the client uploads 1.13 MB and downloads 16.47 MB
 (tables 11.8 MB, check rows 3.9 MB, input-label commitments 82 kB); v2 moved 1.21 MB and 22.1 MB per request.
-`split-public-2` adds 81 984 B of payload to the download and 16 B to the upload against `split-public-1`,
-and no round trip. A cold key schedule takes 7.1 s on a 2/50 Mbit/s link with 80 ms round-trip time (v2:
+`split-public-2` adds 82 048 B of payload to the download and 16 B to the upload against `split-public-1`,
+and no round trip (64 of these bytes are the key-share proof, added in place on 2026-11-22/23). A cold key schedule takes 7.1 s on a 2/50 Mbit/s link with 80 ms round-trip time (v2:
 7.4 s) and 15.7 s with a 10 Mbit/s downlink (v2: 20.1 s). The halved AES count per gate (N 6, C 3, from 12
 and 6) shortens the online stages: locally 31 and 25 ms instead of 38 and 30 ms. Each stage after A1 costs one round trip that v2 did not have: from C's side `handshake` takes 3
 instead of 1 and `application` 1.5 instead of 1 (N's B1 labels need no message from C).
@@ -476,7 +496,8 @@ ECtF, OT layers, 64-bit rows, label-check pairs and anchors. `split-public-2` ch
 | N's circuit input | its share `x_N`, labels sent in the handshake after the challenge | a random mask ρ < p, labels sent before the challenge; the share follows as `δ = x_N − ρ mod p` |
 | other input labels (C's share, the digests) | pointer bit checked only | committed before the challenge under C's 16-byte salt, each label checked |
 | stage A1 against a prepared N | wrong sum passes with about 2^-23 per connection | within the 2^-60.6 bound (argued) |
-| bytes | 16.38 MB down, 1.13 MB up | +81 984 B down, +16 B up, no added round trip |
+| N's key share | `P_N` | `P_N` and a proof of knowledge of `a_N` (added in place on 2026-11-22/23; before that as in `split-public-1`) |
+| bytes | 16.38 MB down, 1.13 MB up | +82 048 B down, +16 B up, no added round trip |
 | tag, offer | `routstr-2pc/split-public-1`, `"split-public-1"` | `routstr-2pc/split-public-2`, `"split-public-2"`; the two do not interoperate |
 
 ## History: v2 and `Proven`

@@ -332,7 +332,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   offline checks, the client root store against `gen-client-roots.py`, every copy of a vector of
   `crypto/conformance/` byte-identical, a secret scan. `CU_CI_SKIP_CARGO=1` skips the Rust tests.
 - Unit tests:
-  - `crypto`: `cargo test --release -p cu-sidecar` (120), `-p zkbench`, `-p twopc` (51 unit tests, 4 of the `cu-2pc` binary)
+  - `crypto`: `cargo test --release -p cu-sidecar` (120), `-p zkbench`, `-p twopc` (55 unit tests, 4 of the `cu-2pc` binary)
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
   - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`, `bun test tests/bun` (vitest
     reports those two files as failed: it cannot load `bun:test`)
@@ -349,7 +349,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 
 | Part | State |
 |---|---|
-| `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-2` with the version tag (2026-11-22: new garbling hash and row hash, N's input a mask fixed before the seed, input-label commitments; 51 unit tests; `v3-check.sh` 53 cases without images); it replaced `split-public-1` on 2026-11-22 |
+| `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-2` with the version tag (2026-11-22: new garbling hash and row hash, N's input a mask fixed before the seed, input-label commitments; 2026-11-22/23, in place under the same tag: N's key share carries a Schnorr proof of knowledge of its scalar, `ks_prove`/`ks_verify` in `lib.rs`; 55 unit tests; `v3-check.sh` 53 cases without images); it replaced `split-public-1` on 2026-11-22 |
 | `crypto/relay` (sidecar) | done; 120 unit tests; `v3-check.sh` clean in one run (51 cases without images, 2026-11-13). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause; a provider refusal of a stream is proven (`disclose_reset`) |
 | `crypto/client` (reference driver) | done for both framings; run live against the sidecar by `v3-check.sh` and against a node by the node gate |
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
@@ -450,8 +450,8 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   process you start.
 - **Open items.**
   - `split-public-2` costs 16.47 MB node→client and 1.13 MB client→node per
-    **connection** (82 kB and 16 B more than `split-public-1`, no added
-    round trip), plus about 1.5 MB each way for the proof channel's
+    **connection** (82 kB and 16 B more than `split-public-1`, 64 B of it
+    the key-share proof, no added round trip), plus about 1.5 MB each way for the proof channel's
     correlations; a cold request takes about 12 s on a 2/50 Mbit/s link
     (the uplink is the limit) against about 1.4 s on an armed connection
     and under 1 s on an open one. A cheating node can learn at most
@@ -467,7 +467,16 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
     routstr.cypherpunk.today, SDK and node PR branches, browser library
     (the conformance vectors run in its native and wasm32 tests) and PWA.
     A change to `crypto/twopc` that alters wire bytes needs a new tag and
-    the same joint rollout (old and new peers refuse each other).
+    the same joint rollout (old and new peers refuse each other). One
+    exception was made on 2026-11-22/23: the node's key-share message
+    gained a proof of knowledge of its scalar (`P_N ‖ e ‖ s`, 129 bytes
+    instead of 65; `PROTOCOL-V3.md` §4.1) **under the same tag**, because
+    everything was redeployed together. A build from before that commit
+    and one after it do not interoperate: they fail at the key share with
+    a message-length error, not with `twopc_version_mismatch`. The browser
+    library must vendor `crypto/twopc` and
+    `crypto/conformance/twopc-hash-vectors.json` (new entry `key_share`)
+    from after it.
   - The sidecar's guard does not see a provider that fails only once a
     request's records arrive (the body is the client's); the profile check
     and the client's fallback cover that.

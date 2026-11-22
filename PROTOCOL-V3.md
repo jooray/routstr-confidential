@@ -264,8 +264,8 @@ One circuit, five stages, a consistency check per stage before C uses any output
 | B2 | `K_0`, `IV_0`, `c_ap_1` from `OS_c0`; `h1`, `h2`, `hk` | `c_ap_1` (C), `K_0 ‖ IV_0` (N), anchors (public) |
 
 - 22 garbled compressions, 479 022 AND gates. Measured: 16.47 MB node → client, 1.13 MB client → node
-  (16 466 993 and 1 134 246 bytes with OT traffic and multiplexer headers; payload of the protocol
-  messages 15 989 746 and 690 bytes).
+  (16 467 057 and 1 134 246 bytes with OT traffic and multiplexer headers; payload of the protocol
+  messages 15 989 810 and 690 bytes).
 - **Label-check pairs** (new, mandatory): for every output wire C reports to N, N sends in preprocessing
   the salted hashes of both candidate labels. C checks its label against the pair before it reveals
   anything and aborts on a mismatch. The pairs **augment** the report hash (C still sends one hash over
@@ -309,8 +309,9 @@ Security statement (informal; no proof, external review outstanding, as for v2):
   fixes everything that determines C's pointer bits before C's challenge seed (§4.1), that C's share is
   hidden from N (DDH in P-256: the share is a function of N's view and of C's Diffie-Hellman point, so it
   is hidden only computationally, whatever N feeds into the conversion; the reduction is not written
-  out, and a sketch of it needs random oracles, strong DH and, beyond stage A1, that N knows the discrete
-  logarithm of its key share, which N does not prove), that C accepts at most two
+  out. A sketch of it needs that N knows the discrete logarithm of its key share: N proves it in the key
+  share (§4.1), and the sketch extracts it by rewinding, with SHA-256 in the proof's challenge and
+  HKDF-Extract as random oracles), that C accepts at most two
   server flights per signature of U (§9.4; N holds `s_hs` and chooses `th_SF` among the flights C
   accepts) and, for `th_SH`, which N relays before stage A2, that `f` keyed by its chaining input behaves
   as a random function. Argued, no proof, no review (`docs/TWOPC-NODE-GARBLING.md` §4). In `split-public-1` N sent its input labels after the
@@ -380,12 +381,38 @@ for `lsb(L)` of w's pair in `in_com` (the pair's position in the order above, no
 the stage and sends the stage's single abort byte. N's own input wires have no commitment and no pointer
 check (their masks are not opened).
 
+**The key share.** C draws `a_C`, a 32-byte nonce, and sends
+`com = SHA256("routstr-twopc-v2 key-share commit" ‖ P_C ‖ nonce)`, `P_C = a_C·G`. N draws `a_N` and
+answers with `P_N = a_N·G` and a proof that it knows `a_N` (Schnorr, non-interactive), in one message of
+129 bytes, `P_N ‖ e ‖ s`:
+
+- `k` uniform in [1, n−1], fresh, used for this proof only; `R = k·G`;
+- `e = SHA256("routstr-twopc-split key-share proof" ‖ rparams ‖ com ‖ P_N ‖ R)`: the 35 ASCII bytes of
+  the tag, the 32 bytes of the row parameters above, the 32 bytes of C's commitment, then the two points
+  (229 bytes in all);
+- `s = (k + ē·a_N) mod n`, where n is the order of P-256 and ē is `e` read as a big-endian integer and
+  reduced mod n; `s` is sent as 32 bytes big-endian.
+
+Points here are 65 bytes, `04 ‖ X ‖ Y`, coordinates big-endian (uncompressed SEC1). C accepts `P_N` only
+in this form, with both coordinates below p and on the curve (the identity has no such encoding). It
+refuses `s ≥ n`, computes `R' = s·G − ē·P_N`, refuses the identity, and accepts iff the hash of the same
+229 bytes with `R'` in place of R equals `e`, byte for byte. Only then does it send the opening
+`P_C ‖ nonce` (97 bytes). On any refusal C ends the session and sends nothing: N never receives `P_C`.
+The check reads only `com`, `rparams` and N's own message, so its outcome tells N nothing about C. N
+checks that the opening matches `com` and that `P_C` is a valid point. The joint share is `P_C + P_N`;
+both refuse the identity. `com` is fresh for every key share and `rparams` is fixed by C's seed and N's
+`hparams`, so a proof made for another key share or another preprocessing does not verify. N's
+operations on `a_N` and `k` must be constant-time, and `k` must never be used twice. C gives no proof for
+`a_C`: its commitment fixes `P_C` before it sees `P_N`, and a C that does not know `a_C` cannot compute
+its input to ECtF and harms only itself.
+
 **Order.** C sends the seed only after `hparams`, both table parts, the d bits, `gl` and `in_com` arrived
 completely. §12.2 lists every message with its size.
 
 **Conformance vectors.** `crypto/conformance/twopc-hash-vectors.json`: `xtime`, GF(2^64) products, σ,
-`H_g`, the row parameters, `row`, one whole three-halves gate, input-label commitments and the masked input
-(ρ, δ and its wire bytes, `x_C'`). The `twopc` tests assert them (`hash_vectors_match_conformance_file`);
+`H_g`, the row parameters, `row`, one whole three-halves gate, input-label commitments, the masked input
+(ρ, δ and its wire bytes, `x_C'`) and one key share (`key_share`: C's commitment, N's message with a proof
+made from a given `k`, the 229 bytes hashed for its challenge, C's opening, the joint share). The `twopc` tests assert them (`hash_vectors_match_conformance_file`);
 another implementation of C must reproduce them.
 
 ## 5. Framing `"2"` (HTTP/2)
@@ -1118,7 +1145,7 @@ LSB first.
 | P6 | N→C, `n2c` | `in_com`: 2 560 pairs of 16-byte commitments | 81 920 | before the seed; needs P1 |
 | P7 | C→N, `c2n` | `seed` | 32 | only after P2 to P6 arrived completely |
 | P8 | N→C, `n2c` | product check; openings and their MAC hash; per stage rows and `Y_N`; label-check pairs | 32; ⌈n_open/8⌉ + 32; 8 per row wire + 8; 32 per reported output wire | after P7 |
-| K | both | key share: C's commitment, `P_N`, C's opening | 32; 65; 97 | |
+| K | C→N, N→C, C→N | key share: C's commitment `com`; `P_N ‖ e ‖ s` (N's point and its proof of knowledge, §4.1); C's opening `P_C ‖ nonce` | 32; 129; 97 | C opens only after the proof verified |
 | H1 | both | ECtF (OLE channel) | | at `handshake` |
 | H2 | N→C, `n2c` | `δ = (x_N − ρ) mod p` | 32 | as soon as N's ECtF returned |
 | H3 | C→N, `c2n` | `d = bits(x_C') ⊕ b` | 32 | after H2 and C's ECtF; C refuses δ ≥ p |
@@ -1126,8 +1153,16 @@ LSB first.
 | S | C→N, then N→C | per stage: C's report (`1 ‖ pointer bits ‖ SHA256(labels)` or the abort byte `0`); N's labels of the next stage's digests (16 bytes per bit) or `0` | report 65 to 157; labels 12 288, 4 096, 8 192, 12 288 | one round trip per stage; N sends the B1 labels without waiting |
 
 Against `split-public-1`: P1, P2, P6 and H2 are new, P5 moved from the handshake (where it carried the labels
-of `x_N`) to before the seed, and P7 waits for P2 to P6. Payload +81 984 bytes N→C, +16 bytes C→N, no added
-round trip (measured: the time from ECtF to the end of stage A3 is unchanged, `crypto/twopc/BENCH.md`). `pi_win` and `pi_c3s` run once per `zk_params` on the channel
+of `x_N`) to before the seed, P7 waits for P2 to P6, and N's message of K carries the proof. Payload
++82 048 bytes N→C, +16 bytes C→N, no added
+round trip (measured: the time from ECtF to the end of stage A3 is unchanged, `crypto/twopc/BENCH.md`).
+
+**`split-public-2` changed in place on 2026-11-22/23.** As first deployed on 2026-11-22, N's message of K
+was `P_N` alone (65 bytes). The proof of knowledge was added under the same tag and the same offer value,
+because every node and client was redeployed together. A build from before that change does not
+interoperate with one after it, although both send `routstr-2pc/split-public-2\n`: the pair fails at K
+with a message-length error (the client's `cu-2pc` reports an error without the code
+`twopc_version_mismatch`), before any TLS byte is sent. `pi_win` and `pi_c3s` run once per `zk_params` on the channel
 (`cu-prover --channel`; the earlier `--multi` is the only mode) or on a socket of their own; `pi_nk` once
 per connection.
 
@@ -1613,6 +1648,7 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | request-offer age (prices end 10 min after the offer stops being served); security-relevant offer changes retire live connections | §3.3 |
 | `after_client_frames`; `evicted`; the per-address total and the eviction of idle used connections; 8 refused requests in a row; recurring cost | §8, §12.9, §12.10 |
 | the `split-public-1` statement: the inner-digest message rule, assumption (3), the idealized 3-bit model, label-check pairs augment the report hash | §4 |
+| `split-public-2`, changed in place on 2026-11-22/23: N sends a proof of knowledge of its key-share scalar with `P_N` (+64 bytes N→C, no round trip); builds from before and after do not interoperate under the same tag | §4, §4.1, §12.2 |
 | `split-public-2` (2026-11-22) replaces `split-public-1`: garbling hash `H_g` with N's `hparams`, the check-row hash keyed from the seed, N's input a mask ρ with labels before the seed and δ in the handshake, input-label commitments under C's `in_salt`, the 2PC message list, conformance vectors; the eight outcomes are those after preprocessing; assumption (4) | §4, §4.1, §10, §11, §12.1, §12.2 |
 | privacy: linkability and its off switches, body padding (off by default), residual risks 7-10 | §1, §9.1, §9.3, §10 |
 | a cancelled request cannot lend its credential reference (the attack and why each form fails) | §5.3.1 |
