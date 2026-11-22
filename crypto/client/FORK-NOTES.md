@@ -89,7 +89,7 @@ changes; without a call the client behaves as before. **This patch is only in
 the reference client's copy**: the SDK fork and the web library do not have it
 yet.
 
-## Security patches (TLS-01 … TLS-16)
+## Security patches (TLS-01 … TLS-17)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -169,8 +169,18 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   accepted (RFC 8446 §5). A plaintext KeyUpdate after the handshake rotated
   the read key, and a plaintext close_notify ended the connection as if the
   server had closed it.
+- **TLS-17, one accepted server flight per signature** (`make-tls-client.js`
+  `processRecord`; `utils/parse-certificate.js`; `utils/packets.js`).
+  The node holds s_hs, so it can open the provider's flight, change it and
+  recompute the Finished; the provider's signature covers the transcript up
+  to Certificate only. CertificateVerify now ends with its signature, an
+  ECDSA signature must be DER, Finished follows CertificateVerify directly,
+  the flight holds only its own message types, all three bytes of a
+  handshake length are read, and the record of the server Finished ends with
+  it. What is left is `(r, s)` and `(r, n − s)` for an ECDSA signature. The
+  full text is in the SDK copy of this file.
 
-Offline check of TLS-15 and TLS-16: `npm run tls-records-check`
+Offline check of TLS-15, TLS-16 and TLS-17: `npm run tls-records-check`
 (`test/tls-fork-records-check.ts`).
 
 ## Runtime dependencies

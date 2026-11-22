@@ -1,4 +1,5 @@
-// Offline check of the vendored TLS fork's record rules (FORK PATCH TLS-15, TLS-16).
+// Offline check of the vendored TLS fork's record rules (FORK PATCH TLS-15,
+// TLS-16) and of what it accepts as a server flight (TLS-17).
 //
 //   node --experimental-strip-types test/tls-fork-records-check.ts
 //
@@ -15,7 +16,15 @@
 //   - application data under s_ap_0 after the handshake is delivered;
 //   - a plaintext handshake record (during and after the handshake) and a
 //     plaintext alert are refused once the handshake keys are installed;
-//   - the compatibility ChangeCipherSpec and an encrypted KeyUpdate still work.
+//   - the compatibility ChangeCipherSpec and an encrypted KeyUpdate still work;
+//   - one accepted flight per signature (TLS-17). The node can open the
+//     flight, change it and recompute the Finished; the provider's signature
+//     covers the transcript up to Certificate only. Each case below has a
+//     Finished that is correct for the changed transcript: bytes after the
+//     signature in CertificateVerify, an ECDSA signature in another encoding
+//     than DER, a message between CertificateVerify and Finished, a message
+//     type that is not part of the flight, a handshake length with its top
+//     byte set, handshake bytes after the Finished in its record.
 //
 // Self-contained: imports only the vendored fork and its dependencies.
 
@@ -95,6 +104,10 @@ function hsMsg(type: number, body: number[] | Uint8Array): Uint8Array {
   const b = Array.from(body)
   return new Uint8Array([type, ...u24(b.length), ...b])
 }
+/** CertificateVerify (ecdsa_secp256r1_sha256) with the given signature bytes. */
+function cvMsg(sig: number[], trailing: number[] = []): Uint8Array {
+  return hsMsg(0x0f, [0x04, 0x03, ...u16(sig.length), ...sig, ...trailing])
+}
 /** A plaintext record. */
 function plain(type: number, body: number[] | Uint8Array): Uint8Array {
   return new Uint8Array([type, 0x03, 0x03, ...u16(body.length), ...Array.from(body)])
@@ -147,11 +160,17 @@ class FakeServer {
     this.transcript.push(msg)
     return msg
   }
-  async certificateVerify(signer: Issued): Promise<Uint8Array> {
+  /** The signer's ECDSA signature (DER) over the transcript so far. */
+  async signature(signer: Issued): Promise<number[]> {
     const data = await getSignatureDataTls13(this.transcript, SUITE)
     const raw = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, signer.keys.privateKey, data))
-    const sig = derEcdsaSig(raw)
-    const msg = hsMsg(0x0f, [0x04, 0x03, ...u16(sig.length), ...Array.from(sig)])
+    return Array.from(derEcdsaSig(raw))
+  }
+  async certificateVerify(signer: Issued): Promise<Uint8Array> {
+    return this.add(cvMsg(await this.signature(signer)))
+  }
+  /** Any handshake message, as given, into the transcript. */
+  add(msg: Uint8Array): Uint8Array {
     this.transcript.push(msg)
     return msg
   }
@@ -312,6 +331,108 @@ const FORGED = new TextEncoder().encode(
   await c.client.handleReceivedBytes(await post.seal(hsMsg(24, [0])))
   const next = (c.client.getKeys() as { serverSecret: Uint8Array }).serverSecret
   check('an encrypted KeyUpdate still rotates the read key', !c.client.hasEnded() && !Buffer.from(next).equals(Buffer.from(sAp0)))
+}
+
+// --- one accepted flight per signature (TLS-17) ----------------------------
+
+/** A client that has processed the flight up to Certificate. */
+async function afterCertificate() {
+  const c = await afterServerHello()
+  await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()))
+  await c.client.handleReceivedBytes(await c.server.seal(c.server.certificate([leaf])))
+  return c
+}
+/** Feeds `msgs` (already in the server's transcript) and then the Finished. */
+async function rest(c: Started, msgs: Uint8Array[], finished = true) {
+  for (const m of msgs) await c.client.handleReceivedBytes(await c.server.seal(m))
+  if (finished) await c.client.handleReceivedBytes(await c.server.seal(await c.server.finished()))
+}
+async function refused(name: string, build: (s: FakeServer) => Promise<Uint8Array[]>, re: RegExp) {
+  const c = await afterCertificate()
+  await rejects(name, rest(c, await build(c.server)), re)
+  check('  no handshake completed and the client ended', c.handshakes() === 0 && c.client.hasEnded())
+}
+const withTopLengthByte = (msg: Uint8Array) => {
+  const m = msg.slice()
+  m[1] = 0x01
+  return m
+}
+
+await refused(
+  'bytes after the signature in CertificateVerify are refused',
+  async (s) => [s.add(cvMsg(await s.signature(leaf), [0xaa, 0xbb, 0xcc]))],
+  /trailing bytes in CertificateVerify/,
+)
+const NOT_DER: [string, (der: number[]) => number[]][] = [
+  ['a byte after the SEQUENCE', (der) => [...der, 0x00]],
+  ['a long-form SEQUENCE length', (der) => [0x30, 0x81, der[1], ...der.slice(2)]],
+  ['r with one more leading zero byte', (der) => [0x30, der[1] + 1, 0x02, der[3] + 1, 0x00, ...der.slice(4)]],
+  ['a third element', (der) => [0x30, der[1] + 2, ...der.slice(2), 0x05, 0x00]],
+]
+for (const [what, variant] of NOT_DER) {
+  await refused(
+    `an ECDSA signature with ${what} is refused`,
+    async (s) => [s.add(cvMsg(variant(await s.signature(leaf))))],
+    /not DER encoded/,
+  )
+}
+await refused(
+  'an ECDSA signature whose r lacks its sign byte is refused',
+  async (s) => {
+    for (;;) {
+      const der = await s.signature(leaf)
+      if (der[3] === 33) return [s.add(cvMsg([0x30, der[1] - 1, 0x02, 32, ...der.slice(5)]))]
+    }
+  },
+  /not DER encoded/,
+)
+const TICKET = hsMsg(0x04, [0, 0, 0, 60, 0, 0, 0, 0, 1, 0, ...u16(4), 1, 2, 3, 4, 0, 0])
+for (const [what, extra] of [
+  ['a message of an unknown type', hsMsg(0xfe, [1, 2, 3])],
+  ['a NewSessionTicket', TICKET],
+  ['a CertificateRequest', hsMsg(0x0d, [0, 0, 0])],
+] as [string, Uint8Array][]) {
+  await refused(
+    `${what} between CertificateVerify and Finished is refused`,
+    async (s) => [await s.certificateVerify(leaf), s.add(extra)],
+    /between CertificateVerify and Finished/,
+  )
+}
+{
+  const c = await afterServerHello()
+  await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()))
+  await rejects(
+    'a message type that is not part of the server flight is refused',
+    c.client.handleReceivedBytes(await c.server.seal(c.server.add(hsMsg(0xfe, [])))),
+    /unexpected handshake message/,
+  )
+}
+{
+  // Read with two length bytes these are the unchanged messages; read in
+  // full they are 64 kB long and do not end here.
+  const c = await afterCertificate()
+  await rest(c, [c.server.add(withTopLengthByte(cvMsg(await c.server.signature(leaf))))])
+  check('a CertificateVerify header with its top length byte set completes nothing', c.handshakes() === 0)
+  const d = await afterCertificate()
+  await rest(d, [await d.server.certificateVerify(leaf)], false)
+  await d.client.handleReceivedBytes(await d.server.seal(withTopLengthByte(await d.server.finished())))
+  check('a Finished header with its top length byte set completes nothing', d.handshakes() === 0)
+}
+{
+  const c = await afterCertificate()
+  await rest(c, [await c.server.certificateVerify(leaf)], false)
+  const record = concatenateUint8Arrays([await c.server.finished(), hsMsg(24, [0])])
+  await rejects(
+    'handshake bytes after the Finished in its record are refused',
+    c.client.handleReceivedBytes(await c.server.seal(record)),
+    /after the server Finished/,
+  )
+  check('  no handshake completed and the client ended', c.handshakes() === 0 && c.client.hasEnded())
+}
+{
+  const c = await afterCertificate()
+  await rest(c, [await c.server.certificateVerify(leaf)])
+  check('the unchanged flight completes the handshake (control)', c.handshakes() === 1 && !c.client.hasEnded())
 }
 
 if (failures) {
