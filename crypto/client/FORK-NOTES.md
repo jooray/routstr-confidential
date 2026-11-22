@@ -89,7 +89,7 @@ changes; without a call the client behaves as before. **This patch is only in
 the reference client's copy**: the SDK fork and the web library do not have it
 yet.
 
-## Security patches (TLS-01 … TLS-17)
+## Security patches (TLS-01 … TLS-19)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -179,8 +179,20 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   handshake length are read, and the record of the server Finished ends with
   it. What is left is `(r, s)` and `(r, n − s)` for an ECDSA signature. The
   full text is in the SDK copy of this file.
+- **TLS-18, the ServerHello starts the flight and ends its record**
+  (`make-tls-client.js` `processRecord`). The first handshake message must
+  be the ServerHello, and nothing may follow it in its record (the read key
+  changes there, RFC 8446 §5.1). A flight in the ServerHello's plaintext
+  record, a message that spans the key change and a message before the
+  ServerHello (it entered `th_SH`) were accepted.
+- **TLS-19, TLS 1.3 strictness and P-384 signatures** (`make-tls-client.js`;
+  `crypto/webcrypto.js`). Refused: a ChangeCipherSpec inside a protected
+  record, a zero-length handshake record, an RSASSA-PKCS1-v1_5 signature in
+  CertificateVerify. Fixed: a P-384 signature whose r or s is shorter than
+  48 bytes (about one in 128) failed to verify. The full text of both is in
+  the SDK copy of this file.
 
-Offline check of TLS-15, TLS-16 and TLS-17: `npm run tls-records-check`
+Offline check of TLS-15 to TLS-19: `npm run tls-records-check`
 (`test/tls-fork-records-check.ts`).
 
 ## Runtime dependencies

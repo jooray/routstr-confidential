@@ -1,5 +1,5 @@
 // Offline check of the vendored TLS fork's record rules (FORK PATCH TLS-15,
-// TLS-16) and of what it accepts as a server flight (TLS-17).
+// TLS-16) and of what it accepts as a server flight (TLS-17, TLS-18, TLS-19).
 //
 //   node --experimental-strip-types test/tls-fork-records-check.ts
 //
@@ -24,7 +24,13 @@
 //     signature in CertificateVerify, an ECDSA signature in another encoding
 //     than DER, a message between CertificateVerify and Finished, a message
 //     type that is not part of the flight, a handshake length with its top
-//     byte set, handshake bytes after the Finished in its record.
+//     byte set, handshake bytes after the Finished in its record;
+//   - the flight starts with the ServerHello, which ends its record (TLS-18):
+//     the flight in the ServerHello's plaintext record, a message that spans
+//     the key change, a message before the ServerHello;
+//   - TLS 1.3 strictness (TLS-19): a ChangeCipherSpec inside a protected
+//     record, an empty handshake record, an RSASSA-PKCS1-v1_5 signature in
+//     CertificateVerify; a P-384 signature with a short r or s verifies.
 //
 // Self-contained: imports only the vendored fork and its dependencies.
 
@@ -66,8 +72,11 @@ async function rejects(name: string, p: Promise<unknown>, re: RegExp) {
 
 type Issued = { cert: x509.X509Certificate; keys: CryptoKeyPair }
 let serial = 1
-async function issue(subject: string, opts: { issuer?: Issued; ca?: boolean; san?: string[] }): Promise<Issued> {
-  const keys = (await crypto.subtle.generateKey(ALG, true, ['sign', 'verify'])) as CryptoKeyPair
+async function issue(
+  subject: string,
+  opts: { issuer?: Issued; ca?: boolean; san?: string[]; keyAlg?: object },
+): Promise<Issued> {
+  const keys = (await crypto.subtle.generateKey((opts.keyAlg ?? ALG) as any, true, ['sign', 'verify'])) as CryptoKeyPair
   const extensions: x509.Extension[] = []
   if (opts.ca !== undefined) extensions.push(new x509.BasicConstraintsExtension(opts.ca, undefined, true))
   extensions.push(
@@ -125,8 +134,9 @@ function derEcdsaSig(raw: Uint8Array): Uint8Array {
     if (v[0] & 0x80) v = [0, ...v]
     return [0x02, v.length, ...v]
   }
-  const body = [...int(raw.slice(0, 32)), ...int(raw.slice(32))]
-  return new Uint8Array([0x30, body.length, ...body])
+  const half = raw.length / 2
+  const body = [...int(raw.slice(0, half)), ...int(raw.slice(half))]
+  return new Uint8Array(body.length < 0x80 ? [0x30, body.length, ...body] : [0x30, 0x81, body.length, ...body])
 }
 
 /** The server side of one handshake; seals records under `secret`. */
@@ -139,11 +149,15 @@ class FakeServer {
     if (clientHello) this.transcript.push(clientHello)
   }
   async serverHello(): Promise<Uint8Array> {
+    return plain(0x16, await this.serverHelloMsg())
+  }
+  /** The ServerHello message, without a record around it. */
+  async serverHelloMsg(): Promise<Uint8Array> {
     const exts = [...ext(0x002b, [0x03, 0x04]), ...ext(0x0033, [0x00, 0x17, ...u16(65), ...Array.from(await p256Point())])]
     const body = [0x03, 0x03, ...Array.from(crypto.getRandomValues(new Uint8Array(32))), 0x00, ...u16(0x1301), 0x00, ...u16(exts.length), ...exts]
     const msg = hsMsg(0x02, body)
     this.transcript.push(msg)
-    return plain(0x16, msg)
+    return msg
   }
   encryptedExtensions(): Uint8Array {
     const msg = hsMsg(0x08, [0x00, 0x00])
@@ -197,12 +211,13 @@ class FakeServer {
 const root = await issue('CN=Test Root', { ca: true })
 const leaf = await issue(`CN=${HOST}`, { issuer: root, ca: false, san: [HOST] })
 
-/** A client in external mode that has processed the ServerHello. */
-async function afterServerHello() {
+/** A client in external mode that has processed the ServerHello (or not yet). */
+async function afterServerHello(serverHello = true) {
   const written: Uint8Array[] = []
   const appData: Uint8Array[] = []
   const ended: unknown[] = []
   let handshakes = 0
+  let serverHellos = 0
   const sHs = crypto.getRandomValues(new Uint8Array(32))
   const client = makeTLSClient({
     host: HOST,
@@ -226,7 +241,10 @@ async function afterServerHello() {
     },
     external: {
       keyShare: await p256Point(),
-      onServerHello: async () => ({ clientHs: crypto.getRandomValues(new Uint8Array(32)), serverHs: sHs }),
+      onServerHello: async () => {
+        serverHellos++
+        return { clientHs: crypto.getRandomValues(new Uint8Array(32)), serverHs: sHs }
+      },
       onServerFinished: async () => ({
         serverAp0: crypto.getRandomValues(new Uint8Array(32)),
         clientAp1: crypto.getRandomValues(new Uint8Array(32)),
@@ -235,8 +253,8 @@ async function afterServerHello() {
   } as any)
   await client.startHandshake()
   const server = new FakeServer(sHs, written[0])
-  await client.handleReceivedBytes(await server.serverHello())
-  return { client, server, appData, ended, handshakes: () => handshakes }
+  if (serverHello) await client.handleReceivedBytes(await server.serverHello())
+  return { client, server, appData, ended, handshakes: () => handshakes, serverHellos: () => serverHellos }
 }
 type Started = Awaited<ReturnType<typeof afterServerHello>>
 async function flight(c: Started, from = 0) {
@@ -433,6 +451,138 @@ for (const [what, extra] of [
   const c = await afterCertificate()
   await rest(c, [await c.server.certificateVerify(leaf)])
   check('the unchanged flight completes the handshake (control)', c.handshakes() === 1 && !c.client.hasEnded())
+}
+
+// --- the ServerHello starts the flight and ends its record (TLS-18) ---------
+//
+// The fake server signs the transcript the client has, so only the rule
+// under test refuses these flights. The provider would not sign them.
+
+async function restOfFlight(s: FakeServer, signer: Issued = leaf): Promise<Uint8Array[]> {
+  return [s.encryptedExtensions(), s.certificate([signer]), await s.certificateVerify(signer), await s.finished()]
+}
+{
+  const c = await afterServerHello(false)
+  const sh = await c.server.serverHelloMsg()
+  await c.client.handleReceivedBytes(plain(0x16, sh.slice(0, 40)))
+  await c.client.handleReceivedBytes(plain(0x16, sh.slice(40)))
+  await c.client.handleReceivedBytes(await c.server.seal(concatenateUint8Arrays(await restOfFlight(c.server))))
+  check(
+    'a ServerHello split over two records and a flight in one record complete the handshake (control)',
+    c.handshakes() === 1 && !c.client.hasEnded(),
+  )
+}
+{
+  const c = await afterServerHello(false)
+  const sh = await c.server.serverHelloMsg()
+  await rejects(
+    'the server flight in the plaintext record of the ServerHello is refused',
+    c.client.handleReceivedBytes(plain(0x16, concatenateUint8Arrays([sh, ...(await restOfFlight(c.server))]))),
+    /after the ServerHello in its record/,
+  )
+  check('  no handshake completed and the client ended', c.handshakes() === 0 && c.client.hasEnded())
+}
+{
+  const c = await afterServerHello(false)
+  const sh = await c.server.serverHelloMsg()
+  const ee = c.server.encryptedExtensions()
+  await rejects(
+    'a message that spans the key change after the ServerHello is refused',
+    c.client.handleReceivedBytes(plain(0x16, concatenateUint8Arrays([sh, ee.slice(0, 4)]))),
+    /after the ServerHello in its record/,
+  )
+  check('  before the key schedule was asked for the handshake secrets', c.serverHellos() === 0 && c.client.hasEnded())
+}
+for (const [what, first] of [
+  ['a NewSessionTicket', TICKET],
+  ['EncryptedExtensions', hsMsg(0x08, [0, 0])],
+  ['a CertificateRequest', hsMsg(0x0d, [0, 0, 0])],
+  ['a message of an unknown type', hsMsg(0xfe, [1])],
+] as [string, Uint8Array][]) {
+  const c = await afterServerHello(false)
+  c.server.add(first)
+  const sh = await c.server.serverHelloMsg()
+  await rejects(
+    `${what} before the ServerHello is refused`,
+    c.client.handleReceivedBytes(plain(0x16, concatenateUint8Arrays([first, sh]))),
+    /before the ServerHello/,
+  )
+  check('  it did not reach the key schedule', c.serverHellos() === 0 && c.client.hasEnded())
+}
+
+// --- TLS 1.3 strictness (TLS-19) -------------------------------------------
+
+{
+  const c = await afterCertificate()
+  await rest(c, [await c.server.certificateVerify(leaf)], false)
+  await rejects(
+    'a ChangeCipherSpec inside a protected record is refused',
+    c.client.handleReceivedBytes(await c.server.seal(new Uint8Array([1]), 0x14)),
+    /ChangeCipherSpec inside/,
+  )
+  check('  no handshake completed and the client ended', c.handshakes() === 0 && c.client.hasEnded())
+}
+{
+  const c = await afterCertificate()
+  await rest(c, [await c.server.certificateVerify(leaf)], false)
+  await rejects(
+    'an empty handshake record is refused',
+    c.client.handleReceivedBytes(await c.server.seal(new Uint8Array(0))),
+    /empty handshake record/,
+  )
+  check('  no handshake completed and the client ended', c.handshakes() === 0 && c.client.hasEnded())
+}
+{
+  const leafRsa = await issue(`CN=${HOST}`, {
+    issuer: root,
+    ca: false,
+    san: [HOST],
+    keyAlg: { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+  })
+  const c = await afterServerHello()
+  await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()))
+  await c.client.handleReceivedBytes(await c.server.seal(c.server.certificate([leafRsa])))
+  const data = await getSignatureDataTls13(c.server.transcript, SUITE)
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'RSASSA-PKCS1-v1_5' }, leafRsa.keys.privateKey, data))
+  // rsa_pkcs1_sha256, a valid signature of the certificate's key
+  const cv = c.server.add(hsMsg(0x0f, [0x04, 0x01, ...u16(sig.length), ...Array.from(sig)]))
+  await rejects(
+    'an RSASSA-PKCS1-v1_5 signature in CertificateVerify is refused',
+    c.client.handleReceivedBytes(await c.server.seal(cv)),
+    /not allowed in CertificateVerify/,
+  )
+  check('  no handshake completed and the client ended', c.handshakes() === 0 && c.client.hasEnded())
+}
+{
+  // About one P-384 signature in 128 has an r or s below 2^376. They were
+  // converted to a 95-byte r‖s, which no verifier accepts.
+  const leaf384 = await issue(`CN=${HOST}`, {
+    issuer: root,
+    ca: false,
+    san: [HOST],
+    keyAlg: { name: 'ECDSA', namedCurve: 'P-384', hash: 'SHA-384' },
+  })
+  for (const [what, at] of [['r', 0], ['s', 48]] as [string, number][]) {
+    const c = await afterServerHello()
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()))
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.certificate([leaf384])))
+    const data = await getSignatureDataTls13(c.server.transcript, SUITE)
+    let raw: Uint8Array
+    do {
+      raw = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-384' }, leaf384.keys.privateKey, data))
+    } while (raw[at] !== 0)
+    const sig = derEcdsaSig(raw)
+    // ecdsa_secp384r1_sha384
+    const cv = c.server.add(hsMsg(0x0f, [0x05, 0x03, ...u16(sig.length), ...Array.from(sig)]))
+    let err = ''
+    try {
+      await c.client.handleReceivedBytes(await c.server.seal(cv))
+      await c.client.handleReceivedBytes(await c.server.seal(await c.server.finished()))
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e)
+    }
+    check(`a P-384 CertificateVerify whose ${what} is shorter than 48 bytes verifies`, c.handshakes() === 1, err)
+  }
 }
 
 if (failures) {
