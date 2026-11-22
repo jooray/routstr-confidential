@@ -145,7 +145,8 @@ authenticated by a hash of its labels.
   about Δ_B; the first failure ends the session). With all gates consistent, the values behind C's pointer
   bits are the correct function of C's input, N's effective input and the digests C computed itself: C's
   input labels and the digest labels are pinned by pointer checks against opened, MAC-checked masks, and C
-  decodes with such masks. Soundness is about 2^-60 per session (five checks).
+  decodes with such masks. Soundness is about 2^-60 per session (five checks), except for stage A1 (next
+  item).
 - *Soundness is statistical, per connection, and adds up.* The 2^-60.6 bound (five stages at ≤ 2^-63 each,
   `TWOPC-NODE-GARBLING.md` §4) is the chance that one connection's wrong evaluation passes. Every connection
   draws a fresh Δ_B, χ and salt, so a node that cheats on every connection succeeds somewhere with
@@ -153,6 +154,13 @@ authenticated by a hash of its labels.
   2^-30.6 after a billion. Each failed attempt is an abort the client sees. The bound covers what is
   committed in preprocessing; the labels N chooses online are argued separately and heuristically
   (`TWOPC-NODE-GARBLING.md` §5).
+- *Stage A1 does not meet the bound (found 2026-11-22).* N sends the labels of its own input after it
+  knows that stage's challenge χ. With adder gates garbled so that a violation depends on a bit of N's
+  input, N can choose its input so that the violations cancel in the check; a prepared node passes with a
+  wrong sum with probability about 2^-23 per connection. Z is then wrong, C fails on the provider's first
+  encrypted record and the later stages never run. No use against a traffic secret is known; that there
+  is none is an assumption (`TWOPC-NODE-GARBLING.md` §4). The successor variant sends N's input labels
+  before the seed.
 - *Digest labels.* N sends them, and N knows `IS_k`. A label for another digest bit fails the pointer check
   whatever C's secrets are, because C computed the digest itself. A value that is not a label of the wire
   fails the consistency check or a label-check pair (`TWOPC-NODE-GARBLING.md` §5). So the stage runs on the
@@ -326,7 +334,7 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 | public `IS_k`, digest labels from N pinned by pointer checks | argued above; assumptions 1 and 2; new in v3 |
 | leakage bound (≤ 3 bits per connection) | counting argument in the idealized abort model above, conditional on ECtF and the garbling argument; not a full enumeration of a malicious N's observations |
 | harmlessness of the leak | argued above: every value it can concern is a fresh secret of 256 bits, used for one connection; min-entropy loss ≤ log2 of the outcomes |
-| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection for the committed parts, k·2^-60.6 over k connections (above) |
+| soundness of the consistency check | statistical: ≤ 2^-63 per stage for the committed parts, k times that over k connections; stage A1 only about 2^-23 against a prepared node, with a failed handshake as the outcome (above) |
 | distinct inner digests under one key (assumption 3) | assumed: compression-function collision resistance under a known chaining value |
 | the chained multi-output composition with public `IS_k` | **not written** (hybrids over both directions and every value revealed together) |
 | soundness of online digest labels N chooses after the salt is known | argued heuristically (`TWOPC-NODE-GARBLING.md` §5), not for arbitrary online labels |

@@ -1101,7 +1101,8 @@ other connection.
 outputs only to C. N's outputs ($c_{hs}$, $s_{hs}$, $K_0$, $IV_0$, the anchors, the inner states) are
 not ancestors of either. A cheating N that garbles a wrong circuit, for example one that outputs C's
 keys in a form N can read, is caught by C's consistency check before C uses any key, except with
-probability about $2^{-60}$ per connection (below), and learns at most 3 bits about C's fresh,
+probability about $2^{-60}$ per connection (below; the first stage is an exception with a weaker
+bound and is discussed there), and learns at most 3 bits about C's fresh,
 single-use inputs and the connection's internal wires (with ECtF's semi-honest conversion as a stated
 assumption, section 4.4). The proofs that decrypt under C's keys ($\pi_{WIN}$, $\pi_{C3S}$) output one
 equality bit, on parameters C has checked against its own records, so N cannot use them as a decryption
@@ -1124,6 +1125,21 @@ of a stage is consistent, C's outputs of that stage are the correct function of 
 effective inputs and the real digests, because C's inputs and the digest wires are pinned by the
 pointer checks and C decodes with authenticated masks. The digests themselves are public values that C
 computes too, from $IS_k$ and messages it knows, so N cannot feed a stage a digest of another message.
+
+*The first stage is an exception.* The step "$E \neq 0$ except with probability $n/2^{128}$ over
+$\chi$" needs the set of violated gates to be independent of $\chi$. In the first stage it is not: C's
+seed fixes $\chi$ in preprocessing, and N sends the labels of its own input, its share of $Z$, in the
+handshake, when it knows $\chi$. N can garble gates of the adder so that whether a gate is violated
+depends on one bit of its input and on a carry, and then choose its input so that the violations
+cancel and $E = 0$. This succeeds when the carries take the values N guessed, which depends on C's
+share. With the check code of the implementation we measured a success probability of about
+$2^{-23}$ per connection for a node that prepares this. The sum is then wrong, so $Z$ is wrong: C's
+handshake keys do not match U's, C fails on U's first encrypted record, and the later stages do not
+run. We know of no way to use this against $c_{ap,1}$ or $s_{ap,0}$, but that the first stage's
+outputs for a wrong $Z$ unknown to N are useless to N is an assumption, not a proof. Every failed
+attempt is an abort C sees. The fix, planned for the next variant of the key schedule, is to send the
+labels of N's input before the seed: N garbles a random mask as its input and later sends only the
+difference between its share and the mask.
 
 *The salt.* Truncating the rows to 64 bits needs one more step. With $E = 0$, a label that is not N's
 honest label but has the right pointer bit changes no output; it only changes the check sum by the

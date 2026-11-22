@@ -104,6 +104,17 @@ iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   The bound is statistical and per connection. Across connections it adds up: Δ_B, χ and the salt are fresh
   each time, so a node that tries on every connection passes somewhere with probability at most
   k·2^-60.6 after k connections (about 2^-40.6 after 2^20), each failed try being an abort the client sees.
+- **Exception: stage A1 (found 2026-11-22).** The bound assumes that the set of violated gates does not depend
+  on χ. In stage A1 it can: C's seed fixes χ in preprocessing, and N sends the labels of its own input `x_N`
+  in the handshake, when it knows χ. N can garble gates of the adder so that whether a gate is violated
+  depends on a bit of `x_N` and on a carry, and then choose `x_N` so that the violations cancel (E = 0). This
+  passes when the carries take the values N guessed, which depends on C's share: about 2^-23 per connection
+  for a node that prepares it, measured with the check code of this repository. The result is a wrong sum and
+  so a wrong Z: C's handshake keys do not match the provider's, C fails on the provider's first encrypted
+  record, and the later stages never run. No way to use this against a traffic secret is known; that the
+  stage's outputs for a wrong Z that N does not know give N nothing is an assumption, not a proof. Each failed
+  attempt is an abort the client sees. The successor variant (in design) sends N's input labels before the
+  seed, which removes the dependence.
 - **The salt.** H is TCCR with the tweak (salt, stage, row index); the salt comes from C's seed. With E = 0,
   a label that is not one of the wire's two labels but has the right pointer bit changes only the hash term of
   the sum, and a 64-bit hash matches with probability 2^-64. A garbler that reuses Δ_A and its keys across
