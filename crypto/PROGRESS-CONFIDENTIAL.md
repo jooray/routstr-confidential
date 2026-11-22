@@ -710,3 +710,37 @@ Offline `cu-prover --bench` (3 runs, local, emulated transport; its π_NK is the
 964.2 kB V→P, 5 compr., 15 blocks; π_WIN (suffix) 161.9 / 162.6 / 163.9 ms, 484.6 kB / 964.2 kB, 7 / 15;
 π_C3S 200.3 / 201.0 / 205.1 ms, 504.0 kB / 964.2 kB, 7 / 38. At 25 ms one way, 100 Mbit/s: π_NK 1219-1238 ms,
 π_WIN 1203-1270 ms, π_C3S 1261-1301 ms.
+
+## `split-public-2` (2026-11-22, branch `split-public-2`, not deployed)
+
+The two-party key schedule moved from `split-public-1` to `split-public-2` (hard switch; tag
+`routstr-2pc/split-public-2\n`, offer `twopc: "split-public-2"`). Same circuit and stages. Changes: the
+garbling hash `AES_k(Y) ⊕ σ(Y)`, `Y = X ⊕ U(τ)`, with N's 32-byte parameters per session (6 AES calls per AND
+gate for N, 3 for C, from 12 and 6; counted from the code); check rows keyed by row parameters from
+SHA-256 of C's seed and those parameters; N's circuit input a random mask ρ < p whose labels go out before
+the seed, its share following as `δ = x_N − ρ mod p` in the handshake; commitments to both labels of the
+other 2 560 input wires before the seed, under a 16-byte salt from C. Why: in `split-public-1` N sent its
+input labels after the challenge, and a prepared N passed stage A1 with a wrong sum with probability about
+2^-23 per connection (`docs/TWOPC-NODE-GARBLING.md` §4).
+
+Measured (Apple M2 Max, `twopc/examples/bench.rs --runs 3`, both commits built one after the other;
+`crypto/twopc/BENCH.md` has the tables):
+
+- payload N→C 15 907 762 → 15 989 746 B (+81 984: 32 hash parameters, 81 920 commitments, 32 δ), C→N
+  674 → 690 B (+16), 4 more frames;
+- transport per session: C received 16 384 987 → 16 466 993 B, sent 1 134 221 → 1 134 246 B;
+- from ECtF to the end of stage A3 the time is unchanged on every emulated link (no added round trip);
+  online stages locally 38 → 31 ms (`handshake`) and 30 → 25 ms (`application`);
+- live through a loopback sidecar against Venice (`driver.ts --sidecar`, `mistral-small-3-2-24b-instruct`,
+  20 tokens, both framings): `twopc_recv` 16 466 998, `twopc_sent` 1 134 422.
+
+Tests: `cargo test --release -p twopc` 51 unit tests (new: GF(2^64) and hash vectors against
+`crypto/conformance/twopc-hash-vectors.json`, the message order, `adder_switch_attack_caught`, which sees
+the attack pass in the old order through a test hook and fail in the new one, the input-label
+commitments, deviations of N and of C in ECtF) and 4 of the `cu-2pc` binary. `v3-check.sh`: 53 cases
+without images, the new one `h2-j-twopc-tag-old` (a `split-public-1` peer is refused with
+`twopc_version_mismatch`).
+
+Not done: the browser library (re-vendor `crypto/twopc`, run the vectors in the wasm build) and the PWA, the
+SDK and routstrd expected `twopc` value and their PR branches, deployment. The cold end-to-end numbers above
+in this file are `split-public-1`'s.

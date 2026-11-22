@@ -13,7 +13,7 @@ RFC 2119.
 |---|---|---|
 | Unit | a session = one request | a **connection** that carries **requests** `(sid, n)` |
 | HTTP to the provider | HTTP/1.1 | **framing** `"2"` (HTTP/2, many sequential requests) or `"1.1"` (one request), chosen per connection from the offer |
-| Two-party key schedule | 31 garbled SHA-256 compressions, 22.1 MB down | split key schedule, public inner states: 22 compressions, 16.4 MB down |
+| Two-party key schedule | 31 garbled SHA-256 compressions, 22.1 MB down | split key schedule, public inner states: 22 compressions, 16.5 MB down |
 | Proof that C's records are what they must be | π_C2S (one record) | **π_WIN** (any number of windows, any number of records) |
 | Held at the setup | a full-context reservation | a **connection deposit** |
 | Reservation | per session, at the setup | per request, at the `request` |
@@ -86,7 +86,7 @@ current one, and a framing withdrawn meanwhile does not end a live connection (�
 
 - `v: 3` (exactly; no list).
 - `http`, `h2`: copied from the sidecar.
-- `twopc: "split-public-1"`: the key-schedule protocol (§4).
+- `twopc: "split-public-2"`: the key-schedule protocol (§4).
 - `connection_deposit_msat`, `idle_timeout_s` (§8).
 - everything v2's offer has: `upstream_host`, `head_template` (framing `"1.1"`), `chat`, `images`,
   `price_list`, `session_fee_msat`, `abandon_fee_msat`, `max_tokens_cap`, …
@@ -236,11 +236,14 @@ C's disclosure (its anchor is the end of the connection). Abort rules: §12.10.
 (§12.9 says when each applies). `done` is the normal end of a `"1.1"` connection. The `deposit` object is §8's outcome. Any protocol
 violation or failed proof: `{"type":"error","status","reason"}` and the socket closes.
 
-## 4. Two-party key schedule: `split-public-1`
+## 4. Two-party key schedule: `split-public-2`
 
 Base: v2's node-only authenticated garbling (`docs/TWOPC-NODE-GARBLING.md`): N garbles with three-halves
 tables, its wire masks are authenticated to C by IT-MACs over Ferret COTs, C checks every AND gate with a
-salted 64-bit row before it uses an output. ECtF is unchanged.
+64-bit row before it uses an output. ECtF is unchanged. `split-public-2` replaces `split-public-1` (the
+variant of v3 from 2026-11-12) with a hard switch: the same circuit and stages, a new garbling hash and
+check-row hash, N's circuit input fixed before the challenge, and commitments to the other input labels
+(§4.1).
 
 Change: `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))`, `f` the SHA-256 compression function. Every inner digest
 moved out of the circuit has a public message (a fixed HKDF label and a transcript hash); the extraction
@@ -260,7 +263,9 @@ One circuit, five stages, a consistency check per stage before C uses any output
 | B1 | `c_ap_0`, `s_ap_0` from `OS_MS`; `IS_c0`, `OS_c0` | `s_ap_0` (C), `IS_c0` (public) |
 | B2 | `K_0`, `IV_0`, `c_ap_1` from `OS_c0`; `h1`, `h2`, `hk` | `c_ap_1` (C), `K_0 ‖ IV_0` (N), anchors (public) |
 
-- 22 garbled compressions, 479 022 AND gates. Measured: 16.38 MB node → client, 1.13 MB client → node.
+- 22 garbled compressions, 479 022 AND gates. Measured: 16.47 MB node → client, 1.13 MB client → node
+  (16 466 993 and 1 134 246 bytes with OT traffic and multiplexer headers; payload of the protocol
+  messages 15 989 746 and 690 bytes).
 - **Label-check pairs** (new, mandatory): for every output wire C reports to N, N sends in preprocessing
   the salted hashes of both candidate labels. C checks its label against the pair before it reveals
   anything and aborts on a mismatch. The pairs **augment** the report hash (C still sends one hash over
@@ -269,14 +274,19 @@ One circuit, five stages, a consistency check per stage before C uses any output
 - The variant with zero-knowledge proofs of the inner digests (`Proven` in the prototype) is not part of
   v3 and is removed from the code.
 - **Version tag.** The first message of the 2PC channel in each direction is the ASCII tag
-  `routstr-2pc/split-public-1\n`. A peer that reads another tag ends with `twopc_version_mismatch`.
+  `routstr-2pc/split-public-2\n` (27 bytes). A peer that reads another tag, including
+  `routstr-2pc/split-public-1\n`, ends with `twopc_version_mismatch`; the offer names the variant as
+  `twopc: "split-public-2"`, and a client refuses an offer whose `twopc` it does not implement (§2.3).
 
 Security statement (informal; no proof, external review outstanding, as for v2):
 
 - A cheating node learns at most log2 8 = 3 bits per **connection** of additional selective-failure leakage
-  about fresh, single-use values, **in the idealized abort model** (eight observable outcomes: the ECtF
-  abort, an abort in each of the five stages, the server Finished failing, success), conditional on ECtF
-  leaking nothing beyond its outcome and on the garbling argument. It is not a bound on all N learns: N
+  about fresh, single-use values, **in the idealized abort model** (eight observable outcomes after
+  preprocessing: the ECtF abort, an abort in each of the five stages, the server Finished failing,
+  success), conditional on the ECtF argument (a malicious N is limited to input substitution and cannot
+  select the ECtF abort; `docs/TWOPC-DESIGN.md`, ECtF) and on the garbling argument. In preprocessing N
+  also observes whether its KOS consistency checks, the product check and the openings pass: predicates on
+  C's fresh OT keys, not on a key-schedule value. It is not a bound on all N learns: N
   also gets its intended outputs (`IS_k`, `c_hs`, `s_hs`, the anchors, `K_0 ‖ IV_0`). A full proof must
   enumerate every distinguishable result of malicious ECtF, OT, preprocessing, report checks, TLS
   verification, timeouts and errors; that is not done.
@@ -291,7 +301,22 @@ Security statement (informal; no proof, external review outstanding, as for v2):
   one key always differ in their fixed HKDF labels at fixed positions of the block, and `IS_k` is known,
   so an equal pair is a collision of the SHA-256 compression function under a known, unchosen chaining
   value (generic cost about 2^128). In v2 the secret inner key covered this; here it is an explicit
-  assumption (`docs/TWOPC-DESIGN.md`, "Assumptions").
+  assumption (`docs/TWOPC-DESIGN.md`, "Assumptions"); (4) the anchors `h1`, `h2`, `hk` are public hashes
+  of secrets that are also used as HKDF and AES-GCM keys; that this does not weaken those keys holds with
+  SHA-256 as a random oracle and is assumed.
+- Soundness against a cheating node: a wrong evaluation passes the five per-stage checks with
+  probability ≤ 2^-60.6 per connection whose server share N did not choose. The argument needs that N
+  fixes everything that determines C's pointer bits before C's challenge seed (§4.1), that C's share is
+  hidden from N (ECtF; DDH in P-256 when N feeds 0 into its conversion) and, for `th_SH`, which N relays
+  before stage A2, that `f` keyed by its chaining input behaves as a random function. Argued, no proof, no
+  review (`docs/TWOPC-NODE-GARBLING.md` §4). In `split-public-1` N sent its input labels after the
+  challenge, and a prepared N passed stage A1 with a wrong sum with probability about 2^-23 per connection
+  (the handshake then failed; no use against a traffic secret is known).
+- Garbling privacy against a cheating client: proven by Rosulek and Roy's Theorem 3 (CRYPTO 2021) with the
+  hash family their paper recommends (§4.1), for inputs fixed before garbling, with AES under the revealed
+  key modelled as an ideal permutation; the staged use here (tables in preprocessing,
+  inputs later, stage inputs that depend on earlier outputs) is assumed (`docs/SECURITY-CLAIMS.md`,
+  claim 6).
 - Round trips compared with v2, measured: +2 in the handshake call (A1, A2, A3: each stage's public output
   must reach N before it sends the next stage's digest labels) and +0.5 in the application call (N sends
   the B1 labels without waiting for C; B2 needs C's B1 report).
@@ -299,6 +324,65 @@ Security statement (informal; no proof, external review outstanding, as for v2):
   both parties hold `c_hs` and `s_hs`; A3 follows at once, while C decrypts and verifies the server flight,
   so A3 is done before C sends its Finished. B1 and B2 run after the server Finished (they need `th_SF`);
   N has `K_0` only after it verified the handshake inputs it fed in.
+
+### 4.1 What `split-public-2` specifies
+
+Parties: C = evaluator, OLE sender, MAC key Δ_B; N = garbler, OLE receiver, garbling offset Δ_A. Conventions:
+a 128-bit value is a `u128` whose 16 bytes are little-endian (`hi` = bits 64..127, `lo` = bits 0..63; bit 0 of
+a label is its pointer bit). GF(2^64) = GF(2)[x]/(x^64 + x^4 + x^3 + x + 1); a `u64` is the polynomial whose
+coefficient of x^i is bit i, `xtime(a) = (a << 1) ⊕ (0x1b & −(a >> 63))`, and `a·b` is the reduced product.
+`AES_k(v)` is AES-128 under the 16-byte key k on the 16 bytes of v. Field elements are integers mod the
+P-256 prime p, on the wire as 32 bytes little-endian.
+
+**The garbling hash.** `hparams` = 32 bytes: the AES-128 key `k_g` (bytes 0..16, as given to the cipher),
+`u1` (bytes 16..24) and `u2` (bytes 24..32), both u64 little-endian. With `U_{a,b}(τ) = (a·τ) ‖ (b·τ)` (high
+half, low half), `σ(Y) = xtime(hi(Y)) ‖ xtime(lo(Y))` and `Y = X ⊕ U_{u1,u2}(τ)`:
+
+`H_g(X, τ) = AES_{k_g}(Y) ⊕ σ(Y)`.
+
+The three-halves gate takes `lo(H_g)` as the 64-bit half and bit 127 as the control bit. Gate tweaks:
+`τ = 3·gid + slot`, gid the 0-based index of the AND gate in the whole circuit (not per stage), slot 0 for
+input A, 1 for B, 2 for A ⊕ B; all below 2^63. N draws `hparams` per session from a generator seeded by the
+OS, before garbling, independently of every label. C applies no check to `hparams`: it protects only N.
+
+**The check-row hash.** After the seed both parties compute
+`rparams = SHA256("routstr-twopc-ag chi" ‖ seed ‖ "row-params" ‖ hparams)` (ASCII labels, the 32 seed
+bytes, the 32 bytes of `hparams`) and read the 32-byte digest with the layout of `hparams`: `k_r`, `u_r1`,
+`u_r2`. For the row wire at position idx of stage s (0..4), with `τ = s·2^32 | idx`:
+
+`row(X; s, idx) = lo(AES_{k_r}(H_g(X, 2^63 | τ) ⊕ U_{u_r1,u_r2}(τ)))`.
+
+Rows and `Y_N` are formed with `row` where the consistency check of `docs/TWOPC-NODE-GARBLING.md` §4 uses a
+row hash; their sizes are unchanged (8 bytes per row wire and per stage).
+
+**N's circuit input.** Before garbling N draws ρ uniform in [0, p): 32 random bytes read as a little-endian
+integer, redrawn while ≥ p. ρ is N's input to the circuit, bit j on the j-th wire of N's input (LSB first).
+N sends the 256 labels of ρ (`gl`, 4 096 bytes) before it reads the seed. In the handshake, as soon as its
+ECtF returned the share `x_N`, N sends `δ = (x_N − ρ) mod p` (32 bytes) and wipes ρ. C refuses a δ ≥ p
+(an error, the session ends), computes `x_C' = (x_C + δ) mod p` and uses `x_C'` as its circuit input: for
+the bits `d = x_C' ⊕ b` it sends and for the pointer checks of its input labels. The circuit computes
+`x_C' + ρ = x_C + x_N mod p`.
+
+**Input-label commitments.** C's first message on its channel is `in_salt`, 16 random bytes. For each wire w
+whose mask N opens to C as an input mask (C's 256 input wires, then the 2 304 digest wires, in that order;
+w is the wire's feed id, 0..2815) and each pointer bit p, with `P_{w,p}` the label of w with pointer bit p:
+
+`com(w, p, L) = SHA256("routstr-twopc-ag input label" ‖ in_salt ‖ w as 4 bytes big-endian ‖ p as 1 byte ‖ L)[0..16]`.
+
+N sends `in_com` = `com(w, 0, P_{w,0}) ‖ com(w, 1, P_{w,1})` for every such wire (2 560 × 32 = 81 920
+bytes) after `gl` and before it reads the seed. For every label L C receives on such a wire (its own input
+after the corrections, the digest labels of each stage) it checks `com(w, lsb(L), L)` against
+`in_com[w][lsb(L)]` besides the pointer bit. A mismatch is a failed input check of the stage: C evaluates
+the stage and sends the stage's single abort byte. N's own input wires have no commitment and no pointer
+check (their masks are not opened).
+
+**Order.** C sends the seed only after `hparams`, both table parts, the d bits, `gl` and `in_com` arrived
+completely. §12.2 lists every message with its size.
+
+**Conformance vectors.** `crypto/conformance/twopc-hash-vectors.json`: `xtime`, GF(2^64) products, σ,
+`H_g`, the row parameters, `row`, one whole three-halves gate, input-label commitments and the masked input
+(ρ, δ and its wire bytes, `x_C'`). The `twopc` tests assert them (`hash_vectors_match_conformance_file`);
+another implementation of C must reproduce them.
 
 ## 5. Framing `"2"` (HTTP/2)
 
@@ -802,7 +886,7 @@ the `request_ok.reserved_msats` of its request (§12.4).
 |---|---|---|
 | 1 | Requests on one HTTP/2 connection are linkable for the provider | by design; `reuseScope`, §9.1 |
 | 2 | π_WIN, the frame rules and the interval rule of §5.4 are new | no external review |
-| 3 | `split-public-1`: staged check, label-check pairs, both parties see `IS_k` | no external review; assumptions in §4 |
+| 3 | `split-public-2`: staged check, label-check pairs, both parties see `IS_k`, N's input fixed and the other input labels committed before the challenge | no published proof, no external review; assumptions in §4. Open: the staged use of the garbled circuit (not covered by the garbling theorem), the random-oracle step of the ECtF argument, the soundness argument of §4.1 |
 | 4 | A provider that changes HTTP/2 behaviour (table size, KeyUpdate) breaks framing `"2"` | detected, §2.1 auto-disable, §2.3 fallback |
 | 5 | A fabricated error head would need a binary frame header at byte 0 of a server record in the interval (with only stream-0, own-stream WINDOW_UPDATE and probe-stream frames before the head, §5.4) | smaller than v2's equivalent |
 | 6 | 3 bits per connection instead of 2.8 per request (idealized abort model, §4) | fewer connections than requests; with one request per connection it is slightly more |
@@ -814,7 +898,8 @@ the `request_ok.reserved_msats` of its request (§12.4).
 | 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5). (The idle stall, ending an accepted, unwritten request cheaply by waiting for the provider's idle GOAWAY, is closed by the GOAWAY window, §5.4.1.) | as risk 5 |
 
 v2's residual risks carry over unchanged (π_NK does not bind other epoch-0 records; provider reflection;
-ECtF semi-honest; no proof of the garbler-only construction).
+ECtF semi-honest in mpz2's documentation, with our argument for malicious parties in
+`docs/TWOPC-DESIGN.md`; no proof of the garbler-only construction).
 
 **Further epoch-0 records: the framings differ.** π_NK binds the content of the head record only, in both
 framings, so a malicious N can write more records under `K_0` before its KeyUpdate. What such records can do
@@ -871,6 +956,9 @@ Residual: risk 12.
   before fetching offers.
 - There is no v2 fallback in clients or nodes. The v2 code is archived on the branches `v2` (this repo)
   and `confidential-v2` (routstr-core, routstr-sdk, routstrd).
+- The key-schedule variant is a separate switch inside v3: `v` stays 3. A client refuses an offer whose
+  `twopc` is not `"split-public-2"` (§2.3), and on the 2PC channel a `split-public-1` peer is refused at
+  its tag with `twopc_version_mismatch`. Node, sidecar and client releases change together.
 
 ## 12. Wire format
 
@@ -902,7 +990,7 @@ hex, except inside `params`, where they are arrays of numbers. `http` is always 
 Also required for `"2"`: host under 127 bytes, key at most 119 bytes. Framing `"1.1"` serves chat always and
 images when `endpoints.images` exists.
 
-**S** `GET /offer`: the file's content with `v: 3`, `twopc: "split-public-1"`, `notary_pubkey`,
+**S** `GET /offer`: the file's content with `v: 3`, `twopc: "split-public-2"`, `notary_pubkey`,
 `node_settles`, and `http` as currently served: `"2"` is left out while it is withdrawn (§2.1; the `h2`
 block stays). An offer file that names `v` other than 3 is refused at startup.
 
@@ -935,7 +1023,7 @@ unchanged in meaning:
 
 A node without a signing key serves the offer without `sig_payload` and `sig`; clients refuse it (the reference driver accepts it only with `--no-verify-offer` and `ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`).
 
-Client checks before a `setup` (§2.3): `v == 3`; `twopc == "split-public-1"`; `http` non-empty, known
+Client checks before a `setup` (§2.3): `v == 3`; `twopc == "split-public-2"`; `http` non-empty, known
 values, the chosen framing listed; for `"2"` the `h2` block in range and `probe_path` a trusted API base
 plus `/models`; `connection_deposit_msat` at most the client's maximum (reference driver: 100 000 msat);
 the v2 checks (signature, host, chat block, head template, images block). An offer with `v < 3`:
@@ -998,7 +1086,36 @@ and closes. **S** refuses a `setup` without `"v":3` with an `error` whose `code`
 
 The 2PC channel begins with the version tag of §4 in each direction. The client's `cu-2pc` exits with
 status 3 and code `twopc_version_mismatch` on another tag; the sidecar ends the connection with an `error`
-whose `code` is `twopc_version_mismatch`. `pi_win` and `pi_c3s` run once per `zk_params` on the channel
+whose `code` is `twopc_version_mismatch`.
+
+**2PC channel messages** (`split-public-2`). After the tag the channel is a multiplexer: each chunk has a
+5-byte header (1 byte channel, 4 bytes big-endian length). The protocol channels `n2c`, `c2n` and the
+tables channel carry messages framed with a 4-byte big-endian length each; the OT channels (KOS, Ferret,
+the OLEs of ECtF) carry mpz2's own messages beside them. Chunk boundaries depend on timing, so transport
+byte counts vary by a few bytes; the sizes below are payload. Integers little-endian, bit vectors packed
+LSB first.
+
+| # | Direction, channel | Message | Bytes | Condition |
+|---|---|---|---|---|
+| P0 | both | version tag `routstr-2pc/split-public-2\n` | 27 | first bytes |
+| P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n` |
+| P2 | N→C, tables | `hparams` | 32 | after garbling finished, before any table byte |
+| P3 | N→C, tables | tables part 1 (stages A1 to A3), part 2 (B1, B2) | 24 B + 5 bits per AND gate | part 1 once N received 64 KiB of C's MAC-COT bytes, part 2 once it received 500 000 |
+| P4 | N→C, `n2c` | d bits (masks of the base wires, AND products) | ⌈`mac_fixed`/8⌉ | after the MAC COTs |
+| P5 | N→C, `n2c` | `gl`: the 256 labels of ρ | 4 096 | before the seed |
+| P6 | N→C, `n2c` | `in_com`: 2 560 pairs of 16-byte commitments | 81 920 | before the seed; needs P1 |
+| P7 | C→N, `c2n` | `seed` | 32 | only after P2 to P6 arrived completely |
+| P8 | N→C, `n2c` | product check; openings and their MAC hash; per stage rows and `Y_N`; label-check pairs | 32; ⌈n_open/8⌉ + 32; 8 per row wire + 8; 32 per reported output wire | after P7 |
+| K | both | key share: C's commitment, `P_N`, C's opening | 32; 65; 97 | |
+| H1 | both | ECtF (OLE channel) | | at `handshake` |
+| H2 | N→C, `n2c` | `δ = (x_N − ρ) mod p` | 32 | as soon as N's ECtF returned |
+| H3 | C→N, `c2n` | `d = bits(x_C') ⊕ b` | 32 | after H2 and C's ECtF; C refuses δ ≥ p |
+| H4 | N→C, `n2c` | corrections for C's input | 4 096 | after H3 |
+| S | C→N, then N→C | per stage: C's report (`1 ‖ pointer bits ‖ SHA256(labels)` or the abort byte `0`); N's labels of the next stage's digests (16 bytes per bit) or `0` | report 65 to 157; labels 12 288, 4 096, 8 192, 12 288 | one round trip per stage; N sends the B1 labels without waiting |
+
+Against `split-public-1`: P1, P2, P6 and H2 are new, P5 moved from the handshake (where it carried the labels
+of `x_N`) to before the seed, and P7 waits for P2 to P6. Payload +81 984 bytes N→C, +16 bytes C→N, no added
+round trip (measured: the time from ECtF to the end of stage A3 is unchanged, `crypto/twopc/BENCH.md`). `pi_win` and `pi_c3s` run once per `zk_params` on the channel
 (`cu-prover --channel`; the earlier `--multi` is the only mode) or on a socket of their own; `pi_nk` once
 per connection.
 
@@ -1445,7 +1562,8 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 
 1. Gates, all against a real provider with a real key, nothing announced: sidecar + reference client
    (honest cases for both framings; the attacks: hidden request in a body record, TLS padding shift, wrong
-   suffix, wrong path, usage replay across requests, a `Proven`/v2 2PC peer, a v2 socket); node (the money
+   suffix, wrong path, usage replay across requests, a `Proven`/v2 or `split-public-1` 2PC peer, a v2
+   socket); node (the money
    outcome of every case in the node's database, including every deposit outcome); SDK; routstrd (curl
    through the local API: sequential, burst, forced `"1.1"`, fallback from a failing `"2"`); browser
    library and PWA.
@@ -1483,6 +1601,7 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | request-offer age (prices end 10 min after the offer stops being served); security-relevant offer changes retire live connections | §3.3 |
 | `after_client_frames`; `evicted`; the per-address total and the eviction of idle used connections; 8 refused requests in a row; recurring cost | §8, §12.9, §12.10 |
 | the `split-public-1` statement: the inner-digest message rule, assumption (3), the idealized 3-bit model, label-check pairs augment the report hash | §4 |
+| `split-public-2` (2026-11-22) replaces `split-public-1`: garbling hash `H_g` with N's `hparams`, the check-row hash keyed from the seed, N's input a mask ρ with labels before the seed and δ in the handshake, input-label commitments under C's `in_salt`, the 2PC message list, conformance vectors; the eight outcomes are those after preprocessing; assumption (4) | §4, §4.1, §10, §11, §12.1, §12.2 |
 | privacy: linkability and its off switches, body padding (off by default), residual risks 7-10 | §1, §9.1, §9.3, §10 |
 | a cancelled request cannot lend its credential reference (the attack and why each form fails) | §5.3.1 |
 | the usage event: `choices` may hold one choice with no content (allow-list), the argument, usage on every chunk, Google unsupported | §5.4 |

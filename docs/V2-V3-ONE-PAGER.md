@@ -23,7 +23,7 @@ request per connection, inside the same lifecycle.
 |------------------------|----------------------------|--------------------------------------------------------------|
 | Unit | a session = one request | a connection that carries requests |
 | HTTP to the provider | HTTP/1.1 | framing `"2"` (HTTP/2, sequential requests) or `"1.1"` (one request), from the node's signed offer, in the operator's order |
-| 2PC | per request; 22.12 MB down, 1.21 MB up | per connection; 16.38 MB down, 1.13 MB up (22 garbled SHA-256 compressions instead of 31) |
+| 2PC | per request; 22.12 MB down, 1.21 MB up | per connection; 16.47 MB down, 1.13 MB up (22 garbled SHA-256 compressions instead of 31; `split-public-2`, `split-public-1` had 16.38 MB) |
 | Client's proof before the provider may start | π_C2S: the last record is the suffix | π_WIN: HTTP/2 frame headers, the whole header record and the suffix; on HTTP/1.1 the suffix record |
 | Held at the setup | a full-context reservation | a connection deposit (default at least 1 sat) |
 | Reservation; session fee | per session; per request | per request; once per connection |

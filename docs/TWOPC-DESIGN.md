@@ -1,11 +1,14 @@
-# The two-party key schedule (`split-public-1`, protocol v3)
+# The two-party key schedule (`split-public-2`, protocol v3)
 
-Status (2026-11-11): implemented in `crypto/twopc` on the branch `v3-twopc-split`, as the only two-party key
-schedule of protocol v3 (`PROTOCOL-V3.md` §4 is the normative text). Tested against the reference key
-schedule and against a cheating party on either side (`cargo test --release -p twopc`: 32 unit tests, 4 tests
-of the `cu-2pc` binary), and run end to end through the sidecar against api.venice.ai. Not reviewed
-externally. It is not compatible with v2 on purpose: the first bytes on the 2PC channel are a version tag, and
-a v2 peer is refused. Construction details: `docs/TWOPC-NODE-GARBLING.md`. Measurements:
+Status (2026-11-22): implemented in `crypto/twopc` on the branch `split-public-2`, as the only two-party key
+schedule of protocol v3 (`PROTOCOL-V3.md` §4 is the normative text). It replaces `split-public-1` (deployed
+from 2026-11-12) with a hard switch; the circuit and the stages are the same, the garbling hash, the check-row
+hash and the handling of the input labels are new ("Changes from `split-public-1`", below). Tested against the
+reference key schedule and against a cheating party on either side (`cargo test --release -p twopc`: 51 unit
+tests, 4 tests of the `cu-2pc` binary), and run end to end through a loopback sidecar against api.venice.ai.
+The construction has no published proof and has had no external review. It is not compatible with v2 or with
+`split-public-1` on purpose: the first bytes on the 2PC channel are a version tag, and such a peer is refused.
+Construction details: `docs/TWOPC-NODE-GARBLING.md`. Measurements:
 `crypto/twopc/BENCH.md`. Framings, proofs and money: `PROTOCOL-V3.md`.
 
 ## Goal
@@ -57,7 +60,7 @@ enters the next stage as an input whose labels N supplies. `OS_k` never leaves t
 | design | garbled AND gates | garbled compressions |
 |---|---|---|
 | v2 (whole key schedule in the circuit) | 656 179 | 31 |
-| **`split-public-1`** | **479 022** | **22** |
+| **`split-public-1`, `split-public-2`** | **479 022** | **22** |
 
 ## Stages
 
@@ -65,7 +68,7 @@ One circuit, five stages, a consistency check per stage before C uses any output
 
 | Stage | Call | Inputs | Garbled (compressions) | Opened |
 |---|---|---|---|---|
-| A1 | `handshake` | x_C, x_N | `Z = x_C + x_N mod p`; `HS = HMAC(salt, Z)` (2); `IS_HS`, `OS_HS` (2) | `IS_HS` (public) |
+| A1 | `handshake` | x_C' = x_C + δ, ρ | `Z = x_C' + ρ = x_C + x_N mod p`; `HS = HMAC(salt, Z)` (2); `IS_HS`, `OS_HS` (2) | `IS_HS` (public) |
 | A2 | `handshake` | d_c, d_s, d_der | `c_hs`, `s_hs`, `dHS = f(OS_HS, ·)` (3); `IS_dHS`, `OS_dHS` (2) | `c_hs`, `s_hs`, `IS_dHS` (public) |
 | A3 | `handshake` | d_0 | `MS = f(OS_dHS, ·)` (1); `IS_MS`, `OS_MS` (2) | `IS_MS` (public) |
 | B1 | `application` | d_c0, d_s0 | `c_ap_0`, `s_ap_0 = f(OS_MS, ·)` (2); `IS_c0`, `OS_c0` (2) | `s_ap_0` (C), `IS_c0` (public) |
@@ -82,14 +85,18 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
 ## Session flow
 
 1. **Version tag.** The first bytes each party writes on the 2PC channel are the ASCII tag
-   `routstr-2pc/split-public-1\n`. A party that reads anything else stops with `twopc_version_mismatch`
+   `routstr-2pc/split-public-2\n`. A party that reads anything else stops with `twopc_version_mismatch`
    (`twopc::Error::VersionMismatch`; `cu-2pc` reports it as `{"ev":"error","code":"twopc_version_mismatch",…}`
    on its control channel, prints the code on stderr and exits with status 3). A v2 peer starts with a
-   multiplexer frame header and is refused at its first byte.
-2. **Preprocessing** (input independent; in the pre-warm). N garbles the circuit and streams the tables. N's
-   wire masks are authenticated to C by IT-MACs under C's key Δ_B and checked. N opens the masks C will need
-   (its input wires, the digest input wires, the outputs C decodes), sends the check rows per stage and the
-   label-check pairs. KOS gives C the COTs for its 256 input bits; ECtF prepares its OLEs.
+   multiplexer frame header and is refused at its first byte; a `split-public-1` peer differs in the tag's
+   last bytes (tested by the case `h2-j-twopc-tag-old` of `v3-check.sh`).
+2. **Preprocessing** (input independent; in the pre-warm). C sends a 16-byte salt. N draws the garbling
+   hash's parameters and a random mask ρ < p as its own circuit input, garbles the circuit and streams the
+   hash parameters, then the tables. N's wire masks are authenticated to C by IT-MACs under C's key Δ_B. N
+   sends the labels of ρ and commitments to both labels of every other input wire (C's 256, the 2 304
+   digest wires); only then does C send its challenge seed. N proves the products, opens the masks C will
+   need (its input wires, the digest input wires, the outputs C decodes), sends the check rows per stage and
+   the label-check pairs. KOS gives C the COTs for its 256 input bits; ECtF prepares its OLEs.
 3. **Joint key share.** C commits to `P_C = a_C·G` (SHA-256 of the SEC1 point and a 32-byte nonce), N sends
    `P_N = a_N·G`, C opens. Both compute `P = P_C + P_N`. Committing first prevents `P_C = T − P_N`. A
    pre-warmed session stops here.
@@ -98,9 +105,10 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
    could add a share of its own). N takes the server share S from the ServerHello.
 5. **ECtF.** `Q_C = a_C·S`, `Q_N = a_N·S`; point-addition share conversion (two A2M and one M2A over P-256)
    gives additive shares `x_C + x_N = x(Q_C + Q_N) mod p`.
-6. **`handshake(S, th_SH)`: stages A1, A2, A3.** Per stage: C gets its input labels, evaluates, checks, and
-   reports; N answers with the next stage's digest labels. Both hold c_hs and s_hs after A2 and `IS_MS` after
-   A3.
+6. **`handshake(S, th_SH)`: stages A1, A2, A3.** N sends `δ = x_N − ρ mod p`; C's circuit input is
+   `x_C' = x_C + δ mod p`. Per stage: C gets its input labels, checks them against the opened masks and N's
+   commitments, evaluates, checks, and reports; N answers with the next stage's digest labels. Both hold
+   c_hs and s_hs after A2 and `IS_MS` after A3.
 7. C decrypts the server flight with s_hs, verifies the certificate chain, CertificateVerify and the server
    Finished, and sends its Finished. N verifies the same with c_hs and s_hs.
 8. **`application(th_SF)`: stages B1, B2.** N sends the B1 digest labels at once (it has `IS_MS`). After B2,
@@ -112,20 +120,27 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
 | when | direction | content | bytes |
 |---|---|---|---|
 | start | both | version tag | 27 |
-| preprocess | N→C | three-halves tables (bulk channel) | 11.80 MB |
+| preprocess | C→N | `in_salt`, the salt of the input-label commitments (first message) | 16 |
+| preprocess | N→C | hash parameters, then the three-halves tables (bulk channel) | 32; 11.80 MB |
 | preprocess | both | Ferret over KOS, C sender (Δ_B): 960 988 MAC COTs | C→N 1.09 MB, N→C 0.45 MB |
 | preprocess | both | KOS, N sender (Δ_A): 256 COTs for C's input | C→N 12 kB, N→C 4 kB |
 | preprocess | N→C | mask commitment bits d (one per base wire and per AND product) | 0.12 MB |
-| preprocess | C→N | challenge seed, after the tables and d arrived | 32 |
+| preprocess | N→C | labels of ρ on N's 256 input wires; commitments to both labels of the other 2 560 input wires | 4 096; 81 920 |
+| preprocess | C→N | challenge seed, after all of the above arrived | 32 |
 | preprocess | N→C | product check (U, V); opened masks and one MAC hash; per stage check rows and Y_N; label-check pairs | 32; 0.7 kB; 3.86 MB; 81 kB |
 | key share | C→N, N→C, C→N | commitment; P_N; opening | 32; 65; 97 |
-| A1 | C→N | `d = x_C ⊕ b` | 32 |
-| A1 | N→C | labels of x_N; corrections for x_C | 4 096 + 4 096 |
+| A1 | N→C | `δ = x_N − ρ mod p` | 32 |
+| A1 | C→N | `d = x_C' ⊕ b` | 32 |
+| A1 | N→C | corrections for x_C' | 4 096 |
 | each stage | C→N | report: `1 ‖ pointer bits ‖ SHA256(labels)`, or `0` (abort) | 65–157 |
 | A2, A3, B1, B2 | N→C | labels of the stage's digests (16 B per bit), or `0` (N rejected the report) | 12 288; 4 096; 8 192; 12 288 |
 
 The report of a stage is C's only message in that stage. N sends the next stage's labels only after the
 report's label hash verified.
+
+Payload per session (`twopc::message_sizes`, without OT traffic and the tag): N→C 15 989 746 B, C→N 690 B.
+On the wire with the OT traffic and the multiplexer: C receives 16 466 993 B and sends 1 134 246 B
+(`crypto/twopc/BENCH.md`).
 
 ## Security model
 
@@ -134,9 +149,10 @@ argued informally. Nothing here has a published proof or an external review.
 
 **Construction** (`docs/TWOPC-NODE-GARBLING.md`): three-halves garbling by N with a global Δ_A; N's mask of
 every base wire and the product t_k = λ_i·λ_j of every AND gate committed by IT-MACs under C's Δ_B before C's
-challenge; a QuickSilver product check; openings under one MAC hash; per stage, an AND-gate consistency check
-with one salted 64-bit row per row wire; label-check pairs for the outputs C reports; C's report
-authenticated by a hash of its labels.
+challenge; N's own circuit input a random mask ρ whose labels, like commitments to both labels of every other
+input wire, precede the challenge; a QuickSilver product check; openings under one MAC hash; per stage, an
+AND-gate consistency check with one 64-bit row per row wire, hashed under a key from C's seed; label-check
+pairs for the outputs C reports; C's report authenticated by a hash of its labels.
 
 ### Malicious N (protects the client's s_ap_0, c_ap_1 and shares)
 
@@ -145,25 +161,29 @@ authenticated by a hash of its labels.
   about Δ_B; the first failure ends the session). With all gates consistent, the values behind C's pointer
   bits are the correct function of C's input, N's effective input and the digests C computed itself: C's
   input labels and the digest labels are pinned by pointer checks against opened, MAC-checked masks, and C
-  decodes with such masks. Soundness is about 2^-60 per session (five checks), except for stage A1 (next
-  item).
+  decodes with such masks. The check equation contains a label only through its pointer bit and its row
+  hash, and with all gates consistent the decoded values are right whatever labels carried them. For
+  "passes ⇒ all gates consistent" N must not be able to adapt the pointer bits to the challenge. It cannot:
+  its own input labels (of ρ) and commitments to all other input labels precede the challenge, and after it
+  N only sends δ, which shifts C's input, and that input stays uniform from N's view (`TWOPC-NODE-GARBLING.md`
+  §4 has the argument, its assumptions and the remaining influence of N on the transcript hashes).
+  Soundness is about 2^-60 per connection (five checks), for a connection whose server share N did not
+  choose. **Argued**, no review.
 - *Soundness is statistical, per connection, and adds up.* The 2^-60.6 bound (five stages at ≤ 2^-63 each,
   `TWOPC-NODE-GARBLING.md` §4) is the chance that one connection's wrong evaluation passes. Every connection
-  draws a fresh Δ_B, χ and salt, so a node that cheats on every connection succeeds somewhere with
+  draws a fresh Δ_B, χ and row key, so a node that cheats on every connection succeeds somewhere with
   probability at most k·2^-60.6 over k connections: about 2^-40.6 after a million connections (2^20),
-  2^-30.6 after a billion. Each failed attempt is an abort the client sees. The bound covers what is
-  committed in preprocessing; the labels N chooses online are argued separately and heuristically
-  (`TWOPC-NODE-GARBLING.md` §5).
-- *Stage A1 does not meet the bound (found 2026-11-22).* N sends the labels of its own input after it
-  knows that stage's challenge χ. With adder gates garbled so that a violation depends on a bit of N's
-  input, N can choose its input so that the violations cancel in the check; a prepared node passes with a
-  wrong sum with probability about 2^-23 per connection. Z is then wrong, C fails on the provider's first
-  encrypted record and the later stages never run. No use against a traffic secret is known; that there
-  is none is an assumption (`TWOPC-NODE-GARBLING.md` §4). The successor variant sends N's input labels
-  before the seed.
+  2^-30.6 after a billion. Each failed attempt is an abort the client sees.
+- *Stage A1 in `split-public-1` (found 2026-11-22).* There N sent the labels of its own input after it
+  knew that stage's challenge χ. With adder gates garbled so that a violation depends on a bit of N's
+  input, N could choose its input so that the violations cancel in the check; a prepared node passed with a
+  wrong sum with probability about 2^-23 per connection. Z was then wrong, C failed on the provider's first
+  encrypted record and the later stages never ran; no use against a traffic secret is known.
+  `split-public-2` sends the labels of the mask ρ before the seed and only δ after it
+  (`adder_switch_attack_caught`).
 - *Digest labels.* N sends them, and N knows `IS_k`. A label for another digest bit fails the pointer check
-  whatever C's secrets are, because C computed the digest itself. A value that is not a label of the wire
-  fails the consistency check or a label-check pair (`TWOPC-NODE-GARBLING.md` §5). So the stage runs on the
+  whatever C's secrets are, because C computed the digest itself. A value that is not one of the wire's two
+  committed labels fails the commitment check (`TWOPC-NODE-GARBLING.md` §5). So the stage runs on the
   digest of the right message under the right state, or C aborts.
 - *Leakage: selective failure only.* N can make C abort depending on C's private values: a corrupted table,
   row, pair or OT correlation makes the abort a predicate of the values on the wires N aims at, and those
@@ -177,18 +197,25 @@ authenticated by a hash of its labels.
   | 6–7 | C aborts in B1 or B2 |
   | 8 | success |
 
+  Outcome 1 depends on C's randomness only; N cannot select it (ECtF, below). Outcome 5 occurs for every
+  effective deviation of N in ECtF and is not a predicate N can aim there. So 3 bits is a conservative count.
+  The eight outcomes are those after preprocessing: in preprocessing N also observes whether its KOS
+  consistency checks, the product check and the openings pass, which are predicates on C's fresh OT keys
+  (Δ_B, the Δ of the ECtF instance), not on a key-schedule value.
+
   **Eight outcomes, so at most log2 8 = 3 bits per connection of additional selective-failure leakage**
   about fresh, single-use values (the ECDHE share, the session's secrets), **in the idealized abort model
   stated here**: every deviation of N ends in one of these eight outcomes, which N observes and nothing else.
-  It is conditional on ECtF giving a malicious N nothing beyond its outcome (below) and on the garbling
-  argument (`TWOPC-NODE-GARBLING.md`, no published proof). It is not a bound on everything N learns: N also
+  It is conditional on the ECtF argument (below: a malicious N is limited to input substitution) and on the
+  garbling argument (`TWOPC-NODE-GARBLING.md`, no published proof). It is not a bound on everything N learns: N also
   receives the outputs it is meant to have (the public `IS_k`, c_hs, s_hs, the anchors, `K_0 ‖ IV_0`). N may
   choose its predicate for a later stage after seeing the earlier stages' public outputs; that does not add
   outcomes. What a full proof must still enumerate: every externally distinguishable result of a malicious
   ECtF, OT and preprocessing, of every stage, of N's own report checks, of the TLS verification, timeouts and
   error messages; the tests compare selected cheats at two stages (`abort_looks_the_same_whatever_failed`).
 - *Why 3 bits per connection is harmless.* The values N can aim a selective failure at are C's ECDHE share
-  `x_C` and the secrets of the schedule (HS, MS, c_hs, s_hs, c_ap_1, s_ap_0): each is a fresh, uniformly
+  `x_C`, the point `Q_C = a_C·S` (when N feeds 0 into ECtF, C's circuit input is a known shift of its
+  x-coordinate) and the secrets of the schedule (HS, MS, c_hs, s_hs, c_ap_1, s_ap_0): each is a fresh, uniformly
   distributed (or pseudorandom) value of 256 bits, drawn for this connection and used on no other. No prompt,
   no response, no credential and no other low-entropy or long-lived value enters the circuit: C encrypts its
   records outside the 2PC with keys derived from c_ap_1, and N writes the credential under `K_0` outside it.
@@ -198,8 +225,8 @@ authenticated by a hash of its labels.
   stay at most 8 times easier to guess than without the leak (≤ 2^-125). The bits do not accumulate across
   connections, since no secret is used twice; within a connection they cover every request it carries
   (§10 of `PROTOCOL-V3.md`, risk 6), which is why the bound is per connection.
-- *Why an abort is one outcome per stage.* C's three checks of a stage (input pointer bits, consistency
-  check, label-check pairs) end in the same single byte, sent after C evaluated the whole stage
+- *Why an abort is one outcome per stage.* C's checks of a stage (input pointer bits and commitments,
+  consistency check, label-check pairs) end in the same single byte, sent after C evaluated the whole stage
   (`abort_looks_the_same_whatever_failed`). There is no "N rejected C's labels" outcome: the label-check
   pairs make N commit, in preprocessing, to the two labels it expects per reported wire, C compares before it
   reveals anything, and the report hash is then a function of the pointer bits and N's own commitments
@@ -256,8 +283,12 @@ and all values revealed together, and it is **not written yet**.
    not chosen) chaining value. Neither party chooses the labels; the transcript hashes it can influence
    (C picks its random, N relays) sit in both messages alike. Finding such a collision costs about 2^128
    compressions by the generic attack, and it is a property SHA-256 is relied on for everywhere. In v2 the
-   inner key was secret and the PRF assumption covered this; in `split-public-1` it is an explicit
+   inner key was secret and the PRF assumption covered this; since `split-public-1` it is an explicit
    assumption of its own. (A reviewed domain-separation construction could remove it; none is used.)
+4. **The anchors.** `h1 = SHA256(c_ap_1)`, `h2 = SHA256(s_ap_0)` and `hk = SHA256(K_0 ‖ IV_0)` are public,
+   while the same secrets are used as HKDF keys (key update, key and IV derivation) and as an AES-GCM key
+   and IV. That a plain hash of a key does not weaken HMAC or AES-GCM under that key is not implied by
+   assumptions 1 to 3; it holds with SHA-256 as a random oracle. **Assumed.**
 
 | who relies on 1 and 2 | to protect | against |
 |---|---|---|
@@ -271,9 +302,11 @@ and all values revealed together, and it is **not written yet**.
 
 Who learns what first, and what a party can still decide at that point:
 
-- C's input is fixed before it sees anything of N's: it sends `d = x_C ⊕ b` first, and b is uniform to N. N's
-  input is fixed by the labels it sends for x_N; the tables, masks, rows and pairs were fixed in
-  preprocessing. After A1 neither party has an input left to choose. The digests are determined by `IS_k`
+- Before C's challenge seed N has fixed the tables, the hash parameters, the masks, the labels of its
+  circuit input ρ and the commitments to the labels of every other input wire. After the seed N's choices
+  are δ (which only shifts C's input), the rows, openings and pairs (which can only make C abort) and the
+  relayed transcript (`TWOPC-NODE-GARBLING.md` §4). C's input is fixed when it sends `d = x_C' ⊕ b`, and b is
+  uniform to N. After A1 neither party has an input left to choose. The digests are determined by `IS_k`
   and the transcript, and each party uses its own transcript hash (a difference is an abort).
 - In every stage C learns the outputs first (it decodes), N second (from the report). C can stop after seeing
   `IS_k` or its own outputs; N can stop after a report. Stopping gives the other party no output it should
@@ -294,31 +327,85 @@ as row wires. Why the anchors are still SHA-256 in the circuit: `TWOPC-NODE-GARB
 
 ### ECtF
 
-mpz2's OLE-based A2M/M2A, proven secure against semi-honest parties only. The roles
-(`crypto/twopc/src/ectf.rs`, `lib.rs`): **C is the OLE sender** (`ShareConversionSender`, a KOS COT sender,
-Chou–Orlandi receiver for its base OTs), **N is the OLE receiver** (`ShareConversionReceiver`). C inputs
-`[−y1, −x1]`, N `[y2, x2]`, the coordinates of each party's `a·S`, where S is the provider's share of this
-handshake and `a_C`, `a_N` are fresh scalars of this connection. Both parties check their own multiplicative
-share for zero (`ectf: degenerate share`) and abort.
+mpz2's OLE-based A2M/M2A (`mpz-share-conversion`), which mpz2 documents as secure against semi-honest
+parties only. The argument below for malicious parties is ours, for this code; it has no published proof
+and no review. The roles (`crypto/twopc/src/ectf.rs`, `lib.rs`): **C is the OLE sender**
+(`ShareConversionSender`, a KOS COT sender, Chou–Orlandi receiver for its base OTs), **N is the OLE
+receiver** (`ShareConversionReceiver`). C inputs `[−y1, −x1]`, N `[y2, x2]`, the coordinates of each party's
+`a·S`, where S is the provider's share of this handshake and `a_C`, `a_N` are fresh scalars of this
+connection. Two A2M give each party a multiplicative share; each computes `c = (m[0]/m[1])^2` locally; one
+M2A on `c`; the share is `d − x_own`. Both parties check their own multiplicative share for zero
+(`ectf: degenerate share`) and abort. In the M2A both parties send their offset before they read the
+other's, so either can wait for the other's offset first.
 
-*Against a malicious N* (protecting C's `x_C`). We do not argue that the conversion stays private against a
-malicious N; the leakage bound above is conditional on that. Under that assumption a deviation either shifts
-the result (a wrong ECDHE secret, which the TLS handshake detects: the server Finished under s_hs fails) or
-trips C's degenerate-share check, and N can make either depend on C's share: outcomes 1 and 5.
+What N sends in the conversion: Chou–Orlandi sender messages, the KOS extension matrix and its consistency
+check, two A2M offsets and one M2A offset. What it receives: Chou–Orlandi receiver points, the KOS challenge
+seed, the three masked correlations of the OLEs, two masked values and C's M2A offset.
+
+*Against a malicious N* (protecting C's `x_C`). **Argued**, in the ROT-hybrid model, under the assumptions
+listed at the end of this item.
+
+- *N is limited to input substitution.* In ROLE generation N sends nothing after the OTs; its choice bits
+  fix its three OLE inputs. In A2M and M2A it sends one field element per conversion, and any value is the
+  honest message for some input. Beyond that it could send inconsistent KOS columns; the KOS check is run,
+  and a receiver that passes behaves as one with consistent choice bits, except that it learns c bits of C's
+  KOS Δ with probability 2^-c of not being caught (**assumed** from KOS15 as revised and mpz2's code).
+- *N's view is simulatable without C's point.* A simulator that plays C records N's ROT choices, sends
+  uniform correlations, forwards N's substituted inputs to an ideal functionality and computes the masked
+  messages from its answers and N's own OLE outputs; the real messages have the same distribution because
+  each carries a uniform OLE value unknown to N. So N's view is two multiplicative shares, uniform in `F_p^*` unless N's substituted input
+  equals C's coordinate, plus values N could sample itself. That equality test needs a guess of `y1` or `x1`,
+  which gives `Q_C = a_C·S` up to 3 candidates: CDH for `(P_C, S)`.
+- *C's degenerate-share abort depends on C's own randomness only.* N cannot trigger or bias it (outcome 1).
+- *What a deviation gives.* N's total effect is `Z' = k·λ'^2 − x1 + c` for values `k, c, (x2', y2')` of its
+  choice, with `λ' = (y2' − y1)/(x2' − x1)`. As a function of `Q_C` on the curve, `Z'` is never constant
+  (degree ≤ 6, so each value has at most 6 preimages), and it equals the true Z identically only for the
+  honest inputs. To make `Z'` a value it knows, N must know `Q_C`, which is CDH for `(P_C, S)`, or replace S
+  by a share of its own, which ends at C's check of CertificateVerify (N has no signature of U over that
+  transcript). With the genuine S, C decrypts U's flight with a wrong `s_hs`, the AEAD fails (N cannot read
+  the flight, which needs the true Z, nor make one, which needs U's signature), and stages B1 and B2 never
+  run: **that connection carries no record of C and has no `c_ap_1`, `s_ap_0`.**
+- *The handshake-stage outputs for `Z'` give N nothing* if HKDF-Extract is a random oracle: they are then
+  independent of everything else unless N queries the oracle at `Z'`, and such a query yields `Q_C` up to 6
+  candidates, so N's advantage is that of CDH with a list of candidates, or tightly that of strong DH (CDH
+  with a DDH oracle). Without the oracle model this step needs HMAC-SHA256 with a public key to be secure for
+  inputs related by the rational maps above, a correlated-input assumption that no standard assumption
+  covers. It concerns only a connection that never carries data.
+- *Consequence.* If N knew C's KOS Δ of the ECtF instance in full, it would know both ROT messages and so
+  Z. Confidentiality of a recorded connection against N rests on that 128-bit Δ (128 − c bits with
+  probability 2^-c), as for the other KOS and Ferret instances.
+- Assumptions: mpz2's KOS and Chou–Orlandi (assumed), its fixed-key TCCR in the ROT randomization (assumed,
+  ideal-permutation model), HKDF-Extract as a random oracle, strong DH in P-256. Tests:
+  `ectf_n_substitutes_its_point` (one substituted point on the curve, one off it: the conversion behaves as
+  the model says, C sees no error up to stage A3, and the server's first record does not open under C's
+  `s_hs`), `ectf_n_zero_m2a_input`, `ectf_n_shifted_share`, `ectf_c_abort_is_not_n_selectable` (200 runs
+  with random deviations of N, no degenerate-share abort on C).
 
 *Against a malicious C* (protecting N's `x_N`, and with it the ECDHE secret, `K_0` and the credential). As
-the OLE sender, C chooses the correlations behind N's outputs. In a COT-based OLE a sender that deviates can
-at most make the receiver's output wrong as a function of the receiver's choice bits (a selective failure),
-which here is a function of N's input `(x2, y2)`; it cannot read N's input. This is the general shape of such
-attacks, not an analysis of mpz2's code: we have not shown that mpz2's A2M/M2A give a malicious sender no
-more than that. Under that assumption a wrong output shows only as an outcome C observes: N's
-degenerate-share abort (`ectf`), a handshake that fails (the shares no longer add up to the ECDHE secret, so
-the provider's Finished does not verify, for N and C alike), or success: at most log2 3 ≈ 1.6 bits per
-connection about `a_N·S`. That value is fresh and single-use (a new `a_N` and a new S per connection), at
-least 256 bits, and not the input of anything else, so the argument of "Why 3 bits per connection is
-harmless" above applies with 1.6 bits. A wrong ECDHE secret gives C nothing either: N writes the credential
-only after it verified the provider's Finished under its own handshake secrets, and `K_0` is an output of
-the 2PC that only N decodes.
+the OLE sender C may send arbitrary correlations, masked values and offsets. N's multiplicative share is
+then an affine function, of C's choice, of N's 256 ROLE bits, and N's additive share likewise through the
+M2A. That gives C two predicates on N's ROLE bits: N's degenerate-share abort, and whether the handshake
+succeeds (C can aim the second at one guess by shifting its own circuit input). C cannot test candidates
+offline (it does not know Z, which needs `a_N·S`), and it cannot cancel N's unknown bits to make `Z'` a value
+it knows. **3 outcomes, ≤ log2 3 ≈ 1.6 bits per connection about `(x2, y2)`. Argued** for this code, by
+enumeration of its error paths, assuming that Chou–Orlandi gives a malicious receiver one seed per base OT
+(otherwise C would learn all of N's choice bits, hence Z and `K_0`), the PRG, and the oracle model for the
+extract. That value is fresh and single-use (a new `a_N` and a new S per connection), so "Why 3 bits per
+connection is harmless" above applies with 1.6 bits. A wrong ECDHE secret gives C nothing either: N writes
+the credential only after it verified the provider's Finished under its own handshake secrets, and `K_0` is
+an output of the 2PC that only N decodes. Tests: `ectf_c_inconsistent_masks` (one correlation with another
+OLE value: N's share is right or wrong depending on one of its ROT bits, no error and no other outcome),
+`ectf_c_forces_degenerate_share`.
+
+Two small facts. N's OLE value b is 256 uniform bits reduced mod p, so each offset N sends is not exactly
+uniform (statistical distance about 2^-32; for C at most a factor 2 on a guess). mpz2 before revision
+`eaca5f9` computed N's additive share from the bits of the reduced b while the ROT used the unreduced bits;
+for about 2^-30 of connections N's share was wrong and the handshake failed, with no leak. The pin moved to
+`eaca5f9` on 2026-11-22, the upstream fix.
+
+A second conversion with the roles swapped and an equality check in the circuit (TLSNotary's measure) is not
+used: a consistent substitution passes it, it would make N an OLE sender towards C and so give N the
+selective-failure predicate C has here, and the handshake already detects a wrong Z.
 
 Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 
@@ -327,25 +414,30 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 | part | status |
 |---|---|
 | QuickSilver product check, IT-MAC openings | standard (QuickSilver/Wolverine soundness), GF(2^128) |
-| three-halves garbling privacy and authenticity | **assumed, not a cited proof**: Rosulek–Roy prove it for their scheme under their hash assumption; this code was rebuilt without the paper, its evaluator matrices come from a reimplementation and are not yet compared with the paper's figure, and the hash is instantiated, as in mpz2, with fixed-key-AES TCCR, whose fit to that assumption is itself to be reviewed (`TWOPC-NODE-GARBLING.md` §6) |
-| AND-gate consistency check with garbler-held masks, 64-bit projection, salt | argued; **no published proof** for this garbler-only variant |
+| three-halves garbling privacy and authenticity | **proven** for inputs fixed before garbling (Rosulek–Roy, CRYPTO 2021, Theorem 3), with the paper's recommended hash family `AES_k(X ⊕ U(τ)) ⊕ σ(X ⊕ U(τ))`, RTCCR by its Lemmas 5 and 6 (AES-128 a PRF for a random key; AES under the revealed key an ideal permutation); the matrices were compared with the paper's figures (2026-11-21) and the choice of halves is a relabelling (argued); the extension to the check rows is argued. **Assumed, not covered by the theorem:** tables sent in preprocessing and inputs that arrive later, stage by stage (needs a programmable ideal permutation); SHA-256 hashes of labels and KOS correlations under the same Δ_A (`TWOPC-NODE-GARBLING.md` §6) |
+| AND-gate consistency check with garbler-held masks, 64-bit projection, row hash keyed by C's seed | argued; **no published proof** for this garbler-only variant |
 | the check run per stage, crossing wires as row wires | argued (`TWOPC-NODE-GARBLING.md` §2, §4); new in v3 |
 | label-check pairs | argued (`TWOPC-NODE-GARBLING.md` §7); new in v3 |
 | public `IS_k`, digest labels from N pinned by pointer checks | argued above; assumptions 1 and 2; new in v3 |
 | leakage bound (≤ 3 bits per connection) | counting argument in the idealized abort model above, conditional on ECtF and the garbling argument; not a full enumeration of a malicious N's observations |
 | harmlessness of the leak | argued above: every value it can concern is a fresh secret of 256 bits, used for one connection; min-entropy loss ≤ log2 of the outcomes |
-| soundness of the consistency check | statistical: ≤ 2^-63 per stage for the committed parts, k times that over k connections; stage A1 only about 2^-23 against a prepared node, with a failed handshake as the outcome (above) |
+| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection, k·2^-60.6 over k connections, for a connection whose server share N did not choose; argued, under DDH in P-256 (when N feeds 0 into ECtF) and the random-function behaviour of `f` for the transcript hash N relays before stage A2 (`TWOPC-NODE-GARBLING.md` §4). In `split-public-1` stage A1 had only about 2^-23 against a prepared node, with a failed handshake as the outcome |
 | distinct inner digests under one key (assumption 3) | assumed: compression-function collision resistance under a known chaining value |
 | the chained multi-output composition with public `IS_k` | **not written** (hybrids over both directions and every value revealed together) |
-| soundness of online digest labels N chooses after the salt is known | argued heuristically (`TWOPC-NODE-GARBLING.md` §5), not for arbitrary online labels |
+| N's input is fixed before the challenge, the other input labels are committed before it | argued (`TWOPC-NODE-GARBLING.md` §4, §5); new in `split-public-2`; in `split-public-1` neither held |
 | Ferret/KOS against a malicious receiver (N for the MAC COTs under Δ_B; C for the 256 COTs under Δ_A), KOS consistency-check leakage of a few Δ bits with negligible probability | assumed from mpz2 |
-| ECtF | semi-honest only. Against a malicious N: no argument. Against a malicious C (the OLE sender): argued above, assuming a deviating sender gets at most a selective failure on N's choice bits (≤ log2 3 bits per connection); not shown for mpz2's code |
+| ECtF | mpz2 documents it as semi-honest. Malicious N: limited to input substitution, view simulatable, every effective deviation ends the handshake before B1 (argued above, ROT-hybrid model, HKDF-Extract as a random oracle, strong DH in P-256). Malicious C: 3 outcomes, ≤ log2 3 bits per connection (argued above, by enumeration of this code's error paths; base-OT security assumed) |
+| the KOS Δ of the ECtF instance (confidentiality of a recorded connection against N rests on it) | assumed from mpz2, with KOS's selective leakage of a few bits |
+| the anchors are public while the same secrets are keys (assumption 4) | assumed (holds with SHA-256 as a random oracle) |
 | external review | **none yet** |
 
 ## Review as an adversary (2026-11-11)
 
-Done once more when `split-public-1` became the only variant. Nothing was found broken. Each row names the
-test that exercises it.
+Done once more when `split-public-1` became the only variant. Nothing was found broken at the time. Each row
+names the test that exercises it. Two answers did not hold up (2026-11-22): the row on online labels that N
+chooses with the salt known (a label chosen after the challenge lets N adapt pointer bits to it, so its
+effect is not limited to an abort), and the soundness of stage A1 (Security model, above). `split-public-2` commits those labels and
+fixes N's input before the challenge.
 
 | question | finding |
 |---|---|
@@ -361,11 +453,28 @@ test that exercises it.
 
 ## Cost
 
-`crypto/twopc/BENCH.md` has the tables. Per connection the client uploads 1.13 MB and downloads 16.4 MB
-(tables 11.8 MB, check rows 3.9 MB); v2 moved 1.21 MB and 22.1 MB per request. A cold key schedule takes
-7.0 s on a 2/50 Mbit/s link with 80 ms round-trip time (v2: 7.4 s) and 15.6 s with a 10 Mbit/s
-downlink (v2: 20.1 s). Each stage after A1 costs one round trip that v2 did not have: from C's side `handshake` takes 3
+`crypto/twopc/BENCH.md` has the tables. Per connection the client uploads 1.13 MB and downloads 16.47 MB
+(tables 11.8 MB, check rows 3.9 MB, input-label commitments 82 kB); v2 moved 1.21 MB and 22.1 MB per request.
+`split-public-2` adds 81 984 B of payload to the download and 16 B to the upload against `split-public-1`,
+and no round trip. A cold key schedule takes 7.1 s on a 2/50 Mbit/s link with 80 ms round-trip time (v2:
+7.4 s) and 15.7 s with a 10 Mbit/s downlink (v2: 20.1 s). The halved AES count per gate (N 6, C 3, from 12
+and 6) shortens the online stages: locally 31 and 25 ms instead of 38 and 30 ms. Each stage after A1 costs one round trip that v2 did not have: from C's side `handshake` takes 3
 instead of 1 and `application` 1.5 instead of 1 (N's B1 labels need no message from C).
+
+## Changes from `split-public-1`
+
+`split-public-1` (deployed from 2026-11-12) and `split-public-2` (2026-11-22) have the same circuit, stages,
+ECtF, OT layers, 64-bit rows, label-check pairs and anchors. `split-public-2` changes:
+
+| | `split-public-1` | `split-public-2` |
+|---|---|---|
+| garbling hash | mpz2's fixed-key TCCR, 12 AES calls per AND gate for N, 6 for C | `AES_k(Y) ⊕ σ(Y)`, `Y = X ⊕ U(τ)`, N's 32-byte parameters per session, sent before the tables; 6 and 3 AES calls |
+| check rows | TCCR with C's salt XORed into the tweak (the salt cancels between two wires) | `lo64(AES_{k_r}(H_g(X, 2^63 \| τ) ⊕ U_r(τ)))`, `k_r`, `U_r` from SHA-256 of C's seed and N's parameters |
+| N's circuit input | its share `x_N`, labels sent in the handshake after the challenge | a random mask ρ < p, labels sent before the challenge; the share follows as `δ = x_N − ρ mod p` |
+| other input labels (C's share, the digests) | pointer bit checked only | committed before the challenge under C's 16-byte salt, each label checked |
+| stage A1 against a prepared N | wrong sum passes with about 2^-23 per connection | within the 2^-60.6 bound (argued) |
+| bytes | 16.38 MB down, 1.13 MB up | +81 984 B down, +16 B up, no added round trip |
+| tag, offer | `routstr-2pc/split-public-1`, `"split-public-1"` | `routstr-2pc/split-public-2`, `"split-public-2"`; the two do not interoperate |
 
 ## History: v2 and `Proven`
 
@@ -383,4 +492,4 @@ instead of 1 and `application` 1.5 instead of 1 (N's B1 labels need no message f
   (the circuit and the HKDF message blocks), `ectf.rs`, `mux.rs`, and the `cu-2pc` binary (C's side, spawned
   by the clients).
 - `crypto/relay`: the sidecar runs N's side (`run_twopc_n`).
-- The browser library vendors `crypto/twopc`; it has to be re-vendored for v3.
+- The browser library vendors `crypto/twopc`; it has to be re-vendored for `split-public-2` (not done yet).

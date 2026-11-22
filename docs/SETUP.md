@@ -106,7 +106,7 @@ response then carries `x-routstr-confidential-max-tokens: <cap>; requested=<your
 used (`GET https://<node>/v1/confidential/offer`).
 
 What to expect. Opening a **connection** runs a two-party computation with the node, in which the client
-receives about 16.4 MB and sends about 1.1 MB, plus about 1.5 MB each way to prepare the zero-knowledge
+receives about 16.5 MB and sends about 1.1 MB, plus about 1.5 MB each way to prepare the zero-knowledge
 proofs. What happens next depends on the framing the node offers for its provider (`http` in the signed
 offer; an application never sees it):
 
@@ -126,7 +126,7 @@ about 0.45 s is the provider's own latency):
 | 2 Mbit/s up, 10 down, 40 ms one way | 19 s | 1.6 s | 1.2 s |
 
 On a slow uplink the cold time is the upload (2.6 MB at 2 Mbit/s is 10.5 s); on a slow downlink it is the
-16.4 MB download. The answer streams as usual. The node's signed receipt is checked against the usage the
+16.5 MB download. The answer streams as usual. The node's signed receipt is checked against the usage the
 provider reported; a failed check fails the request.
 
 **Pre-warming** hides the cold cost: after a confidential request, routstrd **arms** a connection in the
@@ -339,7 +339,7 @@ you do not trust local users, keep the node's port reachable only by the proxy (
 address). Never trust an address that something else (a Tor daemon, a port forwarder) also connects from
 without overwriting the header.
 
-**Deposit, idle time, surcharge and fees.** Opening a connection costs the node about 16.4 MB of upload
+**Deposit, idle time, surcharge and fees.** Opening a connection costs the node about 16.5 MB of upload
 for the two-party computation (about 18 MB with the proofs, below) and under 0.5 s of CPU, before any
 request exists. The settings:
 
@@ -375,7 +375,7 @@ error (`error` 413 `frame_too_large`, no `fault`), so its deposit is charged.
 
 **Versions and health.** `cu-sidecar --version`, `cu-prover --version` and `cu-2pc --version` print the crate
 version, the git commit they were built from (`unknown` outside a checkout; a container build without `.git`
-passes it as `CU_BUILD_COMMIT`), protocol `3`, the 2PC tag `split-public-1` and the proof-channel version.
+passes it as `CU_BUILD_COMMIT`), protocol `3`, the 2PC tag `split-public-2` and the proof-channel version.
 `GET /healthz` on the sidecar (the same token rule as its other routes) returns JSON with the same version
 fields, `http` as served now, the state of framing `"2"` (`h2_withdrawn`, seconds left, consecutive failed
 opens) and the number of active, armed and provider-connected sessions; no secrets and no session ids. Use it
@@ -439,13 +439,13 @@ do not compress. Leave it off.
 curl -s 'https://<node>/v1/confidential/offer?v=3' | jq '{v, http, h2, twopc, connection_deposit_msat, idle_timeout_s, upstream_host, models: (.price_list|keys)}'
 ```
 
-`v` must be `3`, `twopc` `"split-public-1"`, and `http` what your offer file lists (without `"2"` while the
+`v` must be `3`, `twopc` `"split-public-2"`, and `http` what your offer file lists (without `"2"` while the
 sidecar has withdrawn it). Then run requests through routstrd as in section 1, or with the reference
 client below (`--http 2 --requests 3`, then `--http 1.1`). On the sidecar, each connection logs the 2PC,
 `ClientHello checked: canonical, one P-256 share, the joint key`, `credential record + KeyUpdate written
 to upstream`, and per request the proofs and the settlement.
 
-**Bandwidth and CPU.** Each connection costs the node about 18 MB of upload: 16.4 MB for the two-party
+**Bandwidth and CPU.** Each connection costs the node about 18 MB of upload: 16.5 MB for the two-party
 computation (its garbled circuit cannot be reused, so an armed connection that is never used costs this
 too) and the rest for the proofs, and under 0.5 s of CPU. On framing `"2"` each further request costs
 about 1 MB of upload (the proof correlations) and no two-party computation; on framing `"1.1"` every
@@ -477,6 +477,6 @@ together; clients must be v3 to use the node afterwards.
 5. **Clients.** v2 clients get `error 426 upgrade_required` (`min_v: 3`) from your node; v3 clients ask
    for `/v1/confidential/offer?v=3`, so before you upgrade, your access log shows whether v3 clients are
    already asking. A v3 client does not use a v2 node (`node_protocol_outdated`).
-6. **What your users see.** The first request to your node costs them 16.4 MB instead of 22 MB; with
+6. **What your users see.** The first request to your node costs them 16.5 MB instead of 22 MB; with
    HTTP/2 the following requests cost about 1 MB. They need a balance that covers your connection deposit.
 

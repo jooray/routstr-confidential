@@ -85,7 +85,7 @@ authors' working documents and are not published:
 >   record), so the node cannot aim them at other plaintext. On an upstream
 >   error the client discloses only the response head.
 > - **Not reviewed.** π_WIN, the HTTP/2 frame rules and the key schedule
->   `split-public-1` have had no external review (`docs/SECURITY-CLAIMS.md` lists
+>   `split-public-2` have had no external review (`docs/SECURITY-CLAIMS.md` lists
 >   what is proven, argued and assumed). Venice is the deployed provider;
 >   Numes, xKiro, OpenRouter and Cloudflare Workers AI also ran end to end,
 >   through a node (`docs/PROVIDERS.md`).
@@ -794,7 +794,7 @@ carries one request.
 ### 4.4 What does a wasted connection cost, and who pays?
 
 A connection costs the node a two-party handshake: garbling (457 MiB peak
-memory per run), 16.38 MB of upload and a session slot. v2 charged the
+memory per run), 16.47 MB of upload and a session slot. v2 charged the
 abandon fee for an unused session. v3:
 
 | How the connection ends | Deposit | Who bears the cost of the handshake |
@@ -835,7 +835,7 @@ work; the per-address limits (12 unused, 16 in all), the session slots
 (a full node or address evicts its longest-idle used connection before it
 refuses) and the cap of 8 refused requests in a row bound that. One
 handshake costs the node about 0.40 s of CPU, 457 MiB peak memory and
-16.4 MB of upload in a single run (`crypto/twopc/BENCH.md`); a request on
+16.5 MB of upload in a single run (`crypto/twopc/BENCH.md`); a request on
 an open connection about 1 MB of proof-channel download and two proof
 verifications, which usage at the frozen rates covers except for the
 smallest requests (`PROTOCOL-V3.md` §8.5). Whether the default deposit

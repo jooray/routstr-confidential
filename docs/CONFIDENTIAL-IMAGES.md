@@ -99,7 +99,7 @@ Cost of an image request (decision 8 and §5.8 give v2's figures, about 26 MB pe
 
 - On an open HTTP/2 connection: 36 kB up, the image plus about 9 kB down (measured, loopback). No two-party
   handshake.
-- On a new connection, either framing: one two-party handshake (16.38 MB down, 1.13 MB up) plus the proofs
+- On a new connection, either framing: one two-party handshake (16.47 MB down, 1.13 MB up) plus the proofs
   and the image. Total per framing: `[TO MEASURE]`.
 - The PWA's per-image data warning (decision 8) should use these figures; the web library and the PWA
   speak v3 since 2026-11-12.

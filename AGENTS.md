@@ -22,7 +22,7 @@ Each has `origin` = Routstr upstream and `fork` = `jooray/<repo>`.
 | `routstr-core/` | **`confidential-2pc`** on `fork` (v3: the open upstream PR #855, and what routstr.cypherpunk.today runs; the local checkout's branch is `confidential-v3`, pushed as `confidential-2pc`); `confidential-v2` (v2 archive); `confidential-upstream` (retired v1, unmaintained) | the node (Python/FastAPI) |
 | `routstr-sdk/` | **`confidential-2pc`** on `fork` (v3: the open PR #112; local branch `confidential-v3`, pushed as `confidential-2pc`); `confidential-v2` (v2 archive); `confidential-upstream` (retired v1, unmaintained) | client SDK (TypeScript) |
 | `routstrd/` | **`confidential-upstream`** on `fork` (v3: the open PR #155; local branch `confidential-v3`, pushed as `confidential-upstream`); `confidential-v2` (v2 archive) | client daemon (TypeScript/Bun) |
-| `crypto/` | this repo, branch **`main`** (v3, the default branch; `v2` is the v2 archive, the same as the old `twopc-v2`, which stays as it was; `v1-poc` is v1) | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (the two-party key schedule `split-public-1` + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK statements π_NK, π_WIN, π_C3S; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (gates, the provider profile check, `shape-proxy.py`), `runs/` (evidence) |
+| `crypto/` | this repo, branch **`main`** (v3, the default branch; `v2` is the v2 archive, the same as the old `twopc-v2`, which stays as it was; `v1-poc` is v1) | the protocol implementation: `cu-crypto` (TLS 1.3 key schedule, GCM, RFC 8448/NIST vectors), `twopc` (the two-party key schedule `split-public-2` on the branch `split-public-2`, `split-public-1` on `main` + `cu-2pc` binary), `zkbench` (mpz2 VOLE-ZK statements π_NK, π_WIN, π_C3S; `cu-prover` binary), `relay/` (**cu-sidecar**, the node's Rust side), `client/` (reference TS client `driver.ts`), `tools/` (gates, the provider profile check, `shape-proxy.py`), `runs/` (evidence) |
 | `paper/` | — | the paper (`paper.md` → `build.sh` → `paper.pdf`) |
 | `docs/` | — | engineering docs and research (below) |
 | `PROTOCOL-V3.md` | — | the v3 specification; `PROTOCOL-V3-DRAFT.md` has the reasoning |
@@ -46,7 +46,7 @@ README note. Do not rebase or update them.
 | `docs/APPROACH.md` | engineering overview: properties, components, negotiation, pre-warm |
 | `docs/ADVERSARIAL-QA.md` | model binding, provider transferability (OpenRouter, Groq…), what the node learns, cost bounds (starts with a current-state box) |
 | `docs/REVIEW-2026-10-09.md` | every bug found and fixed (numbered findings), measurements, the plug-in refactor (§8) |
-| `PROTOCOL-V3.md` | **the protocol**: lifecycle, both framings, `split-public-1`, π_WIN, money, §12 wire format, §5.6 what framing "2" needs from a provider |
+| `PROTOCOL-V3.md` | **the protocol**: lifecycle, both framings, `split-public-2` (§4, §4.1, its messages in §12.2), π_WIN, money, §12 wire format, §5.6 what framing "2" needs from a provider |
 | `docs/V2-V3-ONE-PAGER.md` / `.pdf` | v2 vs v3 for operators and users (what changes, what to do) |
 | `docs/SETUP.md` | how to try it and how to run a node (operator settings: `http`, `h2`, deposit, idle time) |
 | `docs/TWOPC-DESIGN.md` | the two-party handshake, epochs, the 2PC security model |
@@ -86,7 +86,7 @@ or `"1.1"` (one request). An application never sees the framing.
 **One connection (protocol v3, the only protocol; `PROTOCOL-V3.md` §3, §12).**
 1. *Offer.* The sidecar's offer file says which framings it serves (`http`,
    in the operator's order; `"2"` needs the `h2` block). The node signs an
-   offer with `v: 3`, `http`, `h2`, `twopc: "split-public-1"`,
+   offer with `v: 3`, `http`, `h2`, `twopc: "split-public-2"`,
    `connection_deposit_msat`, `idle_timeout_s` and the v2 fields (host, head
    template, `chat`, `images`, price list, fees). The client verifies it and
    takes the first framing it supports and has not marked bad for the node.
@@ -95,7 +95,7 @@ or `"1.1"` (one request). An application never sees the framing.
    deposit**, only then dials the sidecar and forwards the setup without the
    credential. `ready` names the connection (`sid`).
 3. *Preprocessing and key share.* The node garbles the key schedule
-   (`split-public-1`: 16.4 MB down, 1.1 MB up) and streams it to the client
+   (`split-public-2`: 16.5 MB down, 1.1 MB up) and streams it to the client
    (`cu-2pc`); both run the joint P-256 key share. An **armed** connection
    stops here, bound to the credential only; the sidecar has no provider
    connection yet.
@@ -203,8 +203,8 @@ dual-execution 2PC is the tag `v2-symmetric`. There is no fallback: a v3 node
 answers a v2 socket with `error 426 upgrade_required` (`min_v: 3`), the
 sidecar refuses a `setup` without `"v":3` and an offer file naming another
 `v`, a v3 client reports `node_protocol_outdated` for an offer with `v < 3`,
-and the 2PC channel starts with the tag `routstr-2pc/split-public-1`
-(`twopc_version_mismatch`). `docs/V2-V3-ONE-PAGER.md` says what changes for
+and the 2PC channel starts with the tag `routstr-2pc/split-public-2`
+(`twopc_version_mismatch`; a `split-public-1` peer is refused the same way). `docs/V2-V3-ONE-PAGER.md` says what changes for
 operators and users.
 
 **Where the code is.**
@@ -214,7 +214,7 @@ operators and users.
 | sidecar: setup, limits, framing "1.1" (`request_11`, `final_record_params`, `disclose_11`), the offer and its validation, `H2Guard` (withdrawal of "2"), error-head disclosure | `crypto/relay/src/main.rs` (`handle_setup`, `handle_control`, `check_hello`, `validate_error_head`; + `tls.rs` handshake verification) |
 | sidecar: framing "2" (requests, record hold, π_WIN windows, `release`, `settings_seen`, intervals, disclosures) | `crypto/relay/src/h2_session.rs`, `h2.rs` (connection head, request block, frame rules), `hpack.rs` |
 | the canonical ClientHello, the ServerHello checks, the early transcript hashes | `crypto/relay/src/tls_v2.rs` (`canonical_client_hello`, `check_client_hello`) |
-| two-party key schedule (`split-public-1`), `cu-2pc` | `crypto/twopc` (`BENCH.md` has the measurements); `docs/TWOPC-NODE-GARBLING.md` |
+| two-party key schedule (`split-public-2`), `cu-2pc` | `crypto/twopc` (`gc.rs`: `HashG`, `RowHash`; `lib.rs`: ρ, δ, `in_com`; `BENCH.md` has the measurements; vectors in `crypto/conformance/twopc-hash-vectors.json`); `docs/TWOPC-NODE-GARBLING.md` |
 | chat suffix (offer `chat` block: render + policy) | sidecar `ChatSuffix` in `main.rs`; SDK and web `suffix.ts` (`validateChatSuffix`, `canonicalSuffix`); reference client `offer.ts` (`chatBlockProblem`); shared vectors `chat-suffix-vectors.json` (SDK `tests/unit/fixtures`, web `test/fixtures`) |
 | ZK statements / circuits (`pi_nk`, `pi_win`, `pi_c3s`; one-bit equality `eq_bytes`), the proof channel | `crypto/zkbench/src/statements.rs`, `gadgets.rs`, `channel.rs`, `bin/cu-prover.rs` (`--channel`, `--job-stdin`); tests in `zkbench/tests` |
 | reference client | `crypto/client/src/driver.ts` (connection, offer checks, flags), `driver-h2.ts` + `h2.ts` (framing "2"), `driver-h11.ts` + `http1.ts` (framing "1.1"), `ctx.ts`, `offer.ts` (suffix, images block, receipt bound), `params.ts` (proof parameter checks); offline checks `src/{h2-selfcheck,h2-conn-test,fork-selfcheck}.ts`, `test/{tls-fork-records-check,offer-check}.ts` |
@@ -288,11 +288,11 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 **Checks.**
 - `crypto/tools/v3-check.sh` (**the sidecar + reference client gate**; real
   provider, no node; `CU_V3_PORT` picks the sidecar port): the offline
-  self-checks, then 54 cases (52 without the two paid images), both framings: honest (one, several, error
+  self-checks, then 55 cases (53 without the two paid images), both framings: honest (one, several, error
   head, 200 kB body, decoy model, armed, refused-then-good, image), a v2
   socket, every attack (hidden HEADERS, TLS padding, suffix/model/cap swap,
   path, usage replay, image suffix, early record, no proof, own key share,
-  2PC version tag, forged refusals `h2-r-refusal-*`, a 9 MiB client message
+  2PC version tag (`h2-j-twopc-tag`; `h2-j-twopc-tag-old` for a `split-public-1` peer), forged refusals `h2-r-refusal-*`, a 9 MiB client message
   `h2-l-big-frame`: `error` 413 `frame_too_large` without `fault`), and the forced failure of "2" (fallback, withdrawal,
   return). `v3_eval.py` judges each case from the driver's output and the
   sidecar's own run files; exit ≠ 0 on any deviation. Two paid images
@@ -332,7 +332,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   offline checks, the client root store against `gen-client-roots.py`, every copy of a vector of
   `crypto/conformance/` byte-identical, a secret scan. `CU_CI_SKIP_CARGO=1` skips the Rust tests.
 - Unit tests:
-  - `crypto`: `cargo test --release -p cu-sidecar` (120), `-p zkbench`, `-p twopc`
+  - `crypto`: `cargo test --release -p cu-sidecar` (120), `-p zkbench`, `-p twopc` (51 unit tests, 4 of the `cu-2pc` binary)
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
   - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`, `bun test tests/bun` (vitest
     reports those two files as failed: it cannot load `bun:test`)
@@ -349,7 +349,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 
 | Part | State |
 |---|---|
-| `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-1` with the version tag |
+| `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-1` with the version tag (on `main`, deployed). `split-public-2` is implemented on the branch `split-public-2` (2026-11-22: new garbling hash and row hash, N's input a mask fixed before the seed, input-label commitments; 51 unit tests; `v3-check.sh` 53 cases without images) and is **not deployed**: production runs `split-public-1`, the browser library and the PWA are not ported, the PR branches of the sub-repos are not updated |
 | `crypto/relay` (sidecar) | done; 120 unit tests; `v3-check.sh` clean in one run (51 cases without images, 2026-11-13). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause; a provider refusal of a stream is proven (`disclose_reset`) |
 | `crypto/client` (reference driver) | done for both framings; run live against the sidecar by `v3-check.sh` and against a node by the node gate |
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
@@ -443,15 +443,25 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   pick others (`CU_V3_PORT`) when several agents work at once, and stop every
   process you start.
 - **Open items.**
-  - `split-public-1` costs 16.4 MB node→client and 1.1 MB client→node per
-    **connection**, plus about 1.5 MB each way for the proof channel's
+  - `split-public-2` costs 16.47 MB node→client and 1.13 MB client→node per
+    **connection** (82 kB and 16 B more than `split-public-1`, no added
+    round trip), plus about 1.5 MB each way for the proof channel's
     correlations; a cold request takes about 12 s on a 2/50 Mbit/s link
     (the uplink is the limit) against about 1.4 s on an armed connection
     and under 1 s on an open one. A cheating node can learn at most
-    log2 8 = 3 bits per connection about fresh, single-use values, assuming
-    ECtF's semi-honest share conversion leaks nothing beyond its outcome.
-    The garbler-only construction, π_WIN and the frame rules have no
-    published proof and need external review (`PROTOCOL-V3.md` §4, §10).
+    log2 8 = 3 bits per connection about fresh, single-use values (argued,
+    idealized abort model; the ECtF argument for a malicious party is ours,
+    mpz2 documents the conversion as semi-honest). `split-public-1`, which
+    production runs, lets a prepared node pass stage A1 with a wrong sum
+    with probability about 2^-23 per connection (the handshake then fails);
+    `split-public-2` fixes it. The garbler-only construction, π_WIN and the
+    frame rules have no published proof and need external review
+    (`PROTOCOL-V3.md` §4, §10; `docs/SECURITY-CLAIMS.md`).
+  - `split-public-2` rollout (not done): re-vendor `crypto/twopc` into the
+    browser library (and run the conformance vectors in its wasm build),
+    pin the PWA, update the SDK's and routstrd's expected `twopc` value and
+    the PR branches, deploy sidecar, node and clients together (a hard
+    switch: old and new peers refuse each other).
   - The sidecar's guard does not see a provider that fails only once a
     request's records arrive (the body is the client's); the profile check
     and the client's fallback cover that.
