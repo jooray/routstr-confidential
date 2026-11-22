@@ -1162,15 +1162,24 @@ of what N sent before the seed, of C's input $x_C' = x_C + \delta$ and of the di
 messages after the seed enter only the right-hand side of the check and the abort conditions. N still
 acts with $\chi$ known in two places. It chooses $\delta$ and its inputs to ECtF. C's share is a
 function of N's view and of C's point $a_C S$, with at most 6 points per value, so it is not uniform
-given N's view and is hidden only computationally. For a uniform point, C's input meets the inputs on
-which a prepared violation passes with probability at most $6n/2^{128}$; that the real point gives N no
-more is an assumption, DDH in P-256, for every N. And it relays the ServerHello and the server flight,
+given N's view and is hidden only computationally. N knows the challenges of all stages when it makes
+this choice, and every stage's pointer bits depend on C's input. For a uniform point, C's input meets
+the inputs on which a prepared violation passes in a stage of $n$ gates with probability at most
+$6n/2^{128}$; that the real point gives N no
+more is an assumption, DDH in P-256, for every N. We have not written the reduction out. A sketch of it
+models HKDF-Extract and the hash of the key-share commitment as random oracles and uses strong
+Diffie-Hellman for the keys of U's flight, which N holds before the first stage ends. Written this way
+it covers the first stage. For the later stages it needs in addition that N knows the discrete logarithm
+of its key share $P_N$, which the protocol does not make N prove (a proof of knowledge in the key share
+would), and to decide whether a violation is present it reads N's masks from N's queries to the hash of
+the base OT, modelled as a random oracle. An N that cannot compute $s P_N$ cannot supply its input to
+the share conversion, and the connection ends at U's flight before an application secret exists. And it relays the ServerHello and the server flight,
 which enter the digests through $th_{SH}$ and $th_{SF}$. N holds $s_{hs}$, so it can open the flight,
 change it and recompute the Finished: C must accept only what U's signature fixes. C's TLS stack
 therefore accepts no message besides the four of the flight, nothing after the signature in
 CertificateVerify and one encoding of the signature, which leaves N two values of $th_{SF}$ for an ECDSA
-signature (s and its negation). The stacks released with `split-public-1` ignored bytes after the
-signature, and N's choice of $th_{SF}$ was unbounded: the fourth stage's error was then a bound on N's
+signature (s and its negation): a factor 2 on the terms of the last two stages. The stacks released with `split-public-1` ignored bytes after the
+signature, and N's choice of $th_{SF}$ was unbounded: the error of the last two stages was then a bound on N's
 work, at most about $2^{-111}$ per flight tried, and not a statistical one. $th_{SH}$ is fixed before the first stage runs, when N does not know $IS_{HS}$; that a
 choice of $th_{SH}$ made with $\chi$ known does not raise the later stages' error noticeably is an
 assumption (it holds if $f$ keyed by its chaining input behaves as a random function). Under these assumptions a wrong evaluation passes the
@@ -1468,7 +1477,8 @@ C's TLS stack is a fork of an MIT-licensed TLS 1.3 client with two hooks: an ext
 traffic secrets injected from the 2PC instead of computed locally. It accepts only the version, suite and
 group it offered, requires the server's flight in RFC 8446 order with each message once and a
 CertificateVerify over the validated chain before it accepts the Finished, accepts no other message in
-the flight, nothing after the signature and one encoding of it, validates certificate paths
+the flight, nothing after the signature and one encoding of it, no handshake message before the
+ServerHello and none behind it in its record, validates certificate paths
 per RFC 5280 and hostnames per RFC 6125 against the same Mozilla root set as N's relay (generated from
 the relay's pinned copy), and uses the full 64-bit sequence number in the nonce.
 

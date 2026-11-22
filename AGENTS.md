@@ -419,7 +419,7 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
 - **`crypto/` builds into `zkbench/target`** (see `crypto/.cargo/config.toml`).
 - **The client's TLS stack is part of the 2PC soundness argument.** The node holds `s_hs`, so whatever
   the fork accepts after the provider's signature (between CertificateVerify and Finished, or as another
-  encoding of the signature) is the node's choice of `th_SF`. Keep the TLS-17 rules in all three copies
+  encoding of the signature) is the node's choice of `th_SF`. Keep the TLS-17 to TLS-19 rules in all three copies
   of the fork (`FORK-NOTES.md`; `docs/TWOPC-NODE-GARBLING.md` §4) and their negative tests
   (`crypto/client/test/tls-fork-records-check.ts`, the `confidential-tls` tests of the SDK and the web
   library).

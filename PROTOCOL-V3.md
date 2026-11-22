@@ -308,7 +308,9 @@ Security statement (informal; no proof, external review outstanding, as for v2):
   probability ≤ 2^-60.6 per connection whose server share N did not choose. The argument needs that N
   fixes everything that determines C's pointer bits before C's challenge seed (§4.1), that C's share is
   hidden from N (DDH in P-256: the share is a function of N's view and of C's Diffie-Hellman point, so it
-  is hidden only computationally, whatever N feeds into the conversion), that C accepts at most two
+  is hidden only computationally, whatever N feeds into the conversion; the reduction is not written
+  out, and a sketch of it needs random oracles, strong DH and, beyond stage A1, that N knows the discrete
+  logarithm of its key share, which N does not prove), that C accepts at most two
   server flights per signature of U (§9.4; N holds `s_hs` and chooses `th_SF` among the flights C
   accepts) and, for `th_SH`, which N relays before stage A2, that `f` keyed by its chaining input behaves
   as a random function. Argued, no proof, no review (`docs/TWOPC-NODE-GARBLING.md` §4). In `split-public-1` N sent its input labels after the
@@ -877,7 +879,11 @@ by its own TLS stack. That stack MUST accept only what U's signature fixes, beca
 could otherwise choose `th_SF` (§4): the server flight is EncryptedExtensions, Certificate,
 CertificateVerify, Finished and no other message; CertificateVerify ends with its signature; an ECDSA
 signature is the DER encoding of `(r, s)`; handshake lengths are read as 24 bits; the record of the
-Finished ends with it. Framing `"2"`, the provider's frames as RFC 9113 has them: a frame above 16 KiB
+Finished ends with it. The same at the first key change (RFC 8446 §5.1): the first handshake message is
+the ServerHello and its record ends with it, so `th_SH` covers the ClientHello and the ServerHello and
+nothing else, and no message of the flight is read in plaintext. The stack also refuses what RFC 8446
+forbids and a provider never sends: a ChangeCipherSpec inside a protected record, an empty handshake
+record, an RSASSA-PKCS1-v1_5 signature in CertificateVerify. Framing `"2"`, the provider's frames as RFC 9113 has them: a frame above 16 KiB
 (the head never raises `SETTINGS_MAX_FRAME_SIZE`) ends the connection; a change of
 `SETTINGS_INITIAL_WINDOW_SIZE` applies to the open request's stream too; no record of a stream above a
 GOAWAY's last-stream-id is released. A refusal of the request's stream (`RST_STREAM(REFUSED_STREAM)`, or

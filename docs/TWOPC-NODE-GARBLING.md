@@ -133,13 +133,37 @@ accepts iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   (`TWOPC-DESIGN.md`, ECtF), so `x_C + δ` is a function of N's view and of `Q_C`. It is therefore not
   uniform given N's view, whatever N feeds into the conversion (N holds `a_C·G` and S, which determine
   `Q_C`); it is hidden only computationally. As a function of `Q_C` on the curve the map has degree ≤ 6,
-  so each value has at most 6 preimages. For a uniform point independent of N's view, C's input would hit
-  the set of inputs on which a prepared violation passes with probability at most `6·n_0/2^128`, averaged
-  over χ_0 and for every choice N makes with χ_0 known. That the real `Q_C` gives N no more is
-  **assumed**: DDH in P-256, for every N (not only one that feeds 0 into the conversion). Before stage A1
-  ends N also holds U's flight, encrypted under keys derived from Z; that it does not help is the
-  oracle-model step of the ECtF argument. The reduction is not written out. For a server share N chose
-  itself no claim is made, and that connection ends at CertificateVerify.
+  so each value has at most 6 preimages. The pointer bits of every stage depend on C's input, and N
+  knows the challenges of all five stages when it chooses the map and δ. For a uniform point independent
+  of N's view, C's input would hit the set of inputs on which a prepared violation passes in stage s with
+  probability at most `6·n_s/2^128`, averaged over χ_s and for every choice N makes with χ known: a
+  factor 6 on the term of every stage. That the real `Q_C` gives N no more is
+  **assumed**: DDH in P-256, for every N (not only one that feeds 0 into the conversion). For a server
+  share N chose itself no claim is made, and that connection ends at CertificateVerify.
+  The reduction is **not written out**. What a sketch of it uses, and where it stops:
+  - *U's flight.* Before stage A1 ends N holds U's flight, encrypted under keys derived from
+    `Z = x(s·(P_C + P_N))`. With HKDF-Extract as a random oracle, N can tell these keys from random ones
+    only by a query at Z, which gives the point `s·(P_C + P_N)` up to the sign of y: 2 candidates. That
+    is a Diffie-Hellman value for the joint share, not `Q_C`. N sends `P_N` after C's commitment to `P_C`
+    and does not prove that it knows its discrete logarithm, so a reduction to strong DH (CDH with a DDH
+    oracle) has to put its challenge into the joint share: it opens C's commitment to `A − P_N` for its
+    challenge A, which needs SHA-256 in the key-share commitment as a programmable random oracle.
+  - *Which stages it covers.* A reduction that works this way does not know `Q_C`. It can produce C's
+    messages up to C's d bits of stage A1 (the simulator of the ECtF argument), but not C's report of
+    stage A1 or anything later. So the sketch covers stage A1. For stages A2 to B2 it needs in addition
+    that N knows the discrete logarithm `a_N` of `P_N`: then one reduction from DDH computes U's key as
+    `x(Q + a_N·S)` from its challenge point Q and runs every stage. The protocol does not make N prove
+    this knowledge (a proof of knowledge of `a_N` in the key share would; it would add bytes to the
+    wire). **Assumed.** An N that cannot compute `s·P_N` cannot supply its honest input to the conversion,
+    so C's Z differs from U's and the connection ends at U's flight, before stage B1: in that case the
+    stages the sketch does not reach protect no traffic secret.
+  - *N's masks.* To decide whether a violation is present the reduction needs N's masks λ. N is the
+    receiver of the COTs under Δ_B. Its choice bits are fixed by the seeds it sends as sender of the
+    base OTs and by its corrections. mpz2's base OT (Chou-Orlandi) has no proof of knowledge of the
+    sender's key, so the seeds are read from N's queries to the base OT's hash (BLAKE3): the hash as a
+    random oracle whose queries the reduction sees. In the standard model the masks are not extractable.
+    Read against mpz2 at the pinned revision for the base OT and KOS; for Ferret taken from its
+    structure, not checked line by line.
   (2) *The transcript hashes.* N relays the ServerHello and the server flight and so can influence `th_SH`
   and `th_SF`. N holds `s_hs`: it can open U's flight, change it, seal it again and recompute the
   Finished, with χ and `IS_MS` known. What C accepts is then N's choice of `th_SF`, so C must accept only
@@ -147,18 +171,24 @@ accepts iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   that CertificateVerify ends with its signature, that an ECDSA signature is the DER encoding of `(r, s)`,
   that the Finished follows directly, and that no other message type appears (the three client stacks:
   `FORK-NOTES.md`, TLS-17). An ECDSA signature `(r, s)` also verifies as `(r, n − s)`, so N has at most two
-  values of `th_SF`: a factor 2 on stage B1's term. A stack that accepts q flights per signature gives
-  `q·n_3/2^128` there; the stacks released with `split-public-1` accepted any number (among others,
-  bytes after the signature were ignored), which made that term a bound on N's work (at most about
+  values of `th_SF`: a factor 2 on the terms of stages B1 and B2 (`th_SF` enters B1 through its digests
+  and B2 through `IS_c0`, which is derived from `c_ap_0`). A stack that accepts q flights per signature
+  gives a factor q there; the stacks released with `split-public-1` accepted any number (among others,
+  bytes after the signature were ignored), which made those terms a bound on N's work (at most about
   2^-111 per flight tried) and not a statistical one. `th_SH`
   is fixed before stage A1 runs, when N does not know `IS_HS`, and a flight of U that N has not opened yet
-  is fixed with it; that a choice of `th_SH` with χ known does not raise the later terms noticeably is
-  **assumed** (it holds if `f` keyed by its chaining input behaves as a random function). Under these
-  assumptions the bound per connection is
-  `5·2^-63 + (6·n_0 + n_1 + n_2 + 2·n_3 + n_4)·2^-128 + ε_QS ≤ 2^-60.6` for a connection whose server
-  share N did not choose (ε_QS: the product check's error). **Argued**, new in `split-public-2`, no
+  is fixed with it. C's stack takes `th_SH` over the ClientHello and the ServerHello only (the ServerHello
+  is the first message and ends its record, TLS-18), so N's choice of `th_SH` is its choice of the
+  ServerHello. That a choice of `th_SH` with χ known does not raise the later terms noticeably is
+  **assumed** (it holds if `f` keyed by its chaining input behaves as a random function; the PRF
+  property of assumption 1 is not shown to be enough, because the key `IS_HS` becomes public at the end
+  of stage A1). Under these assumptions the bound per connection is
+  `5·2^-63 + (6·(n_0 + n_1 + n_2) + 12·(n_3 + n_4))·2^-128 + ε_QS ≤ 2^-60.6` for a connection whose server
+  share N did not choose (ε_QS: the product check's error; 12 = 6 preimages times 2 flights; the second
+  term is about 2^-106). **Argued**, new in `split-public-2`, no
   review. Tests: `adder_switch_attack_caught`, `gl_precedes_seed`, `in_com_precedes_seed`,
-  `delta_out_of_range_rejected`; for the flights C accepts, the TLS-17 tests of the three client stacks.
+  `delta_out_of_range_rejected`; for the flights C accepts, the TLS-17 and TLS-18 tests of the three
+  client stacks.
 - **`split-public-1` did not have this (found 2026-11-22).** There N sent the labels of its input `x_N` in
   the handshake, after the seed, so with χ known. Garbling every second gate of the adder as `(¬A)∧B` makes
   that gate's `e_k` equal to a bit of `x_N` whenever the carry into it is 0; N then solves 128 linear

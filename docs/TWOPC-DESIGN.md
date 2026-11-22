@@ -424,7 +424,7 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 | public `IS_k`, digest labels from N pinned by pointer checks | argued above; assumptions 1 and 2; new in v3 |
 | leakage bound (≤ 3 bits per connection) | counting argument in the idealized abort model above, conditional on ECtF and the garbling argument; not a full enumeration of a malicious N's observations |
 | harmlessness of the leak | argued above: every value it can concern is a fresh secret of 256 bits, used for one connection; min-entropy loss ≤ log2 of the outcomes |
-| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection, k·2^-60.6 over k connections, for a connection whose server share N did not choose; argued, under DDH in P-256 (C's share is hidden from N only computationally), a client TLS stack that accepts at most two server flights per signature of U, and the random-function behaviour of `f` for the transcript hash N relays before stage A2 (`TWOPC-NODE-GARBLING.md` §4). In `split-public-1` stage A1 had only about 2^-23 against a prepared node, with a failed handshake as the outcome |
+| soundness of the consistency check | statistical: ≤ 2^-60.6 per connection, k·2^-60.6 over k connections, for a connection whose server share N did not choose; argued, under DDH in P-256 (C's share is hidden from N only computationally; the reduction is not written out, and a sketch of it needs random oracles, strong DH and, beyond stage A1, that N knows the discrete logarithm of its key share), a client TLS stack that accepts at most two server flights per signature of U, and the random-function behaviour of `f` for the transcript hash N relays before stage A2 (`TWOPC-NODE-GARBLING.md` §4). In `split-public-1` stage A1 had only about 2^-23 against a prepared node, with a failed handshake as the outcome |
 | distinct inner digests under one key (assumption 3) | assumed: compression-function collision resistance under a known chaining value |
 | the chained multi-output composition with public `IS_k` | **not written** (hybrids over both directions and every value revealed together) |
 | N's input is fixed before the challenge, the other input labels are committed before it | argued (`TWOPC-NODE-GARBLING.md` §4, §5); new in `split-public-2`; in `split-public-1` neither held |
@@ -495,4 +495,5 @@ ECtF, OT layers, 64-bit rows, label-check pairs and anchors. `split-public-2` ch
   (the circuit and the HKDF message blocks), `ectf.rs`, `mux.rs`, and the `cu-2pc` binary (C's side, spawned
   by the clients).
 - `crypto/relay`: the sidecar runs N's side (`run_twopc_n`).
-- The browser library vendors `crypto/twopc`; it has to be re-vendored for `split-public-2` (not done yet).
+- The browser library vendors `crypto/twopc` (`crates/vendor/twopc` there, with `split-public-2`); a change
+  to `crypto/twopc` has to be re-vendored.
