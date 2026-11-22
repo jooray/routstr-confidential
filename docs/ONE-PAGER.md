@@ -76,4 +76,4 @@ when it sees everything. On a provider error it sees only the status and headers
   from one client (routstrd keeps separate connections per local API key). The node can refuse service or
   keep money after a failed request (reputation protects you). The two-party computation and the HTTP/2
   rules are new, have no published proof and need external review; a cheating node could learn at most
-  3 bits per connection about single-use values, if its semi-honest first step leaks no more.
+  3 bits per connection about single-use values, by an argument that is not yet a proof.
