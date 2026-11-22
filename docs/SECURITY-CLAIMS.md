@@ -60,6 +60,6 @@ root; Rust tests run with `cargo test --release -p <crate>` in `crypto/`, the ga
 5. **π_WIN with the frame and interval rules** (`PROTOCOL-V3.md` §5, §7.1, §12.6–§12.8;
    `crypto/zkbench/src/statements.rs`, `crypto/relay/src/h2.rs`, `h2_session.rs`): that every byte U acts on
    is proven, and that disclosures cannot come from model output.
-6. **The pinned mpz2 revision** (`8f897838f4e24aff9da8e8b012e8ba35ae770141`, `crypto/Cargo.lock`): KOS,
+6. **The pinned mpz2 revision** (`eaca5f9d9f30167c9525716e8f0aa9e33d886e5e`, `crypto/Cargo.lock`): KOS,
    Ferret, the VOLE-based proofs, the OLE, against what the code above relies on.
 7. **Side channels** (above).
