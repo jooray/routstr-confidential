@@ -1,9 +1,10 @@
 //! Garbler-only authenticated garbling: the primitives.
 //!
 //! * Three-halves garbling / evaluation (Rosulek–Roy 2021; 1.5κ+5 bits per
-//!   AND, free XOR, fixed-key-AES TCCR hash as in mpz2), keeping every wire's
-//!   zero-label (garbler) and every active label (evaluator), which the
-//!   consistency check needs.
+//!   AND, free XOR), keeping every wire's zero-label (garbler) and every
+//!   active label (evaluator), which the consistency check needs. The hash is
+//!   the paper's recommended RTCCR family [`HashG`], `AES_k(Y) ⊕ σ(Y)` with
+//!   `Y = X ⊕ U(τ)`, its key and `U` drawn by N per session ([`gf64`]).
 //! * IT-MAC bookkeeping over GF(2^128): the garbler N holds authenticated bits
 //!   `[x] = (x, M[x])`, the evaluator C holds `(K[x], Δ_B)` with
 //!   `M[x] = K[x] ⊕ x·Δ_B`. Wire masks `λ_w` (= the point-and-permute bit of
@@ -11,8 +12,8 @@
 //!   output; every other wire follows by linearity (XOR: sum, INV: `λ ⊕ 1`,
 //!   i.e. `K ⊕ Δ_B` on C's side).
 //! * The per-AND products `t_k = λ_i·λ_j` (QuickSilver-style batched check).
-//! * The consistency check of the evaluation (one 64-bit row per base wire,
-//!   hashed under a per-session salt).
+//! * The consistency check of the evaluation (one 64-bit row per row wire,
+//!   hashed by [`RowHash`] under a key from C's challenge seed).
 //!
 //! Notation: `P_{w,Λ}` is the label of wire w whose pointer bit is Λ:
 //! `P_{w,Λ} = k_w ⊕ (Λ ⊕ λ_w)·Δ_A` (k_w = label of the value 0). The evaluator
@@ -20,26 +21,167 @@
 
 use mpz_circuits::{Circuit, Gate};
 use mpz_core::Block;
-use mpz_core::aes::{FIXED_KEY_AES, FixedKeyAes};
+use mpz_core::aes::AesEncryptor;
 use rand::RngExt;
 use zeroize::Zeroize;
 
-/// Tweak base of the garbling hash for a phase (garbling and check rows use
-/// disjoint tweak spaces: bit 127 is set only for check rows).
-fn gid_base(phase: usize) -> u128 {
-    (phase as u128) << 64
+/// GF(2^64) = GF(2)[x]/(x^64 + x^4 + x^3 + x + 1); a `u64` is the polynomial
+/// whose coefficient of x^i is bit i.
+pub mod gf64 {
+    /// Multiplication by x. Branch-free: its input holds label bits.
+    #[inline]
+    pub fn xtime(a: u64) -> u64 {
+        (a << 1) ^ (0x1b & (a >> 63).wrapping_neg())
+    }
+
+    /// The product, reduced. Branch-free (bit-serial with masks).
+    pub fn mul(a: u64, b: u64) -> u64 {
+        let (mut a, mut r) = (a, 0u64);
+        for i in 0..64 {
+            r ^= a & ((b >> i) & 1).wrapping_neg();
+            a = xtime(a);
+        }
+        r
+    }
+
+    /// σ(Y_hi ‖ Y_lo) = x·Y_hi ‖ x·Y_lo (Rosulek–Roy's σ with α = x).
+    #[inline]
+    pub fn sigma(y: u128) -> u128 {
+        ((xtime((y >> 64) as u64) as u128) << 64) | xtime(y as u64) as u128
+    }
+
+    /// `U_{a,b}(τ) = a·τ ‖ b·τ` for public multipliers and a public tweak:
+    /// a table of `a·x^i`, `b·x^i`, XORed per set bit of τ.
+    #[derive(Clone)]
+    pub struct UMap {
+        hi: [u64; 64],
+        lo: [u64; 64],
+    }
+
+    impl UMap {
+        pub fn new(a: u64, b: u64) -> UMap {
+            let (mut hi, mut lo) = ([0u64; 64], [0u64; 64]);
+            let (mut x, mut y) = (a, b);
+            for i in 0..64 {
+                hi[i] = x;
+                lo[i] = y;
+                x = xtime(x);
+                y = xtime(y);
+            }
+            UMap { hi, lo }
+        }
+
+        /// `U(τ)`; branches on the bits of τ (a gate index or a row position).
+        #[inline]
+        pub fn at(&self, tau: u64) -> u128 {
+            let (mut h, mut l, mut t) = (0u64, 0u64, tau);
+            while t != 0 {
+                let i = t.trailing_zeros() as usize;
+                h ^= self.hi[i];
+                l ^= self.lo[i];
+                t &= t - 1;
+            }
+            ((h as u128) << 64) | l as u128
+        }
+    }
 }
 
-/// Tweak of the check-row hash of base wire `idx`: a per-session salt (from
-/// C's challenge seed, revealed only after N's tables and commitments) XOR the
-/// wire position, with bit 127 forced to 1 so it never equals a garbling
-/// tweak (those stay below 2^67). The salt is what makes 64-bit rows safe: any
-/// label deviation N fixed before the seed (tables, Δ_A, its keys) changes the
-/// projected check sum by a fresh-looking 64-bit value, so N cannot precompute
-/// a garbage label whose truncated hash matches the honest one, even if it
-/// reuses its labels across sessions.
-fn check_tweak(salt: u128, phase: usize, idx: usize) -> Block {
-    blk((salt | (1u128 << 127)) ^ (((phase as u128) << 64) | idx as u128))
+/// Parses the 32-byte layout shared by the hash parameters and the row
+/// parameters: AES-128 key (bytes 0..16, as given to the cipher), the
+/// multiplier of the high half (16..24) and of the low half (24..32), both
+/// little-endian.
+fn parse_params(p: &[u8; 32]) -> (AesEncryptor, gf64::UMap) {
+    let key = Block::new(p[..16].try_into().expect("16 bytes"));
+    let a = u64::from_le_bytes(p[16..24].try_into().expect("8 bytes"));
+    let b = u64::from_le_bytes(p[24..32].try_into().expect("8 bytes"));
+    (AesEncryptor::new(key), gf64::UMap::new(a, b))
+}
+
+/// The garbling hash `H_g(X, τ) = AES_k(Y) ⊕ σ(Y)`, `Y = X ⊕ U(τ)`, from N's
+/// 32-byte parameters (fresh per session; sent to C right before the
+/// tables). It protects only N: no check of C rests on it.
+#[derive(Clone)]
+pub struct HashG {
+    aes: AesEncryptor,
+    u: gf64::UMap,
+}
+
+impl HashG {
+    pub fn new(params: &[u8; 32]) -> HashG {
+        let (aes, u) = parse_params(params);
+        HashG { aes, u }
+    }
+
+    #[inline]
+    pub fn h(&self, x: u128, tau: u64) -> u128 {
+        let y = x ^ self.u.at(tau);
+        u(self.aes.encrypt_block(blk(y))) ^ gf64::sigma(y)
+    }
+
+    #[inline]
+    pub fn h_many<const N: usize>(&self, x: [u128; N], tau: [u64; N]) -> [u128; N] {
+        let y: [u128; N] = core::array::from_fn(|i| x[i] ^ self.u.at(tau[i]));
+        let mut b = y.map(blk);
+        self.aes.encrypt_many_blocks(&mut b);
+        core::array::from_fn(|i| u(b[i]) ^ gf64::sigma(y[i]))
+    }
+}
+
+/// Bit 63 of a tweak of [`HashG`] marks a check row; gate tweaks stay below.
+pub const ROW_TWEAK: u64 = 1 << 63;
+
+/// The check-row hash
+/// `row(X; s, idx) = lo64(AES_{k_r}(H_g(X, 2^63 | τ) ⊕ U_r(τ)))`,
+/// `τ = s·2^32 | idx`, keyed by the row parameters N derives from C's seed
+/// after it committed to everything else. The inner call is a full-width
+/// query of the garbling hash on a tweak no gate uses, the outer one a
+/// bijection under a key N could not know when it committed.
+pub struct RowHash<'a> {
+    hg: &'a HashG,
+    aes: AesEncryptor,
+    u: gf64::UMap,
+}
+
+impl<'a> RowHash<'a> {
+    pub fn new(hg: &'a HashG, rparams: &[u8; 32]) -> RowHash<'a> {
+        let (aes, u) = parse_params(rparams);
+        RowHash { hg, aes, u }
+    }
+
+    #[inline]
+    fn tau(stage: usize, idx: usize) -> u64 {
+        assert!(stage < 8 && idx < (1 << 32), "row tweak out of range");
+        ((stage as u64) << 32) | idx as u64
+    }
+
+    /// The row hash of one label.
+    #[inline]
+    pub fn row(&self, x: Block, stage: usize, idx: usize) -> u64 {
+        let t = Self::tau(stage, idx);
+        let w = self.hg.h(u(x), ROW_TWEAK | t) ^ self.u.at(t);
+        u(self.aes.encrypt_block(blk(w))) as u64
+    }
+
+    /// The row hashes of both labels of a wire (N).
+    #[inline]
+    fn row2(&self, x: [Block; 2], stage: usize, idx: usize) -> [u64; 2] {
+        let t = Self::tau(stage, idx);
+        let h = self.hg.h_many([u(x[0]), u(x[1])], [ROW_TWEAK | t; 2]);
+        let ut = self.u.at(t);
+        let mut b = [blk(h[0] ^ ut), blk(h[1] ^ ut)];
+        self.aes.encrypt_many_blocks(&mut b);
+        [u(b[0]) as u64, u(b[1]) as u64]
+    }
+
+    /// Test vectors: the intermediate values of [`RowHash::row`].
+    #[doc(hidden)]
+    pub fn trace(&self, x: Block, stage: usize, idx: usize) -> (u128, u128, u128, u128) {
+        let t = Self::tau(stage, idx);
+        let inner = self.hg.h(u(x), ROW_TWEAK | t);
+        let ut = self.u.at(t);
+        let out = u(self.aes.encrypt_block(blk(inner ^ ut)));
+        (inner, ut, inner ^ ut, out)
+    }
 }
 
 #[inline]
@@ -50,6 +192,11 @@ fn sel(bit: bool, b: Block) -> Block {
 #[inline]
 fn m64(bit: bool) -> u64 {
     (bit as u64).wrapping_neg()
+}
+
+#[inline]
+fn m128(bit: bool) -> u128 {
+    (bit as u128).wrapping_neg()
 }
 
 #[inline]
@@ -189,15 +336,16 @@ pub fn tables_from_bytes(b: &[u8], n: usize) -> Option<Vec<Gate3>> {
 // 2 = B_L, 3 = B_R. Each matrix is (row0, row1).
 const S1: (u8, u8) = (0b0111, 0b1001);
 const S2: (u8, u8) = (0b1001, 0b1110);
-const RP: [[(u8, u8); 2]; 2] = [[(0b0100, 0b0010), (0b0100, 0)], [(0, 0b0010), (0, 0)]];
+// Rp[s][t] = ((¬s)·B_L, (¬t)·A_R): [[(0b0100, 0b0010), (0b0100, 0)], [(0, 0b0010), (0, 0)]].
 
+/// R_st = r0·S1 ⊕ r1·S2 ⊕ Rp[s][t], by masks: s and t are colour bits, so no
+/// table is indexed by them.
 #[inline]
 fn r_matrix(r0: bool, r1: bool, s: bool, t: bool) -> (u8, u8) {
-    let m = |b: bool| if b { 0xffu8 } else { 0 };
-    let rp = RP[s as usize][t as usize];
+    let m = |b: bool| (b as u8).wrapping_neg();
     (
-        (m(r0) & S1.0) ^ (m(r1) & S2.0) ^ rp.0,
-        (m(r0) & S1.1) ^ (m(r1) & S2.1) ^ rp.1,
+        (m(r0) & S1.0) ^ (m(r1) & S2.0) ^ (m(!s) & 0b0100),
+        (m(r0) & S1.1) ^ (m(r1) & S2.1) ^ (m(!t) & 0b0010),
     )
 }
 
@@ -212,35 +360,36 @@ fn apply_row(row: u8, v: &[u64; 4]) -> u64 {
     m64(row & 1 != 0) & v[0] ^ m64(row & 2 != 0) & v[1] ^ m64(row & 4 != 0) & v[2] ^ m64(row & 8 != 0) & v[3]
 }
 
+/// Gate tweak `3·gid + slot` (gid = the global AND index; below 2^63, so
+/// never a row tweak).
 #[inline]
-fn tw3(gid: u128, slot: u128) -> Block {
-    blk(gid * 3 + slot)
+fn tw3(gid: u64, slot: u64) -> u64 {
+    assert!(gid < 1 << 61, "gate index out of range");
+    gid * 3 + slot
 }
 
-/// Hash for three-halves: TCCR, 64-bit half (low bits) plus one extra bit (bit 127).
+/// Hash for three-halves: 64-bit half (low bits) plus one extra bit (bit 127).
 #[inline]
-fn split_h(h: Block) -> (u64, bool) {
-    let x = u(h);
+fn split_h(x: u128) -> (u64, bool) {
     (x as u64, (x >> 127) & 1 == 1)
 }
 
 /// Garbles one AND gate. `a0`, `b0`: zero-labels; returns the output
 /// zero-label and the gate. `dice`: two fresh random bits.
 #[inline]
-pub fn and_garble3(c: &FixedKeyAes, a0: Block, b0: Block, delta: Block, gid: u128, dice: [bool; 2]) -> (Block, Gate3) {
+pub fn and_garble3(hg: &HashG, a0: Block, b0: Block, delta: Block, gid: u64, dice: [bool; 2]) -> (Block, Gate3) {
     let d = u(delta);
     let (a0, b0) = (u(a0), u(b0));
     let pa = a0 & 1 == 1;
     let pb = b0 & 1 == 1;
     // Colour-0 labels.
-    let a_s = a0 ^ if pa { d } else { 0 };
-    let b_s = b0 ^ if pb { d } else { 0 };
+    let a_s = a0 ^ (m128(pa) & d);
+    let b_s = b0 ^ (m128(pb) & d);
     let x = a_s ^ b_s;
     let t0 = tw3(gid, 0);
     let t1 = tw3(gid, 1);
     let t2 = tw3(gid, 2);
-    let mut h = [blk(a_s), blk(a_s ^ d), blk(b_s), blk(b_s ^ d), blk(x), blk(x ^ d)];
-    c.tccr_many(&[t0, t0, t1, t1, t2, t2], &mut h);
+    let h = hg.h_many([a_s, a_s ^ d, b_s, b_s ^ d, x, x ^ d], [t0, t0, t1, t1, t2, t2]);
     let [ha0, ha1, hb0, hb1, hx0, hx1] = h.map(split_h);
 
     let dh = halves(d);
@@ -249,8 +398,8 @@ pub fn and_garble3(c: &FixedKeyAes, a0: Block, b0: Block, delta: Block, gid: u12
         let r0 = dice[0] ^ (s & !pa) ^ ((s ^ t) & (pa ^ pb));
         let r1 = dice[1] ^ (t & !pb) ^ ((s ^ t) & (pa ^ pb));
         let (row0, row1) = r_matrix(r0, r1, s, t);
-        let ah = halves(a_s ^ if s { d } else { 0 });
-        let bh = halves(b_s ^ if t { d } else { 0 });
+        let ah = halves(a_s ^ (m128(s) & d));
+        let bh = halves(b_s ^ (m128(t) & d));
         let v = [ah[0], ah[1], bh[0], bh[1]];
         let val = (s ^ pa) & (t ^ pb);
         [apply_row(row0, &v) ^ (m64(val) & dh[0]), apply_row(row1, &v) ^ (m64(val) & dh[1])]
@@ -285,12 +434,11 @@ pub fn and_garble3(c: &FixedKeyAes, a0: Block, b0: Block, delta: Block, gid: u12
 }
 
 #[inline]
-pub fn and_eval3(c: &FixedKeyAes, a: Block, b: Block, gate: &Gate3, gid: u128) -> Block {
+pub fn and_eval3(hg: &HashG, a: Block, b: Block, gate: &Gate3, gid: u64) -> Block {
     let (au, bu) = (u(a), u(b));
     let s = au & 1 == 1;
     let t = bu & 1 == 1;
-    let mut h = [a, b, blk(au ^ bu)];
-    c.tccr_many(&[tw3(gid, 0), tw3(gid, 1), tw3(gid, 2)], &mut h);
+    let h = hg.h_many([au, bu, au ^ bu], [tw3(gid, 0), tw3(gid, 1), tw3(gid, 2)]);
     let [ha, hb, hx] = h.map(split_h);
     let z = |k: u8| (gate.z >> k) & 1 == 1;
     let r0 = z(0) ^ (s & z(2)) ^ ((s ^ t) & z(4)) ^ ha.1 ^ hx.1;
@@ -328,27 +476,55 @@ pub fn and_gates(circ: &Circuit) -> Vec<(usize, usize, usize)> {
 }
 
 /// Garbles `circ` (three-halves); returns the zero-label of every feed and the
-/// tables. `rng` supplies the per-gate dicing bits.
+/// tables. `rng` supplies the per-gate dicing bits. Gate tweaks use the
+/// global AND index.
 pub fn garble<R: rand::Rng + ?Sized>(
     circ: &Circuit,
+    hg: &HashG,
     delta: Block,
     in_keys: &[Block],
-    phase: usize,
     rng: &mut R,
 ) -> (Vec<Block>, Vec<Gate3>) {
-    let cipher = &*FIXED_KEY_AES;
+    garble_impl(circ, hg, delta, in_keys, rng, |_| (false, false))
+}
+
+/// A garbler that deviates per AND gate (tests): `dev(and index)` returns
+/// (shift A's zero-label by Δ: the gate becomes `(¬A)∧B`; complement the
+/// output zero-label: the gate becomes a NAND). Every label stays valid.
+#[cfg(test)]
+pub(crate) fn garble_dev<R: rand::Rng + ?Sized>(
+    circ: &Circuit,
+    hg: &HashG,
+    delta: Block,
+    in_keys: &[Block],
+    rng: &mut R,
+    dev: impl Fn(usize) -> (bool, bool),
+) -> (Vec<Block>, Vec<Gate3>) {
+    garble_impl(circ, hg, delta, in_keys, rng, dev)
+}
+
+#[inline(always)]
+fn garble_impl<R: rand::Rng + ?Sized>(
+    circ: &Circuit,
+    hg: &HashG,
+    delta: Block,
+    in_keys: &[Block],
+    rng: &mut R,
+    dev: impl Fn(usize) -> (bool, bool),
+) -> (Vec<Block>, Vec<Gate3>) {
     let mut k = vec![Block::ZERO; circ.feed_count()];
     k[..in_keys.len()].copy_from_slice(in_keys);
     let mut tables = Vec::with_capacity(circ.and_count());
-    let base = gid_base(phase);
     for g in circ.gates() {
         match g {
             Gate::Xor { x, y, z } => k[z.id()] = k[x.id()] ^ k[y.id()],
             Gate::And { x, y, z } => {
-                let gid = base + tables.len() as u128;
+                let gid = tables.len();
+                let (shift_a, flip_out) = dev(gid);
                 let r: u8 = rng.random();
-                let (z0, t) = and_garble3(cipher, k[x.id()], k[y.id()], delta, gid, [r & 1 == 1, r & 2 == 2]);
-                k[z.id()] = z0;
+                let a0 = k[x.id()] ^ sel(shift_a, delta);
+                let (z0, t) = and_garble3(hg, a0, k[y.id()], delta, gid as u64, [r & 1 == 1, r & 2 == 2]);
+                k[z.id()] = z0 ^ sel(flip_out, delta);
                 tables.push(t);
             }
             Gate::Inv { x, z } => k[z.id()] = k[x.id()] ^ delta,
@@ -359,33 +535,30 @@ pub fn garble<R: rand::Rng + ?Sized>(
 }
 
 /// Evaluates; returns the active label of every feed.
-pub fn evaluate(circ: &Circuit, in_labels: &[Block], tables: &[Gate3], phase: usize) -> Vec<Block> {
+pub fn evaluate(circ: &Circuit, hg: &HashG, in_labels: &[Block], tables: &[Gate3]) -> Vec<Block> {
     let mut l = vec![Block::ZERO; circ.feed_count()];
     l[..in_labels.len()].copy_from_slice(in_labels);
-    evaluate_range(circ, &mut l, tables, 0..circ.gates().len(), 0, phase);
+    evaluate_range(circ, hg, &mut l, tables, 0..circ.gates().len(), 0);
     l
 }
 
 /// Evaluates the gates `gates` (a stage) in place: `l` holds the active label
 /// of every feed computed so far, `and_start` is the index of the stage's
-/// first AND gate in `tables`.
+/// first AND gate in `tables` (and its gate tweak).
 pub fn evaluate_range(
     circ: &Circuit,
+    hg: &HashG,
     l: &mut [Block],
     tables: &[Gate3],
     gates: std::ops::Range<usize>,
     and_start: usize,
-    phase: usize,
 ) {
-    let cipher = &*FIXED_KEY_AES;
-    let base = gid_base(phase);
     let mut a = and_start;
     for g in &circ.gates()[gates] {
         match g {
             Gate::Xor { x, y, z } => l[z.id()] = l[x.id()] ^ l[y.id()],
             Gate::And { x, y, z } => {
-                let gid = base + a as u128;
-                l[z.id()] = and_eval3(cipher, l[x.id()], l[y.id()], &tables[a], gid);
+                l[z.id()] = and_eval3(hg, l[x.id()], l[y.id()], &tables[a], a as u64);
                 a += 1;
             }
             // The evaluator's label does not change under INV (the garbler
@@ -575,7 +748,7 @@ pub fn dvzk_verifier_acc(
 
 /// N's consistency-check material for one stage: `ands`, `t_mac` and `pw` are
 /// the stage's AND gates, `base` its row wires ([`StageShape::rows`]), `gates`
-/// the stage's gates, and `phase` the stage index (it separates the row-hash
+/// the stage's gates, and `stage` the stage index (it separates the row-hash
 /// tweaks of the stages).
 ///
 /// For AND gate k = (i, j → o) the relation to check is
@@ -606,8 +779,8 @@ pub struct CheckMaterial {
 pub fn check_material(
     circ: &Circuit,
     gates: std::ops::Range<usize>,
-    salt: u128,
-    phase: usize,
+    rh: &RowHash,
+    stage: usize,
     ands: &[(usize, usize, usize)],
     base: &[usize],
     k: &[Block],
@@ -650,18 +823,15 @@ pub fn check_material(
             Gate::And { .. } => {}
         }
     }
-    let cipher = &*FIXED_KEY_AES;
     let mut rows = Vec::with_capacity(base.len());
-    let mut y_n = a_n;
+    let mut y_n = lo64(a_n);
     for (idx, &b) in base.iter().enumerate() {
         let p0 = k[b] ^ sel(lam[b], delta_a);
-        let tw = check_tweak(salt, phase, idx);
-        let h0 = cipher.tccr(tw, p0);
-        let h1 = cipher.tccr(tw, p0 ^ delta_a);
-        rows.push(lo64(h0 ^ h1 ^ x.get(b)));
+        let [h0, h1] = rh.row2([p0, p0 ^ delta_a], stage, idx);
+        rows.push(h0 ^ h1 ^ lo64(x.get(b)));
         y_n ^= h0;
     }
-    CheckMaterial { rows, y_n: lo64(y_n) }
+    CheckMaterial { rows, y_n }
 }
 
 /// The values X_w of one stage's check material, by feed id.
@@ -721,7 +891,7 @@ impl Drop for StageX {
     }
 }
 
-/// C's preprocessed key material for the check of one phase:
+/// C's preprocessed key material for the check of one stage:
 /// `static = Σ χ^k (K_o ⊕ K_t)`, and per gate `(χ^k, χ^k K_j, χ^k K_i)` so
 /// that the online part is XORs plus one multiplication.
 pub struct CheckKeys {
@@ -753,8 +923,8 @@ impl Drop for CheckKeys {
 /// C, online: runs the consistency check over the active labels `l`.
 /// Returns true iff `Y_N ⊕ Y_C = K_tot`.
 pub fn run_check(
-    salt: u128,
-    phase: usize,
+    rh: &RowHash,
+    stage: usize,
     ands: &[(usize, usize, usize)],
     base: &[usize],
     l: &[Block],
@@ -772,11 +942,10 @@ pub fn run_check(
         c_sum ^= sel(lo ^ (li & lj), c);
     }
     k_tot ^= c_sum.gfmul(delta_b);
-    let cipher = &*FIXED_KEY_AES;
     let mut y_c = 0u64;
     for (idx, &b) in base.iter().enumerate() {
         let lb = l[b];
-        y_c ^= lo64(cipher.tccr(check_tweak(salt, phase, idx), lb)) ^ (m64(lb.lsb()) & rows[idx]);
+        y_c ^= rh.row(lb, stage, idx) ^ (m64(lb.lsb()) & rows[idx]);
     }
     (y_n ^ y_c) == lo64(k_tot)
 }

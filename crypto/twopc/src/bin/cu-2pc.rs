@@ -14,7 +14,7 @@
 //! ```
 //!
 //! A peer that speaks another version of the two-party key schedule (its
-//! first bytes are not `routstr-2pc/split-public-1\n`) is reported as
+//! first bytes are not `routstr-2pc/split-public-2\n`) is reported as
 //! `{"ev":"error","code":"twopc_version_mismatch","msg":"twopc_version_mismatch: .."}`,
 //! one line `twopc_version_mismatch` on stderr, and exit status 3.
 //!

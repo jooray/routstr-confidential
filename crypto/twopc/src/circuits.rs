@@ -1,4 +1,4 @@
-//! The key-schedule circuit of `split-public-1` (`Split`, one circuit in
+//! The key-schedule circuit of `split-public-2` (`Split`, one circuit in
 //! five stages) and the public HMAC message blocks around it.
 //!
 //! Wire conventions: a byte string is a `Vec<W>` with 8 wires per byte, least
@@ -344,7 +344,8 @@ pub(crate) fn derived_es() -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// The split key schedule (`split-public-1`).
+// The split key schedule (`split-public-2`; the circuit is that of
+// `split-public-1`).
 //
 // One circuit, evaluated in five stages (A1, A2, A3, B1, B2). The garbled
 // circuit computes only the HMAC key-pad states `IS_k = f(IV, k ⊕ ipad)`,
@@ -506,7 +507,7 @@ fn build_split() -> Split {
     }
 }
 
-/// The circuit of `split-public-1`.
+/// The circuit of `split-public-2` (unchanged from `split-public-1`).
 pub static SPLIT: LazyLock<Split> = LazyLock::new(build_split);
 
 /// The single padded block of an HMAC inner hash over `msg` (the key block

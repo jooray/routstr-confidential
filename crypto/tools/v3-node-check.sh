@@ -301,7 +301,7 @@ o = json.load(open(sys.argv[1]))
 model, fee, abandon, deposit, idle, image_model, no_images = sys.argv[2:9]
 problems = []
 if model not in o.get("price_list", {}): problems.append(f"no price for {model}")
-if o.get("v") != 3 or o.get("twopc") != "split-public-1": problems.append("not a v3 offer")
+if o.get("v") != 3 or o.get("twopc") != "split-public-2": problems.append("not a v3 offer")
 want_http = sys.argv[9].split(",")
 if o.get("http") != want_http or ("2" in want_http) != isinstance(o.get("h2"), dict): problems.append(f"http is {o.get('http')}")
 if not o.get("sig"): problems.append("unsigned")

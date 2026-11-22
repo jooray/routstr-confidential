@@ -1,4 +1,4 @@
-//! Benchmark of the two-party key schedule (`split-public-1`: node-only
+//! Benchmark of the two-party key schedule (`split-public-2`: node-only
 //! authenticated garbling, split key schedule) on emulated links (`zkbench::transport::emulated_link`:
 //! per-direction rate, pipelined one-way delay).
 //!

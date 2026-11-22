@@ -308,9 +308,14 @@ async fn against_first_bytes(first: &[u8]) -> (Vec<Value>, Vec<u8>, std::process
 /// status 3.
 #[tokio::test(flavor = "multi_thread")]
 async fn cu_2pc_reports_a_version_mismatch() {
-    assert_eq!(twopc::VERSION_TAG, b"routstr-2pc/split-public-1\n");
+    assert_eq!(twopc::VERSION_TAG, b"routstr-2pc/split-public-2\n");
     let v2_first_frame = [1u8, 0, 0, 0, 16, 0xaa, 0xbb, 0xcc];
-    for first in [&b"routstr-2pc/split-proven-1\n"[..], &v2_first_frame[..], &b"routstr-2pc/split-public-2\n"[..]] {
+    for first in [
+        &b"routstr-2pc/split-public-1\n"[..],
+        &b"routstr-2pc/split-proven-1\n"[..],
+        &v2_first_frame[..],
+        &b"routstr-2pc/split-public-3\n"[..],
+    ] {
         let (evs, net, status) = against_first_bytes(first).await;
         assert!(net.starts_with(twopc::VERSION_TAG), "cu-2pc writes the tag first: {:?}", &net[..net.len().min(32)]);
         assert_eq!(status.code(), Some(3), "{evs:?}");

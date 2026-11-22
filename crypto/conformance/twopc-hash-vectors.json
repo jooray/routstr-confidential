@@ -1,0 +1,343 @@
+{
+  "conventions": "a 128-bit value is a u128 whose 16 bytes are little-endian; integers are hex, most significant digit first; byte strings are hex in order; GF(2^64) = GF(2)[x]/(x^64+x^4+x^3+x+1), bit i = coefficient of x^i; field elements are integers mod the P-256 prime",
+  "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments and the masked input",
+  "gate": {
+    "a0": "00112233445566778899aabbccddeeff",
+    "b0": "fedcba98765432100f1e2d3c4b5a6979",
+    "delta": "243f6a8885a308d313198a2e03707345",
+    "dice": [
+      1,
+      0
+    ],
+    "eval": [
+      {
+        "a": 0,
+        "b": 0,
+        "label_a": "00112233445566778899aabbccddeeff",
+        "label_b": "fedcba98765432100f1e2d3c4b5a6979",
+        "out": "09406465d6b465ae0df893208cdefd14"
+      },
+      {
+        "a": 0,
+        "b": 1,
+        "label_a": "00112233445566778899aabbccddeeff",
+        "label_b": "dae3d010f3f73ac31c07a712482a1a3c",
+        "out": "09406465d6b465ae0df893208cdefd14"
+      },
+      {
+        "a": 1,
+        "b": 0,
+        "label_a": "242e48bbc1f66ea49b802095cfad9dba",
+        "label_b": "fedcba98765432100f1e2d3c4b5a6979",
+        "out": "09406465d6b465ae0df893208cdefd14"
+      },
+      {
+        "a": 1,
+        "b": 1,
+        "label_a": "242e48bbc1f66ea49b802095cfad9dba",
+        "label_b": "dae3d010f3f73ac31c07a712482a1a3c",
+        "out": "2d7f0eed53176d7d1ee1190e8fae8e51"
+      }
+    ],
+    "g": [
+      "53f61b086b22a052",
+      "465e7dec83c606c1",
+      "3b1b00c37d0339d2"
+    ],
+    "gid": 12345,
+    "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+    "k0": "09406465d6b465ae0df893208cdefd14",
+    "z": 28
+  },
+  "gf64_mul": [
+    {
+      "a": "0000000000000000",
+      "b": "0123456789abcdef",
+      "product": "0000000000000000"
+    },
+    {
+      "a": "8000000000000000",
+      "b": "0000000000000002",
+      "product": "000000000000001b"
+    },
+    {
+      "a": "ffffffffffffffff",
+      "b": "ffffffffffffffff",
+      "product": "5555555555555513"
+    },
+    {
+      "a": "0123456789abcdef",
+      "b": "fedcba9876543210",
+      "product": "48827ab55d976fa0"
+    },
+    {
+      "a": "0000000000000001",
+      "b": "deadbeefcafef00d",
+      "product": "deadbeefcafef00d"
+    },
+    {
+      "a": "000000000000001b",
+      "b": "8000000000000000",
+      "product": "80000000000000af"
+    },
+    {
+      "a": "0000000000000002",
+      "b": "0000000000000002",
+      "product": "0000000000000004"
+    },
+    {
+      "a": "9e3779b97f4a7c15",
+      "b": "c2b2ae3d27d4eb4f",
+      "product": "ccd31c13bec2d95d"
+    }
+  ],
+  "h_g": [
+    {
+      "aes_in": "ffeeddccbbaa99887766554433221100",
+      "aes_out": "1b872378795f4ffd772855fc87ca964d",
+      "bit": 0,
+      "gid": 0,
+      "h_g": "4db48ee174ffe499ec7c0a0ee1985afe",
+      "half": "ec7c0a0ee1985afe",
+      "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+      "slot": 0,
+      "tau": 0,
+      "u": "00000000000000000000000000000000",
+      "x": "00112233445566778899aabbccddeeff",
+      "y": "00112233445566778899aabbccddeeff"
+    },
+    {
+      "aes_in": "7f797b797f797b7987b8e9de4b742512",
+      "aes_out": "83485987012d4e9d26e1e1ca81ad3bad",
+      "bit": 1,
+      "gid": 5,
+      "h_g": "89714516773290286fb8dfff75afba7d",
+      "half": "6fb8dfff75afba7d",
+      "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+      "slot": 1,
+      "tau": 16,
+      "u": "123456789abcdef0f1e2d3c4b5a69780",
+      "x": "00112233445566778899aabbccddeeff",
+      "y": "1225744bdee9b887797b797f797b797f"
+    },
+    {
+      "aes_in": "ca2c3928f932eff5354c40477cd83630",
+      "aes_out": "dfe1c0df06651dcee664f97e9f961e77",
+      "bit": 0,
+      "gid": 479021,
+      "h_g": "17732667f079fc8c25c300f48fb2b850",
+      "half": "25c300f48fb2b850",
+      "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+      "slot": 2,
+      "tau": 1437065,
+      "u": "3027fa4f03152a427d769842e4e4c235",
+      "x": "00112233445566778899aabbccddeeff",
+      "y": "3036d87c47404c35f5ef32f928392cca"
+    },
+    {
+      "aes_in": "ffeeddccbbaa99887766554433221100",
+      "aes_out": "2fd5b87f9abb67558a9fee7f666d29f4",
+      "bit": 1,
+      "gid": 0,
+      "h_g": "f40b2900f74453644454eeede60308ca",
+      "half": "4454eeede60308ca",
+      "hparams": "c5a821ac70d569762878961f3b1942b8886b06fc37abc9cbd362668c4a384ad6",
+      "slot": 0,
+      "tau": 0,
+      "u": "00000000000000000000000000000000",
+      "x": "00112233445566778899aabbccddeeff",
+      "y": "00112233445566778899aabbccddeeff"
+    },
+    {
+      "aes_in": "60c3bb0a132e3aec43de33844c918bbc",
+      "aes_out": "c7725192c771493eac47adba1fd37548",
+      "bit": 0,
+      "gid": 5,
+      "h_g": "3162f186b2cafb31e63d2de18726f41c",
+      "half": "e63d2de18726f41c",
+      "hparams": "c5a821ac70d569762878961f3b1942b8886b06fc37abc9cbd362668c4a384ad6",
+      "slot": 1,
+      "tau": 16,
+      "u": "bc9ab37fc066b83464a384a8c6662d9f",
+      "x": "00112233445566778899aabbccddeeff",
+      "y": "bc8b914c8433de43ec3a2e130abbc360"
+    },
+    {
+      "aes_in": "8dd2e27d028e7372d2eb2b68522eb9ed",
+      "aes_out": "4a5d48428fe9fb0f181137a1714fa8a2",
+      "bit": 0,
+      "gid": 479021,
+      "h_g": "79da13d57160c6a7eb1cf58bb98df850",
+      "half": "eb1cf58bb98df850",
+      "hparams": "c5a821ac70d569762878961f3b1942b8886b06fc37abc9cbd362668c4a384ad6",
+      "slot": 2,
+      "tau": 1437065,
+      "u": "eda80c612c7e8da5faea24b9b13f3c72",
+      "x": "00112233445566778899aabbccddeeff",
+      "y": "edb92e52682bebd272738e027de2d28d"
+    }
+  ],
+  "input_label_commitment": [
+    {
+      "com": "0fccf73249dc5a3283c8b11f03f299c9",
+      "in_salt": "404142434445464748494a4b4c4d4e4f",
+      "label": "ffeeddccbbaa99887766554433221100",
+      "p": 1,
+      "w": 0
+    },
+    {
+      "com": "40bfa0806e2f8179092578ee0b39f8a7",
+      "in_salt": "404142434445464748494a4b4c4d4e4f",
+      "label": "feeeddccbbaa99887766554433221100",
+      "p": 0,
+      "w": 2815
+    },
+    {
+      "com": "4d0b9cf2ddc4daf593308ba0c68d2ce0",
+      "in_salt": "505152535455565758595a5b5c5d5e5f",
+      "label": "feeeddccbbaa99887766554433221100",
+      "p": 0,
+      "w": 17
+    },
+    {
+      "com": "1f4111269ebb18765645634548bd8e7d",
+      "in_salt": "505152535455565758595a5b5c5d5e5f",
+      "label": "ffeeddccbbaa99887766554433221100",
+      "p": 1,
+      "w": 512
+    }
+  ],
+  "masked_input": [
+    {
+      "delta": "dea89a799915db0d2aefde4e23cc4e4737b5d99594f09a348d0841ceebb5f1bc",
+      "delta_le": "bcf1b5ebce41088d349af09495d9b537474ecc234edeef2a0ddb1599799aa8de",
+      "rho": "0ddbc6c1d81a078b803040a615f91362642e985d2737a945535b86da2681952f",
+      "sum": "0a6a60816fd6c3e5b58b15424449bb5d319b4c40727e8d8d20dcbc7351b970a9",
+      "x_c": "1de5ff44fea6e14e0a6af64e0a8459b395b6da4eb6564a134078f3ca3f81e9bd",
+      "x_c_prime": "fc8e99be97bcbc5b355ad49c2e50a7facd6cb3e44b46e447cd8135992b37db79",
+      "x_n": "ec84613b712fe298ab201ef439c561a99be471f2bc284379e063c8a9123786eb"
+    },
+    {
+      "delta": "30f2c5f75ccefc2352a432f6bba396190eb917f3d8ad9330a257017328c0e7a4",
+      "delta_le": "a4e7c028730157a23093add8f317b90e1996a3bbf632a45223fcce5cf7c5f230",
+      "rho": "d0ee9ba7d4de441e4f52cd1a14e2daf6d52edb9927a83eb48d8bd1677c8cbba8",
+      "sum": "444bd1b971e185f33914c59360c7a47db5e8fc97499357384e71092ffd856783",
+      "x_c": "426a7019403445b2971dc5829041336dd201090b493d85531e8e36555837c436",
+      "x_c_prime": "735d36109d0341d5e9c1f8794be4c986e0ba20ff21eb1883c0e537c880f8abda",
+      "x_n": "01e161a031ad4040a1f70010d086710fe3e7f38c0055d1e52fe2d2daa54da34d"
+    },
+    {
+      "delta": "d02a1da9a6b788bf982f48fea14c6a27c0ca7eeff44a6124e97bd65cadd452d1",
+      "delta_le": "d152d4ad5cd67be924614af4ef7ecac0276a4ca1fe482f98bf88b7a6a91d2ad0",
+      "rho": "10d496d21b9a7aa6f5d9f1cb7b88509fda675cb0e82647987717731f49b47ebb",
+      "sum": "d1489053265dbdffe7d1d03230ba3b5f7741e98979c4ff23cbf228294c17d433",
+      "x_c": "f049dbd6640bba9a59c8956813e58097dc100de99d5456666b5edead548f02a6",
+      "x_c_prime": "c073f9810ac34358f1f7de66b531eabf9cda8cd8919eb78b54dab50a02635578",
+      "x_n": "e0feb47bc25203668e093aca1cd4bac79b31dba0dc70a8bd6093497bf788d18c"
+    }
+  ],
+  "row": [
+    {
+      "aes_in": "7e299be3d86c2b81c4e40a55293043fa",
+      "aes_out": "0eccedbc26d24057dc7956767bd47e26",
+      "h_g": "7e299be3d86c2b81c4e40a55293043fa",
+      "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+      "idx": 0,
+      "row": "dc7956767bd47e26",
+      "rparams": "8ca93c8d10659702fca83b6bcf5486fca5e60c1a8ffe57551dba1e2c5395a41f",
+      "stage": 0,
+      "tau": "0000000000000000",
+      "tau_row": "8000000000000000",
+      "u_r": "00000000000000000000000000000000",
+      "x": "00112233445566778899aabbccddeeff"
+    },
+    {
+      "aes_in": "5af09ecc402adb25da9475fa43fe0297",
+      "aes_out": "bb6cf335be7053503b5c2b5394fd4ca8",
+      "h_g": "08034b4806276ed131da5db121eb5eec",
+      "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+      "idx": 70000,
+      "row": "3b5c2b5394fd4ca8",
+      "rparams": "8ca93c8d10659702fca83b6bcf5486fca5e60c1a8ffe57551dba1e2c5395a41f",
+      "stage": 3,
+      "tau": "0000000300011170",
+      "tau_row": "8000000300011170",
+      "u_r": "52f3d584460db5f4eb4e284b62155c7b",
+      "x": "00112233445566778899aabbccddeeff"
+    },
+    {
+      "aes_in": "589b632376c3abeddd7672e25e1b5038",
+      "aes_out": "9f5841a77f55574792c8428140b0f3f4",
+      "h_g": "247d9d4130863f32421b948d548ecca4",
+      "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+      "idx": 70000,
+      "row": "92c8428140b0f3f4",
+      "rparams": "8ca93c8d10659702fca83b6bcf5486fca5e60c1a8ffe57551dba1e2c5395a41f",
+      "stage": 0,
+      "tau": "0000000000011170",
+      "tau_row": "8000000000011170",
+      "u_r": "7ce6fe62464594df9f6de66f0a959c9c",
+      "x": "00112233445566778899aabbccddeeff"
+    },
+    {
+      "aes_in": "5745401bab596c0d3a200ed895b27bef",
+      "aes_out": "3260a446d22a392971f915e148bd83bc",
+      "h_g": "79506bfdab114d264e03c0fcfd32bb08",
+      "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+      "idx": 0,
+      "row": "71f915e148bd83bc",
+      "rparams": "8ca93c8d10659702fca83b6bcf5486fca5e60c1a8ffe57551dba1e2c5395a41f",
+      "stage": 3,
+      "tau": "0000000300000000",
+      "tau_row": "8000000300000000",
+      "u_r": "2e152be60048212b7423ce246880c0e7",
+      "x": "00112233445566778899aabbccddeeff"
+    }
+  ],
+  "row_params": [
+    {
+      "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+      "k_r": "8ca93c8d10659702fca83b6bcf5486fc",
+      "rparams": "8ca93c8d10659702fca83b6bcf5486fca5e60c1a8ffe57551dba1e2c5395a41f",
+      "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "u_r1": "5557fe8f1a0ce6a5",
+      "u_r2": "1fa495532c1eba1d"
+    },
+    {
+      "hparams": "c5a821ac70d569762878961f3b1942b8886b06fc37abc9cbd362668c4a384ad6",
+      "k_r": "96b05d2115f702511a5ea96abe473aa4",
+      "rparams": "96b05d2115f702511a5ea96abe473aa4c1f1165f6cb485be1a221e5a4eabc49f",
+      "seed": "adac297385ee77059887f8a1ef10a331b57dabda5ad6a1313fca9a84a43e24cb",
+      "u_r1": "be85b46c5f16f1c1",
+      "u_r2": "9fc4ab4e5a1e221a"
+    }
+  ],
+  "sigma": [
+    {
+      "sigma": "000000000000001b0000000000000002",
+      "y": "80000000000000000000000000000001"
+    },
+    {
+      "sigma": "000000000000001b000000000000001b",
+      "y": "80000000000000008000000000000000"
+    },
+    {
+      "sigma": "00000000000000000000000000000000",
+      "y": "00000000000000000000000000000000"
+    },
+    {
+      "sigma": "02468acf13579bdefdb97530eca8643b",
+      "y": "0123456789abcdeffedcba9876543210"
+    }
+  ],
+  "xtime": [
+    {
+      "a": "8000000000000000",
+      "xtime": "000000000000001b"
+    },
+    {
+      "a": "0123456789abcdef",
+      "xtime": "02468acf13579bde"
+    }
+  ]
+}

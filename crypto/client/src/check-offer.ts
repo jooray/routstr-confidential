@@ -11,7 +11,7 @@ import { errText, shown, termSafe } from './term.ts'
 
 /** The protocol version, and the key-schedule protocol this client implements (§4). */
 export const PROTO = 3
-export const TWOPC = 'split-public-1'
+export const TWOPC = 'split-public-2'
 
 /** An offer this client does not use; `code` is the driver's exit code (4, or 6 for an older node). */
 export class OfferRefused extends Error {

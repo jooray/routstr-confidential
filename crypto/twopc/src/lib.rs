@@ -1,4 +1,4 @@
-//! Two-party TLS 1.3 key schedule, version `split-public-1` (protocol v3,
+//! Two-party TLS 1.3 key schedule, version `split-public-2` (protocol v3,
 //! `PROTOCOL-V3.md` §4; `docs/TWOPC-DESIGN.md`, `docs/TWOPC-NODE-GARBLING.md`).
 //! Only N garbles (authenticated garbling with garbler-held masks and an
 //! IT-MAC consistency check), and the garbled circuit holds only the part of
@@ -55,18 +55,26 @@
 //! that stage's AND gates, before any output of the stage is decoded, reported
 //! or used.
 //!
-//! * **Preprocess.** N garbles the circuit and streams the tables. Random
-//!   COTs with C as sender (Δ_B; Ferret over KOS) authenticate N's masks and
-//!   the AND products (`Fix`). C sends its challenge seed only after the
-//!   tables and commitments arrived. N then sends the product check, the
+//! * **Preprocess.** C sends a salt. N draws the garbling hash's parameters
+//!   ([`gc::HashG`]), garbles the circuit, and streams the parameters, then
+//!   the tables. Random COTs with C as sender (Δ_B; Ferret over KOS)
+//!   authenticate N's masks and the AND products (`Fix`). N's own input to
+//!   the circuit is a random mask ρ < p: N sends its labels, and salted
+//!   commitments to both labels of every other input wire (C's share, the
+//!   digests). C sends its challenge seed only after all of that arrived, so
+//!   N has fixed everything that determines C's pointer bits before it knows
+//!   the challenge. The check rows are keyed by the seed ([`gc::RowHash`]).
+//!   N then sends the product check, the
 //!   opened masks (C's input wires, the digest input wires, every output that
 //!   C may decode) with one hash of their MACs, per stage the check rows and
 //!   `Y_N`, and the *label-check pairs*: for every output wire that C reports
 //!   to N, two salted 128-bit hashes of its two labels. KOS COTs with N as
 //!   sender (Δ_A) cover C's 256 input bits.
-//! * **Online, per stage.** C gets its input labels (stage A1: `d = x ⊕ b`,
-//!   then N's corrections; later stages: the digest labels), checks their
-//!   pointer bits, evaluates, runs the stage's consistency check, checks the
+//! * **Online, per stage.** Stage A1: N sends `δ = x_N − ρ mod p` and C
+//!   uses `x_C' = x_C + δ mod p` as its input (the circuit adds ρ, so it gets
+//!   `x_C + x_N`), sends `d = x_C' ⊕ b` and gets N's corrections; later
+//!   stages: the digest labels. C checks every input label's pointer bit and
+//!   its commitment, evaluates, runs the stage's consistency check, checks the
 //!   label-check pair of every output wire it is about to report, and only
 //!   then sends one message: the pointer bits of the outputs N may know and
 //!   one hash over their labels. N checks the hash (C cannot report a wrong
@@ -145,7 +153,7 @@ pub enum Error {
     /// version of the two-party key schedule (or another protocol). The
     /// field is what was read up to the first differing byte, in hex. The
     /// message starts with the error code `twopc_version_mismatch`.
-    #[error("twopc_version_mismatch: this side speaks routstr-2pc/split-public-1, the peer's first bytes were 0x{0}")]
+    #[error("twopc_version_mismatch: this side speaks routstr-2pc/split-public-2, the peer's first bytes were 0x{0}")]
     VersionMismatch(String),
 }
 
@@ -239,7 +247,7 @@ pub struct CircuitStats {
 pub fn circuit_stats() -> CircuitStats {
     let sp = &*circuits::SPLIT;
     CircuitStats {
-        name: "split-public-1",
+        name: "split-public-2",
         and_gates: sp.circ.and_count(),
         xor_gates: sp.circ.xor_count(),
         compressions: sp.compressions,
@@ -286,8 +294,45 @@ pub(crate) enum Cheat {
     /// the opened inputs (0..256: C's x share; then the digest inputs).
     LieOpenIn(usize),
     /// N: send a garbage label (right pointer bit) for its first own input
-    /// (stage 0) or for the first digest input of a later stage.
+    /// (stage 0; in preprocessing) or for the first digest input of a later
+    /// stage.
     BadInputLabel(usize),
+    /// N: a third label (right pointer bit) for C's first input wire.
+    BadInputLabelC,
+    /// N: a wrong commitment for the label with pointer bit 1 of the input
+    /// wire at this position of the opened inputs.
+    BadInCom(usize),
+    /// N: sends the tables without the hash parameters before them.
+    OmitHparams,
+    /// N: sends the input-label commitments where its own input labels belong.
+    OmitGl,
+    /// N: sends the input-label commitments 16 bytes short.
+    ShortInCom,
+    /// N: hash parameters with u1 = u2 = 0.
+    DegenerateHparams,
+    /// N: δ ≥ p.
+    DeltaOutOfRange,
+    /// N: garbles the even gates of the first adder as `(¬A)∧B` (their
+    /// violation is N's input bit while the carry is 0), one later gate of
+    /// stage A1 as a NAND, and after the seed solves for the input bits that
+    /// cancel the NAND in the check of stage A1. It can put the solution only
+    /// into δ.
+    AdderSwitch,
+    /// N: as `AdderSwitch`, but in the message order of `split-public-1`:
+    /// its input labels go out after the seed, for the solution (needs a C
+    /// with `DeadCarries(true)`).
+    AdderSwitchLate,
+    /// C: forces the even bits of its input to 1 (every carry the attack
+    /// starts dies at the next gate); with `true`, also sends its seed before
+    /// N's input labels and commitments arrived.
+    DeadCarries(bool),
+    /// N: substitutes its point in ECtF (on the curve: Q_N + G; off it:
+    /// (x2 + 1, y2)).
+    EctfOtherPoint(bool),
+    /// N: feeds 0 to the M2A.
+    EctfZeroC,
+    /// N: adds 1 to its share before stage A1 (in δ).
+    EctfShift,
     /// N: the label of the flipped bit (shifted by Δ_A) for one digest input.
     FlipDigestLabel(usize),
     /// N: valid labels, but of another inner digest (the next block's of the
@@ -297,8 +342,9 @@ pub(crate) enum Cheat {
     KosDelta,
     /// N: add random offsets to every check row of a stage.
     BadRows(usize),
-    /// N: computes the check rows of a stage under a different salt.
-    WrongSalt(usize),
+    /// N: computes the check rows of a stage under a row key derived from
+    /// another seed (one bit flipped).
+    WrongRowKey(usize),
     /// N: flip Y_N of a stage.
     BadYn(usize),
     /// N: the two halves of the label-check pair of one reported wire of a
@@ -331,9 +377,14 @@ struct NState {
     lam_out: Zeroizing<Vec<bool>>,
     /// COT keys under Δ_A for C's inputs.
     cota: SecretBlocks,
+    /// N's garbled input: a uniform ρ < p (little-endian); wiped once δ is sent.
+    rho: Zeroizing<[u8; 32]>,
     /// Decoded values of the reported output groups.
     vals: Vec<Option<Zeroizing<Vec<bool>>>>,
     next: usize,
+    /// Test: the input that cancels the planted violations (`AdderSwitch`).
+    #[cfg(test)]
+    adder_v: Option<Zeroizing<[u8; 32]>>,
 }
 
 /// C's state after preprocessing.
@@ -344,8 +395,19 @@ struct CState {
     ck: Vec<Option<gc::CheckKeys>>,
     rows: Vec<Vec<u64>>,
     y_n: Vec<u64>,
-    /// Per-session salt of the check-row hash (from the challenge seed).
-    salt: u128,
+    /// Salt of the label-check pairs (from the challenge seed).
+    pair_salt: [u8; 16],
+    /// N's hash parameters and the row parameters (from the seed); not
+    /// secret from N, the ciphers are rebuilt from them per stage.
+    hparams: Zeroizing<[u8; 32]>,
+    rparams: Zeroizing<[u8; 32]>,
+    /// Labels of N's garbled input ρ (received before the seed).
+    gl: SecretBlocks,
+    /// Commitments to both labels of each opened input wire, by its position
+    /// in `Lay::open_in` and by pointer bit.
+    in_com: Vec<[[u8; 16]; 2]>,
+    /// C's salt of the input-label commitments.
+    in_salt: [u8; 16],
     /// Opened masks, by input wire / output index (false where not opened).
     lam_in: Vec<bool>,
     lam_out: Vec<bool>,
@@ -359,6 +421,16 @@ struct CState {
     /// Inner digests C computed, waiting for N's labels.
     dig: Vec<Option<Zeroizing<Vec<bool>>>>,
     next: usize,
+}
+
+impl CState {
+    /// Whether `lab` on input wire `w` opens N's commitment for its pointer
+    /// bit (the commitments are indexed by pointer bit, not by value).
+    fn com_ok(&self, w: usize, lab: Block) -> bool {
+        let Some(i) = lay().open_pos[w] else { return false };
+        let p = lab.lsb();
+        in_com(&self.in_salt, w, p, lab) == self.in_com[i][p as usize]
+    }
 }
 
 enum Pre {
@@ -377,7 +449,7 @@ const N_CH: usize = 6;
 /// The version tag: the first bytes each party writes on the transport,
 /// before any multiplexer frame. A peer that reads anything else fails with
 /// [`Error::VersionMismatch`].
-pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-1\n";
+pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-2\n";
 
 /// N streams the first part of the tables (stages A1–A3) once this many
 /// MAC-COT bytes from C arrived (C has N's OT bootstrap messages and is
@@ -396,6 +468,7 @@ const TAG_OPEN: &[u8] = b"routstr-twopc-ag open";
 const TAG_OUT: &[u8] = b"routstr-twopc-split output labels";
 const TAG_CHI: &[u8] = b"routstr-twopc-ag chi";
 const TAG_PAIR: &[u8] = b"routstr-twopc-split label check";
+const TAG_INCOM: &[u8] = b"routstr-twopc-ag input label";
 
 /// COTs under Δ_A: one per bit of C's x-coordinate share.
 const N_COTA: usize = 256;
@@ -412,7 +485,10 @@ struct Lay {
     /// Feed id of output 0.
     out0: usize,
     /// Input wires whose mask is opened to C: its x share, the digest inputs.
+    /// N commits to both labels of each of them before the seed.
     open_in: Vec<usize>,
+    /// Position of an input wire in `open_in`.
+    open_pos: Vec<Option<usize>>,
     /// Per output: index of its label-check pair (the outputs C reports).
     e_idx: Vec<Option<usize>>,
     n_pairs: usize,
@@ -438,6 +514,10 @@ impl Lay {
         for d in &sp.dig {
             open_in.extend(d.clone());
         }
+        let mut open_pos = vec![None; n_in];
+        for (i, &w) in open_in.iter().enumerate() {
+            open_pos[w] = Some(i);
+        }
         let mut e_idx = vec![None; n_out];
         let mut n_pairs = 0;
         for g in &sp.outs {
@@ -459,6 +539,7 @@ impl Lay {
             n_out,
             out0: circ.outputs().start,
             open_in,
+            open_pos,
             e_idx,
             n_pairs,
             mac_fixed,
@@ -518,6 +599,9 @@ pub struct Party {
     timings: Vec<StepTiming>,
     #[cfg(test)]
     pub(crate) cheat: Cheat,
+    /// Test: this party's ECtF output (little-endian).
+    #[cfg(test)]
+    pub(crate) ectf_share: Option<[u8; 32]>,
 }
 
 impl Drop for Party {
@@ -607,6 +691,46 @@ fn pair_hash(salt: &[u8; 16], o: usize, p: bool, x: Block) -> [u8; 16] {
     h[..16].try_into().unwrap()
 }
 
+/// The row parameters of the check-row hash ([`gc::RowHash`]): one SHA-256
+/// over C's seed and N's hash parameters, read with the layout of the hash
+/// parameters.
+fn row_params(seed: &[u8; 32], hparams: &[u8; 32]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(TAG_CHI)
+        .chain_update(seed)
+        .chain_update(b"row-params")
+        .chain_update(hparams)
+        .finalize()
+        .into()
+}
+
+/// The commitment to the label `x` with pointer bit `p` of input wire `w`
+/// (feed id), under C's salt.
+fn in_com(salt: &[u8; 16], w: usize, p: bool, x: Block) -> [u8; 16] {
+    let h: [u8; 32] = Sha256::new()
+        .chain_update(TAG_INCOM)
+        .chain_update(salt)
+        .chain_update((w as u32).to_be_bytes())
+        .chain_update([p as u8])
+        .chain_update(x.as_bytes())
+        .finalize()
+        .into();
+    h[..16].try_into().unwrap()
+}
+
+/// A uniform field element: 32 random bytes as a little-endian integer,
+/// redrawn while ≥ p (not reduced mod p, which would make small values twice
+/// as likely; the mask must hide `x_N` exactly).
+fn random_fp_le(rng: &mut StdRng) -> Zeroizing<[u8; 32]> {
+    loop {
+        let b = Zeroizing::new(rng.random::<[u8; 32]>());
+        if let Ok(mut f) = Fp::try_from(*b) {
+            ectf::wipe_fp(&mut f);
+            return b;
+        }
+    }
+}
+
 fn parse_point(b: &[u8]) -> Result<ProjectivePoint> {
     if b.len() != 65 || b[0] != 0x04 {
         return Err(Error::Input("point must be 65-byte uncompressed SEC1".into()));
@@ -677,6 +801,18 @@ where
     rd.reunite(wr).map_err(|_| Error::Protocol("transport halves".into()))
 }
 
+/// C: N's input labels (of ρ) and the input-label commitments, both before
+/// the seed.
+async fn c_recv_inputs(n2c: &mut FrameChan) -> Result<(SecretBlocks, Vec<[[u8; 16]; 2]>)> {
+    let gl = SecretBlocks(bytes_to_blocks(&n2c.recv_exact(16 * 256).await?));
+    let com = n2c.recv_exact(32 * lay().open_in.len()).await?;
+    let com = com
+        .chunks_exact(32)
+        .map(|c| [c[..16].try_into().unwrap(), c[16..].try_into().unwrap()])
+        .collect();
+    Ok((gl, com))
+}
+
 fn perr<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> Error {
     move |e| Error::Protocol(format!("{what}: {e}"))
 }
@@ -723,7 +859,7 @@ impl Party {
         // of protocol messages; N→C-only channels accept nothing from C. C
         // bounds N too, so a malicious node cannot grow the client's memory:
         // an honest N sends about 0.5 MB on CH_COTB, a few KB on CH_COTA,
-        // 21 KB on CH_SC, about 4.1 MB on CH_N2C and 11.8 MB of tables (the
+        // 21 KB on CH_SC, about 4.2 MB on CH_N2C and 11.8 MB of tables (the
         // circuit is fixed).
         const MIB: u64 = 1 << 20;
         let caps: [u64; N_CH] = match role {
@@ -804,6 +940,8 @@ impl Party {
             timings: Vec::new(),
             #[cfg(test)]
             cheat: Cheat::None,
+            #[cfg(test)]
+            ectf_share: None,
         })
     }
 
@@ -920,10 +1058,28 @@ impl Party {
         let sp = lay.sp;
         let delta = self.delta;
         let mut grng = StdRng::from_seed(self.rng.random());
+        // The hash parameters, fresh per session and fixed before garbling
+        // (no check of C rests on them; C gets them right before the tables).
+        #[allow(unused_mut)]
+        let mut hparams: [u8; 32] = self.rng.random();
+        #[cfg(test)]
+        if cheat == Cheat::DegenerateHparams {
+            hparams[16..].fill(0);
+        }
+        // N's garbled input: a mask ρ < p, fixed now; its labels go out before
+        // the seed, and the share enters as δ = x_N − ρ in the handshake.
+        #[allow(unused_mut)]
+        let mut rho = random_fp_le(&mut self.rng);
 
         let garble = tokio::task::spawn_blocking(move || {
+            let hg = gc::HashG::new(&hparams);
             let in_keys = SecretBlocks((0..lay.n_in).map(|_| Block::random(&mut grng)).collect());
-            let (k, tables) = gc::garble(&sp.circ, delta, &in_keys, 0, &mut grng);
+            #[cfg(test)]
+            if matches!(cheat, Cheat::AdderSwitch | Cheat::AdderSwitchLate) {
+                let (k, tables) = gc::garble_dev(&sp.circ, &hg, delta, &in_keys, &mut grng, tests::adder_switch_gates);
+                return (SecretBlocks(k), tables);
+            }
+            let (k, tables) = gc::garble(&sp.circ, &hg, delta, &in_keys, &mut grng);
             (SecretBlocks(k), tables)
         });
 
@@ -996,9 +1152,18 @@ impl Party {
                 }
             }
             let cut = sp.and_end[HS_STAGES - 1];
-            for part in [&tables[..cut], &tables[cut..]] {
+            for (i, part) in [&tables[..cut], &tables[cut..]].into_iter().enumerate() {
                 if let Some(g) = gates.next() {
                     g.await;
+                }
+                #[allow(unused_mut)]
+                let mut send_hp = i == 0;
+                #[cfg(test)]
+                if cheat == Cheat::OmitHparams {
+                    send_hp = false;
+                }
+                if send_hp {
+                    tab.send(&hparams).await?;
                 }
                 tab.send(&gc::tables_to_bytes(part)).await?;
             }
@@ -1056,30 +1221,106 @@ impl Party {
         drop((r_bits, r_macs));
         n2c.send(&from_bits(&d_bits)).await?;
 
+        // Before the seed: the labels of ρ on N's input wires, then the
+        // commitments to both labels of every other input wire (under C's
+        // salt, the first message C sent).
+        #[allow(unused_mut)]
+        let mut late = false;
+        #[cfg(test)]
+        if cheat == Cheat::AdderSwitchLate {
+            late = true;
+        }
+        #[allow(unused_mut)]
+        let mut omit_gl = late;
+        #[cfg(test)]
+        if cheat == Cheat::OmitGl {
+            omit_gl = true;
+        }
+        let gl_of = |rho: &[u8; 32]| -> Vec<u8> {
+            let bits = Zeroizing::new(to_bits(rho));
+            #[allow(unused_mut)]
+            let mut labels: Vec<Block> = sp.xn.clone().zip(bits.iter()).map(|(w, b)| k[w] ^ sel(*b, delta)).collect();
+            #[cfg(test)]
+            if cheat == Cheat::BadInputLabel(0) {
+                labels[0] = labels[0] ^ Block::new([0x5a; 16]);
+            }
+            let out = blocks_to_bytes(&labels);
+            gc::wipe_blocks(&mut labels);
+            out
+        };
+        if !omit_gl {
+            let mut gl = Zeroizing::new(gl_of(&rho));
+            n2c.send(&gl).await?;
+            gl.zeroize();
+        }
+        let in_salt: [u8; 16] = c2n.recv_exact(16).await?.try_into().expect("16 bytes");
+        #[allow(unused_mut)]
+        let mut coms = Vec::with_capacity(32 * lay.open_in.len());
+        #[allow(unused_variables)]
+        for (j, &w) in lay.open_in.iter().enumerate() {
+            let p0 = k[w] ^ sel(lam[w], delta);
+            #[allow(unused_mut)]
+            let mut c = [in_com(&in_salt, w, false, p0), in_com(&in_salt, w, true, p0 ^ delta)];
+            #[cfg(test)]
+            if cheat == Cheat::BadInCom(j) {
+                c[1][0] ^= 1;
+            }
+            coms.extend_from_slice(&c[0]);
+            coms.extend_from_slice(&c[1]);
+        }
+        #[cfg(test)]
+        if cheat == Cheat::ShortInCom {
+            coms.truncate(coms.len() - 16);
+        }
+        if !late {
+            n2c.send(&coms).await?;
+        }
+
         // Challenge.
         let seed: [u8; 32] = c2n.recv_exact(32).await?.try_into().expect("32 bytes");
         let t_seed = Instant::now();
         let chi_dv = chi(&seed, b"dvzk");
         let chi_ck: Vec<Block> = (0..N_STAGES).map(|s| chi(&seed, format!("check{s}").as_bytes())).collect();
         let salt_b = chi(&seed, b"check-salt").to_bytes();
-        let salt = u128::from_le_bytes(salt_b);
+        let rparams = row_params(&seed, &hparams);
+        #[allow(unused_mut)]
+        let mut rparams_of = [rparams; N_STAGES];
+        #[cfg(test)]
+        if let Cheat::WrongRowKey(s) = cheat {
+            let mut other = seed;
+            other[0] ^= 1;
+            rparams_of[s] = row_params(&other, &hparams);
+        }
+        #[cfg(test)]
+        let mut adder_v: Option<Zeroizing<[u8; 32]>> = None;
+        #[cfg(test)]
+        if matches!(cheat, Cheat::AdderSwitch | Cheat::AdderSwitchLate) {
+            let v = tests::adder_switch_solution(chi_ck[0]);
+            if late {
+                // The order of `split-public-1`: the input labels after the
+                // challenge, for the solution itself.
+                rho = Zeroizing::new(*v);
+                let mut gl = Zeroizing::new(gl_of(&rho));
+                n2c.send(&gl).await?;
+                gl.zeroize();
+                n2c.send(&coms).await?;
+            }
+            adder_v = Some(v);
+        }
 
         // Product check, openings, consistency-check material, label-check
         // pairs (CPU, blocking).
         let (st, msgs) = tokio::task::spawn_blocking(move || {
+            let hg = gc::HashG::new(&hparams);
+            let hg = &hg;
             let rows_of = |s: usize| -> (Vec<u8>, Vec<u8>) {
                 let sh = &lay.shapes[s];
                 let pw = gc::powers(chi_ck[s], sh.ands.len());
-                #[allow(unused_mut)]
-                let mut salt_s = salt;
-                #[cfg(test)]
-                if cheat == Cheat::WrongSalt(s) {
-                    salt_s ^= 1 << 7;
-                }
+                let rh = gc::RowHash::new(hg, &rparams_of[s]);
                 let cm = gc::check_material(
                     &sp.circ,
                     sh.gates.clone(),
-                    salt_s,
+                    &rh,
                     s,
                     &lay.ands[sh.ands.clone()],
                     &sh.rows,
@@ -1197,8 +1438,11 @@ impl Party {
                 k_out: SecretBlocks(k[outs.clone()].to_vec()),
                 lam_out: Zeroizing::new(lam[outs].to_vec()),
                 cota,
+                rho,
                 vals: (0..sp.outs.len()).map(|_| None).collect(),
                 next: 0,
+                #[cfg(test)]
+                adder_v,
             };
             (st, msgs)
         })
@@ -1213,10 +1457,13 @@ impl Party {
     }
 
     async fn preprocess_c(&mut self) -> Result<()> {
+        #[allow(unused_variables)]
+        let cheat = self.cheat();
         let lay = lay();
         let sp = lay.sp;
         let delta_b = self.delta;
         let seed: [u8; 32] = self.rng.random();
+        let in_salt: [u8; 16] = self.rng.random();
         let mut kos_a = self.kos_a_r.take().ok_or(Error::State("preprocess already ran"))?;
         let Party {
             ctx_a,
@@ -1231,7 +1478,11 @@ impl Party {
         } = self;
 
         let t0 = Instant::now();
+        // The salt of N's input-label commitments: the first message to N.
+        c2n.send(&in_salt).await?;
         let recv_fut = async {
+            // The hash parameters come first, then the tables.
+            let hparams = Zeroizing::new(<[u8; 32]>::try_from(tab.recv_exact(32).await?).expect("32 bytes"));
             let mut t = Vec::with_capacity(lay.n_and);
             let cut = sp.and_end[HS_STAGES - 1];
             for n in [cut, lay.n_and - cut] {
@@ -1241,7 +1492,7 @@ impl Party {
             }
             let d = n2c.recv_exact(lay.mac_fixed.div_ceil(8)).await?;
             tr(t0, "C", "d recv");
-            Ok::<_, Error>((t, unpack(&d, lay.mac_fixed)))
+            Ok::<_, Error>((hparams, t, unpack(&d, lay.mac_fixed)))
         };
         let cot_a_fut = async {
             let (c, m) = rcot_recv!(&mut kos_a, ctx_a, N_COTA);
@@ -1259,7 +1510,7 @@ impl Party {
             r
         };
         let (rcv, cr, kb, scr) = futures::join!(recv_fut, cot_a_fut, cot_b_fut, sc_fut);
-        let (tables, d) = rcv?;
+        let (hparams, tables, d) = rcv?;
         let (cot_choices, cot_msgs) = cr?;
         let kb = SecretBlocks(kb?);
         scr?;
@@ -1276,9 +1527,25 @@ impl Party {
                 .collect(),
         );
         drop(kb);
-        // The χ challenge only after N's tables and commitments are in.
+        // N's input labels and the input-label commitments: what N fixes
+        // before the challenge, besides the tables and the masks.
+        #[allow(unused_mut)]
+        let mut seed_early = false;
+        #[cfg(test)]
+        if cheat == Cheat::DeadCarries(true) {
+            seed_early = true;
+        }
+        let mut inputs = None;
+        if !seed_early {
+            inputs = Some(c_recv_inputs(n2c).await?);
+        }
+        // The χ challenge only after everything N commits to is in.
         c2n.send(&seed).await?;
         tr(t0, "C", "seed sent");
+        let (gl, in_com) = match inputs {
+            Some(v) => v,
+            None => c_recv_inputs(n2c).await?,
+        };
 
         // Receive the rest while computing the keys.
         let n_open: usize = lay.open_in.len()
@@ -1298,7 +1565,8 @@ impl Party {
         };
         let chi_dv = chi(&seed, b"dvzk");
         let chi_ck: Vec<Block> = (0..N_STAGES).map(|s| chi(&seed, format!("check{s}").as_bytes())).collect();
-        let salt = u128::from_le_bytes(chi(&seed, b"check-salt").to_bytes());
+        let pair_salt = chi(&seed, b"check-salt").to_bytes();
+        let rparams = Zeroizing::new(row_params(&seed, &hparams));
         let compute = tokio::task::spawn_blocking(move || {
             let nb = lay.base.len();
             let key = SecretBlocks(gc::propagate_c(&sp.circ, &kfix[..nb], delta_b));
@@ -1367,7 +1635,12 @@ impl Party {
             ck: cks.into_iter().map(Some).collect(),
             rows,
             y_n,
-            salt,
+            pair_salt,
+            hparams,
+            rparams,
+            gl,
+            in_com,
+            in_salt,
             lam_in,
             lam_out,
             pairs,
@@ -1462,26 +1735,42 @@ impl Party {
         let a = Zeroizing::new(self.scalar.take().ok_or(Error::State("no scalar"))?);
         let q = Zeroizing::new((s * *a).to_affine());
         drop(a);
+        #[cfg(test)]
+        let q = if self.role == Role::N && self.cheat == Cheat::EctfOtherPoint(true) {
+            Zeroizing::new((ProjectivePoint::from(*q) + ProjectivePoint::GENERATOR).to_affine())
+        } else {
+            q
+        };
         let ep = Zeroizing::new(q.to_encoded_point(false));
         drop(q);
-        let x = SecretFp(fp_from_be(ep.x().ok_or_else(|| Error::Protocol("identity".into()))?)?);
+        #[allow(unused_mut)]
+        let mut x = SecretFp(fp_from_be(ep.x().ok_or_else(|| Error::Protocol("identity".into()))?)?);
         let y = SecretFp(fp_from_be(ep.y().ok_or_else(|| Error::Protocol("identity".into()))?)?);
         drop(ep);
+        #[allow(unused_mut)]
+        let mut dev = ectf::Dev::default();
+        #[cfg(test)]
+        if self.role == Role::N {
+            use mpz_fields::Field;
+            if self.cheat == Cheat::EctfOtherPoint(false) {
+                x.0 = x.0 + Fp::one();
+            }
+            dev.zero_c = self.cheat == Cheat::EctfZeroC;
+        }
 
         let m = self.mark();
-        let share = SecretFp(self.sc.point_add_x(&mut self.ctx_sc, x.0, y.0).await?);
+        let share = SecretFp(self.sc.point_add_x(&mut self.ctx_sc, x.0, y.0, &mut dev).await?);
         drop((x, y));
         self.record("ectf", m);
-        let x_le: [u8; 32] = share.0.into();
-        drop(share);
-        let x_bits = Zeroizing::new(to_bits(&x_le));
-        let mut x_le = x_le;
-        x_le.zeroize();
+        #[cfg(test)]
+        {
+            self.ectf_share = Some(share.0.into());
+        }
 
         let m = self.mark();
         let r = match self.role {
-            Role::N => self.handshake_n(&x_bits, th_sh).await,
-            Role::C => self.handshake_c(&x_bits, th_sh).await,
+            Role::N => self.handshake_n(share, th_sh).await,
+            Role::C => self.handshake_c(share, th_sh).await,
         };
         self.record("phase_a", m);
         r
@@ -1513,32 +1802,55 @@ impl Party {
         r
     }
 
-    async fn handshake_n(&mut self, x_bits: &[bool], th: [u8; 32]) -> Result<HsSecrets> {
+    async fn handshake_n(&mut self, share: SecretFp, th: [u8; 32]) -> Result<HsSecrets> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
         let lay = lay();
         let sp = lay.sp;
         let delta = self.delta;
-        // Own input labels, sent at once.
+        // N's input labels (of ρ) went out before the seed; its share enters
+        // as the public correction δ = x_N − ρ mod p, sent at once. Any δ is
+        // the honest message for the share δ + ρ.
         #[allow(unused_mut)]
-        let mut labels: Vec<Block> = {
+        let mut dl: [u8; 32] = {
             let st = self.nst()?;
             if st.next != 0 {
                 return Err(Error::State("handshake already ran"));
             }
-            sp.xn.clone().zip(x_bits).map(|(w, b)| st.k_in[w] ^ sel(*b, delta)).collect()
+            let rho = SecretFp(Fp::try_from(*st.rho).map_err(|_| Error::State("mask"))?);
+            #[allow(unused_mut)]
+            let mut x = SecretFp(share.0);
+            #[cfg(test)]
+            {
+                use mpz_fields::Field;
+                if cheat == Cheat::EctfShift {
+                    x.0 = x.0 + Fp::one();
+                }
+                if let (Cheat::AdderSwitch, Some(v)) = (cheat, st.adder_v.as_ref()) {
+                    x.0 = x.0 + Fp::try_from(**v).expect("below p");
+                }
+            }
+            let d = SecretFp(x.0 - rho.0);
+            st.rho.zeroize();
+            d.0.into()
         };
+        drop(share);
         #[cfg(test)]
-        if cheat == Cheat::BadInputLabel(0) {
-            labels[0] = labels[0] ^ Block::new([0x5a; 16]);
+        if cheat == Cheat::DeltaOutOfRange {
+            dl = [0xff; 32];
         }
-        self.n2c.send(&blocks_to_bytes(&labels)).await?;
-        gc::wipe_blocks(&mut labels);
+        self.n2c.send(&dl).await?;
+        dl.zeroize();
         let d = unpack(&self.c2n.recv_exact(32).await?, 256);
+        #[allow(unused_mut)]
         let mut adj: Vec<Block> = {
             let st = self.nst()?;
             sp.xc.clone().enumerate().map(|(j, w)| st.k_in[w] ^ st.cota[j] ^ sel(d[j], delta)).collect()
         };
+        #[cfg(test)]
+        if cheat == Cheat::BadInputLabelC {
+            adj[0] = adj[0] ^ Block::new([0x5a; 16]);
+        }
         self.n2c.send(&blocks_to_bytes(&adj)).await?;
         gc::wipe_blocks(&mut adj);
 
@@ -1713,29 +2025,51 @@ impl Party {
         Ok(m)
     }
 
-    async fn handshake_c(&mut self, x_bits: &[bool], th: [u8; 32]) -> Result<HsSecrets> {
+    async fn handshake_c(&mut self, share: SecretFp, th: [u8; 32]) -> Result<HsSecrets> {
+        #[allow(unused_variables)]
+        let cheat = self.cheat();
         let lay = lay();
         let sp = lay.sp;
+        if self.cst()?.next != 0 {
+            return Err(Error::State("handshake already ran"));
+        }
+        // N's correction first: C's input is x_C' = x_C + δ mod p (the circuit
+        // adds ρ). A δ ≥ p is malformed; nothing secret decides that.
+        let dl: [u8; 32] = self.c_recv(32).await?.try_into().expect("32 bytes");
+        let delta = Fp::try_from(dl).map_err(|_| Error::Protocol("δ is not below p".into()))?;
+        let x = SecretFp(share.0 + delta);
+        drop(share);
+        let mut x_le: [u8; 32] = x.0.into();
+        drop(x);
+        #[allow(unused_mut)]
+        let mut x_bits = Zeroizing::new(to_bits(&x_le));
+        x_le.zeroize();
+        #[cfg(test)]
+        if let Cheat::DeadCarries(_) = cheat {
+            for r in 0..128 {
+                x_bits[2 * r] = true;
+            }
+        }
         let d: Vec<bool> = {
             let st = self.cst()?;
-            if st.next != 0 {
-                return Err(Error::State("handshake already ran"));
-            }
             x_bits.iter().zip(st.cot_choices.iter()).map(|(x, r)| x ^ r).collect()
         };
         self.c2n.send(&from_bits(&d)).await?;
-        let gl = SecretBlocks(bytes_to_blocks(&self.c_recv(16 * 256).await?));
         let el = SecretBlocks(bytes_to_blocks(&self.c_recv(16 * 256).await?));
         // Active labels: with N's zero-labels and Δ_A they give C's inputs.
-        let mut ok_in = true;
+        // Each must have the pointer bit of C's input and open N's
+        // commitment for that pointer bit.
+        let mut ok_in = (true, true);
         {
             let st = self.cst()?;
             for (j, w) in sp.xc.clone().enumerate() {
-                st.l[w] = el[j] ^ st.cot_msgs[j];
-                ok_in &= st.l[w].lsb() == x_bits[j] ^ st.lam_in[w];
+                let lab = el[j] ^ st.cot_msgs[j];
+                st.l[w] = lab;
+                ok_in.0 &= lab.lsb() == x_bits[j] ^ st.lam_in[w];
+                ok_in.1 &= st.com_ok(w, lab);
             }
             for (j, w) in sp.xn.clone().enumerate() {
-                st.l[w] = gl[j];
+                st.l[w] = st.gl[j];
             }
         }
         for s in 0..HS_STAGES {
@@ -1802,14 +2136,15 @@ impl Party {
     /// hash`). On a failure it tells N (one zero byte) and aborts.
     ///
     /// The checks, in this order: the pointer bits of the stage's input
-    /// labels (`ok_in`, done by the caller against opened masks), the
+    /// labels and their commitments (`ok_in`, done by the caller against
+    /// opened masks and the commitments of preprocessing), the
     /// consistency check of every AND gate of the stage, and the label check
     /// of every output wire that is reported: the label C holds must hash to
     /// the half of N's pair that belongs to the pointer bit C is about to
     /// send. N fixed the pairs in preprocessing, so the hash C then sends
     /// tells N nothing it did not commit to. Whatever fails, C evaluates the
     /// whole stage first and sends the same single byte.
-    async fn c_stage(&mut self, s: usize, ok_in: bool) -> Result<Vec<u8>> {
+    async fn c_stage(&mut self, s: usize, ok_in: (bool, bool)) -> Result<Vec<u8>> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
         let lay = lay();
@@ -1821,13 +2156,16 @@ impl Party {
         }
         let ck = st.ck[s].take().ok_or(Error::State("stage already used"))?;
         let rows = std::mem::take(&mut st.rows[s]);
-        let (y_n, salt) = (st.y_n[s], st.salt);
+        let y_n = st.y_n[s];
+        let (hparams, rparams) = (st.hparams.clone(), st.rparams.clone());
         let tables = std::mem::take(&mut st.tables);
         let mut l = std::mem::take(&mut st.l);
         let (ok_check, tables, l) = tokio::task::spawn_blocking(move || {
             let sh = &lay.shapes[s];
-            gc::evaluate_range(&sp.circ, &mut l, &tables, sh.gates.clone(), sh.ands.start, 0);
-            let ok = gc::run_check(salt, s, &lay.ands[sh.ands.clone()], &sh.rows, &l, &ck, &rows, y_n, delta_b);
+            let hg = gc::HashG::new(&hparams);
+            gc::evaluate_range(&sp.circ, &hg, &mut l, &tables, sh.gates.clone(), sh.ands.start);
+            let rh = gc::RowHash::new(&hg, &rparams);
+            let ok = gc::run_check(&rh, s, &lay.ands[sh.ands.clone()], &sh.rows, &l, &ck, &rows, y_n, delta_b);
             (ok, tables, l)
         })
         .await
@@ -1839,7 +2177,7 @@ impl Party {
             st.tables = Vec::new();
         }
 
-        let salt_b = salt.to_le_bytes();
+        let salt_b = st.pair_salt;
         let mut ok_pair = true;
         let mut body = vec![1u8];
         let mut h = Sha256::new();
@@ -1882,11 +2220,13 @@ impl Party {
         if cheat == Cheat::FeedOther(s) {
             ignore = true;
         }
-        if !(ok_in && ok_check && ok_pair) && !ignore {
+        if !(ok_in.0 && ok_in.1 && ok_check && ok_pair) && !ignore {
             let _ = self.c2n.send(&[0u8]).await;
             return Err(Error::Abort(
-                if !ok_in {
+                if !ok_in.0 {
                     "input label pointer bits do not match the opened masks"
+                } else if !ok_in.1 {
+                    "input label does not open N's commitment"
                 } else if !ok_check {
                     "garbled-circuit consistency check failed"
                 } else {
@@ -1910,10 +2250,11 @@ impl Party {
     /// Computes the inner digests of stage `s`'s inputs from the public `IS`
     /// and C's own transcript hash, receives N's labels for them and checks
     /// every label's pointer bit against the opened, authenticated mask of
-    /// its wire and C's own digest bit. Returns whether all matched (the
-    /// caller aborts in `c_stage`, after evaluating, like for any other
-    /// failed check of the stage).
-    async fn c_next_digests(&mut self, s: usize, th: &[u8; 32]) -> Result<bool> {
+    /// its wire and C's own digest bit, and against N's commitment. Returns
+    /// whether all pointer bits and all commitments matched (the caller
+    /// aborts in `c_stage`, after evaluating, like for any other failed
+    /// check of the stage).
+    async fn c_next_digests(&mut self, s: usize, th: &[u8; 32]) -> Result<(bool, bool)> {
         #[allow(unused_variables)]
         let cheat = self.cheat();
         let lay = lay();
@@ -1929,13 +2270,14 @@ impl Party {
         let msg = self.c_recv(16 * 256 * digs.len()).await?;
         let blocks = SecretBlocks(bytes_to_blocks(&msg));
         let st = self.cst()?;
-        let mut ok = true;
+        let mut ok = (true, true);
         for (n, &j) in digs.iter().enumerate() {
             let bits = st.dig[j].take().ok_or(Error::State("digest missing"))?;
             for (i, w) in sp.dig[j].clone().enumerate() {
                 let lab = blocks[256 * n + i];
                 st.l[w] = lab;
-                ok &= lab.lsb() == bits[i] ^ st.lam_in[w];
+                ok.0 &= lab.lsb() == bits[i] ^ st.lam_in[w];
+                ok.1 &= st.com_ok(w, lab);
             }
         }
         #[cfg(test)]
@@ -1963,23 +2305,31 @@ pub fn message_sizes() -> (usize, usize) {
         + sp.outs.iter().enumerate().filter(|(gi, _)| l.opened(*gi)).map(|(_, g)| g.len).sum::<usize>();
     n2c += n_open.div_ceil(8) + 32;
     n2c += l.shapes.iter().map(|s| 8 * s.rows.len() + 8).sum::<usize>();
-    n2c += 16 * l.n_in + 65; // online labels and corrections, N's key share
-    let mut c2n = 32 + 32 + 32 + 97; // seed, d, key-share commitment and opening
+    // Hash parameters, input-label commitments; every input label (N's
+    // before the seed, C's corrections, the digests), N's key share, δ.
+    n2c += 32 + 32 * l.open_in.len();
+    n2c += 16 * l.n_in + 65 + 32;
+    let mut c2n = 16 + 32 + 32 + 32 + 97; // salt, seed, d, key-share commitment and opening
     for s in 0..N_STAGES {
         c2n += 1 + 32 + l.reported(s).iter().map(|&g| sp.outs[g].len / 8).sum::<usize>();
     }
     (c2n, n2c)
 }
 
-/// Bytes N→C by kind (tables, check rows and Y_N, mask commitment bits,
-/// label-check pairs, online labels), for reports.
-pub fn download_breakdown() -> [(&'static str, usize); 5] {
+/// Bytes N→C by kind (hash parameters, tables, check rows and Y_N, mask
+/// commitment bits, label-check pairs, input-label commitments, N's input
+/// labels, online labels), for reports.
+pub fn download_breakdown() -> [(&'static str, usize); 8] {
     let l = lay();
+    let n_n = l.sp.xn.len();
     [
+        ("hash parameters", 32),
         ("three-halves tables", gc::tables_len(l.n_and)),
         ("check rows and Y_N", l.shapes.iter().map(|s| 8 * s.rows.len() + 8).sum()),
         ("mask commitment bits", l.mac_fixed.div_ceil(8)),
         ("label-check pairs", 32 * l.n_pairs),
-        ("online labels and corrections", 16 * l.n_in),
+        ("input-label commitments", 32 * l.open_in.len()),
+        ("labels of N's input mask (before the seed)", 16 * n_n),
+        ("online labels, corrections and delta", 16 * (l.n_in - n_n) + 32),
     ]
 }

@@ -100,7 +100,7 @@ console.log('offer-check: ok')
   const tpl = (path: string) =>
     `POST ${path} HTTP/1.1\r\nHost: ${H}\r\nAuthorization: Bearer {KEY:42}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n`
   const base = (http: string[], chatPath = '/api/v1/chat/completions', imagesPath = '/api/v1/image/generate') => ({
-    v: 3, twopc: 'split-public-1', http, upstream_host: H, head_template: tpl(chatPath),
+    v: 3, twopc: 'split-public-2', http, upstream_host: H, head_template: tpl(chatPath),
     key_length: 42, chat: { cap_keys: ['max_tokens'], fixed_pins: [['n', 1], ['stream', true], ['stream_options', { include_usage: true }]] },
     suffix_keys: ['model', 'max_tokens', 'n', 'stream', 'stream_options'],
     h2: { probe_path: '/api/v1/models', idle_secs: 300 },
