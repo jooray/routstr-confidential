@@ -98,6 +98,9 @@
 //!   two assumptions of Bellare's HMAC proof, used directly: `f` keyed by its
 //!   chaining input is a PRF, and `OS_k` is pseudorandom given `IS_k`.
 //! * **Inputs are never revealed.** ECtF is semi-honest A2M/M2A.
+//! * **N knows its key-share scalar.** With its point `P_N` N sends a Schnorr
+//!   proof of knowledge of `a_N` (`ks_prove`), bound to C's commitment and
+//!   to the preprocessing, and C opens `P_C` only after it verified.
 
 pub mod circuits;
 
@@ -120,7 +123,9 @@ use mpz_fields::p256::P256 as Fp;
 use mpz_ot::{chou_orlandi, ferret, kos};
 use mpz_ot_core::rcot::{RCOTReceiver, RCOTReceiverOutput, RCOTSender, RCOTSenderOutput};
 use p256::elliptic_curve::PrimeField;
+use p256::elliptic_curve::bigint::U256;
 use p256::elliptic_curve::group::Group;
+use p256::elliptic_curve::ops::Reduce;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
 use rand::rngs::StdRng;
@@ -358,6 +363,11 @@ pub(crate) enum Cheat {
     FlipReported(&'static str),
     /// C: opens its key-share commitment to a different point.
     BadOpen,
+    /// N: a key-share proof that does not verify. 0: one bit of `s` flipped;
+    /// 1: a valid proof, sent with another point (`P_N + G`); 2: a valid
+    /// proof for another commitment of C; 3: a valid proof for another
+    /// preprocessing; 4: `s` ≥ the group order.
+    BadKsProof(u8),
     /// C: uses another label than the one it got for a digest input of a
     /// stage, ignores its own checks and reports what it computed.
     FeedOther(usize),
@@ -379,6 +389,9 @@ struct NState {
     cota: SecretBlocks,
     /// N's garbled input: a uniform ρ < p (little-endian); wiped once δ is sent.
     rho: Zeroizing<[u8; 32]>,
+    /// The row parameters (from C's seed and N's hash parameters): the
+    /// session value in the key-share proof.
+    rparams: [u8; 32],
     /// Decoded values of the reported output groups.
     vals: Vec<Option<Zeroizing<Vec<bool>>>>,
     next: usize,
@@ -469,6 +482,11 @@ const TAG_OUT: &[u8] = b"routstr-twopc-split output labels";
 const TAG_CHI: &[u8] = b"routstr-twopc-ag chi";
 const TAG_PAIR: &[u8] = b"routstr-twopc-split label check";
 const TAG_INCOM: &[u8] = b"routstr-twopc-ag input label";
+const TAG_KSP: &[u8] = b"routstr-twopc-split key-share proof";
+
+/// N's key-share message: `P_N` (65-byte uncompressed SEC1) and the proof
+/// `e ‖ s` (32 + 32 bytes).
+const KS_MSG: usize = 65 + 64;
 
 /// COTs under Δ_A: one per bit of C's x-coordinate share.
 const N_COTA: usize = 256;
@@ -761,6 +779,63 @@ fn random_scalar(rng: &mut StdRng) -> Scalar {
             }
         }
     }
+}
+
+/// The challenge of the key-share proof: SHA-256 over the tag, the row
+/// parameters (C's seed and N's hash parameters: this preprocessing), C's
+/// commitment to `P_C` (fresh per key share), `P_N` and the proof's
+/// commitment `R`, the points as 65-byte uncompressed SEC1. Every field has
+/// a fixed length.
+fn ks_challenge(rparams: &[u8; 32], com: &[u8; 32], p_n: &[u8; 65], r: &[u8; 65]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(TAG_KSP)
+        .chain_update(rparams)
+        .chain_update(com)
+        .chain_update(p_n)
+        .chain_update(r)
+        .finalize()
+        .into()
+}
+
+/// The challenge as a scalar: the 32 bytes as a big-endian integer mod n.
+fn ks_scalar(e: &[u8; 32]) -> Scalar {
+    <Scalar as Reduce<U256>>::reduce_bytes(&(*e).into())
+}
+
+/// N: the Schnorr proof of knowledge of `a` with `P_N = a·G`, non-interactive
+/// by [`ks_challenge`]: `R = k·G`, `e = H(…, P_N, R)`, `s = k + e·a mod n`;
+/// the proof is `e ‖ s`, `s` big-endian. `k` must be uniform, secret and used
+/// for this proof only. The scalar arithmetic and `k·G` are p256's
+/// constant-time operations.
+fn ks_prove(a: &Scalar, k: &Scalar, rparams: &[u8; 32], com: &[u8; 32], p_n: &[u8; 65]) -> [u8; 64] {
+    let r = encode_point(&(ProjectivePoint::GENERATOR * *k));
+    let e = ks_challenge(rparams, com, p_n, &r);
+    // e·a alone would give `a` away (e is public).
+    let mut ea = ks_scalar(&e) * *a;
+    let mut s = *k + ea;
+    ea.zeroize();
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&e);
+    out[32..].copy_from_slice(&s.to_repr());
+    s.zeroize();
+    out
+}
+
+/// C: checks the proof `e ‖ s` for the point `p_n`: the point parses (65
+/// bytes uncompressed, on the curve, coordinates below p), `s` < n,
+/// `R' = s·G − e·P_N` is not the identity, and the challenge of `R'` equals
+/// `e` byte for byte. All inputs are public to both parties.
+fn ks_verify(rparams: &[u8; 32], com: &[u8; 32], p_n: &[u8; 65], proof: &[u8; 64]) -> bool {
+    let Ok(point) = parse_point(p_n) else { return false };
+    let e: [u8; 32] = proof[..32].try_into().expect("32 bytes");
+    let s: [u8; 32] = proof[32..].try_into().expect("32 bytes");
+    let s: Option<Scalar> = Scalar::from_repr(s.into()).into();
+    let Some(s) = s else { return false };
+    let r = ProjectivePoint::GENERATOR * s - point * ks_scalar(&e);
+    if bool::from(r.is_identity()) {
+        return false;
+    }
+    ks_challenge(rparams, com, p_n, &encode_point(&r)) == e
 }
 
 fn fp_from_be(be: &[u8]) -> Result<Fp> {
@@ -1439,6 +1514,7 @@ impl Party {
                 lam_out: Zeroizing::new(lam[outs].to_vec()),
                 cota,
                 rho,
+                rparams,
                 vals: (0..sp.outs.len()).map(|_| None).collect(),
                 next: 0,
                 #[cfg(test)]
@@ -1654,7 +1730,8 @@ impl Party {
         Ok(())
     }
 
-    /// Joint P-256 key share: C commits to `P_C`, N sends `P_N`, C opens.
+    /// Joint P-256 key share: C commits to `P_C`, N sends `P_N` with a proof
+    /// of knowledge of its scalar, C verifies it and opens.
     pub async fn key_share(&mut self) -> Result<[u8; 65]> {
         self.check_stage(Stage::Preprocessed, "key_share after preprocess")?;
         let m = self.mark();
@@ -1682,8 +1759,16 @@ impl Party {
                     .finalize()
                     .into();
                 self.c2n.send(&com).await?;
-                let pn = self.n2c.recv_exact(65).await?;
+                let msg = self.n2c.recv_exact(KS_MSG).await?;
+                let pn: [u8; 65] = msg[..65].try_into().expect("65 bytes");
                 let p_n = parse_point(&pn)?;
+                // Before the opening: an N that cannot prove knowledge of
+                // its scalar never sees P_C. The check reads public values
+                // only, so its outcome tells N nothing about C.
+                let rparams = *self.cst()?.rparams;
+                if !ks_verify(&rparams, &com, &pn, msg[65..].try_into().expect("64 bytes")) {
+                    return Err(Error::Abort("key-share proof does not verify".into()));
+                }
                 #[allow(unused_mut)]
                 let mut open = own.to_vec();
                 #[cfg(test)]
@@ -1696,8 +1781,35 @@ impl Party {
                 p_own + p_n
             }
             Role::N => {
-                let com = self.c2n.recv_exact(32).await?;
-                self.n2c.send(&own).await?;
+                let com: [u8; 32] = self.c2n.recv_exact(32).await?.try_into().expect("32 bytes");
+                let rparams = self.nst()?.rparams;
+                // The nonce is drawn like the scalar and used once; a
+                // scalar has one proof.
+                let a = Zeroizing::new(self.scalar.ok_or(Error::State("no scalar"))?);
+                let k = Zeroizing::new(random_scalar(&mut self.rng));
+                #[allow(unused_mut)]
+                let mut proof = ks_prove(&a, &k, &rparams, &com, &own);
+                drop(k);
+                #[allow(unused_mut)]
+                let mut msg = own.to_vec();
+                #[cfg(test)]
+                if let Cheat::BadKsProof(mode) = self.cheat {
+                    let k = Zeroizing::new(random_scalar(&mut self.rng));
+                    let (mut rp, mut cm) = (rparams, com);
+                    match mode {
+                        0 => proof[63] ^= 1,
+                        1 => msg = encode_point(&(p_own + ProjectivePoint::GENERATOR)).to_vec(),
+                        2 => cm[0] ^= 1,
+                        3 => rp[0] ^= 1,
+                        _ => proof[32..].fill(0xff),
+                    }
+                    if mode == 2 || mode == 3 {
+                        proof = ks_prove(&a, &k, &rp, &cm, &own);
+                    }
+                }
+                drop(a);
+                msg.extend_from_slice(&proof);
+                self.n2c.send(&msg).await?;
                 let open = self.c2n.recv_exact(97).await?;
                 let check: [u8; 32] = Sha256::new()
                     .chain_update(TAG_KS)
@@ -2306,9 +2418,10 @@ pub fn message_sizes() -> (usize, usize) {
     n2c += n_open.div_ceil(8) + 32;
     n2c += l.shapes.iter().map(|s| 8 * s.rows.len() + 8).sum::<usize>();
     // Hash parameters, input-label commitments; every input label (N's
-    // before the seed, C's corrections, the digests), N's key share, δ.
+    // before the seed, C's corrections, the digests), N's key share with
+    // its proof, δ.
     n2c += 32 + 32 * l.open_in.len();
-    n2c += 16 * l.n_in + 65 + 32;
+    n2c += 16 * l.n_in + KS_MSG + 32;
     let mut c2n = 16 + 32 + 32 + 32 + 97; // salt, seed, d, key-share commitment and opening
     for s in 0..N_STAGES {
         c2n += 1 + 32 + l.reported(s).iter().map(|&g| sp.outs[g].len / 8).sum::<usize>();
@@ -2318,8 +2431,8 @@ pub fn message_sizes() -> (usize, usize) {
 
 /// Bytes N→C by kind (hash parameters, tables, check rows and Y_N, mask
 /// commitment bits, label-check pairs, input-label commitments, N's input
-/// labels, online labels), for reports.
-pub fn download_breakdown() -> [(&'static str, usize); 8] {
+/// labels, online labels, N's key share with its proof), for reports.
+pub fn download_breakdown() -> [(&'static str, usize); 9] {
     let l = lay();
     let n_n = l.sp.xn.len();
     [
@@ -2331,5 +2444,6 @@ pub fn download_breakdown() -> [(&'static str, usize); 8] {
         ("input-label commitments", 32 * l.open_in.len()),
         ("labels of N's input mask (before the seed)", 16 * n_n),
         ("online labels, corrections and delta", 16 * (l.n_in - n_n) + 32),
+        ("key share and its proof of knowledge", KS_MSG),
     ]
 }

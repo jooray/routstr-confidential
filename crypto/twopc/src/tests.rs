@@ -729,6 +729,147 @@ async fn rogue_key_share_aborts() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn key_share_proof_refused_before_the_opening() {
+    // N's point comes with a proof of knowledge of its scalar. A proof that
+    // does not verify (a changed `s`, a valid proof sent with another point,
+    // a proof made for another commitment of C or for another preprocessing,
+    // `s` out of range) ends the key share on C with one error, before C
+    // opens its commitment: N never receives the opening. The check reads
+    // only what N itself sent and what N already has, so the abort is not an
+    // outcome N can make depend on a secret of C.
+    let srv = server();
+    let th = ths();
+    let mut views = Vec::new();
+    for mode in 0..5 {
+        let (c, n) = session(Cheat::None, Cheat::BadKsProof(mode), th, &srv).await;
+        c.pre.unwrap();
+        n.pre.unwrap();
+        let e = c.ks.unwrap_err();
+        assert!(matches!(e, Error::Abort(_)), "mode {mode}: {e:?}");
+        assert!(matches!(n.ks, Err(Error::Io(_))), "mode {mode}: {:?}", n.ks);
+        // N's view of the step: C's 32-byte commitment (a frame on one mux
+        // chunk) and nothing else.
+        let got = n.recv.iter().find(|(s, _)| *s == "key_share").expect("the step ran").1;
+        assert!(got < 97, "mode {mode}: N received {got} bytes");
+        views.push(e.to_string());
+    }
+    assert!(views.windows(2).all(|w| w[0] == w[1]), "{views:?}");
+    assert!(views[0].contains("key-share proof"), "{views:?}");
+}
+
+#[test]
+fn key_share_proof_checks() {
+    let mut rng = os_rng();
+    let (rp, com): ([u8; 32], [u8; 32]) = (rng.random(), rng.random());
+    let (a, k) = (random_scalar(&mut rng), random_scalar(&mut rng));
+    let p = ProjectivePoint::GENERATOR * a;
+    let pn = encode_point(&p);
+    let proof = ks_prove(&a, &k, &rp, &com, &pn);
+    assert!(ks_verify(&rp, &com, &pn, &proof));
+
+    // Another point: P + G, −P, and a point with a proof of its own.
+    let other = encode_point(&(p + ProjectivePoint::GENERATOR));
+    assert!(!ks_verify(&rp, &com, &other, &proof));
+    assert!(!ks_verify(&rp, &com, &encode_point(&-p), &proof));
+    // Another session: C's commitment or the preprocessing differs.
+    let (rp2, com2): ([u8; 32], [u8; 32]) = (rng.random(), rng.random());
+    assert!(!ks_verify(&rp, &com2, &pn, &proof));
+    assert!(!ks_verify(&rp2, &com, &pn, &proof));
+    assert!(ks_verify(&rp2, &com2, &pn, &ks_prove(&a, &k, &rp2, &com2, &pn)));
+    // Every bit of the proof matters.
+    for i in 0..64 {
+        let mut bad = proof;
+        bad[i] ^= 0x10;
+        assert!(!ks_verify(&rp, &com, &pn, &bad), "byte {i}");
+    }
+    // `s` out of range: n itself (0 mod n), n + 1, 2^256 − 1. A proof whose
+    // `s` is 0 is refused too, as the proof it is (for this challenge it
+    // does not verify).
+    const N: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
+    let mut n_plus_1 = hex32(N);
+    n_plus_1[31] += 1;
+    for s in [hex32(N), n_plus_1, [0xff; 32], [0u8; 32]] {
+        let mut bad = proof;
+        bad[32..].copy_from_slice(&s);
+        assert!(!ks_verify(&rp, &com, &pn, &bad));
+    }
+    assert!(Option::<Scalar>::from(Scalar::from_repr(hex32(N).into())).is_none());
+    // R' = identity (s = e·a for a chosen e): refused.
+    let e: [u8; 32] = rng.random();
+    let mut bad = [0u8; 64];
+    bad[..32].copy_from_slice(&e);
+    bad[32..].copy_from_slice(&(ks_scalar(&e) * a).to_repr());
+    assert!(!ks_verify(&rp, &com, &pn, &bad));
+    // The challenge scalar is the 32 bytes mod n.
+    assert_eq!(ks_scalar(&n_plus_1), Scalar::ONE);
+
+    // Encodings of the point: only 65 bytes, 0x04, both coordinates below p,
+    // on the curve. Compressed, hybrid, the identity, a coordinate ≥ p and a
+    // point off the curve are refused by the parser and by the verifier.
+    let mut cases: Vec<Vec<u8>> = Vec::new();
+    let comp = p.to_affine().to_encoded_point(true);
+    cases.push(comp.as_bytes().to_vec());
+    let mut padded = comp.as_bytes().to_vec();
+    padded.resize(65, 0);
+    cases.push(padded);
+    let mut hybrid = pn;
+    hybrid[0] = 0x06 | (pn[64] & 1);
+    cases.push(hybrid.to_vec());
+    cases.push(vec![0u8]);
+    cases.push(vec![0u8; 65]);
+    let mut zero = [0u8; 65];
+    zero[0] = 4;
+    cases.push(zero.to_vec());
+    let mut off = pn;
+    off[64] ^= 1;
+    cases.push(off.to_vec());
+    // x = p + 5 with the y of x = 5 (5 is the x of a curve point): the same
+    // point if the coordinate were reduced.
+    const P: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
+    let mut five = [0u8; 33];
+    (five[0], five[32]) = (2, 5);
+    let five = parse_point(
+        p256::AffinePoint::from_encoded_point(&EncodedPoint::from_bytes(five).unwrap()).unwrap().to_encoded_point(false).as_bytes(),
+    )
+    .unwrap();
+    let mut big = encode_point(&five);
+    let mut xp = hex32(P);
+    xp[31] += 5;
+    big[1..33].copy_from_slice(&xp);
+    cases.push(big.to_vec());
+    for c in &cases {
+        assert!(parse_point(c).is_err(), "{}", hex::encode(c));
+        if let Ok(c65) = <[u8; 65]>::try_from(&c[..]) {
+            assert!(!ks_verify(&rp, &com, &c65, &proof));
+        }
+    }
+    assert!(parse_point(&encode_point(&five)).is_ok());
+}
+
+#[test]
+fn key_share_proof_vector() {
+    // The values of the conformance file, computed by an independent script.
+    let v = vectors();
+    let ks = &v["key_share"];
+    assert_eq!(ks["com"], "7dffa614c8cc4d4c13d0eeb9d4475063319835af9a697bb3a9b2860e074244ca");
+    assert_eq!(ks["e"], "8ce48cccc8dec4ee1ea8a843f5dff29c56a0aab4c8bd9c28b689e1eb373fedf2");
+    assert_eq!(ks["s"], "6fe8447ae3b901b261287222db0abf7e9274c0c674d1591fa84e47b0e7103f94");
+    assert_eq!(ks["joint"], "04d498887b09364e6ee0b8676f05194d77395f342d6f8cf71b7360755491ec7551c94eda9cf8eaa2b03ba6bd399db08e94c6edb01117594877339bdb878080510e");
+    let msg = hex::decode(ks["n_message"].as_str().unwrap()).unwrap();
+    assert_eq!(msg.len(), KS_MSG);
+    let rp = hex32(ks["rparams"].as_str().unwrap());
+    let com = hex32(ks["com"].as_str().unwrap());
+    assert!(ks_verify(&rp, &com, msg[..65].try_into().unwrap(), msg[65..].try_into().unwrap()));
+}
+
+#[test]
+fn message_sizes_count_the_key_share_proof() {
+    let (c2n, n2c) = message_sizes();
+    assert_eq!((c2n, n2c), (690, 15_989_746 + 64));
+    assert_eq!(download_breakdown()[8], ("key share and its proof of knowledge", 65 + 64));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wan_session_works() {
     let srv = server();
     let th = ths();
@@ -807,6 +948,13 @@ fn gf64_mul_ref(a: u64, b: u64) -> u64 {
 const HP1: &str = "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f";
 const X: u128 = 0x00112233445566778899aabbccddeeff;
 const SEED1: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+/// The key share of the conformance file: C's and N's scalars, C's nonce
+/// and the nonce of N's proof (big-endian).
+const KS_AC: &str = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+const KS_AN: &str = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721";
+const KS_K: &str = "a6e3c57dd01abe90086538398355dd4c3b17aa873382b0f24d6129493d8aad60";
+const KS_NONCE: &str = "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf";
 
 fn hp2() -> [u8; 32] {
     Sha256::digest(b"routstr twopc vectors: hash parameters 2").into()
@@ -967,8 +1115,34 @@ fn vectors() -> serde_json::Value {
         }));
     }
 
+    // The key share: C's commitment, N's point with its proof (fixed nonce),
+    // C's opening, the joint share.
+    let sc = |h: &str| Scalar::from_repr(hex32(h).into()).unwrap();
+    let (a_c, a_n, k) = (sc(KS_AC), sc(KS_AN), sc(KS_K));
+    let nonce = hex32(KS_NONCE);
+    let p_c = encode_point(&(ProjectivePoint::GENERATOR * a_c));
+    let p_n = encode_point(&(ProjectivePoint::GENERATOR * a_n));
+    let ks_com: [u8; 32] = Sha256::new().chain_update(TAG_KS).chain_update(p_c).chain_update(nonce).finalize().into();
+    let ks_rp = row_params(&hex32(SEED1), &hp1);
+    let r = encode_point(&(ProjectivePoint::GENERATOR * k));
+    let proof = ks_prove(&a_n, &k, &ks_rp, &ks_com, &p_n);
+    assert!(ks_verify(&ks_rp, &ks_com, &p_n, &proof));
+    let ch_in = [TAG_KSP, &ks_rp[..], &ks_com[..], &p_n[..], &r[..]].concat();
+    assert_eq!(Sha256::digest(&ch_in)[..], proof[..32]);
+    let joint = encode_point(&(parse_point(&p_c).unwrap() + parse_point(&p_n).unwrap()));
+    let key_share = json!({
+        "commit_tag": String::from_utf8_lossy(TAG_KS), "proof_tag": String::from_utf8_lossy(TAG_KSP),
+        "a_c": KS_AC, "p_c": hex::encode(p_c), "nonce": KS_NONCE, "com": hex::encode(ks_com),
+        "seed": SEED1, "hparams": HP1, "rparams": hex::encode(ks_rp),
+        "a_n": KS_AN, "p_n": hex::encode(p_n), "k": KS_K, "r": hex::encode(r),
+        "challenge_input": hex::encode(&ch_in), "e": hex::encode(&proof[..32]), "s": hex::encode(&proof[32..]),
+        "n_message": hex::encode([&p_n[..], &proof[..]].concat()),
+        "c_opening": hex::encode([&p_c[..], &nonce[..]].concat()),
+        "joint": hex::encode(joint),
+    });
+
     json!({
-        "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments and the masked input",
+        "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input and the key share with N's proof of knowledge",
         "conventions": "a 128-bit value is a u128 whose 16 bytes are little-endian; integers are hex, most significant digit first; byte strings are hex in order; GF(2^64) = GF(2)[x]/(x^64+x^4+x^3+x+1), bit i = coefficient of x^i; field elements are integers mod the P-256 prime",
         "xtime": xt,
         "gf64_mul": gf64,
@@ -979,6 +1153,7 @@ fn vectors() -> serde_json::Value {
         "gate": gate,
         "input_label_commitment": com_cases,
         "masked_input": mi,
+        "key_share": key_share,
     })
 }
 

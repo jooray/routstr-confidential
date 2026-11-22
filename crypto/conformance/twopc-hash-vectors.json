@@ -1,6 +1,6 @@
 {
   "conventions": "a 128-bit value is a u128 whose 16 bytes are little-endian; integers are hex, most significant digit first; byte strings are hex in order; GF(2^64) = GF(2)[x]/(x^64+x^4+x^3+x+1), bit i = coefficient of x^i; field elements are integers mod the P-256 prime",
-  "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments and the masked input",
+  "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input and the key share with N's proof of knowledge",
   "gate": {
     "a0": "00112233445566778899aabbccddeeff",
     "b0": "fedcba98765432100f1e2d3c4b5a6979",
@@ -207,6 +207,27 @@
       "w": 512
     }
   ],
+  "key_share": {
+    "a_c": "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+    "a_n": "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721",
+    "c_opening": "04984225585d2285c138033d6140e3cef8b91859704e53c313f8b636ba4f9676499734144f46fd19a767a545287c4396b97b69dd38faaea8981adc1a4fed9b401e909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "challenge_input": "726f75747374722d74776f70632d73706c6974206b65792d73686172652070726f6f668ca93c8d10659702fca83b6bcf5486fca5e60c1a8ffe57551dba1e2c5395a41f7dffa614c8cc4d4c13d0eeb9d4475063319835af9a697bb3a9b2860e074244ca0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d446229904efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf371634a7e72c423213443152c82df94fe0f6851bf894fd91c64b19555346093ff492",
+    "com": "7dffa614c8cc4d4c13d0eeb9d4475063319835af9a697bb3a9b2860e074244ca",
+    "commit_tag": "routstr-twopc-v2 key-share commit",
+    "e": "8ce48cccc8dec4ee1ea8a843f5dff29c56a0aab4c8bd9c28b689e1eb373fedf2",
+    "hparams": "000102030405060708090a0b0c0d0e0fefcdab896745230178695a4b3c2d1e0f",
+    "joint": "04d498887b09364e6ee0b8676f05194d77395f342d6f8cf71b7360755491ec7551c94eda9cf8eaa2b03ba6bd399db08e94c6edb01117594877339bdb878080510e",
+    "k": "a6e3c57dd01abe90086538398355dd4c3b17aa873382b0f24d6129493d8aad60",
+    "n_message": "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d44622998ce48cccc8dec4ee1ea8a843f5dff29c56a0aab4c8bd9c28b689e1eb373fedf26fe8447ae3b901b261287222db0abf7e9274c0c674d1591fa84e47b0e7103f94",
+    "nonce": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "p_c": "04984225585d2285c138033d6140e3cef8b91859704e53c313f8b636ba4f9676499734144f46fd19a767a545287c4396b97b69dd38faaea8981adc1a4fed9b401e",
+    "p_n": "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299",
+    "proof_tag": "routstr-twopc-split key-share proof",
+    "r": "04efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf371634a7e72c423213443152c82df94fe0f6851bf894fd91c64b19555346093ff492",
+    "rparams": "8ca93c8d10659702fca83b6bcf5486fca5e60c1a8ffe57551dba1e2c5395a41f",
+    "s": "6fe8447ae3b901b261287222db0abf7e9274c0c674d1591fa84e47b0e7103f94",
+    "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+  },
   "masked_input": [
     {
       "delta": "dea89a799915db0d2aefde4e23cc4e4737b5d99594f09a348d0841ceebb5f1bc",
