@@ -76,6 +76,7 @@
 #   h2-h-no-proof         the records are never proven: held, the provider answers nothing
 #   h2-i-own-keyshare     the client's own key share instead of the joint one
 #   h2-j-twopc-tag        a 2PC peer of another version (twopc_version_mismatch)
+#   h2-j-twopc-tag-old    a 2PC peer of the previous variant, split-public-1 (twopc_version_mismatch)
 #   h2-l-big-frame        one 9 MiB binary message right after `ready`, above the sidecar's client
 #                         buffer: `error` 413 frame_too_large, without `fault` (the client's doing)
 #   h11-c-suffix          the final record is another model's suffix of the same length (π_WIN fails)
@@ -269,6 +270,7 @@ run_case h2-g-early-record   "refused:2:0:." 0 none -- --http 2 --adv early-reco
 run_case h2-h-no-proof       "withheld:2:1" 0 none -- --http 2 --adv no-proof
 run_case h2-i-own-keyshare   "refused:2:0:share" 0 none -- --http 2 --adv own-keyshare
 run_case h2-j-twopc-tag      "refused:2:0:twopc_version_mismatch" 0 none -- --http 2 --adv twopc-tag
+run_case h2-j-twopc-tag-old  "refused:2:0:twopc_version_mismatch" 0 none -- --http 2 --adv twopc-tag-old
 run_case h2-l-big-frame      "refused:2:0:frame_too_large" 0 none -- --http 2 --adv big-frame
 
 # --- attacks, framing "1.1" ----------------------------------------------------
