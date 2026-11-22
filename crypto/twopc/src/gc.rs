@@ -150,7 +150,7 @@ impl<'a> RowHash<'a> {
 
     #[inline]
     fn tau(stage: usize, idx: usize) -> u64 {
-        assert!(stage < 8 && idx < (1 << 32), "row tweak out of range");
+        assert!(stage < 8 && (idx as u64) < (1 << 32), "row tweak out of range");
         ((stage as u64) << 32) | idx as u64
     }
 
