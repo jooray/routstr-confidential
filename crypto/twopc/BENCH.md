@@ -1,8 +1,15 @@
-# twopc benchmark (two-party key schedule, `split-public-1`)
+# twopc benchmark (two-party key schedule, `split-public-2`)
 
 Protocol v3's key schedule (`PROTOCOL-V3.md` §4, `docs/TWOPC-DESIGN.md`, `docs/TWOPC-NODE-GARBLING.md`):
-node-only authenticated garbling with three-halves tables and 64-bit salted check rows, as in v2, over the
-split circuit (key-pad states and outer compressions only, `IS_k` public). The **v2** column is v2's own
+node-only authenticated garbling with three-halves tables and 64-bit check rows, as in v2, over the split
+circuit (key-pad states and outer compressions only, `IS_k` public).
+
+`split-public-2` changes against `split-public-1` (section "split-public-2 against split-public-1" below has
+the measurements): the garbling hash is `AES_k(Y) ⊕ σ(Y)`, `Y = X ⊕ U(τ)`, with N's per-session parameters
+(32 bytes before the tables) instead of mpz2's fixed-key TCCR, so a gate costs N 6 AES calls and C 3 instead
+of 12 and 6; the check rows are keyed by row parameters from C's seed; N's garbled input is a random mask ρ
+whose labels go out before the seed (its share follows as δ = x_N − ρ in the handshake); N commits to both
+labels of the other 2 560 input wires before the seed, under a 16-byte salt from C. The circuit is the same. The **v2** column is v2's own
 measurement from this file's earlier version (branch `twopc-v2`, same machine, 2026-11-11); CPU and memory of
 v2 were measured now, from the v2 sources at commit `17540f8`, with the same `procbench`.
 
@@ -29,10 +36,10 @@ AND gates at the end of each stage (A1, A2, A3, B1, B2): 87 674 / 196 696 / 262 
 
 ## Bytes per run
 
-| | v2 | v3 | |
-|---|---|---|---|
-| client up | 1.21 MB | **1.13 MB** | −7 % |
-| client down | 22.12 MB | **16.38 MB** | −26 % |
+| | v2 | v3 (`split-public-1`) | | v3 (`split-public-2`) |
+|---|---|---|---|---|
+| client up | 1.21 MB | 1.13 MB | −7 % | **1.13 MB** (+25 B) |
+| client down | 22.12 MB | 16.38 MB | −26 % | **16.47 MB** (+82 006 B, +0.5 %) |
 
 By phase, C's view (v2's phases A and B correspond to `handshake` and `application`):
 
@@ -45,8 +52,10 @@ By phase, C's view (v2's phases A and B correspond to `handshake` and `applicati
 | `handshake` stages (v2: phase A) | 73 | 20 498 | 327 | 24 612 |
 | `application` stages (v2: phase B) | 238 | 24 077 | 240 | 20 498 |
 
-(v3's online rows are computed from the message sizes plus framing: the last report of a call and N's first
-labels cross the step boundary in the measured per-step counters below.)
+(The v3 rows above are `split-public-1`'s, computed from the message sizes plus framing: the last report of a
+call and N's first labels cross the step boundary in the measured per-step counters below. `split-public-2`
+moves N's 4 096 bytes of input labels into preprocessing and adds 32 bytes of δ to the handshake; the next
+section has its measured counters.)
 
 Where v3's bytes go (computed from the circuit; OT traffic measured):
 
@@ -56,8 +65,10 @@ Where v3's bytes go (computed from the circuit; OT traffic measured):
 | check rows and Y_N (8 B per AND gate and per entering wire), N→C | 3 864 984 |
 | mask commitment bits, N→C | 120 108 |
 | label-check pairs (32 B per reported output wire), N→C | 80 896 |
-| online labels and corrections, N→C | 45 056 |
-| reports, d bits, seed, key share, C→N | 674 |
+| online labels and corrections, N→C | 45 056 (`split-public-2`: 4 096 of them in preprocessing, + 32 δ) |
+| hash parameters, N→C (`split-public-2`) | 32 |
+| input-label commitments, N→C (`split-public-2`: 2 560 wires × 2 × 16 B) | 81 920 |
+| reports, d bits, seed, key share, C→N | 674 (`split-public-2`: 690, the 16-byte salt) |
 | MAC COTs (Ferret over KOS, C sender, Δ_B): C→N / N→C | 1.09 MB / 0.45 MB |
 | COTs for C's input (KOS, N sender, Δ_A): C→N / N→C | 12 kB / 4 kB |
 
@@ -175,6 +186,42 @@ What is left on the 2/10 link: 16.4 MB at 10 Mbit/s is 13.1 s; the rest is 1.1 s
 (the OT bootstrap), 0.7 s of turn-arounds (between the table parts, and d bits → seed → rows) and 0.8 s of
 key share, ECtF and stages. The rows cannot be sent earlier: they depend on C's seed, which C sends only
 after the tables and commitments arrived.
+
+## `split-public-2` against `split-public-1`
+
+Apple M2 Max, 2026-11-22, `examples/bench.rs --runs 3` built from both commits one after the other on the same
+machine (medians of 3). Payload (`message_sizes()`): N→C 15 907 762 → 15 989 746 B (+81 984: 32 hash
+parameters, 81 920 commitments, 32 δ), C→N 674 → 690 B (+16 salt); 4 more frames (3 N→C, 1 C→N).
+
+Transport bytes per session including the tag, mux headers and OT traffic:
+
+| | `split-public-1` | `split-public-2` | |
+|---|---|---|---|
+| C received | 16 384 987 | 16 466 993 | +82 006 (payload +81 984, +12 frame prefixes, the rest mux headers) |
+| C sent | 1 134 221 | 1 134 246 | +25 (16 + 4 + one 5-byte mux header) |
+| C received in preprocessing | 16 339 646 | 16 425 716 | +86 070 (N's input labels moved here) |
+| C received in ECtF + stages A1–A3 | 24 742 | 20 678 | −4 064 |
+
+Wall time, C's view, ms (cold session in seconds):
+
+| link | step | `split-public-1` | `split-public-2` |
+|---|---|---|---|
+| local | cold session | 0.48 s | 0.46 s |
+| local | preprocess / ECtF / `handshake` stages / `application` stages | 391 / 5.1 / 37.9 / 30.3 | 393 / 5.3 / 30.8 / 25.3 |
+| 40 ms, 2 up / 50 down | cold session | 7.15 s | 7.09 s |
+| 40 ms, 2 up / 50 down | ECtF + `handshake` stages / `application` stages | 171 + 337 / 230 | 172 + 320 / 206 |
+| 40 ms, 7 up / 50 down | ECtF + `handshake` stages | 171 + 332 | 169 + 334 |
+| 25 ms, 100 symmetric | ECtF + `handshake` stages / `application` stages | 110 + 240 / 169 | 111 + 228 / 149 |
+| 40 ms, 2 up / 10 down | cold session | 15.67 s | 15.71 s |
+
+δ adds no round trip: from ECtF to the end of stage A3 the time is unchanged on every link (a round trip is
+50 to 80 ms there). The online stages are faster by the halved AES count (local: 38 → 31 ms and 30 → 25 ms).
+Preprocessing is unchanged within noise; it is bound by the link and the OTs.
+
+Live, through a loopback sidecar against the real provider (`driver.ts --sidecar`, 2026-11-22, model
+`mistral-small-3-2-24b-instruct`, 20 tokens): `twopc_recv` 16 466 998, `twopc_sent` 1 134 422 for both framings
+(`split-public-1`: 16 384 987 / 1 134 397); cu-2pc preprocess 432 ms, ECtF 0.4 ms, `handshake` stages 25 ms,
+`application` stages 22 ms.
 
 ## Live (real provider, sidecar and reference driver on one host, 2026-11-11)
 
