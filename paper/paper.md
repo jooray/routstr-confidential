@@ -466,7 +466,12 @@ credential record.
 
 **Joint key share.** C draws a scalar $a_C$, sends a commitment $\mathrm{SHA256}(P_C \Vert \rho)$ to
 $P_C = a_C G$, receives $P_N = a_N G$ from N and opens. Both compute $P = P_C + P_N$. Committing first
-prevents C from choosing $P_C = T - P_N$ for a point $T$ whose discrete logarithm it knows. Scalars are
+prevents C from choosing $P_C = T - P_N$ for a point $T$ whose discrete logarithm it knows. With $P_N$
+N sends a proof that it knows $a_N$: a Schnorr proof made non-interactive with SHA-256, 64 bytes, whose
+challenge hashes C's commitment, a value both parties derived in preprocessing from C's seed and N's
+hash parameters, $P_N$ and the proof's commitment. C verifies it before it opens, so the proof adds no
+message, and a proof made for another key share does not verify. The soundness argument of section 5
+uses it; C gives no such proof, because no argument needs one. Scalars are
 fresh in every connection. The key exchange uses P-256 rather than X25519 because the joint share needs
 full point addition, which X25519's x-only Montgomery form does not offer.
 
@@ -1167,13 +1172,15 @@ this choice, and every stage's pointer bits depend on C's input. For a uniform p
 the inputs on which a prepared violation passes in a stage of $n$ gates with probability at most
 $6n/2^{128}$; that the real point gives N no
 more is an assumption, DDH in P-256, for every N. We have not written the reduction out. A sketch of it
-models HKDF-Extract and the hash of the key-share commitment as random oracles and uses strong
-Diffie-Hellman for the keys of U's flight, which N holds before the first stage ends. Written this way
-it covers the first stage. For the later stages it needs in addition that N knows the discrete logarithm
-of its key share $P_N$, which the protocol does not make N prove (a proof of knowledge in the key share
-would), and to decide whether a violation is present it reads N's masks from N's queries to the hash of
-the base OT, modelled as a random oracle. An N that cannot compute $s P_N$ cannot supply its input to
-the share conversion, and the connection ends at U's flight before an application secret exists. And it relays the ServerHello and the server flight,
+plays C with one point of a DDH challenge and U with the other, and to compute U's key it needs the
+discrete logarithm of N's key share $P_N$. N proves that it knows it (section 4.3), and the sketch
+extracts it by running N twice from its query for the proof's challenge, with SHA-256 there as a random
+oracle. This is extraction by rewinding, for one connection at a time, not straight-line. With $a_N$
+one reduction covers all five stages, with HKDF-Extract as a random oracle for the keys of U's flight,
+which N holds before the first stage ends. To decide whether a violation is present it reads N's masks
+from N's queries to the hash of the base OT, modelled as a random oracle. (As first deployed, the
+variant had no such proof, and N's knowledge of $a_N$ was an assumption for every stage after the
+first.) And it relays the ServerHello and the server flight,
 which enter the digests through $th_{SH}$ and $th_{SF}$. N holds $s_{hs}$, so it can open the flight,
 change it and recompute the Finished: C must accept only what U's signature fixes. C's TLS stack
 therefore accepts no message besides the four of the flight, nothing after the signature in
@@ -1508,7 +1515,7 @@ The CPU and memory rows are `split-public-1`'s (2026-11-11) and were not measure
 rows are `split-public-2`'s. Of the 16.5 MB C downloads, 11.8 MB are the three-halves tables and 3.9 MB
 the 64-bit check rows; the mask commitments, the label-check pairs (81 kB), the input-label commitments
 (82 kB) and the correlated OT are the rest. Of the 1.13 MB it uploads, 1.09 MB is its part of Ferret, in
-which C is the sender. `split-public-2` moves 81,984 bytes more to C and 16 bytes more from C than
+which C is the sender. `split-public-2` moves 82,048 bytes more to C and 16 bytes more from C than
 `split-public-1`, and adds no round trip. Locally the handshake stages take 31 ms and the application
 stages 25 ms at C (`split-public-1`: 38 and 30 ms; the garbling hash of `split-public-2` needs half the
 AES calls). The split adds round trips on the request path: at 80 ms round-trip time the handshake
