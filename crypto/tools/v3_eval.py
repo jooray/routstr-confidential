@@ -29,6 +29,8 @@ Arguments: case expect driver_rc driver_out driver_err sidecar_runs_dir
                          which the provider answered, is refused for that reason (by the frame
                          rules, or by a failed π_WIN); request n was released and is never settled
   legacy                 a protocol-v2 setup is answered with `upgrade_required`
+  silent2pc              the 2PC channel got the tag and the salt, then nothing for 20 s or more:
+                         the driver's SILENT_2PC line shows no table byte and under 64 KiB in all
 In every case the driver must print no DEPOSIT_DEVIATION line (a deposit outcome that
 deviates from the signed terms, PROTOCOL-V3.md §12.10).
 """
@@ -108,6 +110,18 @@ def honest(http, n):
 
 if rc in (124, 137):
     dev.append(f"TIMEOUT (rc={rc})")
+elif kind == "silent2pc":
+    sil = tagged("SILENT_2PC")
+    evidence += f" silent={json.dumps(sil)[:200] if sil else None}"
+    if rc != 0 or not sil:
+        dev.append("no SILENT_2PC result (driver exit != 0: a table byte came, or it failed)")
+    else:
+        if sil.get("table_bytes") != 0:
+            dev.append(f"the node sent {sil.get('table_bytes')} table bytes to a silent client")
+        if not sil.get("recv_bytes", 1 << 30) < 65536:
+            dev.append(f"{sil.get('recv_bytes')} bytes on the 2PC channel to a silent client")
+        if (sil.get("wait_ms") or 0) < 20000:
+            dev.append("waited less than 20 s")
 elif kind == "legacy":
     leg = tagged("LEGACY_JSON")
     evidence += f" answer={json.dumps((leg or {}).get('answer'))[:200]}"

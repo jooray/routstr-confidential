@@ -129,14 +129,20 @@
 #   no-funds                row 1: a setup with an unfunded key (402), sidecar not dialed
 #   low-balance             row 1: funds below D (402 `connection_deposit_unfunded`)
 #   sidecar-down            row 2: the sidecar is gone at the setup: D released (`not_started`)
-#   h2-n-evict-spare        row 13: an armed connection held unused while the address is at its
-#                           unused limit (set to 1 for the case, the minimum age to 8 s): a second
-#                           client's setup closes it (`closed` `evicted`, `unused: true`); one unused
-#                           connection is below CONFIDENTIAL_EVICT_CHARGE_FROM (5): D released
-#                           (`evicted_released`), signed; the second client's request settles
-#   h2-n-evict-hoard        the same with a second armed connection of another key at the address,
-#                           the unused limit and the threshold at 2 (the smallest the node takes):
-#                           the older one is closed, D charged (`evicted`), signed with the count 2
+#   eviction under slot pressure (row 13, §8.4): the node restarted with 3 session slots
+#   (CU_TEST_MAX_SESSIONS), loopback trusted as its proxy so each client names its address
+#   (`--client-ip`, X-Forwarded-For), the minimum age 8 s; every armed connection held unused:
+#   h2-n-evict-lone         the case's spare alone at its address (the oldest), two at a second
+#                           address: a third address's setup closes the hoard's older one (h1,
+#                           count 2), not the older lone spare; with one each left (the third
+#                           address's connection too young), a fourth address's setup closes the
+#                           oldest, the case's spare: `closed` `evicted` `unused: true`, D charged
+#                           (`evicted`), signed with the count 1; that setup's request settles
+#   h2-n-evict-own          the case's spare and a second one at address H, one lone spare at B: a
+#                           setup from H closes H's own oldest (the case's, count 2, charged), never
+#                           B's spare, which holds fewer
+#   h2-n-silent-2pc         the 2PC channel gets the version tag and the salt, then nothing for 25 s:
+#                           the node sends no table byte (under 64 KiB in all), D charged (`unused`)
 #   fb-h2                   row 3: the HTTP/2 open fails (test hook): D released
 #                           (`provider_unreachable`)
 #   sidecar-killed          row 4: the sidecar dies under an open connection: D released
@@ -186,6 +192,9 @@ MAX_TOKENS=20
 # the node's 15 s of proof-channel quiet).
 EVICT_AFTER=8
 EVICT_WAIT=18
+# The eviction cases' node: this many session slots (a test hook of the node).
+EVICT_SLOTS=3
+TEST_MAX_SESSIONS=""
 export CU_PROVER="${CU_PROVER:-$CRYPTO/zkbench/target/release/cu-prover}"
 export CU_2PC="${CU_2PC:-$CRYPTO/zkbench/target/release/cu-2pc}"
 read -r -a DRIVER <<< "${CU_DRIVER:-node --experimental-strip-types src/driver.ts}"
@@ -280,6 +289,7 @@ start_node() {
       HTTP_URL="$NODE" RELAYS='["ws://127.0.0.1:9"]' ENABLE_ANALYTICS_SHARING=false \
       CONFIDENTIAL_SESSION_FEE_MSAT="$FEE" CONFIDENTIAL_ABANDON_FEE_MSAT="$ABANDON" \
       CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT="$DEPOSIT" CONFIDENTIAL_IDLE_TIMEOUT_S="$IDLE"
+    if [ -n "$TEST_MAX_SESSIONS" ]; then export CU_TEST_MAX_SESSIONS="$TEST_MAX_SESSIONS"; fi
     exec "$CORE/.venv/bin/uvicorn" --app-dir "$CORE" routstr.core.main:app --host 127.0.0.1 --port "$NPORT" \
       --ws-ping-timeout 300
   ) >> "$OUT/node.out" 2>&1 &
@@ -309,11 +319,14 @@ if [ -n "${CU_NODE_MODELS:-}" ]; then
   done
 fi
 fetch_offer() { curl -fsS "$NODE/v1/confidential/offer?v=3"; }
-for _ in $(seq 1 150); do
-  fetch_offer > "$OUT/offer.json" 2>/dev/null \
-    && "$PY" -I -c 'import json,sys; o=json.load(open(sys.argv[1])); sys.exit(0 if sys.argv[2] in o.get("price_list", {}) else 1)' "$OUT/offer.json" "$MODEL" && break
-  sleep 0.4
-done
+wait_priced() { # until the node's offer prices the model
+  for _ in $(seq 1 150); do
+    fetch_offer > "$OUT/offer.json" 2>/dev/null \
+      && "$PY" -I -c 'import json,sys; o=json.load(open(sys.argv[1])); sys.exit(0 if sys.argv[2] in o.get("price_list", {}) else 1)' "$OUT/offer.json" "$MODEL" && break
+    sleep 0.4
+  done
+}
+wait_priced
 "$PY" -I - "$OUT/offer.json" "$MODEL" "$FEE" "$ABANDON" "$DEPOSIT" "$IDLE" "$IMAGE_MODEL" "${CU_NO_IMAGES:-0}" "$HTTP_LIST" <<'PYEOF' || { echo "the node's offer is not usable; see $OUT/offer.json and $OUT/node.out" >&2; exit 2; }
 import json, sys
 o = json.load(open(sys.argv[1]))
@@ -367,33 +380,33 @@ set_setting() { # <name> <integer value>: a node setting, through its admin API
   curl -fsS -o /dev/null -X PATCH -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
     -d "{\"$1\": $2}" "$NODE/admin/api/settings"
 }
-# companion <id>: one more armed framing-"2" connection from the same address, on a
-# key of its own, held unused until `stop_companion` (the `evict-hoard` hook).
-companion() {
-  local key3
-  key3="$(openssl rand -hex 32)"
-  sqlite3 -cmd ".timeout 5000" "$DB" "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('$key3',$START_BALANCE,0,0,0);"
-  : > "$OUT/$1.companion.out"
-  ( cd "$CRYPTO/client" && sleep "$((CASE_TIMEOUT + 2 * EVICT_WAIT))" | "$TIMEOUT_BIN" -k 5 "$((CASE_TIMEOUT + 2 * EVICT_WAIT))" "${DRIVER[@]}" --http 2 --arm \
-      --node "$NODE" --model "$MODEL" --max-tokens "$MAX_TOKENS" --auth "sk-$key3" --runs-dir "$OUT/client-runs" ) \
-    > "$OUT/$1.companion.out" 2> "$OUT/$1.companion.err" &
-  echo "$key3" > "$OUT/$1.companion.key"
-  wait_for "$OUT/$1.companion.out" '^READY' "$CASE_TIMEOUT"
+# side <id> <name> <address> arm|req: one more client on a key of its own, counted at
+# <address> (`--client-ip`): `arm` holds an armed framing-"2" connection unused until
+# `stop_sides`; `req` sets up a framing-"2" connection and runs one request.
+SIDE_HOLD=$((CASE_TIMEOUT + 4 * EVICT_WAIT))
+side() {
+  local id="$1" name="$2" ip="$3" mode="$4" k rc2=0
+  k="$(openssl rand -hex 32)"
+  sqlite3 -cmd ".timeout 5000" "$DB" "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('$k',$START_BALANCE,0,0,0);"
+  echo "$k" > "$OUT/$id.$name.key"
+  : > "$OUT/$id.$name.out"
+  if [ "$mode" = arm ]; then
+    ( cd "$CRYPTO/client" && sleep "$SIDE_HOLD" | "$TIMEOUT_BIN" -k 5 "$SIDE_HOLD" "${DRIVER[@]}" --http 2 --arm --client-ip "$ip" \
+        --node "$NODE" --model "$MODEL" --max-tokens "$MAX_TOKENS" --auth "sk-$k" --runs-dir "$OUT/client-runs" ) \
+      > "$OUT/$id.$name.out" 2> "$OUT/$id.$name.err" &
+    wait_for "$OUT/$id.$name.out" '^READY' "$CASE_TIMEOUT"
+  else
+    ( cd "$CRYPTO/client" && "$TIMEOUT_BIN" -k 5 "$CASE_TIMEOUT" "${DRIVER[@]}" --http 2 --client-ip "$ip" --node "$NODE" --model "$MODEL" \
+        --max-tokens "$MAX_TOKENS" --auth "sk-$k" --runs-dir "$OUT/client-runs" < /dev/null ) \
+      > "$OUT/$id.$name.out" 2> "$OUT/$id.$name.err" || rc2=$?
+    echo "$rc2" > "$OUT/$id.$name.rc"
+  fi
 }
-stop_companion() {
-  [ -f "$OUT/$1.companion.key" ] && pkill -f -- "--auth sk-$(cat "$OUT/$1.companion.key")" 2>/dev/null || true
-}
-# newcomer <id>: a second client from the same address sets up a framing-"2"
-# connection with one request, on a key of its own (the `evict` hook).
-newcomer() {
-  local key2 rc2=0
-  key2="$(openssl rand -hex 32)"
-  sqlite3 -cmd ".timeout 5000" "$DB" "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('$key2',$START_BALANCE,0,0,0);"
-  echo "$key2" > "$OUT/$1.new.key"
-  ( cd "$CRYPTO/client" && "$TIMEOUT_BIN" -k 5 "$CASE_TIMEOUT" "${DRIVER[@]}" --http 2 --node "$NODE" --model "$MODEL" \
-      --max-tokens "$MAX_TOKENS" --auth "sk-$key2" --runs-dir "$OUT/client-runs" < /dev/null ) \
-    > "$OUT/$1.new.out" 2> "$OUT/$1.new.err" || rc2=$?
-  echo "$rc2" > "$OUT/$1.new.rc"
+stop_sides() {
+  local f
+  for f in "$OUT/$1".*.key; do
+    [ -f "$f" ] && pkill -f -- "--auth sk-$(cat "$f")" 2>/dev/null || true
+  done
 }
 # wait_for <file> <pattern> <seconds>: until the driver printed the pattern.
 wait_for() {
@@ -414,11 +427,12 @@ wait_for() {
 #   offer         after the first receipt, change the node's idle timeout (a new offer)
 #   kill-driver   kill the driver when it sees `body_released`
 #   kill-sidecar  kill the sidecar when the connection head is written
-#   evict         an armed connection held unused (stdin silent); once it is past the
-#                 node's minimum age and its proof channel is quiet, a second client of the
-#                 same address sets up (`newcomer`) against an unused limit of 1
-#   evict-hoard   as `evict`, but a second armed connection (`companion`, a key of its own)
-#                 is opened at the address first and held: two unused connections there
+#   evict-lone    the case's armed connection held unused (stdin silent); two more armed at a
+#                 second address (`side` h1, h2); once all are past the minimum age and their
+#                 proof channels are quiet, a third address holds one (n1), then a fourth sets
+#                 up and runs one request (`side` new)
+#   evict-own     the case's armed connection and one more (o1) at its address, one lone at
+#                 another (b1); then a setup from the case's address runs one request (new)
 run_case() {
   local id="$1" expect="$2" balance="$3" hook="$4"; shift 5
   selected "$id" || return 0
@@ -449,12 +463,14 @@ run_case() {
     kill-sidecar)
       ( wait_for "$OUT/$id.err" '<- head_written' "$CASE_TIMEOUT" && kill -9 "$SIDECAR_PID" ) & watcher=$! ;;
     hold) limit=700 ;;
-    evict)
-      limit=$((CASE_TIMEOUT + EVICT_WAIT))
-      ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT" && sleep "$EVICT_WAIT" && newcomer "$id" ) & watcher=$! ;;
-    evict-hoard)
-      limit=$((CASE_TIMEOUT + 2 * EVICT_WAIT))
-      ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT" && companion "$id" && sleep "$EVICT_WAIT" && newcomer "$id"; stop_companion "$id" ) & watcher=$! ;;
+    evict-lone)
+      limit=$SIDE_HOLD
+      ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT" && side "$id" h1 198.51.100.2 arm && side "$id" h2 198.51.100.2 arm \
+          && sleep "$EVICT_WAIT" && side "$id" n1 198.51.100.3 arm && sleep 1 && side "$id" new 198.51.100.4 req; stop_sides "$id" ) & watcher=$! ;;
+    evict-own)
+      limit=$SIDE_HOLD
+      ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT" && side "$id" o1 198.51.100.5 arm && side "$id" b1 198.51.100.6 arm \
+          && sleep "$EVICT_WAIT" && side "$id" new 198.51.100.5 req; stop_sides "$id" ) & watcher=$! ;;
   esac
   (
     cd "$CRYPTO/client"
@@ -463,12 +479,12 @@ run_case() {
       --auth "sk-$key" --runs-dir "$OUT/client-runs"; }
     case "$hook" in
       go) ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT"; sleep 1; echo go ) | run "$@" ;;
-      hold|evict|evict-hoard) sleep "$limit" | run "$@" ;;
+      hold|evict-lone|evict-own) sleep "$limit" | run "$@" ;;
       *) run "$@" < /dev/null ;;
     esac
   ) > "$OUT/$id.out" 2> "$OUT/$id.err" || rc=$?
-  # The newcomer of `evict` runs to its end; other watchers are stopped.
-  if [ -n "$watcher" ] && [ "$hook" != evict ] && [ "$hook" != evict-hoard ]; then kill "$watcher" 2>/dev/null || true; fi
+  # The sides of the eviction cases run to their end; other watchers are stopped.
+  if [ -n "$watcher" ] && [ "$hook" != evict-lone ] && [ "$hook" != evict-own ]; then kill "$watcher" 2>/dev/null || true; fi
   if [ -n "$watcher" ]; then wait "$watcher" 2>/dev/null || true; fi
   if [ "$hook" = offer ]; then set_idle "$IDLE"; fi
   # The signed offer after the case, too: a receipt's rates are one of the two.
@@ -618,21 +634,25 @@ run_case h2-received   "received:2"                          "$B" kill-driver --
 run_case h11-received  "received:1.1"                        "$B" kill-driver -- --http 1.1 --max-tokens 600 --prompt 'Write a 400 word essay about rivers.'
 run_case legacy-v2     "legacy"                              "$B" none -- --legacy-v2-socket
 run_case legacy-no-v   "legacy"                              "$B" none -- --legacy-v2-socket --legacy-no-v
+# A 2PC client that stays silent after its tag and salt gets no garbled table.
+run_case h2-n-silent-2pc "silent2pc"                         "$B" none -- --http 2 --adv silent-2pc
 # Slot pressure (§8.4): an unused connection past the minimum age yields its
-# slot to a newer setup and is charged its deposit (row 13, `evicted`).
-if selected h2-n-evict-spare || selected h2-n-evict-hoard; then
-  set_setting confidential_max_unused_per_ip 1
+# slot to a newer setup and is charged its deposit (row 13, `evicted`). The
+# node runs with EVICT_SLOTS session slots and takes each client's address from
+# X-Forwarded-For (loopback is its trusted proxy) for these cases.
+if selected h2-n-evict-lone || selected h2-n-evict-own; then
+  stop "$NODE_PID"; NODE_PID=""
+  TEST_MAX_SESSIONS="$EVICT_SLOTS"; start_node
+  wait_priced
+  set_setting confidential_trusted_proxies '["127.0.0.1"]'
   set_setting confidential_evict_unused_after_s "$EVICT_AFTER"
-  # A lone spare (1 unused connection at the address, below the default 5): released.
-  run_case h2-n-evict-spare "evicted:released"               "$B" evict -- --http 2 --arm
-  # Two unused connections at the address, the threshold at 2 (the node takes
-  # no lower one): the address counts as hoarding, the older one is charged.
-  set_setting confidential_max_unused_per_ip 2
-  set_setting confidential_evict_charge_from 2
-  run_case h2-n-evict-hoard "evicted:charged"                "$B" evict-hoard -- --http 2 --arm
-  set_setting confidential_evict_charge_from 5
-  set_setting confidential_max_unused_per_ip 12
+  run_case h2-n-evict-lone "evicted:1:h1:h2,n1"              "$B" evict-lone -- --http 2 --arm --client-ip 198.51.100.1
+  run_case h2-n-evict-own  "evicted:2::o1,b1"                "$B" evict-own  -- --http 2 --arm --client-ip 198.51.100.5
+  set_setting confidential_trusted_proxies '[]'
   set_setting confidential_evict_unused_after_s 60
+  stop "$NODE_PID"; NODE_PID=""
+  TEST_MAX_SESSIONS=""; start_node
+  wait_priced
 fi
 if [ "${CU_SLOW:-0}" = 1 ]; then
   run_case setup-timeout "unused:setup_timeout:anyrc"        "$B" hold -- --http 2 --arm

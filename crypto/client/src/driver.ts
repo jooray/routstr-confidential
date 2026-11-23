@@ -36,13 +36,17 @@
 //   --auth CREDENTIAL  --node-pubkey HEX|npub  --runs-dir DIR  --no-accept-fee
 //   --trusted-host H           required (repeatable; or CU_TRUSTED_HOSTS, comma-separated): the provider
 //                              hosts the offer's upstream_host may name; there is no built-in host
+//   --client-ip A              (tests) send X-Forwarded-For: A on the session socket; a node that trusts
+//                              loopback as its proxy counts the connection at address A
 //   --legacy-v2-socket [--legacy-no-v]   open a protocol-v2 socket and print the peer's answer (LEGACY_JSON)
 //   --adv MODE [--adv-at N]    an attack on request N (also --adv-h2):
 //       both framings: suffix (another suffix: --adv-suffix-model M = model swap, --adv-body-max-tokens N =
 //                      cap swap, --adv-image-count N), padding, early-record, no-proof, own-keyshare, twopc-tag,
 //                      twopc-tag-old (the 2PC peer speaks the previous variant, split-public-2),
 //                      big-frame (one 9 MiB binary message after `ready`: an `error` 413 frame_too_large
-//                      without `fault`, the client's doing)
+//                      without `fault`, the client's doing), silent-2pc (the 2PC channel gets the version tag
+//                      and the salt, then nothing for --adv-wait-ms, default 25000: prints SILENT_2PC with the
+//                      bytes the node sent per channel, exit 0 when no table byte came)
 //       framing "2":   hidden-headers, path [--adv-h2-path P], replay-usage
 //       framing "1.1": not-alone (the suffix is not alone in the final record)
 //       cancel-and-reuse (a later request that refers to the credential unbilled):
@@ -91,7 +95,7 @@ import { RequestRefused, advOutcome, type Ctx, type Framing, type ImageTerms, ty
 import { H11 } from './driver-h11.ts'
 import { H2Conn, runHttp2 } from './driver-h2.ts'
 import { MAX_DATA_IN_RECORD, chatPath, checkPiNKParamsH2, type H2OfferBlock } from './h2.ts'
-import { OfferRefused, PROTO, checkOffer as checkOfferTerms, imagesBlock, trustedHosts } from './check-offer.ts'
+import { OfferRefused, PROTO, TWOPC, checkOffer as checkOfferTerms, imagesBlock, trustedHosts } from './check-offer.ts'
 import { padBody, pinnedModel, renderChatSuffix, renderImagesSuffix } from './offer.ts'
 import { checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { makeReceiptChecker } from './receipt-check.ts'
@@ -200,6 +204,8 @@ const ADV_SUFFIX_MODEL = arg('--adv-suffix-model')
 const ADV_BODY_MAX_TOKENS = arg('--adv-body-max-tokens') === undefined ? undefined : Number(arg('--adv-body-max-tokens'))
 const ADV_IMAGE_COUNT = arg('--adv-image-count') === undefined ? undefined : Number(arg('--adv-image-count'))
 const ADV_ACCEPT_ANY = argv.includes('--adv-accept-any')
+/** `--client-ip A`: sent as X-Forwarded-For on the session socket (a test node that trusts loopback as its proxy takes it as the client's address). */
+const CLIENT_IP = arg('--client-ip')
 const ADV_MODE: string | undefined =
   arg('--adv') ?? arg('--adv-h2') ??
   (argv.includes('--adv-no-proof') || argv.includes('--adv-no-suffix') ? 'no-proof'
@@ -218,6 +224,8 @@ const ADV_MODES: Record<string, Framing[]> = {
   'extra-record': ['1.1'],
   // One binary message larger than the sidecar's client buffer, right after `ready`.
   'big-frame': ['2', '1.1'],
+  // A 2PC client that sends its version tag and salt and then nothing: no table may come.
+  'silent-2pc': ['2', '1.1'],
 }
 if (ADV_MODE !== undefined && !ADV_MODES[ADV_MODE]) usage(`--adv ${ADV_MODE}: one of ${Object.keys(ADV_MODES).join(', ')}`)
 const ADV_AT = Number(arg('--adv-at', ADV_MODE === 'replay-usage' ? '2' : '1'))
@@ -590,7 +598,7 @@ class Session {
   }
 
   async connect(): Promise<void> {
-    this.ws = new WebSocket(this.controlUrl())
+    this.ws = CLIENT_IP ? new (WebSocket as any)(this.controlUrl(), { headers: { 'X-Forwarded-For': CLIENT_IP } }) : new WebSocket(this.controlUrl())
     this.ws.binaryType = 'arraybuffer'
     this.ws.onopen = () => {
       this.wsOpen = true
@@ -863,6 +871,61 @@ class Session {
     this.sendBytes(new Uint8Array(BIG_FRAME_BYTES))
     await this.waitT('error', 60000)
     throw new Error('the peer answered an oversized client message with no error')
+  }
+
+  /**
+   * `--adv silent-2pc`: open the 2PC channel, send the version tag and C's
+   * first message (its 16-byte salt) and nothing more, for
+   * `--adv-wait-ms` (default 25 s, past the 20 s after which an older node
+   * streamed its tables anyway). Prints `SILENT_2PC {…}`: the bytes the node
+   * sent, per channel of the multiplexer (5 = the tables), then ends.
+   */
+  async silent2pc(): Promise<never> {
+    const ws = new WebSocket(this.zkUrl('twopc'))
+    ws.binaryType = 'arraybuffer'
+    let buf = new Uint8Array(0)
+    let tagLeft = new TextEncoder().encode(`routstr-2pc/${TWOPC}\n`).length
+    let recv = 0
+    const byChannel: Record<string, number> = {}
+    let closed = false
+    ws.onclose = () => (closed = true)
+    ws.onmessage = (ev) => {
+      const d = new Uint8Array(ev.data as ArrayBuffer)
+      recv += d.length
+      buf = concat(buf, d)
+      const skip = Math.min(tagLeft, buf.length)
+      tagLeft -= skip
+      buf = buf.subarray(skip)
+      // Multiplexer frames: [channel u8][length u32 BE][payload].
+      while (buf.length >= 5) {
+        const len = new DataView(buf.buffer, buf.byteOffset).getUint32(1)
+        if (buf.length < 5 + len) break
+        byChannel[buf[0]!] = (byChannel[buf[0]!] ?? 0) + len
+        buf = buf.subarray(5 + len)
+      }
+    }
+    ws.onopen = () => {
+      ws.send(new TextEncoder().encode(`routstr-2pc/${TWOPC}\n`))
+      // C→N channel (4): one framed message, the 16-byte salt.
+      const f = new Uint8Array(5 + 4 + 16)
+      f[0] = 4
+      new DataView(f.buffer).setUint32(1, 20)
+      new DataView(f.buffer).setUint32(5, 16)
+      f.set(cryptoRandom(16), 9)
+      ws.send(f)
+    }
+    const waitMs = Number(arg('--adv-wait-ms', '25000'))
+    await new Promise((r) => setTimeout(r, waitMs))
+    const tables = byChannel['5'] ?? 0
+    console.log('SILENT_2PC ' + JSON.stringify({ sid: this.sid, wait_ms: waitMs, recv_bytes: recv, by_channel: byChannel, table_bytes: tables, closed_by_node: closed }))
+    try {
+      ws.close()
+    } catch {
+      /* ignore */
+    }
+    this.close()
+    await new Promise((r) => setTimeout(r, 500))
+    process.exit(tables === 0 ? 0 : 1)
   }
 
   /** 2PC preprocessing, the joint key share and the proof channel: an armed connection stops here. */
@@ -1168,6 +1231,7 @@ async function openConnection(framing: Framing, label: string, arm: boolean, ctx
   await s.connect()
   await s.setup(arm)
   if (ctx.adv?.mode === 'big-frame') await s.bigFrame()
+  if (ctx.adv?.mode === 'silent-2pc') await s.silent2pc()
   const earlyAdv = ctx.adv && ['twopc-tag', 'twopc-tag-old', 'own-keyshare'].includes(ctx.adv.mode) ? ctx.adv.mode : undefined
   const keyShare = await s.prewarm(earlyAdv)
   let tClaim = s.tStart

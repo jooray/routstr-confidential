@@ -105,6 +105,12 @@ for v in crypto/conformance/*; do
       echo "DIFF  $c (differs from $v)"; vec_ok=0
     fi
   done < <(grep -E "(^|/)${name//./\\.}\$" "$ALLFILES")
+  # The SDK and browser-library checkouts, when present beside this one (git-ignored here).
+  for c in "routstr-sdk/tests/unit/fixtures/$name" "../routstr-confidential-web/test/fixtures/$name"; do
+    [ -f "$c" ] || continue
+    copies=$((copies + 1))
+    if cmp -s "$v" "$c"; then echo "same  $c"; else echo "DIFF  $c (differs from $v)"; vec_ok=0; fi
+  done
   echo "$v: $copies cop$([ $copies = 1 ] && echo y || echo ies)"
 done
 if [ "$vec_ok" = 1 ]; then pass "shared vectors"; else fail "shared vectors"; fi

@@ -56,11 +56,15 @@ the arithmetic. `expect` is one of (H is the framing, "2" or "1.1"):
                                 reservation is charged, the deposit released (`request_received`)
   setup-refused:<status>:<regex>  the setup is refused before the sidecar is dialed: nothing reserved
   legacy                        a protocol-v2 socket gets `error` 426 `upgrade_required`
-  evicted:charged|released      an armed connection held unused is closed for a newer setup of the
-                                same address (`closed` `evicted`, `unused: true`): the deposit is
-                                charged (`evicted`) or released (`evicted_released`), signed, with the
-                                address's count; the newcomer's request settles (its output in
-                                <case>.new.out, its key in <case>.new.key)
+  evicted:<count>:<gone>:<kept>  the case's armed connection, held unused, is closed for a newer
+                                setup (`closed` `evicted`, `unused: true`): the deposit is charged
+                                (`evicted`), signed, with its address's count <count>; the other
+                                clients (`side`, comma lists of names) in <gone> were evicted too, with
+                                their deposits charged, those in <kept> were not; the last setup's
+                                request settles (its output in <case>.new.out, its key in <case>.new.key)
+  silent2pc                     the 2PC channel got the tag and the salt, then nothing: the driver's
+                                SILENT_2PC line shows no table byte and under 64 KiB in all; the deposit
+                                is charged (`unused`), nothing reserved
 In the attack cases a request finalized without a receipt must be stated in the
 connection's last frame, signed (`request_outcome`): the reservation, the abandon
 fee, or a release in full.
@@ -526,10 +530,18 @@ elif kind == "error":
         if aborted:
             dev.append(f"a reservation was finalized by an abort ({aborted})")
 elif kind == "evicted":
+    count, gone, kept = (rest.split(":") + ["", ""])[:3]
+    gone = [x for x in gone.split(",") if x]
+    kept = [x for x in kept.split(",") if x]
     sid = sids[0] if sids else None
     told = re.search(r"deposit: outcome=(\w+) reason=(\w+) msat=(\d+) .*signed=(\w+)", out)
-    new_out_f = out_f[: -len(".out")] + ".new.out"
-    new_out = open(new_out_f, errors="replace").read() if os.path.exists(new_out_f) else ""
+    base = out_f[: -len(".out")]
+
+    def side_out(name):
+        f = f"{base}.{name}.out"
+        return open(f, errors="replace").read() if os.path.exists(f) else ""
+
+    new_out = side_out("new")
     new_e2e = None
     for line in new_out.splitlines():
         if line.startswith("E2E_JSON "):
@@ -540,13 +552,24 @@ elif kind == "evicted":
         dev.append("the held connection never got a sid")
     if not re.search(r"closed: reason=evicted unused=true", out):
         dev.append("the held connection was not closed `evicted` with `unused: true`")
-    want_dep = ("charged", "evicted") if rest == "charged" else ("released", "evicted_released")
+    want_dep = ("charged", "evicted")
     if deposit_of(sid) != [(*want_dep, DEP)]:
         dev.append(f"the held connection's deposit was not {want_dep} (node: {deposit_of(sid)})")
     if not told or told.groups() != (*want_dep, str(DEP), "true"):
-        dev.append(f"the held connection's client was not told, signed, that the deposit was {want_dep[0]}")
-    if not re.search("unused_at_address=2 charge_from=2" if rest == "charged" else "unused_at_address=1 charge_from=5", out):
-        dev.append("the deposit outcome does not carry the address's count and the threshold")
+        dev.append("the held connection's client was not told, signed, that the deposit was charged")
+    if not re.search(rf"deposit: .*unused_at_address={count}\b", out):
+        dev.append(f"the deposit outcome does not carry the address's count {count}")
+    for name in gone:
+        o = side_out(name)
+        if not re.search(r"closed: reason=evicted unused=true", o):
+            dev.append(f"{name} was not evicted")
+        elif not re.search(r"deposit: outcome=charged reason=evicted .*signed=true", o):
+            dev.append(f"{name} was evicted without a signed charge of its deposit")
+    for name in kept:
+        if re.search(r"closed: reason=evicted", side_out(name)):
+            dev.append(f"{name} was evicted, though it must not be")
+        if not side_out(name):
+            dev.append(f"no output of {name}")
     if ((sid or "")[:12], 1) in reserved:
         dev.append("a request was reserved on the held connection")
     if len(new_reqs) != 1 or new_reqs[0].get("status") != 200 or new_reqs[0].get("receipt_sig_ok") is not True:
@@ -554,7 +577,7 @@ elif kind == "evicted":
     if not msg(evs, "evicting a connection to make room", sid):
         dev.append("the node did not log the eviction")
     try:
-        key2 = open(out_f[: -len(".out")] + ".new.key").read().strip()
+        key2 = open(f"{base}.new.key").read().strip()
         db = sqlite3.connect(f"file:{ctx['db']}?mode=ro", uri=True, timeout=10)
         r2 = db.execute("select reserved_balance, total_spent from api_keys where hashed_key = ?", (key2,)).fetchone()
         db.close()
@@ -562,11 +585,30 @@ elif kind == "evicted":
             dev.append(f"the newcomer's key is not settled cleanly ({r2})")
     except OSError:
         dev.append("no newcomer key")
-    newdev = [l for l in new_out.splitlines() if l.startswith("DEPOSIT_DEVIATION ")]
-    if newdev:
-        dev.append(f"the newcomer's driver reports a deviation: {newdev[0][:200]}")
-    if rest == "charged":
-        charges.append(DEP)
+    for name in ["new", *gone, *kept]:
+        sd = [l for l in side_out(name).splitlines() if l.startswith("DEPOSIT_DEVIATION ")]
+        if sd:
+            dev.append(f"the driver of {name} reports a deviation: {sd[0][:200]}")
+    charges.append(DEP)
+elif kind == "silent2pc":
+    sid = sids[0] if sids else None
+    line = next((l for l in out.splitlines() if l.startswith("SILENT_2PC ")), None)
+    sil = json.loads(line[len("SILENT_2PC "):]) if line else None
+    evidence += f" {money()} silent={json.dumps(sil)[:200] if sil else None}"
+    if rc != 0 or not sil:
+        dev.append("no SILENT_2PC result (driver exit != 0: a table byte came, or it failed)")
+    else:
+        if sil.get("table_bytes") != 0:
+            dev.append(f"the node sent {sil.get('table_bytes')} table bytes to a silent client")
+        if not sil.get("recv_bytes", 1 << 30) < 65536:
+            dev.append(f"the node sent {sil.get('recv_bytes')} bytes on the 2PC channel to a silent client")
+        if (sil.get("wait_ms") or 0) < 20000:
+            dev.append("waited less than 20 s")
+    if deposit_of(sid) != [("charged", "unused", DEP)]:
+        dev.append(f"the deposit was not charged as unused (node: {deposit_of(sid)})")
+    if reserved or settled or aborted or reqs:
+        dev.append("a request was reserved or settled")
+    charges.append(DEP)
 elif kind == "node-refused":
     http, n, status, reason = rest.split(":", 3)
     n = int(n)
