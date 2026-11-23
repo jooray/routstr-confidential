@@ -174,9 +174,12 @@ accepts iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   Finished, with χ and `IS_MS` known. What C accepts is then N's choice of `th_SF`, so C must accept only
   what U's signature fixes. The signature covers the transcript up to Certificate. C's TLS stack requires
   that CertificateVerify ends with its signature, that an ECDSA signature is the DER encoding of `(r, s)`,
-  that the Finished follows directly, and that no other message type appears (the three client stacks:
-  `FORK-NOTES.md`, TLS-17). An ECDSA signature `(r, s)` also verifies as `(r, n − s)`, so N has at most two
-  values of `th_SF`: a factor 2 on the terms of stages B1 and B2 (`th_SF` enters B1 through its digests
+  that an RSA signature has exactly the length of the modulus, that the Finished follows directly, and
+  that no other message type appears (the three client stacks: `FORK-NOTES.md`, TLS-17 and TLS-20; until
+  2026-11-23 a stack on OpenSSL's WebCrypto also verified an RSA signature whose leading zero bytes were
+  dropped, a second encoding for one RSA-PSS signature in 256, which stayed within the factor below). An
+  RSA signature has one accepted form. An ECDSA signature `(r, s)` also verifies as `(r, n − s)`, so N has
+  at most two values of `th_SF`: a factor 2 on the terms of stages B1 and B2 (`th_SF` enters B1 through its digests
   and B2 through `IS_c0`, which is derived from `c_ap_0`). A stack that accepts q flights per signature
   gives a factor q there; the stacks released with `split-public-1` accepted any number (among others,
   bytes after the signature were ignored), which made those terms a bound on N's work (at most about
@@ -192,7 +195,7 @@ accepts iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   share N did not choose (ε_QS: the product check's error; 12 = 6 preimages times 2 flights; the second
   term is about 2^-106). **Argued**, new in `split-public-2`, no
   review. Tests: `adder_switch_attack_caught`, `gl_precedes_seed`, `in_com_precedes_seed`,
-  `delta_out_of_range_rejected`; for the flights C accepts, the TLS-17 and TLS-18 tests of the three
+  `delta_out_of_range_rejected`; for the flights C accepts, the TLS-17, TLS-18 and TLS-20 tests of the three
   client stacks.
 - **`split-public-1` did not have this (found 2026-11-22).** There N sent the labels of its input `x_N` in
   the handshake, after the seed, so with χ known. Garbling every second gate of the adder as `(¬A)∧B` makes

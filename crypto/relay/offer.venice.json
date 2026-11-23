@@ -85,7 +85,7 @@
   },
   "h2": {
     "probe_path": "/api/v1/models",
-    "idle_secs": 390,
+    "idle_secs": 300,
     "max_requests": 100,
     "max_lifetime_s": 3600,
     "kinds": [

@@ -533,7 +533,7 @@ every case above with exact money (`h2-k-*`, `h11-k-extra-record`, `h11-k-pipeli
   The top level of the event is an allow-list too. Its members are only `choices`; `usage`; the labels
   `id`, `object`, `model`, `provider`, `service_tier`, `system_fingerprint` (each `null` or a string of at
   most 128 characters from `[A-Za-z0-9 ._:/@+-]`, the empty string included); `created` (a non-negative
-  integer); and `cost` (`null`, a number or a numeric object, as `usage`: Venice sends `{"usd","diem"}`). `usage` holds only numbers, booleans, `null` and nested objects of these: keys `[A-Za-z0-9_]{1,64}`,
+  integer); and `cost` (`null`, a number or a numeric object, as `usage`: Venice sends `{"usd","diem"}`). `usage` holds only numbers, booleans, `null` and nested objects of these (every number in `usage` and `cost` has a magnitude below 2^53, so that the node and every client read it alike): keys `[A-Za-z0-9_]{1,64}`,
   at most 3 levels of object counting `usage` itself, no strings, no arrays. A provider field outside the
   list (`citations`, search results, moderation or debug data) could carry prompt- or
   output-derived data to N, so an event with one is not disclosed and the request is charged as a missing
@@ -663,7 +663,18 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   (the rule above; a GOAWAY with an error code never counts) nor row 8 of §12.10: S marks the provider's
   close `client_caused` (§12.9) and the request costs what an abandoned one costs. Tests:
   `a_close_after_the_client_held_the_body_back_is_not_the_providers_answer` (S), the node gate's
-  `h2-m-hold-body`. What remains: a provider whose own body timeout is shorter than `W` (framing `"1.1"`:
+  `h2-m-hold-body`.
+- **A control record inside a request.** S marks a request once a control record of C (SETTINGS ACK, PING
+  ACK, RST_STREAM) is written while the request is in flight and not yet written in full. That includes a
+  control record written before the request's first record: the queue is written in order, so a control
+  record ahead of the HEADERS goes out in the same pass and the provider's reaction falls into the
+  request's interval. For a marked request the provider's early close is `client_caused` and a GOAWAY does
+  not refuse it (`error`), whatever its error code. One control record never marks a request: the
+  connection's first SETTINGS ACK. Every provider sends SETTINGS at the start of the connection and
+  expects exactly this answer, whenever it comes. A control record written before the request was
+  accepted does not mark it: the provider's reaction to it arrives one round trip later, before C's
+  records can be proven and written, so it falls outside the interval and the request ends as an
+  abandoned one. What remains: a provider whose own body timeout is shorter than `W` (framing `"1.1"`:
   30 s) closes before S calls the wait a stall, and the request then ends in row 8. The gain is the
   difference between the deposit (or the abandon fee) and the session fee, once per connection, and a
   minimal real request releases the deposit for its few msat of usage anyway.
@@ -717,7 +728,7 @@ for H5 (its whole life, the provider's first SETTINGS included) and fails H10 wh
 
 The rate is measured over the idle time (`--h2-idle`, default `h2.idle_secs`), so H10 is only as good as
 that window: a provider whose PING rate rises later is not seen. Venice (2026-11-23): one SETTINGS, at the
-start, and no PING in 390 s of idle; H10 passes.
+start, and no PING in 300 s of idle; H10 passes.
 
 H9 is not checked by the profile tool (it sees no record boundaries); the clients check it on every error
 head and the gates exercise it. A provider that splits a frame across records right before an error head
@@ -851,10 +862,11 @@ there is none:
 An unused connection (no settled request: armed, or open and idle) is *evictable* when its setup is at least
 `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (default 60 s) old and nothing of it is under way: no `request` queued,
 being reserved or in flight (from its acceptance to its settlement); not its handshake (the ClientHello
-relayed and `head_written` not reached, for at most 60 s after the ClientHello); its 2PC and proof channel
-quiet for 15 s, or the connection older than the 2PC limit of 180 s. Its last frame is `closed` with reason
+relayed and `head_written` not reached, for at most 60 s after the ClientHello), and not the 15 s after
+`head_written` (in framing `"2"` C sends its first `request` only after it read the provider's SETTINGS);
+its 2PC and proof channel quiet for 15 s, or the connection older than the 2PC limit of 180 s. Its last frame is `closed` with reason
 `evicted` and `"unused": true`. Its deposit is **charged** (§12.10 row 13, `evicted`) only when its address
-held at least `CONFIDENTIAL_EVICT_CHARGE_FROM` (default 5) evictable unused connections at that moment,
+held at least `CONFIDENTIAL_EVICT_CHARGE_FROM` (default 5, at least 2) evictable unused connections at that moment,
 and **released** (`evicted_released`) otherwise; the signed deposit outcome carries both numbers
 (`evicted: {unused_at_address, charge_from}`). Eviction happens only when a setup needs the slot, never on
 a timer. `CONFIDENTIAL_EVICT_UNUSED_AFTER_S = 0` never closes an unused connection.
@@ -871,6 +883,19 @@ minimum age (60 s) is five times an honest cold setup and first request on a 2/5
 `crypto/PROGRESS-CONFIDENTIAL.md`). The handshake and 2PC protections are bounded (60 s, 180 s), so moving
 bytes cannot keep an unused connection out of reach for long; a request in flight protects its connection
 until its settlement (it holds a full reservation, and abandoning it costs the deposit, §12.10 row 9).
+
+What the rules do not give. (a) The count is per address, and an address is not a party. Someone who shares
+an honest client's address (one NAT, one VPN or Tor exit) can hold `CONFIDENTIAL_EVICT_CHARGE_FROM` − 1
+unused connections there past the minimum age and then ask for a slot at a full limit: the honest client's
+spare, if it is the oldest, is closed and its deposit charged. The attacker pays about 17.6 MB of traffic
+per connection it holds, and keeps its own deposits by using each connection for one cheap request. The
+loss is one deposit per spare; the clients stop pre-warming at that node for 10 minutes after it. A count
+per credential would not help: credentials are free to make, so a hoarder would use one per connection.
+(b) `unused_at_address` is N's statement. C checks that it is signed, at or above the signed threshold,
+and that the threshold is at least 2 (a lone unused connection is never charged for its eviction); C cannot
+check the count itself. (c) An accepted request that is never written shields its connection for the
+request's time limit (600 s) at the price of the deposit, so a slot can still be held that long for one
+deposit; the minimum age bounds only connections without a request.
 
 **What it costs.** An address holding `CONFIDENTIAL_EVICT_CHARGE_FROM` or more evictable unused
 connections pays a deposit for each one a setup takes from it, after the minimum age, instead of one per
@@ -1024,7 +1049,7 @@ the `request_ok.reserved_msats` of its request (§12.4).
 | 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
 | 11 | `upstream_models` may map a public id to another provider prefix for the same name (`someorg/claude-opus-4.5` for `claude-opus-4.5`): the rule of §12.1 binds the name, not the publisher | matters only on a provider where anyone can publish models under their own namespace; closing it needs a per-host list of trusted prefixes, or showing the pinned id to the user. the node offers of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro; 970 mappings) and Cloudflare's `@cf/meta/<id>` all have the form `<prefix>/<public id>` |
 | 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5). (The idle stall, ending an accepted, unwritten request cheaply by waiting for the provider's idle GOAWAY, is closed by the GOAWAY window, §5.4.1; the stall after the HEADERS by the same window, except at a provider whose body timeout is shorter than it.) | as risk 5 |
-| 13 | Session slots are priced, not fully protected: under slot pressure a newer setup closes an unused connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s), of the address holding the most, and charges its deposit only when that address held `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more (§8.4). An attacker spread over many addresses with fewer each pays nothing for holding slots, but its connections are evicted on demand after the minimum age and each re-open costs it a full 2PC; an honest pre-warmed spare can lose its slot (not its deposit) on a full node | the operator's deposit, minimum age, threshold and limits; no per-credential fairness |
+| 13 | Session slots are priced, not fully protected: under slot pressure a newer setup closes an unused connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s), of the address holding the most, and charges its deposit only when that address held `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more (§8.4). An attacker spread over many addresses with fewer each pays nothing for holding slots, but its connections are evicted on demand after the minimum age and each re-open costs it a full 2PC; an honest pre-warmed spare can lose its slot (not its deposit) on a full node. Three limits (§8.4): a party that shares an honest client's address can bring that address to the threshold and so make the client's spare pay its deposit; the count in the signed outcome is the node's statement, which C cannot check; a request accepted and never written shields its connection for 600 s at the price of one deposit | the operator's deposit, minimum age, threshold and limits; no per-credential fairness |
 | 14 | A charge with no settlement is now stated, signed (`request_outcome` on the last frame, §12.10), but only to a client that is still connected when the node finalizes it; a client that left first receives nothing, and the charge is the same. The node's statement is its word: what C checks is that the cost is at most `request_ok.reserved_msats` (at most the published fee for a request never written in full), not that the node's reason is true | C sees the charge in its balance either way; the signed outcome is evidence C keeps |
 | 15 | A provider's fatal alert after its Finished (a handshake it accepted and then rejects) reaches C under `s_ap_0`; N cannot read it, and C's stack ends the connection without failing the steps already under way, so `release_head` can still be sent and N writes the head to a connection the provider is closing | no secret is exposed (the head goes only to the authenticated provider, under `K_0`); the connection then ends as any provider close does (§12.10 rows 5, 8, 9) |
 
@@ -1239,20 +1264,20 @@ LSB first.
 | # | Direction, channel | Message | Bytes | Condition |
 |---|---|---|---|---|
 | P0 | both | version tag `routstr-2pc/split-public-2\n` | 27 | first bytes |
-| P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n` |
-| P2 | N→C, tables | `hparams` | 32 | after garbling finished, before any table byte |
+| P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n`, sent before anything else; N reads it only when it builds P6 |
+| P2 | N→C, tables | `hparams` | 32 | the first message on the tables channel, right before tables part 1 and behind the same wait (P3) |
 | P3 | N→C, tables | tables part 1 (stages A1 to A3), part 2 (B1, B2) | 24 B + 5 bits per AND gate | part 1 once N received 64 KiB of C's MAC-COT bytes, part 2 once it received 500 000; each also once the MAC COTs are complete, and at the latest 20 s after N started waiting (scheduling only: C sends P7 after everything of P2 to P6 arrived, whatever the order) |
 | P4 | N→C, `n2c` | d bits (masks of the base wires, AND products) | ⌈`mac_fixed`/8⌉ | after the MAC COTs |
 | P5 | N→C, `n2c` | `gl`: the 256 labels of ρ | 4 096 | before the seed |
 | P6 | N→C, `n2c` | `in_com`: 2 560 pairs of 16-byte commitments | 81 920 | before the seed; needs P1 |
 | P7 | C→N, `c2n` | `seed` | 32 | only after P2 to P6 arrived completely |
-| P8 | N→C, `n2c` | product check; openings and their MAC hash; per stage rows and `Y_N`; label-check pairs | 32; ⌈n_open/8⌉ + 32; 8 per row wire + 8; 32 per reported output wire | after P7 |
-| K | C→N, N→C, C→N | key share: C's commitment `com`; `P_N ‖ e ‖ s` (N's point and its proof of knowledge, §4.1); C's opening `P_C ‖ nonce` | 32; 129; 97 | C opens only after the proof verified |
+| P8 | N→C, `n2c` | 13 messages, each with its own length prefix, in this order: the product check; the openings and their MAC hash; for each of the five stages its rows, then its `Y_N`; the label-check pairs | 32; ⌈n_open/8⌉ + 32; per stage 8 per row wire, then 8; 32 per reported output wire | after P7 |
+| K | C→N, N→C, C→N | key share: C's commitment `com`; `P_N ‖ e ‖ s` (N's point and its proof of knowledge, §4.1); C's opening `P_C ‖ nonce` | 32; 129; 97 | C opens only after the proof verified. Each message has exactly this length; there is no abort byte in K (a peer that refuses ends the channel) |
 | H1 | both | ECtF (OLE channel) | | at `handshake` |
 | H2 | N→C, `n2c` | `δ = (x_N − ρ) mod p` | 32 | as soon as N's ECtF returned |
 | H3 | C→N, `c2n` | `d = bits(x_C') ⊕ b` | 32 | after H2 and C's ECtF; C refuses δ ≥ p |
 | H4 | N→C, `n2c` | corrections for C's input | 4 096 | after H3 |
-| S | C→N, then N→C | per stage: C's report (`1 ‖ pointer bits ‖ h`, with `h` the label hash below, or the abort byte `0`); N's labels of the next stage's digests (16 bytes per bit) or `0` | report 65 to 157; labels 12 288, 4 096, 8 192, 12 288 | one round trip per stage; N sends the B1 labels without waiting |
+| S | C→N, then N→C | per stage: C's report (`1 ‖ pointer bits ‖ h`, with `h` the label hash below, or the abort byte `0`); N's labels of the next stage's digests (16 bytes per bit) or `0` | report 65 to 157; labels 12 288, 4 096, 8 192, 12 288 | one round trip per stage; N sends the B1 labels without waiting. In B2, C also sends `0` in place of the report when `SHA256(c_ap_1) ≠ h1` or `SHA256(s_ap_0) ≠ h2`. N answers nothing to the B2 report: when its own check `SHA256(K_0 ‖ IV_0) = hk` fails it ends the channel |
 
 **Channels, limits and derived values of the 2PC channel.** An independent peer needs these as well:
 
@@ -1265,7 +1290,8 @@ LSB first.
 - *Challenges.* `chi(what) = SHA256("routstr-twopc-ag chi" ‖ seed ‖ what)[0..16]` read as a 128-bit block;
   if it is zero the hash is recomputed with a 4-byte big-endian counter 1, 2, … appended until it is not.
   `what` is the ASCII string `dvzk` for the product check, `check0` to `check4` for the five stage checks
-  and `check-salt` for the label-pair salt (its 16 bytes are used as they are). The weight of the k-th AND
+  and `check-salt` for the label-pair salt (the same derivation, zero rule included; the 16 bytes of the
+  block are the salt). The weight of the k-th AND
   gate of a check is χ^(k+1), k from 0.
 - *Openings hash* (P8): `SHA256("routstr-twopc-ag open" ‖ M_1 ‖ M_2 ‖ …)`, `M_i` the 16-byte MAC of the i-th
   opened mask (C's key for the wire, XOR Δ_B when the opened bit is 1), in the order of the opened bit
@@ -1278,9 +1304,10 @@ LSB first.
   `o` the output wire's index as 4 bytes big-endian, `p` the pointer bit as one byte.
 
 The conformance file `crypto/conformance/twopc-hash-vectors.json` is produced by the implementation it
-tests; it pins the garbling hash, one gate, the input commitments and the key-share proof, and has no vector
-for the stage report, the label pairs, the openings hash or `chi`. A second implementation is checked
-against the running one, not against the file alone.
+tests; it pins the garbling hash, one gate, the input commitments, the key-share proof, `chi`, the
+label-check pair half, the label hash of a stage report and the openings hash. It has no vector for the
+counter rule of `chi` (no known seed gives a zero block) and none for a whole message. A second
+implementation is checked against the running one, not against the file alone.
 
 Against `split-public-1`: P1, P2, P6 and H2 are new, P5 moved from the handshake (where it carried the labels
 of `x_N`) to before the seed, P7 waits for P2 to P6, and N's message of K carries the proof. Payload
@@ -1612,8 +1639,9 @@ request accepted and not released).
 `{"type":"upstream_closed_early","n","response_bytes"[,"client_caused":true]}` precedes the `error` when the
 provider closed before the request was fully written (N relays it). S adds `client_caused` when the close
 may be the client's doing, and the request is then an abandoned one, not the provider's refusal (§12.10).
-Framing `"2"`: a control record of the client was written after the request's first record and before its
-last, or S had written no record of the request for the GOAWAY window `W` (§5.4.1) or longer when a server
+Framing `"2"`: a control record of the client other than the connection's first SETTINGS ACK was written
+while the request was in flight and not yet written in full (before its first record too, §5.4.1), or S had
+written no record of the request for the GOAWAY window `W` (§5.4.1) or longer when a server
 record or the close arrived, while the request was written in part (the client holds back records S has
 proven; an honest client releases them as the provider's flow-control window allows, within
 milliseconds). Framing `"1.1"`: S had written neither the head nor a body record for 30 s or longer when
@@ -1754,7 +1782,7 @@ it cannot walk) stays in rows 8 and 9.
 | `cost_msats` | what the credential paid for it: `msat` when charged, `0` when released |
 | `balance_msats` | the credential's balance afterwards (`null` if the key is gone) |
 | `time` | Unix seconds |
-| `evicted` | rows 13 and 13a only: `{"unused_at_address", "charge_from"}`, the evictable unused connections its address held and the threshold (§8.4). C reports a charge whose count is below the threshold, one without the object, and one after N had accepted a request of the connection |
+| `evicted` | rows 13 and 13a only: `{"unused_at_address", "charge_from"}`, the evictable unused connections its address held and the threshold (§8.4). C reports a charge whose count is below the threshold, one whose threshold is below 2, one without the object, and one after N had accepted a request of the connection |
 
 `deposit_json` is the canonical JSON of `deposit` (keys sorted, no whitespace), `deposit_sig` the node's
 BIP-340 signature over its SHA-256, as for a receipt. Before `ready` the client verifies it with the key of
@@ -1786,7 +1814,11 @@ checks the signature with the node key of `ready`, `sid`, `http`, `n` (the reque
 `reserved_msats` equals `request_ok.reserved_msats` and `cost_msats` is at most it, and, for a request that
 never reached `body_released`, that `cost_msats` is at most max(session fee if still due, abandon fee) and
 the reason is not one of a request written in full. A missing or invalid outcome where C had a request
-accepted (`request_ok`) and no receipt is reported like a deposit outcome problem (detection only).
+accepted (`request_ok`) and no receipt is reported like a deposit outcome problem (detection only). The
+outcomes travel on the last frame only: when the control socket ends without one and not by C's own close,
+while N holds a deposit no receipt released or a request it accepted and did not settle, the SDK and the
+browser library report that too (they cannot tell a node that hides a charge from a lost network path; the
+balance shows which).
 
 **Order at a connection's end.** The node first decides the deposit, then finalizes a request still in
 flight, then sends the last frame; a client that is already gone changes none of it. A client that leaves
@@ -1858,3 +1890,10 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | the server's key epoch (`key_updates`, `epoch_start`) is C's claim, and why a wrong claim gains nothing | §7.1 |
 | `epoch_start` beyond the server records received is refused in every disclosure (both framings); a refusal frame received before `request_ok` refuses nothing; the GOAWAY cutoff counts from N's last write of the head or a request record, not of a control record | §7.1, §12.8 |
 | further epoch-0 records of a malicious N: what they can do in each framing | §10 |
+| a control record of C written while a request is in flight marks that request, before its first record too: the provider's early close is `client_caused` and a GOAWAY does not refuse it. The connection's first SETTINGS ACK never marks | §5.4.1, §12.9 |
+| every number in a usage event's `usage` and `cost` has a magnitude below 2^53 | §5.4 |
+| an unused connection is not evicted in the 15 s after `head_written`; `CONFIDENTIAL_EVICT_CHARGE_FROM` is at least 2 and C reports an eviction charge at a threshold of 1; what the eviction rules do not give | §8.4, §10 risk 13, §12.10 |
+| a control socket that ends without the node's last frame while the node holds money of the connection is reported by the SDK and the browser library | §12.10 |
+| the 2PC channel: P2 and P8 as the code sends them, the abort bytes of stage B2, no abort byte in K; the conformance file gains `chi`, the label-check pair, the stage report hash and the openings hash | §12.2 |
+| C's TLS stack: an RSA signature must have the length of the modulus (TLS-20) | `FORK-NOTES.md`, `docs/TWOPC-NODE-GARBLING.md` §4 |
+| the shipped Venice offer: `h2.idle_secs` 300 (was 390) | §2.1, `docs/SETUP.md` |

@@ -112,9 +112,11 @@ Cloudflare re-run 2026-11-13, `profile/h2final.<provider>.errfield.txt`).
 - Endpoint: `api.venice.ai/api/v1`. Ids carry no prefix, so its offer has no
   `upstream_models` and is unchanged.
 - Profile: every HTTP/1.1 item (A1-A13) and every HTTP/2 item (H1-H8) passes.
-- Idle: a silent HTTP/2 connection is closed after 400 s (GOAWAY). A PING or an
-  empty SETTINGS every 2-5 min holds it 16+ min. Suggested `idle_secs`: 390
-  (production).
+- Idle: measured 2026-11-12, a silent HTTP/2 connection was closed after 400 s
+  (GOAWAY), and a PING or an empty SETTINGS every 2-5 min held it 16+ min. On
+  2026-11-23 the request after 390 s of silence failed twice (H5) and passed
+  after 300 s. `idle_secs`: 300 (the shipped offer file; production from the
+  next deployment).
 - Images: ✓ native `/api/v1/image/generate`.
 - E2E: chat ✓ / ✓ (v3 gates, production), follow-up on a kept connection ✓,
   image ✓, chat + image on one connection ✓.

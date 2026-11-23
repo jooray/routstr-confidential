@@ -187,18 +187,20 @@ python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --image-model <...
 `--h2` also counts the provider's PING and SETTINGS frames on the connection it idles (H10). The client
 answers each with a control record, and the sidecar allows a connection 16 control records and one more per
 10 s. A provider that pings more often than that would get your clients' HTTP/2 connections ended, so H10
-fails it (the criterion: PROTOCOL-V3.md §5.6). Venice, 2026-11-23: one SETTINGS (at the start) and no PING in 390 s of idle; H10 passes.
+fails it (the criterion: PROTOCOL-V3.md §5.6). Venice, 2026-11-23: one SETTINGS (at the start) and no PING in 300 s of idle; H10 passes.
 
 **Framings: the `http` list and the `h2` block.** The offer file says how clients talk to your provider.
 Nothing is probed or assumed: you state it.
 
 ```json
 "http": ["2", "1.1"],
-"h2": {"probe_path": "/api/v1/models", "max_requests": 100, "max_lifetime_s": 3600, "idle_secs": 390, "kinds": ["chat", "images"]}
+"h2": {"probe_path": "/api/v1/models", "max_requests": 100, "max_lifetime_s": 3600, "idle_secs": 300, "kinds": ["chat", "images"]}
 ```
 
-(The shipped offer files, `crypto/relay/offer.venice.json` and `offer.openrouter.json`, set `idle_secs` to 390:
-both providers close a silent HTTP/2 connection after 400 s, `docs/PROVIDERS.md`.)
+(The shipped `crypto/relay/offer.venice.json` sets `idle_secs` to 300: on 2026-11-23 Venice no longer held a
+silent HTTP/2 connection for 390 s (H5 failed twice at 390 s and passed at 300 s; until then it closed one
+after 400 s). `offer.openrouter.json` still has 390, as measured on 2026-11-12, `docs/PROVIDERS.md`: run
+`--h2` again before you deploy either.)
 
 | Field | Range, default | Meaning |
 |---|---|---|
@@ -216,7 +218,7 @@ name the API key by its header-table index) and checks the eight things framing 
 and the key in it, also after the idle time; it honours a zero-size table for response headers; a body of
 the sidecar's `--max-body` passes flow control; no response reflects the key; the usage event ends the
 stream as the proof parses it. It idles one connection for `--h2-idle` seconds (default: the file's
-`h2.idle_secs`: 390 s for the shipped Venice file), sends one body of `--h2-body-bytes` (default 8 MiB, mostly whitespace) and,
+`h2.idle_secs`: 300 s for the shipped Venice file), sends one body of `--h2-body-bytes` (default 8 MiB, mostly whitespace) and,
 when `h2.kinds` lists images, generates one image. It ends with a verdict:
 
 ```
