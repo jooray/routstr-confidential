@@ -134,7 +134,9 @@
 #                           client's setup closes it (`closed` `evicted`, `unused: true`); one unused
 #                           connection is below CONFIDENTIAL_EVICT_CHARGE_FROM (5): D released
 #                           (`evicted_released`), signed; the second client's request settles
-#   h2-n-evict-hoard        the same with the threshold at 1: D charged (`evicted`), signed
+#   h2-n-evict-hoard        the same with a second armed connection of another key at the address,
+#                           the unused limit and the threshold at 2 (the smallest the node takes):
+#                           the older one is closed, D charged (`evicted`), signed with the count 2
 #   fb-h2                   row 3: the HTTP/2 open fails (test hook): D released
 #                           (`provider_unreachable`)
 #   sidecar-killed          row 4: the sidecar dies under an open connection: D released
@@ -318,7 +320,7 @@ o = json.load(open(sys.argv[1]))
 model, fee, abandon, deposit, idle, image_model, no_images = sys.argv[2:9]
 problems = []
 if model not in o.get("price_list", {}): problems.append(f"no price for {model}")
-if o.get("v") != 3 or o.get("twopc") != "split-public-2": problems.append("not a v3 offer")
+if o.get("v") != 3 or o.get("twopc") != "split-public-3": problems.append("not a v3 offer")
 want_http = sys.argv[9].split(",")
 if o.get("http") != want_http or ("2" in want_http) != isinstance(o.get("h2"), dict): problems.append(f"http is {o.get('http')}")
 if not o.get("sig"): problems.append("unsigned")
@@ -365,6 +367,22 @@ set_setting() { # <name> <integer value>: a node setting, through its admin API
   curl -fsS -o /dev/null -X PATCH -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
     -d "{\"$1\": $2}" "$NODE/admin/api/settings"
 }
+# companion <id>: one more armed framing-"2" connection from the same address, on a
+# key of its own, held unused until `stop_companion` (the `evict-hoard` hook).
+companion() {
+  local key3
+  key3="$(openssl rand -hex 32)"
+  sqlite3 -cmd ".timeout 5000" "$DB" "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('$key3',$START_BALANCE,0,0,0);"
+  : > "$OUT/$1.companion.out"
+  ( cd "$CRYPTO/client" && sleep "$((CASE_TIMEOUT + 2 * EVICT_WAIT))" | "$TIMEOUT_BIN" -k 5 "$((CASE_TIMEOUT + 2 * EVICT_WAIT))" "${DRIVER[@]}" --http 2 --arm \
+      --node "$NODE" --model "$MODEL" --max-tokens "$MAX_TOKENS" --auth "sk-$key3" --runs-dir "$OUT/client-runs" ) \
+    > "$OUT/$1.companion.out" 2> "$OUT/$1.companion.err" &
+  echo "$key3" > "$OUT/$1.companion.key"
+  wait_for "$OUT/$1.companion.out" '^READY' "$CASE_TIMEOUT"
+}
+stop_companion() {
+  [ -f "$OUT/$1.companion.key" ] && pkill -f -- "--auth sk-$(cat "$OUT/$1.companion.key")" 2>/dev/null || true
+}
 # newcomer <id>: a second client from the same address sets up a framing-"2"
 # connection with one request, on a key of its own (the `evict` hook).
 newcomer() {
@@ -399,6 +417,8 @@ wait_for() {
 #   evict         an armed connection held unused (stdin silent); once it is past the
 #                 node's minimum age and its proof channel is quiet, a second client of the
 #                 same address sets up (`newcomer`) against an unused limit of 1
+#   evict-hoard   as `evict`, but a second armed connection (`companion`, a key of its own)
+#                 is opened at the address first and held: two unused connections there
 run_case() {
   local id="$1" expect="$2" balance="$3" hook="$4"; shift 5
   selected "$id" || return 0
@@ -432,6 +452,9 @@ run_case() {
     evict)
       limit=$((CASE_TIMEOUT + EVICT_WAIT))
       ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT" && sleep "$EVICT_WAIT" && newcomer "$id" ) & watcher=$! ;;
+    evict-hoard)
+      limit=$((CASE_TIMEOUT + 2 * EVICT_WAIT))
+      ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT" && companion "$id" && sleep "$EVICT_WAIT" && newcomer "$id"; stop_companion "$id" ) & watcher=$! ;;
   esac
   (
     cd "$CRYPTO/client"
@@ -440,12 +463,12 @@ run_case() {
       --auth "sk-$key" --runs-dir "$OUT/client-runs"; }
     case "$hook" in
       go) ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT"; sleep 1; echo go ) | run "$@" ;;
-      hold|evict) sleep "$limit" | run "$@" ;;
+      hold|evict|evict-hoard) sleep "$limit" | run "$@" ;;
       *) run "$@" < /dev/null ;;
     esac
   ) > "$OUT/$id.out" 2> "$OUT/$id.err" || rc=$?
   # The newcomer of `evict` runs to its end; other watchers are stopped.
-  if [ -n "$watcher" ] && [ "$hook" != evict ]; then kill "$watcher" 2>/dev/null || true; fi
+  if [ -n "$watcher" ] && [ "$hook" != evict ] && [ "$hook" != evict-hoard ]; then kill "$watcher" 2>/dev/null || true; fi
   if [ -n "$watcher" ]; then wait "$watcher" 2>/dev/null || true; fi
   if [ "$hook" = offer ]; then set_idle "$IDLE"; fi
   # The signed offer after the case, too: a receipt's rates are one of the two.
@@ -602,9 +625,11 @@ if selected h2-n-evict-spare || selected h2-n-evict-hoard; then
   set_setting confidential_evict_unused_after_s "$EVICT_AFTER"
   # A lone spare (1 unused connection at the address, below the default 5): released.
   run_case h2-n-evict-spare "evicted:released"               "$B" evict -- --http 2 --arm
-  # The same with the threshold at 1: the address counts as hoarding, charged.
-  set_setting confidential_evict_charge_from 1
-  run_case h2-n-evict-hoard "evicted:charged"                "$B" evict -- --http 2 --arm
+  # Two unused connections at the address, the threshold at 2 (the node takes
+  # no lower one): the address counts as hoarding, the older one is charged.
+  set_setting confidential_max_unused_per_ip 2
+  set_setting confidential_evict_charge_from 2
+  run_case h2-n-evict-hoard "evicted:charged"                "$B" evict-hoard -- --http 2 --arm
   set_setting confidential_evict_charge_from 5
   set_setting confidential_max_unused_per_ip 12
   set_setting confidential_evict_unused_after_s 60

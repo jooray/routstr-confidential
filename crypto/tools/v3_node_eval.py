@@ -545,7 +545,7 @@ elif kind == "evicted":
         dev.append(f"the held connection's deposit was not {want_dep} (node: {deposit_of(sid)})")
     if not told or told.groups() != (*want_dep, str(DEP), "true"):
         dev.append(f"the held connection's client was not told, signed, that the deposit was {want_dep[0]}")
-    if not re.search(r"unused_at_address=1 charge_from=" + ("1" if rest == "charged" else "5"), out):
+    if not re.search("unused_at_address=2 charge_from=2" if rest == "charged" else "unused_at_address=1 charge_from=5", out):
         dev.append("the deposit outcome does not carry the address's count and the threshold")
     if ((sid or "")[:12], 1) in reserved:
         dev.append("a request was reserved on the held connection")
