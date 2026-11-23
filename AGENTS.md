@@ -288,12 +288,12 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 **Checks.**
 - `crypto/tools/v3-check.sh` (**the sidecar + reference client gate**; real
   provider, no node; `CU_V3_PORT` picks the sidecar port): the offline
-  self-checks, then 55 cases (53 without the two paid images), both framings: honest (one, several, error
+  self-checks, then 56 cases (54 without the two paid images), both framings: honest (one, several, error
   head, 200 kB body, decoy model, armed, refused-then-good, image), a v2
   socket, every attack (hidden HEADERS, TLS padding, suffix/model/cap swap,
   path, usage replay, image suffix, early record, no proof, own key share,
   2PC version tag (`h2-j-twopc-tag`; `h2-j-twopc-tag-old` for a `split-public-1` peer), forged refusals `h2-r-refusal-*`, a 9 MiB client message
-  `h2-l-big-frame`: `error` 413 `frame_too_large` without `fault`), and the forced failure of "2" (fallback, withdrawal,
+  `h2-l-big-frame`: `error` 413 `frame_too_large` without `fault`; control records past the connection's allowance `h2-m-ctl-flood`), and the forced failure of "2" (fallback, withdrawal,
   return). `v3_eval.py` judges each case from the driver's output and the
   sidecar's own run files; exit ≠ 0 on any deviation. Two paid images
   (`CU_NO_IMAGES=1` skips them).
@@ -304,7 +304,10 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   attacks (`h2-k-rst-reuse`, `-rst-reuse-same`, `-rst-before-final`,
   `-rst-after-release`, `-ctl-headers`, `h11-k-extra-record`,
   `h11-k-pipelined`; driver `--adv rst-*|ctl-headers|extra-record`) and
-  `h2-l-big-frame` (the oversized client message: deposit charged, `unused`).
+  `h2-l-big-frame` (the oversized client message: deposit charged, `unused`),
+  `h2-m-ctl-flood` (control records past the connection's allowance: `unused`)
+  and `h2-m-hold-body` (the HEADERS released, the proven body held back: an
+  abandoned request whatever the provider does; driver `--adv ctl-flood|hold-body`).
 - `crypto/tools/v3-routstrd-check.sh`: sidecar, node, stub mint and a
   scratch routstrd; curl through the local API (sequential, burst, forced
   "1.1"). Needs the SDK and routstrd checkouts built.
@@ -332,7 +335,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   offline checks, the client root store against `gen-client-roots.py`, every copy of a vector of
   `crypto/conformance/` byte-identical, a secret scan. `CU_CI_SKIP_CARGO=1` skips the Rust tests.
 - Unit tests:
-  - `crypto`: `cargo test --release -p cu-sidecar` (128), `-p zkbench`, `-p twopc` (55 unit tests, 4 of the `cu-2pc` binary)
+  - `crypto`: `cargo test --release -p cu-sidecar` (131), `-p zkbench`, `-p twopc` (55 unit tests, 4 of the `cu-2pc` binary)
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
   - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`, `bun test tests/bun` (vitest
     reports those two files as failed: it cannot load `bun:test`)
@@ -350,7 +353,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 | Part | State |
 |---|---|
 | `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-2` with the version tag (2026-11-22: new garbling hash and row hash, N's input a mask fixed before the seed, input-label commitments; 2026-11-22/23, in place under the same tag: N's key share carries a Schnorr proof of knowledge of its scalar, `ks_prove`/`ks_verify` in `lib.rs`; 55 unit tests; `v3-check.sh` 53 cases without images); it replaced `split-public-1` on 2026-11-22 |
-| `crypto/relay` (sidecar) | done; 120 unit tests; `v3-check.sh` clean in one run (51 cases without images, 2026-11-13). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause; a provider refusal of a stream is proven (`disclose_reset`) |
+| `crypto/relay` (sidecar) | done; 131 unit tests; `v3-check.sh` clean in one run (51 cases without images, 2026-11-13). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause; a provider refusal of a stream is proven (`disclose_reset`) |
 | `crypto/client` (reference driver) | done for both framings; run live against the sidecar by `v3-check.sh` and against a node by the node gate |
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
 | measurements | loopback and shaped links (2/50, 2/10 Mbit/s, 40 ms one way) with `bench.sh` + `shape-proxy.py`: `crypto/PROGRESS-CONFIDENTIAL.md` |
@@ -442,7 +445,16 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   a security-relevant offer change retires live connections for further
   requests; `closed upstream_closed` carries `after_client_frames` when the
   client had control frames written on a connection without a request (then
-  not row 5). Clients: optional body padding (`confidential.padBucket`,
+  not row 5). **Limits added 2026-11-23:** a framing-"2" connection carries
+  at most 16 control records and one more per 10 s since `head_written`
+  (`CTL_BURST`, `CTL_REFILL` in `h2_session.rs`; each is a π_WIN with no
+  request behind it); `upstream_closed_early` carries `client_caused` when
+  the client held a request back or had a control frame written inside it
+  before the provider closed (the node then settles an abandoned request,
+  never row 8); the clients refuse a receipt whose cost is above
+  `request_ok.reserved_msats` and bound a usage charge by the node's exact
+  formula. Session slots are priced by the deposit, not protected
+  (`PROTOCOL-V3.md` §8.4, risk 13). Clients: optional body padding (`confidential.padBucket`,
   `--pad-bucket`, off by default); routstrd `x-routstr-reuse-scope` narrows the
   reuse scope.
 - **Ports.** `v3-check.sh` defaults to 7462 and the node gate to 7461/8431;

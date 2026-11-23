@@ -364,7 +364,10 @@ preprocessing the pair
 
 `( H(salt ‖ o ‖ 0 ‖ P_{o,0}), H(salt ‖ o ‖ 1 ‖ P_{o,1}) )`, SHA-256 truncated to 128 bits,
 
-one half per pointer bit. Before C sends a stage's report it checks that the label it holds for each such
+one half per pointer bit. On the wire each half is
+`SHA256("routstr-twopc-split label check" ‖ pair_salt ‖ o ‖ p ‖ label)[0..16]`: the ASCII tag, the 16-byte
+salt derived from C's seed (`chi("check-salt")`), `o` as 4 bytes big-endian, `p` as one byte, the 16-byte
+label (`PROTOCOL-V3.md` §12.2 has every derived value of the channel). Before C sends a stage's report it checks that the label it holds for each such
 wire hashes to the half of its pointer bit, and aborts otherwise (the same single byte as any other failed
 check of the stage).
 

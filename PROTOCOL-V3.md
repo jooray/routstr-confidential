@@ -637,6 +637,11 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   `NO_ERROR`: a GOAWAY with an error code is a connection error, which C's own frames may have caused
   (an unsolicited SETTINGS ACK, say), and a client must not be able to provoke a cheap end. A GOAWAY that
   names the request's stream or a later one as processed does not count either.
+  A GOAWAY also does not refuse a request that was written in part when the record holding it arrived `W`
+  or longer after N's last write of a record of that request (N judges every server record's arrival; the
+  first such record and all later ones are marked): C had its HEADERS written and held the proven body
+  back until the provider gave up. An honest client releases every proven record at once, or as fast as
+  the provider's flow-control window opens.
 - **Why C cannot forge one.** C holds `s_ap_0`, so it could encrypt a refusal of its own; but π_WIN is
   over the ciphertext N received from U on its own TCP connection (N takes every `ct` from its relay
   buffer), so the claim is about bytes U sent, as for every disclosure (§2 of the paper: C could forge
@@ -652,6 +657,16 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   the window, its disclosure is refused, and the request costs what an abandoned one costs (the abandon
   fee, or the deposit on a connection with no settlement). The unit test
   `a_goaway_after_the_window_does_not_refuse_an_unwritten_request` runs both edges of the window.
+- **The stall after the HEADERS is closed the same way.** A C that has its HEADERS written (so the interval
+  is open and the provider's next frame counts as response bytes), holds the proven body back, and waits
+  for the provider's timeout or provokes a connection error with a control frame gets neither a refusal
+  (the rule above; a GOAWAY with an error code never counts) nor row 8 of §12.10: S marks the provider's
+  close `client_caused` (§12.9) and the request costs what an abandoned one costs. Tests:
+  `a_close_after_the_client_held_the_body_back_is_not_the_providers_answer` (S), the node gate's
+  `h2-m-hold-body`. What remains: a provider whose own body timeout is shorter than `W` (framing `"1.1"`:
+  30 s) closes before S calls the wait a stall, and the request then ends in row 8. The gain is the
+  difference between the deposit (or the abandon fee) and the session fee, once per connection, and a
+  minimal real request releases the deposit for its few msat of usage anyway.
 - **The provider closes right after its GOAWAY** (the usual case). N then keeps the request open for
   60 s for a `disclose_reset` alone (no other disclosure, nothing written); without it the request ends
   as before (§12.10 rows 8, 9).
@@ -686,6 +701,10 @@ Checked by `provider-profile-check.py --h2`; an operator offers `"2"` only when 
 | H7 | no response path reflects the `authorization` value (same list as item 8) |
 | H8 | the streamed usage event and `[DONE]` end the stream as §5.4 parses them |
 | H9 | an error response's HEADERS frame lies in a record that starts at a frame boundary (the frames before it in the record being of the kinds §5.4 allows); the same for the records from a request's interval to a refusal of its stream (§5.4.1) |
+
+A provider on framing `"2"` must also not need more control frames of the client than §12.6 allows (16, and
+one more per 10 s): a PING or SETTINGS more often than every 10 s for minutes on end uses the allowance up
+and ends the connection.
 
 H9 is not checked by the profile tool (it sees no record boundaries); the clients check it on every error
 head and the gates exercise it. A provider that splits a frame across records right before an error head
@@ -804,6 +823,18 @@ closes the longest-idle **used** connection there (one that settled a request an
 holds no deposit; `closed`, reason `evicted`) and is refused only when there is none. At most 8 requests in a
 row may be refused on one connection; the ninth refusal ends it (`error` 429).
 
+**What the limits do not give.** The limits are per address, not per credential, and an **unused**
+connection is never evicted. A client with funded credentials can therefore hold slots for the price of
+their deposits: 12 unused connections from one address (which also blocks every other client behind that
+address), all 32 of the node from three addresses. An armed connection lives up to 600 s, so holding the
+whole node costs at most `32 × connection_deposit_msat` per 600 s (32 sat per 10 minutes at the default
+deposit of 1000 msat; nothing at a deposit of 0), plus the attacker's share of the 2PC traffic. Setups are
+refused with 429 or 503 meanwhile; open, used connections keep working. This is priced, not prevented: the
+operator's levers are the deposit, the sidecar's `--max-sessions` together with the node's limit, and the
+per-address limits. A per-credential limit would not change the price (a balance splits into as many
+credentials as needed). Evicting unused connections under pressure would raise it, at the cost of charging
+an honest client's pre-warmed spare its deposit when the node is full; it is not done (residual risk 13).
+
 ### 8.5 Recurring cost
 
 A request on an open connection moves about 86 kB up and 13 kB down on its own path, plus on average about
@@ -871,8 +902,10 @@ that needs more correlations than it holds extends it online, inside the proof, 
   other than 0 or exactly `available + step`, so N cannot make C hold more than agreed.
 - **Bounds.** A top-up leaves at least `step` correlations, and the next one is granted only after proofs
   consumed them, so an idle connection never grows (C does not even ask while the chain holds a step);
-  top-ups are bounded by the proofs, which are bounded by the requests (`h2.max_requests`), and in bytes by
-  the 256 MiB budget; memory by `2 · step` correlations per chain (about 30 MB of keys at N). Chain cp's
+  top-ups are bounded by the proofs, which are bounded by the requests (`h2.max_requests`: the batches of a
+  request's records and one disclosure each) and by the connection's control records (at most 16, and one
+  more per 10 s since `head_written`, §12.6: each is proven by a π_WIN with no request behind it), and in
+  bytes by the 256 MiB budget; memory by `2 · step` correlations per chain (about 30 MB of keys at N). Chain cp's
   lifetime cap on the channel's multiplexer is 512 MiB (at 32 MiB a kept connection ran out after about 33
   requests).
 - **A request during a top-up waits; it does not cancel.** The extension is a lockstep exchange whose
@@ -934,7 +967,10 @@ the `request_ok.reserved_msats` of its request (§12.4).
 | 9 | Compromise scope: one `c_ap_1`/`s_ap_0` pair protects up to `h2.max_requests` requests (C may not KeyUpdate under π_WIN's rules). A live compromise of C exposes the connection's current and later traffic; a later forensic compromise of retained secrets exposes the whole recorded connection, not one request | best effort only: clients clear the traffic secrets they hold (zero the arrays, drop the references) when a connection closes and keep them out of logs. That is not cryptographic erasure: the clients are JavaScript, and copies the runtime made (garbage-collected buffers, heap snapshots, swap, core dumps) may remain. The levers are the connection's scope: operators keep `h2.max_requests` and `h2.max_lifetime_s` in proportion, and a user who needs one request per secret pair uses `reuse: none` or framing `"1.1"`. A per-request ratchet needs a new anchor protocol |
 | 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
 | 11 | `upstream_models` may map a public id to another provider prefix for the same name (`someorg/claude-opus-4.5` for `claude-opus-4.5`): the rule of §12.1 binds the name, not the publisher | matters only on a provider where anyone can publish models under their own namespace; closing it needs a per-host list of trusted prefixes, or showing the pinned id to the user. the node offers of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro; 970 mappings) and Cloudflare's `@cf/meta/<id>` all have the form `<prefix>/<public id>` |
-| 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5). (The idle stall, ending an accepted, unwritten request cheaply by waiting for the provider's idle GOAWAY, is closed by the GOAWAY window, §5.4.1.) | as risk 5 |
+| 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5). (The idle stall, ending an accepted, unwritten request cheaply by waiting for the provider's idle GOAWAY, is closed by the GOAWAY window, §5.4.1; the stall after the HEADERS by the same window, except at a provider whose body timeout is shorter than it.) | as risk 5 |
+| 13 | Session slots are priced, not protected: funded credentials from three addresses can hold all 32 slots with unused connections for `32 × connection_deposit_msat` per 600 s (§8.4) | the operator's deposit and limits; no per-credential fairness, no eviction of unused connections |
+| 14 | A charge with no settlement has no signed document: a request written in full and never settled (the reservation), or abandoned on a connection whose deposit was already released (the abandon fee), or a settlement whose billing write failed, is charged and only logged by N. The `closed` or `error` frame that ends such a connection carries a deposit outcome only while the deposit is still held | the charge is never above `request_ok.reserved_msats`, which C saw before it released the request; C sees the charge in its balance, not in a signature. A signed outcome per unsettled request would be an added field of the last frame |
+| 15 | A provider's fatal alert after its Finished (a handshake it accepted and then rejects) reaches C under `s_ap_0`; N cannot read it, and C's stack ends the connection without failing the steps already under way, so `release_head` can still be sent and N writes the head to a connection the provider is closing | no secret is exposed (the head goes only to the authenticated provider, under `K_0`); the connection then ends as any provider close does (§12.10 rows 5, 8, 9) |
 
 v2's residual risks carry over unchanged (π_NK does not bind other epoch-0 records; provider reflection;
 ECtF semi-honest in mpz2's documentation, with our argument for malicious parties in
@@ -947,8 +983,18 @@ DATA frames on its own stream, and it names the credential by one entry of the p
 N's records can add frames on other streams or change the table (risk 7), but they cannot become bytes of
 C's request. In framing `"1.1"` the byte stream has no frames: whatever N writes after the proven head is
 read by the provider as part of the request that head opened (the start of the body whose length it fixed),
-so N's records and C's body share one message. Neither form reveals the prompt or the key (C's records stay
-under `c_ap_1`, which N does not hold).
+so N's records and C's body share one message. With as many bytes as the head's Content-Length names, N's
+records are the whole body: the provider then answers a request of N's choosing (its model, its prompt, its
+cap), C's own body is never read, the response goes to C under `s_ap_0`, and C is billed for the usage the
+provider reports for it at the pinned model's rates, at most the reservation. In framing `"2"` a HEADERS
+frame of N with incremental indexing moves the proven credential entry to index 63 and puts N's field at
+62, which every request of C then names; a HEADERS frame on C's next stream id opens that stream with N's
+request. Neither form reveals the prompt or the key (C's records stay under `c_ap_1`, which N does not
+hold), and N cannot read the response. What C proves is the bytes of its own records, not what the
+provider made of the connection. `c_commit` and the attestation's `sha256_sent` are N's own statements
+about what it wrote: they are evidence C keeps (signed by S and N), not a check that binds N. The loss is
+bounded as for a node that takes a request and settles nothing: the reservation, and a wrong or failed
+answer.
 
 ### 10.1 Decided (2026-11-13): a stream the provider did not process (`REFUSED_STREAM`, GOAWAY)
 
@@ -1115,7 +1161,7 @@ withdrawn is not a difference (one that is present and differs is).
 |---|---|---|
 | session | `/session` | `/v1/confidential/ws?session_id=<uuid>&v=3` |
 | 2PC | `/zk?proof=twopc&sid=<sid>` | `/v1/confidential/zk?proof=twopc&sid=<sid>&zk_token=<token>` |
-| proof channel | `/zk?proof=zkchan&sid=` | same path, `proof=zkchan` |
+| proof channel | `/zk?proof=zkchan&sid=<sid>` | same path, `proof=zkchan` |
 | one proof | `/zk?proof=pi_nk`, `pi_win`, `pi_c3s` | same |
 
 **N** A session socket whose `v` is not `3` (absent, `2`, anything else), or whose first frame is a `setup`
@@ -1139,7 +1185,7 @@ LSB first.
 | P0 | both | version tag `routstr-2pc/split-public-2\n` | 27 | first bytes |
 | P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n` |
 | P2 | N→C, tables | `hparams` | 32 | after garbling finished, before any table byte |
-| P3 | N→C, tables | tables part 1 (stages A1 to A3), part 2 (B1, B2) | 24 B + 5 bits per AND gate | part 1 once N received 64 KiB of C's MAC-COT bytes, part 2 once it received 500 000 |
+| P3 | N→C, tables | tables part 1 (stages A1 to A3), part 2 (B1, B2) | 24 B + 5 bits per AND gate | part 1 once N received 64 KiB of C's MAC-COT bytes, part 2 once it received 500 000; each also once the MAC COTs are complete, and at the latest 20 s after N started waiting (scheduling only: C sends P7 after everything of P2 to P6 arrived, whatever the order) |
 | P4 | N→C, `n2c` | d bits (masks of the base wires, AND products) | ⌈`mac_fixed`/8⌉ | after the MAC COTs |
 | P5 | N→C, `n2c` | `gl`: the 256 labels of ρ | 4 096 | before the seed |
 | P6 | N→C, `n2c` | `in_com`: 2 560 pairs of 16-byte commitments | 81 920 | before the seed; needs P1 |
@@ -1150,7 +1196,35 @@ LSB first.
 | H2 | N→C, `n2c` | `δ = (x_N − ρ) mod p` | 32 | as soon as N's ECtF returned |
 | H3 | C→N, `c2n` | `d = bits(x_C') ⊕ b` | 32 | after H2 and C's ECtF; C refuses δ ≥ p |
 | H4 | N→C, `n2c` | corrections for C's input | 4 096 | after H3 |
-| S | C→N, then N→C | per stage: C's report (`1 ‖ pointer bits ‖ SHA256(labels)` or the abort byte `0`); N's labels of the next stage's digests (16 bytes per bit) or `0` | report 65 to 157; labels 12 288, 4 096, 8 192, 12 288 | one round trip per stage; N sends the B1 labels without waiting |
+| S | C→N, then N→C | per stage: C's report (`1 ‖ pointer bits ‖ h`, with `h` the label hash below, or the abort byte `0`); N's labels of the next stage's digests (16 bytes per bit) or `0` | report 65 to 157; labels 12 288, 4 096, 8 192, 12 288 | one round trip per stage; N sends the B1 labels without waiting |
+
+**Channels, limits and derived values of the 2PC channel.** An independent peer needs these as well:
+
+- *Channel numbers* (the first header byte): 0 the COTs under Δ_A (N sends; C's input), 1 the MAC COTs
+  under Δ_B (C sends), 2 the share conversion (ECtF's OLEs), 3 `n2c`, 4 `c2n`, 5 the tables. A chunk
+  carries at most 1 MiB; a chunk for another channel number or a longer one ends the connection.
+- *Lifetime caps on received bytes per channel* (0 to 5): N accepts 1, 16, 4, 0, 1, 0 MiB; C accepts 1, 4,
+  1, 16, 0, 32 MiB. A message on `n2c`, `c2n` or the tables channel is at most 64 MiB; N accepts at most
+  64 KiB per message on `c2n`.
+- *Challenges.* `chi(what) = SHA256("routstr-twopc-ag chi" ‖ seed ‖ what)[0..16]` read as a 128-bit block;
+  if it is zero the hash is recomputed with a 4-byte big-endian counter 1, 2, … appended until it is not.
+  `what` is the ASCII string `dvzk` for the product check, `check0` to `check4` for the five stage checks
+  and `check-salt` for the label-pair salt (its 16 bytes are used as they are). The weight of the k-th AND
+  gate of a check is χ^(k+1), k from 0.
+- *Openings hash* (P8): `SHA256("routstr-twopc-ag open" ‖ M_1 ‖ M_2 ‖ …)`, `M_i` the 16-byte MAC of the i-th
+  opened mask (C's key for the wire, XOR Δ_B when the opened bit is 1), in the order of the opened bit
+  vector: the opened input wires in increasing wire order, then the opened output groups in circuit order,
+  each in increasing wire order.
+- *Label hash of a stage report* (S): `h = SHA256("routstr-twopc-split output labels" ‖ s ‖ labels)`, `s`
+  the stage index 0 to 4 as one byte, `labels` the 16-byte labels C holds for the reported wires in report
+  order.
+- *Label-check pair half* (P8): `SHA256("routstr-twopc-split label check" ‖ pair_salt ‖ o ‖ p ‖ label)[0..16]`,
+  `o` the output wire's index as 4 bytes big-endian, `p` the pointer bit as one byte.
+
+The conformance file `crypto/conformance/twopc-hash-vectors.json` is produced by the implementation it
+tests; it pins the garbling hash, one gate, the input commitments and the key-share proof, and has no vector
+for the stage report, the label pairs, the openings hash or `chi`. A second implementation is checked
+against the running one, not against the file alone.
 
 Against `split-public-1`: P1, P2, P6 and H2 are new, P5 moved from the handshake (where it carried the labels
 of `x_N`) to before the seed, P7 waits for P2 to P6, and N's message of K carries the proof. Payload
@@ -1162,7 +1236,10 @@ was `P_N` alone (65 bytes). The proof of knowledge was added under the same tag 
 because every node and client was redeployed together. A build from before that change does not
 interoperate with one after it, although both send `routstr-2pc/split-public-2\n`: the pair fails at K
 with a message-length error (the client's `cu-2pc` reports an error without the code
-`twopc_version_mismatch`), before any TLS byte is sent. `pi_win` and `pi_c3s` run once per `zk_params` on the channel
+`twopc_version_mismatch`), before any TLS byte is sent but after the preprocessing was moved, and the
+connection ends unused (§12.10 row 12: the deposit is charged). A wire change of a key-schedule variant
+normally gets its own tag (§11); this one did not, by the operator's decision, and every deployment of
+`split-public-2` must be of a build after the change. `pi_win` and `pi_c3s` run once per `zk_params` on the channel
 (`cu-prover --channel`; the earlier `--multi` is the only mode) or on a socket of their own; `pi_nk` once
 per connection.
 
@@ -1294,7 +1371,13 @@ HTTP/2 frame per record (§5.1), a DATA payload at most 16 375 bytes.
   with `code: "h2_table_size"`, and C falls back to framing `"1.1"` (§2.3).
 - `C → N  {"type":"ctl","frame":"settings_ack"|"ping_ack"|"rst_stream"}`: the next record is that control
   frame (inner lengths 10, 18, 14). `rst_stream` on the current request's stream, once its records are all
-  received. At most 16 unproven control records. (`window_update` is refused: §5.1 rule 4.)
+  received. At most 16 unproven control records, and over the connection's life at most 16 control records
+  plus one more per 10 s since `head_written` (S counts every control record it accepts; the next one ends
+  the connection with an `error`, no `fault`). The second limit bounds the proofs a client can have N verify
+  without a request or a reservation: at most 376 in a connection of 3600 s. An honest client sends one
+  SETTINGS ACK per SETTINGS of the provider, one PING ACK per PING and at most one RST_STREAM per request; a
+  provider that pings more often than every 10 s for longer than the 16 last is not served on framing `"2"`
+  (§5.6). (`window_update` is refused: §5.1 rule 4.)
 - Any other record belongs to the open request: first the HEADERS record (flags `04`, stream `2k+1`, block
   `83 87 01 <len> <host> 04 <len> <path> 0f 10 10 "application/json" be`, `<path>` the route of
   `head_template` or `images.head_template`), then DATA records (flags `00`, the last `01`) until the
@@ -1468,8 +1551,16 @@ connection may buffer (`client_buffer_cap(max_body)`: the body limit, 1/256 of i
 gets `{"type":"error","status":413,"code":"frame_too_large"}` **without `fault`**, before or after the
 handshake, and the connection ends as after any client protocol error (§12.10: row 12, or row 9 with a
 request accepted and not released).
-`{"type":"upstream_closed_early","n","response_bytes"}` precedes the `error` when the provider closed before
-the request was fully written (N relays it). Framing `"2"`: N then keeps the request for 60 s, for a
+`{"type":"upstream_closed_early","n","response_bytes"[,"client_caused":true]}` precedes the `error` when the
+provider closed before the request was fully written (N relays it). S adds `client_caused` when the close
+may be the client's doing, and the request is then an abandoned one, not the provider's refusal (§12.10).
+Framing `"2"`: a control record of the client was written after the request's first record and before its
+last, or S had written no record of the request for the GOAWAY window `W` (§5.4.1) or longer when a server
+record or the close arrived, while the request was written in part (the client holds back records S has
+proven; an honest client releases them as the provider's flow-control window allows, within
+milliseconds). Framing `"1.1"`: S had written neither the head nor a body record for 30 s or longer when
+the provider closed (a provider that refuses a request from its head answers while the client still
+sends). Framing `"2"`: N then keeps the request for 60 s, for a
 `disclose_reset` alone (§12.8); without one the `error` follows.
 
 **N** sends its own `error` frames as `{"type":"error","status","reason","detail"[,"fault":"node"]}`: a
@@ -1510,6 +1601,7 @@ earlier (row 1) reserved nothing and carries none. When neither side had a last 
 | wallet lock (N) | a setup or request waits at most 10 s for the wallet lock before a first-use Cashu token is redeemed; past it 503 with `detail.error = {"type":"wallet_busy","retry_after_s":1}` (a setup: `error`; a request: `request_refused`, §12.10 row 6) |
 | completion margin (N) | `CONFIDENTIAL_RESERVE_MARGIN_TOKENS` (default 16) tokens beyond `max_tokens` in every chat reservation (§12.10) |
 | refused requests | 8 in a row per connection; the ninth ends it (`error` 429) |
+| control records (S, framing `"2"`) | 16 unproven at once; over the connection 16 and one more per 10 s since `head_written` (§12.6) |
 | `/zk` sockets per connection | 6 |
 
 ### 12.10 Money (N)
@@ -1521,7 +1613,8 @@ earlier (row 1) reserved nothing and carries none. When neither side had a last 
 | refused (`request_refused`) | never made, or released in full |
 | accepted, the connection ends before `body_released` (a failed π_WIN, the client leaves, the time limit) | released; the abandon fee is kept, except when the deposit is charged for it (below) |
 | accepted, the connection ends before `body_released` with the sidecar's `fault` (`"upstream"`, `"node"`) or with its socket lost | released in full: not the client's doing |
-| before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes) | released; the session fee is kept if still due |
+| before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes and without `client_caused`) | released; the session fee is kept if still due |
+| before `body_released`, the provider closed after the client held the request back or had a control frame written inside it (`upstream_closed_early` with `client_caused`, §12.9) | as an accepted request the client left: released; the abandon fee is kept, or the deposit is charged for it |
 | after `body_released` with no settlement | charged in full |
 | settled 2xx | usage at the frozen rates (chat) or `msat_per_image × count` (images), plus the session fee if still due |
 | settled chat 2xx whose usage event lacks `prompt_tokens` or `completion_tokens` as non-negative integers | charged its reservation |
@@ -1557,8 +1650,8 @@ settled request, first matching row:
 | 5 | the provider closed the open, idle connection before any request (`closed`, `upstream_closed`, without `after_client_frames`) | released | `provider_closed` |
 | 6 | the node refused a request of this connection with a 5xx **and accepted none after it**, or a settlement's billing write failed | released | `node_failure` |
 | 7 | a request was written in full (`body_released`) and never settled | released (the reservation is charged) | `request_received` |
-| 8 | the provider answered a request and closed before its body was complete (response bytes in the request's interval) | released (the request keeps the session fee) | `provider_refused` |
-| 9 | a request was accepted and the connection ended before its `body_released` for any other reason (N cannot see a GOAWAY: undisclosed, it lands here when the provider sent nothing in the interval) | **charged**; the reservation is released in full | `request_abandoned` |
+| 8 | the provider answered a request and closed before its body was complete (response bytes in the request's interval, and S did not mark the close `client_caused`, §12.9) | released (the request keeps the session fee) | `provider_refused` |
+| 9 | a request was accepted and the connection ended before its `body_released` for any other reason (N cannot see a GOAWAY: undisclosed, it lands here when the provider sent nothing in the interval, or when its close was `client_caused`) | **charged**; the reservation is released in full | `request_abandoned` |
 | 10 | no request in flight for `idle_timeout_s` | **charged** | `idle` |
 | 11 | `head_written` not reached within 600 s | **charged** | `setup_timeout` |
 | 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake or after the client's control frames (`after_client_frames`), only refused requests | **charged** | `unused` |

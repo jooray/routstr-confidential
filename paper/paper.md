@@ -498,7 +498,9 @@ of the ECDHE secret Z, without either party learning Z.
 Written with the SHA-256 compression function $f$,
 $$\mathrm{HMAC}(k, m) = f(OS_k,\ \mathrm{pad}(f(IS_k, m))), \qquad IS_k = f(IV, k \oplus \mathrm{ipad}),\quad OS_k = f(IV, k \oplus \mathrm{opad}),$$
 for a message $m$ that fits one block after the key block, which holds for every call of the TLS 1.3
-schedule. Every message of the schedule is public: a label, a transcript hash, a constant. Only four
+schedule. Every message of the schedule after the first extract is public: a label, a transcript hash, a constant
+(the first extract, $HS = \mathrm{HMAC}(\mathit{salt}, Z)$, has a public key and the secret $Z$ as its
+message, and is computed in the circuit whole). Only four
 keys are secret: HS, the "derived" secret $dHS$, MS and $c_{ap,0}$. The circuit therefore computes, for
 each of these keys, the two pad states $IS_k$ and $OS_k$, and then only the **outer** compressions. The
 inner state $IS_k$ is a **public output**: both parties compute the inner digest $f(IS_k, m)$ in the
@@ -948,8 +950,10 @@ request. Both go through the node's ordinary billing.
    the SHA-256 of the exact attestation bytes, the released deposit if any, and the time. C requires
    the signature, takes every field from the signed bytes, and checks the connection id, the request
    number and the attestation hash against its own records, the usage against the plaintext it already
-   has, and the cost against that usage at the signed rates. Unused balance stays on the credential and
-   is withdrawn through the node's normal refund endpoint.
+   has, the cost against that usage at the signed rates (N's own formula, cached reads and cache
+   writes at their signed rates), and both the receipt's reservation and its cost against the
+   reservation N announced when it accepted the request: no settlement costs more than that. Unused
+   balance stays on the credential and is withdrawn through the node's normal refund endpoint.
 
 If C does not disclose after U received the request, N charges the full reservation, which is why
 disclosure is always in C's interest. The same holds for a response that has no terminal usage event
@@ -1349,8 +1353,13 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
    only a bounded number of connections that have not yet released a body (twelve by default) and of
    connections in all (sixteen); when the node or an address is full, a new setup first closes the
    longest-idle connection that already settled a request (it holds no deposit) and is refused only when
-   there is none, so cheap, mostly idle connections cannot hold every slot. At most eight requests in a
-   row may be refused on a connection. Connections that have not reserved yet are a separate, smaller
+   there is none, so cheap, mostly idle connections cannot hold every slot. Unused connections are not
+   evicted, and the limits are per address, not per credential: funded credentials from three addresses
+   can hold all 32 slots for the price of 32 deposits per 600 s (the life of an armed connection). The
+   deposit prices this; nothing prevents it. At most eight requests in a
+   row may be refused on a connection. Control frames of the client, each proven by a $\pi_{WIN}$ with no
+   request behind it, are limited per connection (16, and one more per 10 s), so the proofs a client can
+   make N verify are bounded by its requests and that allowance. Connections that have not reserved yet are a separate, smaller
    pool in which the oldest is evicted first. The relay's withdrawal of framing "2" counts only failures
    no client can cause (no answer to the canonical ClientHello, `h2` not selected, a close right after the
    connection head with no client record written), so no client can switch it off for others. Opening a connection costs N about 16 MB of upload and 0.4 s of CPU, which the deposit
@@ -1369,7 +1378,9 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
     and C cannot prove who aborted. This is the trust the existing Routstr design already places in the
     node; in the honest case the cost is computed from upstream-authenticated usage, and the receipt
     binds all of it. The amount at N's discretion is the reservation for the requested model, per
-    request, plus the deposit of a connection that N ends before its first settlement.
+    request, plus the deposit of a connection that N ends before its first settlement. A charge without
+    a settlement (a request written in full and never settled, an abandoned request after the deposit
+    was released) has no signed document: C sees it in its balance only.
 12. *The relay trusts its peer.* N's relay holds the API key but does not check client credentials:
     N validates the credential and reserves before it connects to the relay. Whoever can reach the relay
     directly therefore spends the provider key without paying. The relay requires a bearer token shared
@@ -1434,7 +1445,11 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
     write further HEADERS frames in epoch 0 that add or evict table entries, so that index 62 no longer
     names the proven credential entry, or that change the connection's state. C's own header blocks are
     still proven, and this reveals neither the prompt nor the key, but it can change how C's requests
-    are authenticated or make them fail.
+    are authenticated or make them fail. In framing "1.1" the epoch-0 bytes N adds after the head are
+    read as the start of the body, and with as many as the Content-Length names they are the whole
+    request: U then answers a request of N's choosing, C reads the answer, and C is billed for its
+    usage, at most the reservation. The commitment $c_{commit}$ and the attestation are N's statements
+    about what it wrote; they are evidence for C, not a constraint on N.
 21. *Receipts and attestations are linkable.* The per-request attestations and receipts of a connection
     repeat its id, transcript hashes, $c_{commit}$, the certificate-chain hash and the request numbers and
     intervals: anyone shown several can link them and see their order and gaps. They are private

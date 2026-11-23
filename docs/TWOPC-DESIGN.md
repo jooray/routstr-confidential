@@ -144,7 +144,7 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
 | A1 | N→C | `δ = x_N − ρ mod p` | 32 |
 | A1 | C→N | `d = x_C' ⊕ b` | 32 |
 | A1 | N→C | corrections for x_C' | 4 096 |
-| each stage | C→N | report: `1 ‖ pointer bits ‖ SHA256(labels)`, or `0` (abort) | 65–157 |
+| each stage | C→N | report: `1 ‖ pointer bits ‖ SHA256("routstr-twopc-split output labels" ‖ stage ‖ labels)` (the stage index as one byte), or `0` (abort) | 65–157 |
 | A2, A3, B1, B2 | N→C | labels of the stage's digests (16 B per bit), or `0` (N rejected the report) | 12 288; 4 096; 8 192; 12 288 |
 
 The report of a stage is C's only message in that stage. N sends the next stage's labels only after the
@@ -226,6 +226,11 @@ pairs for the outputs C reports; C's report authenticated by a hash of its label
   outcomes. What a full proof must still enumerate: every externally distinguishable result of a malicious
   ECtF, OT and preprocessing, of every stage, of N's own report checks, of the TLS verification, timeouts and
   error messages; the tests compare selected cheats at two stages (`abort_looks_the_same_whatever_failed`).
+  Observations outside the table that the code has today: which check of preprocessing failed (KOS, the
+  product check, the openings), whether C accepted N's key-share proof and δ (both N's own public values),
+  which TLS check failed at C as far as its error text and timing show it, and whether C retries. None of
+  them was found to be a predicate on a key-schedule value that the eight outcomes do not already count, but
+  that is a reading of the code, not a proof.
 - *Why 3 bits per connection is harmless.* The values N can aim a selective failure at are C's ECDHE share
   `x_C`, the point `Q_C = a_C·S` (when N feeds 0 into ECtF, C's circuit input is a known shift of its
   x-coordinate) and the secrets of the schedule (HS, MS, c_hs, s_hs, c_ap_1, s_ap_0): each is a fresh, uniformly

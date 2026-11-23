@@ -308,6 +308,11 @@ host, or through an encrypted tunnel (WireGuard, or a TLS terminator in front of
 `https://` `CONFIDENTIAL_SIDECAR_URL`), never over a network others can read. To rotate the token, change it
 on both sides and restart both.
 
+**What the deposit prices.** Unused connections are never evicted and the limits below are per address,
+so a client with funded credentials on three addresses can hold all 32 session slots for
+`32 × CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT` per 10 minutes (the life of an armed connection). Set the
+deposit to what a blocked node costs you; with a deposit of 0 the slots are free to hold.
+
 **Denial-of-service limit.** The node refuses a new confidential connection (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
 unused connections. A connection counts as unused from the moment its deposit is reserved until the body of
