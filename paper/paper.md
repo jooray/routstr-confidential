@@ -1353,10 +1353,12 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
    only a bounded number of connections that have not yet released a body (twelve by default) and of
    connections in all (sixteen); when the node or an address is full, a new setup first closes the
    longest-idle connection that already settled a request (it holds no deposit) and is refused only when
-   there is none, so cheap, mostly idle connections cannot hold every slot. Unused connections are not
-   evicted, and the limits are per address, not per credential: funded credentials from three addresses
-   can hold all 32 slots for the price of 32 deposits per 600 s (the life of an armed connection). The
-   deposit prices this; nothing prevents it. At most eight requests in a
+   there is none, so cheap, mostly idle connections cannot hold every slot. With no such connection it
+   closes the oldest unused one older than a minimum age (60 s by default) that is not still setting up,
+   and charges that connection's deposit; this happens only when a setup needs the slot. The limits are
+   per address, not per credential, so funded credentials can still hold slots, but each slot then costs
+   a deposit every time others want it, after about a minute, instead of once per 600 s. An honest
+   pre-warmed connection on a full node pays its deposit the same way. At most eight requests in a
    row may be refused on a connection. Control frames of the client, each proven by a $\pi_{WIN}$ with no
    request behind it, are limited per connection (16, and one more per 10 s), so the proofs a client can
    make N verify are bounded by its requests and that allowance. Connections that have not reserved yet are a separate, smaller
@@ -1380,7 +1382,8 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
     binds all of it. The amount at N's discretion is the reservation for the requested model, per
     request, plus the deposit of a connection that N ends before its first settlement. A charge without
     a settlement (a request written in full and never settled, an abandoned request after the deposit
-    was released) has no signed document: C sees it in its balance only.
+    was released) is stated in N's signed last frame, with the request and the amount, and C checks it
+    against the reservation N announced; a client that has left receives no statement.
 12. *The relay trusts its peer.* N's relay holds the API key but does not check client credentials:
     N validates the credential and reserves before it connects to the relay. Whoever can reach the relay
     directly therefore spends the provider key without paying. The relay requires a bearer token shared

@@ -313,10 +313,12 @@ host, or through an encrypted tunnel (WireGuard, or a TLS terminator in front of
 `https://` `CONFIDENTIAL_SIDECAR_URL`), never over a network others can read. To rotate the token, change it
 on both sides and restart both.
 
-**What the deposit prices.** Unused connections are never evicted and the limits below are per address,
-so a client with funded credentials on three addresses can hold all 32 session slots for
-`32 × CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT` per 10 minutes (the life of an armed connection). Set the
-deposit to what a blocked node costs you; with a deposit of 0 the slots are free to hold.
+**What the deposit prices.** The limits below are per address, so a client with funded credentials on
+several addresses can hold session slots with unused connections. Under slot pressure a newer setup closes
+the oldest unused one past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (below) and charges its deposit, so holding
+all 32 slots costs `32 × CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT` each time others want them, after about a
+minute, not per 10 minutes. Set the deposit to what a blocked slot costs you; with a deposit of 0 the slots
+are free to hold.
 
 **Denial-of-service limit.** The node refuses a new confidential connection (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
@@ -328,8 +330,17 @@ oldest connection still waiting for its setup is evicted. Beyond the unused ones
 most `CONFIDENTIAL_MAX_ACTIVE_PER_IP` (default 16) connections in all, and the node at most 32: when the
 address or the node is full, the node first closes the connection of that address (or, for a full node, of
 any address) that has idled longest after a settled request (`closed`, reason `evicted`; its deposit was
-already released by that settlement, so its client loses only a handshake), and refuses the setup only when
-there is none. The limits are
+already released by that settlement, so its client loses only a handshake). With none, it closes the
+oldest **unused** connection there (no settled request) whose setup is at least
+`CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (default 60, 0 never) seconds old and that is not still setting up (its
+handshake, its 2PC or proof channel moving bytes, a request being reserved, or a first request younger than
+the minimum age plus its body's upload time at 32 kB/s); that connection's deposit is charged (`closed`,
+reason `evicted`, `"unused": true`). A full unused limit of the address yields the same way, to an unused
+connection of that address. The node refuses the setup only when there is none, and closes nothing on a
+timer. The cost to honest clients: a pre-warmed spare older than the minimum age loses its deposit when the
+node or its address is full; the clients then stop pre-warming for that node for 10 minutes. Raise the
+minimum age if your clients sit on links slower than 2/50 Mbit/s (a cold connection there takes about 12 s
+to its first request). PROTOCOL-V3.md §8.4 has the rule. The limits are
 only as good as the node's idea of the client address, which depends on how the node is reached:
 
 | Deployment | What to set | Result |
