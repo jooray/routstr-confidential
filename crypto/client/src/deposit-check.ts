@@ -27,6 +27,8 @@ export interface DepositContext {
   signed?: boolean
   /** A `request` of the client is neither refused nor settled (default: not judged). */
   requestOpen?: boolean
+  /** The open request reached `body_released` (default: not judged). */
+  requestReleased?: boolean
 }
 
 /** The outcome as parsed from `deposit_json` (or `deposit`). */
@@ -59,6 +61,16 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
       problems.push(`charged with reason ${JSON.stringify(d.reason)}, which releases it`)
     }
     if (c.signed === false) problems.push('charged without a valid signature of the node')
+    // Row 13: a newer setup closed the connection while it held its slot
+    // unused (§8.4). Legitimate only on that `closed` frame, and never for a
+    // connection whose request the provider had in full.
+    const evictedUnused = frame?.type === 'closed' && frame.reason === 'evicted' && frame.unused === true
+    if (d.reason === 'evicted' && !evictedUnused) problems.push('charged as evicted, but the last frame is not `closed` `evicted` with `unused: true`')
+    if (evictedUnused && d.reason !== 'evicted') problems.push(`charged with reason ${JSON.stringify(d.reason ?? null).slice(0, 40)} on an eviction (row 13 names "evicted")`)
+    if (frame?.type === 'closed' && frame.reason === 'evicted' && frame.unused !== true) {
+      problems.push('charged on the eviction of a used connection (it holds no deposit)')
+    }
+    if (d.reason === 'evicted' && c.requestReleased === true) problems.push('charged as evicted, though the open request was written in full (never evicted)')
     // Row 5: the provider closed the open connection while no request of the
     // client was open, and not after control frames of the client alone.
     if (frame?.type === 'closed' && frame.reason === 'upstream_closed' && frame.after_client_frames !== true && c.requestOpen === false) {

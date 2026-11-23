@@ -129,6 +129,10 @@
 #   no-funds                row 1: a setup with an unfunded key (402), sidecar not dialed
 #   low-balance             row 1: funds below D (402 `connection_deposit_unfunded`)
 #   sidecar-down            row 2: the sidecar is gone at the setup: D released (`not_started`)
+#   h2-n-evict-unused       row 13: an armed connection held unused while the address is at its
+#                           unused limit (set to 1 for the case, the minimum age to 8 s): a second
+#                           client's setup closes it (`closed` `evicted`, `unused: true`), D charged
+#                           (`evicted`), signed; the second client's request settles
 #   fb-h2                   row 3: the HTTP/2 open fails (test hook): D released
 #                           (`provider_unreachable`)
 #   sidecar-killed          row 4: the sidecar dies under an open connection: D released
@@ -173,6 +177,11 @@ IDLE=12
 # 30 s the node caches the sidecar's offer, so the node's offer shows the withdrawal.
 RETRY_SECS=45
 MAX_TOKENS=20
+# The eviction case: the node's minimum age for an unused connection, and how
+# long after the holder is armed the newcomer sets up (past the minimum age and
+# the node's 15 s of proof-channel quiet).
+EVICT_AFTER=8
+EVICT_WAIT=18
 export CU_PROVER="${CU_PROVER:-$CRYPTO/zkbench/target/release/cu-prover}"
 export CU_2PC="${CU_2PC:-$CRYPTO/zkbench/target/release/cu-2pc}"
 read -r -a DRIVER <<< "${CU_DRIVER:-node --experimental-strip-types src/driver.ts}"
@@ -348,8 +357,23 @@ record() { # id expect verdict evidence
   case "$3" in PASS) ;; *) failures=$((failures + 1)) ;; esac
 }
 set_idle() { # the node's idle timeout, through its admin API (changes the signed offer)
+  set_setting confidential_idle_timeout_s "$1"
+}
+set_setting() { # <name> <integer value>: a node setting, through its admin API
   curl -fsS -o /dev/null -X PATCH -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-    -d "{\"confidential_idle_timeout_s\": $1}" "$NODE/admin/api/settings"
+    -d "{\"$1\": $2}" "$NODE/admin/api/settings"
+}
+# newcomer <id>: a second client from the same address sets up a framing-"2"
+# connection with one request, on a key of its own (the `evict` hook).
+newcomer() {
+  local key2 rc2=0
+  key2="$(openssl rand -hex 32)"
+  sqlite3 -cmd ".timeout 5000" "$DB" "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('$key2',$START_BALANCE,0,0,0);"
+  echo "$key2" > "$OUT/$1.new.key"
+  ( cd "$CRYPTO/client" && "$TIMEOUT_BIN" -k 5 "$CASE_TIMEOUT" "${DRIVER[@]}" --http 2 --node "$NODE" --model "$MODEL" \
+      --max-tokens "$MAX_TOKENS" --auth "sk-$key2" --runs-dir "$OUT/client-runs" < /dev/null ) \
+    > "$OUT/$1.new.out" 2> "$OUT/$1.new.err" || rc2=$?
+  echo "$rc2" > "$OUT/$1.new.rc"
 }
 # wait_for <file> <pattern> <seconds>: until the driver printed the pattern.
 wait_for() {
@@ -370,6 +394,9 @@ wait_for() {
 #   offer         after the first receipt, change the node's idle timeout (a new offer)
 #   kill-driver   kill the driver when it sees `body_released`
 #   kill-sidecar  kill the sidecar when the connection head is written
+#   evict         an armed connection held unused (stdin silent); once it is past the
+#                 node's minimum age and its proof channel is quiet, a second client of the
+#                 same address sets up (`newcomer`) against an unused limit of 1
 run_case() {
   local id="$1" expect="$2" balance="$3" hook="$4"; shift 5
   selected "$id" || return 0
@@ -400,6 +427,9 @@ run_case() {
     kill-sidecar)
       ( wait_for "$OUT/$id.err" '<- head_written' "$CASE_TIMEOUT" && kill -9 "$SIDECAR_PID" ) & watcher=$! ;;
     hold) limit=700 ;;
+    evict)
+      limit=$((CASE_TIMEOUT + EVICT_WAIT))
+      ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT" && sleep "$EVICT_WAIT" && newcomer "$id" ) & watcher=$! ;;
   esac
   (
     cd "$CRYPTO/client"
@@ -408,11 +438,13 @@ run_case() {
       --auth "sk-$key" --runs-dir "$OUT/client-runs"; }
     case "$hook" in
       go) ( wait_for "$OUT/$id.out" '^READY' "$CASE_TIMEOUT"; sleep 1; echo go ) | run "$@" ;;
-      hold) sleep "$limit" | run "$@" ;;
+      hold|evict) sleep "$limit" | run "$@" ;;
       *) run "$@" < /dev/null ;;
     esac
   ) > "$OUT/$id.out" 2> "$OUT/$id.err" || rc=$?
-  if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true; fi
+  # The newcomer of `evict` runs to its end; other watchers are stopped.
+  if [ -n "$watcher" ] && [ "$hook" != evict ]; then kill "$watcher" 2>/dev/null || true; fi
+  if [ -n "$watcher" ]; then wait "$watcher" 2>/dev/null || true; fi
   if [ "$hook" = offer ]; then set_idle "$IDLE"; fi
   # The signed offer after the case, too: a receipt's rates are one of the two.
   fetch_offer > "$OUT/$id.offer-after.json" 2>/dev/null || cp "$OUT/$id.offer.json" "$OUT/$id.offer-after.json"
@@ -561,6 +593,15 @@ run_case h2-received   "received:2"                          "$B" kill-driver --
 run_case h11-received  "received:1.1"                        "$B" kill-driver -- --http 1.1 --max-tokens 600 --prompt 'Write a 400 word essay about rivers.'
 run_case legacy-v2     "legacy"                              "$B" none -- --legacy-v2-socket
 run_case legacy-no-v   "legacy"                              "$B" none -- --legacy-v2-socket --legacy-no-v
+# Slot pressure (§8.4): an unused connection past the minimum age yields its
+# slot to a newer setup and is charged its deposit (row 13, `evicted`).
+if selected h2-n-evict-unused; then
+  set_setting confidential_max_unused_per_ip 1
+  set_setting confidential_evict_unused_after_s "$EVICT_AFTER"
+  run_case h2-n-evict-unused "evicted"                       "$B" evict -- --http 2 --arm
+  set_setting confidential_max_unused_per_ip 12
+  set_setting confidential_evict_unused_after_s 60
+fi
 if [ "${CU_SLOW:-0}" = 1 ]; then
   run_case setup-timeout "unused:setup_timeout:anyrc"        "$B" hold -- --http 2 --arm
 fi

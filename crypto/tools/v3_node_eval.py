@@ -56,6 +56,13 @@ the arithmetic. `expect` is one of (H is the framing, "2" or "1.1"):
                                 reservation is charged, the deposit released (`request_received`)
   setup-refused:<status>:<regex>  the setup is refused before the sidecar is dialed: nothing reserved
   legacy                        a protocol-v2 socket gets `error` 426 `upgrade_required`
+  evicted                       an armed connection held unused is closed for a newer setup of the
+                                same address (`closed` `evicted`, `unused: true`): the deposit is
+                                charged (`evicted`, row 13), signed; the newcomer's request settles
+                                (its output in <case>.new.out, its key in <case>.new.key)
+In the attack cases a request finalized without a receipt must be stated in the
+connection's last frame, signed (`request_outcome`): the reservation, the abandon
+fee, or a release in full.
 In every case the key's balance must equal its start (plus any top-up) minus
 exactly the charges named above, with nothing left reserved, and the driver
 must print no DEPOSIT_DEVIATION line (a deposit outcome off the signed terms).
@@ -517,6 +524,44 @@ elif kind == "error":
             dev.append("the connection did not close with `error_settled`")
         if aborted:
             dev.append(f"a reservation was finalized by an abort ({aborted})")
+elif kind == "evicted":
+    sid = sids[0] if sids else None
+    told = re.search(r"deposit: outcome=(\w+) reason=(\w+) msat=(\d+) .*signed=(\w+)", out)
+    new_out_f = out_f[: -len(".out")] + ".new.out"
+    new_out = open(new_out_f, errors="replace").read() if os.path.exists(new_out_f) else ""
+    new_e2e = None
+    for line in new_out.splitlines():
+        if line.startswith("E2E_JSON "):
+            new_e2e = json.loads(line[len("E2E_JSON "):])
+    new_reqs = (new_e2e or {}).get("requests") or []
+    evidence += f" {money()} told={told.group(0)[9:] if told else None} newcomer={[(r.get('status'), r.get('cost_msats')) for r in new_reqs]}"
+    if not sid:
+        dev.append("the held connection never got a sid")
+    if not re.search(r"closed: reason=evicted unused=true", out):
+        dev.append("the held connection was not closed `evicted` with `unused: true`")
+    if deposit_of(sid) != [("charged", "evicted", DEP)]:
+        dev.append(f"the held connection's deposit was not charged for /evicted/ (node: {deposit_of(sid)})")
+    if not told or told.groups() != ("charged", "evicted", str(DEP), "true"):
+        dev.append("the held connection's client was not told, signed, that the deposit was charged")
+    if ((sid or "")[:12], 1) in reserved:
+        dev.append("a request was reserved on the held connection")
+    if len(new_reqs) != 1 or new_reqs[0].get("status") != 200 or new_reqs[0].get("receipt_sig_ok") is not True:
+        dev.append("the newcomer's request did not settle")
+    if not msg(evs, "evicting a connection to make room", sid):
+        dev.append("the node did not log the eviction")
+    try:
+        key2 = open(out_f[: -len(".out")] + ".new.key").read().strip()
+        db = sqlite3.connect(f"file:{ctx['db']}?mode=ro", uri=True, timeout=10)
+        r2 = db.execute("select reserved_balance, total_spent from api_keys where hashed_key = ?", (key2,)).fetchone()
+        db.close()
+        if not r2 or r2[0] != 0 or r2[1] <= 0:
+            dev.append(f"the newcomer's key is not settled cleanly ({r2})")
+    except OSError:
+        dev.append("no newcomer key")
+    newdev = [l for l in new_out.splitlines() if l.startswith("DEPOSIT_DEVIATION ")]
+    if newdev:
+        dev.append(f"the newcomer's driver reports a deviation: {newdev[0][:200]}")
+    charges.append(DEP)
 elif kind == "node-refused":
     http, n, status, reason = rest.split(":", 3)
     n = int(n)
@@ -570,6 +615,13 @@ else:  # attack
     else:
         if not res:
             dev.append(f"request {n} was never reserved (the attack did not reach the node's billing)")
+        told_req = re.search(rf"request outcome: n={n} outcome=(\w+) reason=(\w+) cost_msats=(\d+) .*signed=(\w+)", out)
+        if how == "abandoned":
+            want_req = ("released", "request_abandoned", "0") if n == 1 else ("charged", "request_abandoned", str(ABANDON))
+        else:
+            want_req = ("charged", "request_received", str(res[-1] if res else None))
+        if not told_req or told_req.groups() != (*want_req, "true"):
+            dev.append(f"the client was not told, signed, what request {n} cost (want {want_req}, told {told_req.groups() if told_req else None})")
         if how == "abandoned":
             if adv and adv.get("body_released"):
                 dev.append("the driver saw body_released for the attacked request")

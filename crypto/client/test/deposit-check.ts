@@ -71,4 +71,18 @@ assert.equal(missingDepositProblem({ ...ctx, releasedByReceipt: true }, true, fa
 assert.equal(missingDepositProblem({ ...ctx, depositMsat: 0 }, true, false), null)
 assert.equal(missingDepositProblem({ ...ctx, sid: '' }, true, false), null) // refused before ready
 
+// Row 13: closed for a newer setup while unused. Legitimate when signed, on
+// `closed` `evicted` `unused: true`, with no receipt and no request written in full.
+const evicted = { type: 'closed', reason: 'evicted', unused: true }
+assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted' }), { ...ctx, signed: true, requestOpen: false }), [])
+// A first request accepted and stalled: evicted too, its reservation released.
+assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted' }), { ...ctx, signed: true, requestOpen: true, requestReleased: false }), [])
+assert.match(depositProblems(evicted, d({ reason: 'evicted' }), { ...ctx, releasedByReceipt: true }).join(), /receipt of this connection released it/)
+assert.match(depositProblems(evicted, d({ reason: 'evicted' }), { ...ctx, signed: false }).join(), /without a valid signature/)
+assert.match(depositProblems(evicted, d({ reason: 'evicted' }), { ...ctx, requestOpen: true, requestReleased: true }).join(), /written in full/)
+assert.match(depositProblems(closed, d({ reason: 'evicted' }), ctx).join(), /not `closed` `evicted`/)
+assert.match(depositProblems({ type: 'closed', reason: 'evicted' }, d({ reason: 'evicted' }), ctx).join(), /used connection/)
+assert.match(depositProblems(evicted, d({ reason: 'unused' }), ctx).join(), /on an eviction/)
+assert.deepEqual(depositProblems(evicted, d({ outcome: 'released', reason: 'not_started' }), ctx), [])
+
 console.log('deposit-check: ok')

@@ -97,6 +97,7 @@ import { checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { makeReceiptChecker } from './receipt-check.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
 import { depositProblems, missingDepositProblem } from './deposit-check.ts'
+import { requestOutcomeProblems, type OpenRequest } from './request-outcome.ts'
 import { errText, shown, termSafe } from './term.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
 import { runZk } from './zkbridge.ts'
@@ -515,8 +516,14 @@ class Session {
   /** The connection deposit's outcome, as the node reported it (a receipt, or its last frame). */
   deposit: { msat: number; outcome: string; reason: string; signed: boolean } | undefined
   closedReason: string | undefined
+  /** The node's `closed` said the connection was closed for a newer setup while unused (`evicted`, `unused: true`). */
+  closedUnused = false
   /** A `request` was sent and is neither refused nor settled. */
   requestOpen = false
+  /** That request, as far as the node answered it (for its signed outcome, §12.10). */
+  openReq: OpenRequest | undefined
+  /** The node's signed outcome of a request finalized without a receipt (§12.9). */
+  requestOutcome: { n: unknown; outcome: string; reason: string; cost_msats: unknown; signed: boolean } | undefined
   /** The node sent a last frame (`closed` or `error`). */
   lastFrameSeen = false
   /** The provider closed before the request in flight was written in full (`upstream_closed_early`). */
@@ -602,8 +609,18 @@ class Session {
         process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
         trace('<-', shown(m.type))
         if (typeof m.type === 'string' && this.tFirst[m.type] === undefined) this.tFirst[m.type] = Date.now()
-        if (m.type === 'body_released') this.bodyReleased = true
-        if (m.type === 'request_refused' || m.type === 'receipt') this.requestOpen = false
+        if (m.type === 'body_released') {
+          this.bodyReleased = true
+          if (this.openReq && m.n === this.openReq.n) this.openReq.bodyReleased = true
+        }
+        if (m.type === 'request_ok' && this.openReq && m.n === this.openReq.n) {
+          this.openReq.accepted = true
+          if (Number.isSafeInteger(m.reserved_msats) && m.reserved_msats >= 0) this.openReq.reservedMsats = m.reserved_msats
+        }
+        if (m.type === 'request_refused' || m.type === 'receipt') {
+          this.requestOpen = false
+          this.openReq = undefined
+        }
         if (m.type === 'upstream_closed_early') {
           this.closedEarly = true
           console.log(`[client ${this.label}] the provider closed before the request was written in full (response_bytes=${shown(m.response_bytes)} client_caused=${m.client_caused === true})`)
@@ -640,8 +657,10 @@ class Session {
     this.lastFrameSeen = true
     if (m.type === 'closed') {
       this.closedReason = String(m.reason ?? '')
-      console.log(`[client ${this.label}] closed: reason=${shown(m.reason)}`)
+      this.closedUnused = m.unused === true
+      console.log(`[client ${this.label}] closed: reason=${shown(m.reason)}${m.unused === true ? ' unused=true (closed for a newer setup while unused; the deposit is the cost)' : ''}`)
     }
+    this.onRequestOutcome(m)
     if (m.deposit === undefined || m.deposit === null) return
     const json: string = typeof m.deposit_json === 'string' ? m.deposit_json : JSON.stringify(m.deposit)
     let signed = false
@@ -664,9 +683,49 @@ class Session {
     if (!NODE_MODE) return
     // The node's own word against its signed terms (§12.10): a deviation is
     // printed on a line of its own, which the gates' evaluators fail on.
-    const problems = depositProblems(m, d, { sid: this.sid, depositMsat: DEPOSIT, releasedByReceipt, signed, requestOpen: this.requestOpen })
+    const problems = depositProblems(m, d, {
+      sid: this.sid,
+      depositMsat: DEPOSIT,
+      releasedByReceipt,
+      signed,
+      requestOpen: this.requestOpen,
+      requestReleased: this.openReq?.bodyReleased === true,
+    })
     if (problems.length) {
       const dev = { sid: this.sid || null, frame: m.type, outcome: shown(d.outcome), reason: shown(d.reason), signed, problems: problems.map((p) => termSafe(p)) }
+      DEPOSIT_DEVIATIONS.push(dev)
+      console.log('DEPOSIT_DEVIATION ' + JSON.stringify(dev))
+    }
+  }
+
+  /** The signed outcome of a request the node finalized without a receipt, on the last frame (§12.9, §12.10). */
+  private onRequestOutcome(m: any): void {
+    let o: any
+    let signed = false
+    if (m.request_outcome !== undefined && m.request_outcome !== null) {
+      const json: string = typeof m.request_outcome_json === 'string' ? m.request_outcome_json : JSON.stringify(m.request_outcome)
+      try {
+        o = JSON.parse(json)
+        if (o === null || typeof o !== 'object') o = {}
+        signed = verifySig(json, m.request_outcome_sig, this.ready?.pubkey ?? OFFER_PUBKEY, m.sig_scheme)
+      } catch {
+        o = {}
+      }
+      this.requestOutcome = { n: o.n, outcome: String(o.outcome), reason: String(o.reason), cost_msats: o.cost_msats, signed }
+      console.log(
+        `[client ${this.label}] request outcome: n=${shown(o.n)} outcome=${shown(o.outcome)} reason=${shown(o.reason)} ` +
+          `cost_msats=${shown(o.cost_msats)} reserved_msats=${shown(o.reserved_msats)} balance_msats=${shown(o.balance_msats)} signed=${signed}`,
+      )
+    }
+    if (!NODE_MODE) return
+    const problems = requestOutcomeProblems(o, signed, {
+      sid: this.sid,
+      framing: this.framing,
+      open: this.openReq,
+      feeMsat: Math.max(this.settledOnce ? 0 : SESSION_FEE, ABANDON_FEE),
+    })
+    if (problems.length) {
+      const dev = { sid: this.sid || null, frame: 'request_outcome', outcome: shown(o?.outcome), reason: shown(o?.reason), signed, problems: problems.map((p) => termSafe(p)) }
       DEPOSIT_DEVIATIONS.push(dev)
       console.log('DEPOSIT_DEVIATION ' + JSON.stringify(dev))
     }
@@ -689,7 +748,10 @@ class Session {
     const text = JSON.stringify(obj)
     this.bytes.control_sent += text.length
     trace('->', shown((obj as any)?.type))
-    if ((obj as any)?.type === 'request') this.requestOpen = true
+    if ((obj as any)?.type === 'request') {
+      this.requestOpen = true
+      this.openReq = { n: Number((obj as any).n), accepted: false, bodyReleased: false }
+    }
     this.ws.send(text)
   }
   sendBytes(b: Uint8Array): void {
@@ -1261,10 +1323,10 @@ async function main() {
       )
     })
     results.push(...out.results)
-    lastClosed = s.closedReason === undefined ? undefined : { reason: s.closedReason, idle_ms: out.lingered }
+    lastClosed = s.closedReason === undefined ? undefined : { reason: s.closedReason, unused: s.closedUnused || undefined, idle_ms: out.lingered }
     conns.push({
       sid: s.sid, http: framing, armed: out.armed, requests: out.results.length, phases: s.phases(out.tClaim),
-      setup_bytes: s.setupBytes, total_bytes: s.allBytes(), deposit: s.deposit, closed: lastClosed,
+      setup_bytes: s.setupBytes, total_bytes: s.allBytes(), deposit: s.deposit, request_outcome: s.requestOutcome, closed: lastClosed,
       topups: s.zkchan?.topups.length ? s.zkchan.topups : undefined,
     })
     writePrivate(`${s.runDir}/client.jsonl`, s.logLines.join('\n') + '\n')
@@ -1285,6 +1347,7 @@ async function main() {
     fallback,
     refusals: REFUSALS.length ? REFUSALS : undefined,
     deposit: last?.deposit,
+    request_outcome: last?.request_outcome,
     deposit_deviations: DEPOSIT_DEVIATIONS.length ? DEPOSIT_DEVIATIONS : undefined,
     closed: lastClosed,
     phases: last?.phases,
