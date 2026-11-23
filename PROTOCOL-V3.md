@@ -679,9 +679,19 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   control record written before the request's first record: the queue is written in order, so a control
   record ahead of the HEADERS goes out in the same pass and the provider's reaction falls into the
   request's interval. For a marked request the provider's early close is `client_caused` and a GOAWAY does
-  not refuse it (`error`), whatever its error code. One control record never marks a request: the
-  connection's first SETTINGS ACK. Every provider sends SETTINGS at the start of the connection and
-  expects exactly this answer, whenever it comes. A control record written before the request was
+  not refuse it (`error`), whatever its error code. Two kinds of control record do not mark a request.
+  The connection's first SETTINGS ACK never marks: every provider sends SETTINGS at the start of the
+  connection and expects exactly this answer, whenever it comes. A PING ACK does not mark when at least
+  one server record arrived since the previous PING ACK of the connection, up to 2 per request: these are
+  the answers an honest client owes to keep-alive PINGs during a long upload (RFC 9113 §6.7). S cannot
+  read the provider's records, so a cheating client can send up to 2 PING ACKs per request that the
+  provider never asked for, each after some server record. That is harmless: a provider ignores a PING
+  ACK it did not ask for (RFC 9113 defines no error for it; nghttp2 and Go's server ignore it), so it
+  cannot cause a close or a GOAWAY. A later SETTINGS ACK still marks: S cannot see whether the provider
+  sent another SETTINGS, and an unsolicited SETTINGS ACK is a connection error (PROTOCOL_ERROR) for
+  common servers. RST_STREAM is accepted only after the request is complete, so it is written after all of
+  the request's records and never falls under this rule. Test:
+  `owed_ping_acks_are_bounded_and_need_a_server_record_each` (S). A control record written before the request was
   accepted does not mark it: the provider's reaction to it arrives one round trip later, before C's
   records can be proven and written, so it falls outside the interval and the request ends as an
   abandoned one. What remains: a provider whose own body timeout is shorter than `W` (framing `"1.1"`:
@@ -1645,7 +1655,8 @@ request accepted and not released).
 `{"type":"upstream_closed_early","n","response_bytes"[,"client_caused":true]}` precedes the `error` when the
 provider closed before the request was fully written (N relays it). S adds `client_caused` when the close
 may be the client's doing, and the request is then an abandoned one, not the provider's refusal (§12.10).
-Framing `"2"`: a control record of the client other than the connection's first SETTINGS ACK was written
+Framing `"2"`: a control record of the client other than the connection's first SETTINGS ACK and an owed
+PING ACK (at most 2 per request, each after a server record, §5.4.1) was written
 while the request was in flight and not yet written in full (before its first record too, §5.4.1), or S had
 written no record of the request for the GOAWAY window `W` (§5.4.1) or longer when a server
 record or the close arrived, while the request was written in part (the client holds back records S has
@@ -1897,7 +1908,7 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | the server's key epoch (`key_updates`, `epoch_start`) is C's claim, and why a wrong claim gains nothing | §7.1 |
 | `epoch_start` beyond the server records received is refused in every disclosure (both framings); a refusal frame received before `request_ok` refuses nothing; the GOAWAY cutoff counts from N's last write of the head or a request record, not of a control record | §7.1, §12.8 |
 | further epoch-0 records of a malicious N: what they can do in each framing | §10 |
-| a control record of C written while a request is in flight marks that request, before its first record too: the provider's early close is `client_caused` and a GOAWAY does not refuse it. The connection's first SETTINGS ACK never marks | §5.4.1, §12.9 |
+| a control record of C written while a request is in flight marks that request, before its first record too: the provider's early close is `client_caused` and a GOAWAY does not refuse it. The connection's first SETTINGS ACK never marks; a PING ACK after a server record since the previous PING ACK does not mark, up to 2 per request | §5.4.1, §12.9 |
 | every number in a usage event's `usage` and `cost` has a magnitude below 2^53 | §5.4 |
 | an unused connection is not evicted in the 15 s after `head_written`; `CONFIDENTIAL_EVICT_CHARGE_FROM` is at least 2 and C reports an eviction charge at a threshold of 1; what the eviction rules do not give | §8.4, §10 risk 13, §12.10 |
 | a control socket that ends without the node's last frame while the node holds money of the connection is reported by the SDK and the browser library | §12.10 |

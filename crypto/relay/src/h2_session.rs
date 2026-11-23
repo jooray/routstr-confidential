@@ -43,6 +43,13 @@ const MAX_QUEUED_CTL: usize = 16;
 /// `CTL_REFILL` and `MAX_QUEUED_CTL` for its check H10 (PROTOCOL-V3.md §5.6):
 /// change both together.
 pub(crate) const CTL_BURST: u64 = 16;
+/// PING ACKs a request may carry that do not mark it (`Req::ctl_written`):
+/// the acknowledgements an honest client owes for the provider's keep-alive
+/// PINGs while it uploads. Each needs a server record since the previous
+/// PING ACK of the connection (`H2::ping_ack_mark`). Keep-alive PINGs are
+/// tens of seconds apart; two cover one that arrived just before
+/// `request_ok` and one during a long upload.
+const OWED_PING_ACKS: u8 = 2;
 pub(crate) const CTL_REFILL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Most records an error head may span (a response head is about 1 kB).
 const MAX_HEAD_RECORDS: usize = 8;
@@ -151,8 +158,11 @@ struct Req {
     /// flight and not yet written in full (before its first record too):
     /// a provider close or GOAWAY that follows may be the client's doing (an
     /// unsolicited SETTINGS ACK is a connection error). The connection's
-    /// first SETTINGS ACK does not count (`H2::settings_acked`).
+    /// first SETTINGS ACK does not count (`H2::settings_acked`), nor a PING
+    /// ACK the client may owe the provider (`OWED_PING_ACKS`).
     ctl_written: bool,
+    /// PING ACKs written inside the request that did not mark it.
+    owed_ping_acks: u8,
     /// The first `PINNED_RECORDS` server application-data records of the
     /// interval (indices `s_k`, `s_k + 1`, ...), for `record_windows`.
     pinned: Vec<Record>,
@@ -209,6 +219,10 @@ pub(crate) struct H2 {
     /// answer, whenever it comes: it is the one control record that cannot
     /// make a provider close (`Req::ctl_written`).
     settings_acked: bool,
+    /// `app_records` when N last wrote a PING ACK: a PING ACK owed to the
+    /// provider follows at least one server record (its PING) since the
+    /// previous one.
+    ping_ack_mark: usize,
 }
 
 impl H2 {
@@ -240,6 +254,7 @@ impl H2 {
             last_req_write: None,
             ctl_records: 0,
             settings_acked: false,
+            ping_ack_mark: 0,
         }
     }
 
@@ -548,6 +563,7 @@ pub(crate) fn on_request(
         late_write: false,
         stall_from: None,
         ctl_written: false,
+        owed_ping_acks: 0,
         pinned: Vec::new(),
     });
     // The per-request limit: up to the release, then
@@ -747,11 +763,31 @@ async fn flush(
         } else if matches!(rec.kind, RecKind::Ctl(Ctl::SettingsAck)) && !h.settings_acked {
             // The answer the provider's own SETTINGS asks for.
             h.settings_acked = true;
-        } else if let Some(q) = h.req.as_mut().filter(|q| !q.released) {
-            // Also before the request's first record: the queue is written
-            // in order, so a control record ahead of the HEADERS goes out in
-            // the same pass and the provider's reaction falls in the interval.
-            q.ctl_written = true;
+        } else {
+            // A PING ACK that may answer a PING of the provider: a server
+            // record arrived since the previous PING ACK (N cannot read the
+            // provider's records, so it cannot know more). A compliant
+            // provider ignores a PING ACK it did not ask for (RFC 9113 §6.7),
+            // so an exempt one cannot cause a close.
+            let ping = matches!(rec.kind, RecKind::Ctl(Ctl::PingAck));
+            let after_server_record = h.app_records > h.ping_ack_mark;
+            if ping {
+                h.ping_ack_mark = h.app_records;
+            }
+            if let Some(q) = h.req.as_mut().filter(|q| !q.released) {
+                if ping && after_server_record && q.owed_ping_acks < OWED_PING_ACKS {
+                    q.owed_ping_acks += 1;
+                } else {
+                    // Also before the request's first record: the queue is
+                    // written in order, so a control record ahead of the
+                    // HEADERS goes out in the same pass and the provider's
+                    // reaction falls in the interval. A later SETTINGS ACK
+                    // stays here: N cannot see whether the provider sent a
+                    // SETTINGS, and an unsolicited SETTINGS ACK is a
+                    // connection error for common servers.
+                    q.ctl_written = true;
+                }
+            }
         }
         write_upstream(tcp_tx, &rec.bytes, deadline).await?;
         st.sent.update(&rec.bytes);
@@ -1482,6 +1518,7 @@ mod tests {
             late_write: false,
             stall_from: None,
             ctl_written: false,
+            owed_ping_acks: 0,
             pinned: Vec::new(),
         });
         st.h2 = Some(Box::new(h));
@@ -3048,38 +3085,53 @@ mod tests {
         let (mut w, _up) = upstream().await;
         let window = goaway_window(st_idle_secs(&open_session(300)));
         let past = |d: std::time::Duration| std::time::Instant::now().checked_sub(d).unwrap();
+        // `ctl`: 0 none; 1 two PING ACKs between the request's records (the
+        // second with no server record since the first); 2 the same ahead of
+        // its HEADERS; 3 the connection's first SETTINGS ACK ahead of the
+        // HEADERS, which the provider expects; 4 one PING ACK inside, after
+        // server records (owed to a PING of the provider); 5 a second
+        // SETTINGS ACK inside (N cannot know a SETTINGS came).
         for (what, stall, ctl) in [
             ("prompt close", false, 0),
             ("stall", true, 0),
             ("control record inside", false, 1),
             ("control record first", false, 2),
             ("the first SETTINGS ACK", false, 3),
+            ("an owed PING ACK", false, 4),
+            ("a later SETTINGS ACK", false, 5),
         ] {
             let mut log = RelayLog::default();
             let mut st = open_session(300);
             for c in [&[1u8; 40][..], &[2; 900]] {
                 feed(&mut st, &mut log, c);
             }
-            // HEADERS, DATA, and a control record: a PING ACK between the
-            // request's records (1) or ahead of its HEADERS (2), or the
-            // connection's first SETTINGS ACK ahead of the HEADERS (3), which
-            // the provider expects.
+            let ping = |st: &mut Session| {
+                on_ctl(st, "ping_ack").unwrap();
+                client_bytes(st, &record(10 + 8)).unwrap();
+            };
             let block = h2::request_block("h", "/api/v1/chat/completions").len();
             if ctl == 2 {
-                on_ctl(&mut st, "ping_ack").unwrap();
-                client_bytes(&mut st, &record(10 + 8)).unwrap();
+                ping(&mut st);
+                ping(&mut st);
             }
-            if ctl == 3 {
+            if ctl == 3 || ctl == 5 {
                 on_ctl(&mut st, "settings_ack").unwrap();
                 client_bytes(&mut st, &record(10)).unwrap();
             }
             client_bytes(&mut st, &record(9 + block + 1)).unwrap();
             if ctl == 1 {
-                on_ctl(&mut st, "ping_ack").unwrap();
-                client_bytes(&mut st, &record(10 + 8)).unwrap();
+                ping(&mut st);
+                ping(&mut st);
+            }
+            if ctl == 4 {
+                ping(&mut st);
+            }
+            if ctl == 5 {
+                on_ctl(&mut st, "settings_ack").unwrap();
+                client_bytes(&mut st, &record(10)).unwrap();
             }
             client_bytes(&mut st, &record(10 + 300)).unwrap();
-            let ctl = ctl == 1 || ctl == 2;
+            let ctl = matches!(ctl, 1 | 2 | 5);
             on_release(&mut st, 1, 1).unwrap();
             pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
             prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
@@ -3121,6 +3173,48 @@ mod tests {
         assert!(stalled(Some(past(std::time::Duration::from_secs(31))), std::time::Instant::now(), EARLY_ANSWER_WINDOW));
         assert!(!stalled(Some(past(std::time::Duration::from_secs(5))), std::time::Instant::now(), EARLY_ANSWER_WINDOW));
         assert!(!stalled(None, std::time::Instant::now(), EARLY_ANSWER_WINDOW));
+    }
+
+    /// The PING ACKs a request may carry without being marked: each after a
+    /// server record since the previous PING ACK of the connection, at most
+    /// `OWED_PING_ACKS`. Two in a row, or one more than the bound, mark it.
+    #[tokio::test]
+    async fn owed_ping_acks_are_bounded_and_need_a_server_record_each() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        // Steps: 's' a server record arrives, 'p' a PING ACK is proven and
+        // written. Expected: whether the request ends up marked.
+        for (steps, marked) in [
+            ("sp", false),
+            ("spsp", false),
+            ("pp", true),
+            ("spp", true),
+            ("spspsp", true),
+            ("ssspp", true),
+            ("p", true),
+        ] {
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            // The request starts with no server record seen (as `open_session`
+            // has it, before any `feed`), so "p" alone owes nothing.
+            for c in steps.chars() {
+                if c == 's' {
+                    feed(&mut st, &mut log, &[7u8; 17]);
+                } else {
+                    on_ctl(&mut st, "ping_ack").unwrap();
+                    client_bytes(&mut st, &record(10 + 8)).unwrap();
+                    // As a verified π_WIN leaves it (the proof itself is
+                    // covered elsewhere): written by the next pump.
+                    st.h2.as_mut().unwrap().queue.back_mut().unwrap().proven = true;
+                    pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+                }
+            }
+            let h = st.h2.as_ref().unwrap();
+            assert!(h.queue.is_empty(), "{steps}: every PING ACK written");
+            assert_eq!(h.req.as_ref().unwrap().ctl_written, marked, "{steps}");
+        }
     }
 
     #[test]
