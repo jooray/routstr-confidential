@@ -2861,6 +2861,11 @@ fn disclose_11(
             if (key_updates == 0) != (epoch_start == 0) {
                 bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
             }
+            // `epoch_start` counts records after the handshake flight: bounded
+            // by those received (client-supplied, so checked; again below).
+            if let Some(info) = st.handshake.as_ref() {
+                h2_session::epoch_floor(key_updates, info.server_handshake_records, epoch_start, log.server_app_records)?;
+            }
             let r = hex::decode(r)?;
             check_disclosure_size(r.len(), skip)?;
             // Either the terminal usage event of a successful stream (anchored
@@ -2895,6 +2900,7 @@ fn disclose_11(
             };
             st.usage = Some(usage);
             let info = st.handshake.as_ref().ok_or_else(|| anyhow!("no handshake"))?;
+            h2_session::epoch_floor(key_updates, info.server_handshake_records, epoch_start, log.server_app_records)?;
             let chosen = log.covered_records(info.server_handshake_records, tail_lens, trailing)?;
             // Covered records are in the last epoch: sequence numbers restart
             // at its first record. (A wrong claim only makes the proof fail:
@@ -5128,6 +5134,48 @@ mod hardening_tests {
             };
             let err = futures_executor_block(handle_control(usage, &app, &s, &tx, &mut img, &mut log, &mut w)).unwrap_err();
             assert!(err.to_string().contains("only an error head"), "{err}");
+        });
+    }
+
+    /// Framing "1.1": a client `epoch_start` past the records received (or
+    /// one that would overflow with the handshake records) is a client error
+    /// in both disclosures, never a wrap or a panic.
+    #[test]
+    fn an_epoch_start_out_of_range_is_refused_in_framing_11() {
+        let app = images_app();
+        let (s, _rx) = shared(&app);
+        let (tx, _out) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let c = tokio::net::TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+            let (_r, mut w) = c.into_split();
+            let hs = 2usize;
+            for e in [usize::MAX - hs + 1, usize::MAX - hs, usize::MAX, 1 << 40] {
+                for head in [false, true] {
+                    let mut log = RelayLog::default();
+                    let mut st = Session { state: SessionState::Attested, released: true, model: "m".into(), ..Session::default() };
+                    st.handshake = Some(HandshakeInfo {
+                        client_hs: [0; 32],
+                        server_hs: [0; 32],
+                        th_sh: [1; 32],
+                        th_sf: [2; 32],
+                        cert_chain_hash: [3; 32],
+                        leaf_der: Vec::new(),
+                        server_handshake_records: hs,
+                        alpn: Some(b"http/1.1".to_vec()),
+                    });
+                    let r = if head { hex::encode(b"HTTP/1.1 400 Bad Request\r\n\r\n") } else { hex::encode(b"\ndata: {}") };
+                    let msg = if head {
+                        ClientMsg::DiscloseHead { n: 1, record: None, r, tail_lens: vec![40], skip: 0, trailing: None, key_updates: 1, epoch_start: e }
+                    } else {
+                        ClientMsg::Disclose { r, tail_lens: vec![40], skip: 0, key_updates: 1, epoch_start: e, trailing: None, n: Some(1), server_records: None }
+                    };
+                    let res = futures_executor_block(handle_control(msg, &app, &s, &tx, &mut st, &mut log, &mut w));
+                    let err = res.unwrap_err().to_string();
+                    assert!(err.contains("epoch_start"), "head={head} {e}: {err}");
+                }
+            }
         });
     }
 

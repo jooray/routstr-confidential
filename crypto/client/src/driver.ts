@@ -750,7 +750,9 @@ class Session {
     trace('->', shown((obj as any)?.type))
     if ((obj as any)?.type === 'request') {
       this.requestOpen = true
-      this.openReq = { n: Number((obj as any).n), accepted: false, bodyReleased: false }
+      // A `request` while one is open is a protocol error the node refuses
+      // (one request at a time): the open one is still the one at stake.
+      this.openReq ??= { n: Number((obj as any).n), accepted: false, bodyReleased: false }
     }
     this.ws.send(text)
   }

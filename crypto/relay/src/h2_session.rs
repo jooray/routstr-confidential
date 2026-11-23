@@ -123,6 +123,10 @@ struct Req {
     refused: bool,
     /// When N accepted it (`request_ok`).
     ok_at: std::time::Instant,
+    /// Server application-data records received when N accepted it (as
+    /// `RelayLog::server_app_records`): a refusal in an earlier record
+    /// predates the request and refuses nothing.
+    ok_records: usize,
     /// The index (as `RelayLog::server_app_records`) of the first server
     /// record that arrived after the GOAWAY window closed (`goaway_window`):
     /// a GOAWAY in it or later that arrived before the request's first
@@ -285,18 +289,20 @@ impl H2 {
         self.app_records += 1;
         let now = std::time::Instant::now();
         let window = goaway_window(self.cfg.idle_secs);
-        let last_write = self.last_write;
+        let last_req_write = self.last_req_write;
         let idle = std::time::Duration::from_secs(self.cfg.idle_secs);
         if let Some(q) = self.req.as_mut().filter(|q| q.late_from.is_none()) {
             // Past the window after `request_ok`, or as long after N's last
-            // write as the provider may keep an idle connection (H5): a
-            // GOAWAY from here on may be an idle close the client waited for.
-            let cutoff = last_write.map_or(q.ok_at + window, |w| (q.ok_at + window).min(w + idle));
+            // write of the head or of a request record as the provider may
+            // keep an idle connection (H5): a GOAWAY from here on may be an
+            // idle close the client waited for. Control records do not move
+            // this: a client can have them written at will, and a provider
+            // need not count them as activity.
+            let cutoff = last_req_write.map_or(q.ok_at + window, |w| (q.ok_at + window).min(w + idle));
             if now >= cutoff {
                 q.late_from = Some(index);
             }
         }
-        let last_req_write = self.last_req_write;
         if let Some(q) = self.req.as_mut().filter(|q| q.written > 0 && !q.released && q.stall_from.is_none()) {
             if stalled(last_req_write, now, window) {
                 q.stall_from = Some(index);
@@ -528,6 +534,7 @@ pub(crate) fn on_request(
         attestation: None,
         refused: false,
         ok_at: std::time::Instant::now(),
+        ok_records: h.app_records,
         late_from: None,
         late_write: false,
         stall_from: None,
@@ -917,9 +924,7 @@ pub(crate) fn on_disclose(
     if r.len() > 2 * MAX_DISCLOSE_R {
         bail!("disclosed R is too long");
     }
-    if key_updates > zkbench::statements::MAX_SERVER_KEY_UPDATES || (key_updates == 0) != (epoch_start == 0) {
-        bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
-    }
+    let floor = epoch_floor(key_updates, hs_records, epoch_start, log.server_app_records)?;
     let r = hex::decode(r)?;
     check_disclosure_size(r.len(), 0)?;
     // The covered records: the last `tail_lens.len()` N holds, all inside
@@ -930,7 +935,7 @@ pub(crate) fn on_disclose(
     }
     let first_abs = log.server_app_records - k;
     let s_k = q.s_k.ok_or_else(|| anyhow!("the request has no interval"))?;
-    if first_abs < s_k || first_abs < hs_records + epoch_start {
+    if first_abs < s_k || first_abs < floor {
         bail!("the disclosed records start before the request's interval (or its key epoch)");
     }
     let chosen: Vec<&Record> = log.server_tail.iter().skip(log.server_tail.len() - k).collect();
@@ -957,7 +962,7 @@ pub(crate) fn on_disclose(
         .map(|(i, rec)| {
             let off = if i == 0 { first_off } else { 0 };
             zkbench::statements::TailRecord {
-                seq: (first_abs + i - hs_records - epoch_start) as u64,
+                seq: (first_abs + i - floor) as u64,
                 ct: rec.payload[off..rec.payload.len() - 16].to_vec(),
                 off,
             }
@@ -1009,14 +1014,14 @@ pub(crate) fn on_disclose_head(
     if r.len() > 2 * MAX_DISCLOSE_R {
         bail!("disclosed R is too long");
     }
-    check_epoch(key_updates, epoch_start)?;
+    let floor = epoch_floor(key_updates, hs_records, epoch_start, log.server_app_records)?;
     let r = hex::decode(r)?;
     let status = h2::parse_error_head(&r, q.stream)?;
     // Record `record` is in the request's interval and still held.
     if record < s_k {
         bail!("server record {record} is outside the request's interval");
     }
-    let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r, Some((s_k, &q.pinned)))?;
+    let p = record_windows(anchor, key_updates, log, floor, record, &r, Some((s_k, &q.pinned)))?;
     q.usage = Some(serde_json::json!({ "error_status": status, "choices": [] }));
     q.settle_on = Some("pi_win");
     h.win = Some(WinInflight::ErrorHead);
@@ -1098,14 +1103,23 @@ pub(crate) fn on_disclose_reset(
     if r.len() > 2 * MAX_DISCLOSE_R {
         bail!("disclosed R is too long");
     }
-    check_epoch(key_updates, epoch_start)?;
+    let floor = epoch_floor(key_updates, hs_records, epoch_start, log.server_app_records)?;
     let r = hex::decode(r)?;
     let refusal = h2::parse_refusal(&r, q.stream, q.s_k.is_some())?;
     if q.s_k.is_some_and(|s_k| record > s_k) {
         bail!("server record {record} is after the start of the request's interval: the walk must cover all of it");
     }
     let pinned = q.s_k.map(|s_k| (s_k, q.pinned.as_slice()));
-    let p = record_windows(anchor, key_updates, log, hs_records, epoch_start, record, &r, pinned)?;
+    let p = record_windows(anchor, key_updates, log, floor, record, &r, pinned)?;
+    // The refusing frame must have arrived after N accepted the request: a
+    // GOAWAY (or a reset) received before `request_ok` was about something
+    // else and refuses nothing of this request. The frame ends in the last
+    // record R covers.
+    let covered = p.windows.iter().map(|w| w.seq).collect::<std::collections::BTreeSet<_>>().len();
+    let refusing_record = record + covered.max(1) - 1;
+    if refusing_record < q.ok_records {
+        bail!("the refusing frame arrived before request {n} was accepted (server record {refusing_record}, the request was accepted at {})", q.ok_records);
+    }
     if let h2::Refusal::GoAway { .. } = refusal {
         // A GOAWAY that arrived before any record of the request was written
         // counts only when it arrived within the window after `request_ok`
@@ -1113,8 +1127,7 @@ pub(crate) fn on_disclose_reset(
         // covers). That holds also when the client released records after
         // the GOAWAY arrived, while the provider still read (S_k set later):
         // the provider never saw the stream when it decided to close.
-        let covered = p.windows.iter().map(|w| w.seq).collect::<std::collections::BTreeSet<_>>().len();
-        let goaway_record = record + covered - 1;
+        let goaway_record = refusing_record;
         let before_write = q.s_k.is_none_or(|s_k| goaway_record < s_k);
         if before_write && q.late_from.is_some_and(|late| goaway_record >= late) {
             bail!(
@@ -1151,11 +1164,19 @@ pub(crate) fn on_disclose_reset(
     Ok(())
 }
 
-fn check_epoch(key_updates: u32, epoch_start: usize) -> Result<()> {
+/// The index (as `RelayLog::server_app_records`) of the first server record
+/// of the key epoch the client names: the handshake flight, then
+/// `epoch_start` records. Client-supplied, so checked: it must fit the
+/// KeyUpdate count and lie within the records received (a value past them
+/// would otherwise wrap, or panic where overflow is checked).
+pub(crate) fn epoch_floor(key_updates: u32, hs_records: usize, epoch_start: usize, received: usize) -> Result<usize> {
     if key_updates > zkbench::statements::MAX_SERVER_KEY_UPDATES || (key_updates == 0) != (epoch_start == 0) {
         bail!("epoch_start {epoch_start} does not fit {key_updates} server KeyUpdates");
     }
-    Ok(())
+    hs_records
+        .checked_add(epoch_start)
+        .filter(|floor| *floor <= received)
+        .ok_or_else(|| anyhow!("epoch_start {epoch_start} is past the {received} server records received"))
 }
 
 /// The π_WIN of a disclosure that starts at byte 0 of server record `record`
@@ -1169,8 +1190,7 @@ fn record_windows(
     anchor: [u8; 32],
     key_updates: u32,
     log: &RelayLog,
-    hs_records: usize,
-    epoch_start: usize,
+    floor: usize,
     record: usize,
     r: &[u8],
     pinned: Option<(usize, &[Record])>,
@@ -1186,7 +1206,7 @@ fn record_windows(
             pinned.and_then(|(s_k, p)| j.checked_sub(s_k).and_then(|k| p.get(k)))
         }
     };
-    if record >= log.server_app_records || record < hs_records + epoch_start || held(record).is_none() {
+    if record >= log.server_app_records || record < floor || held(record).is_none() {
         bail!("server record {record} is no longer held, not yet received, or outside the key epoch");
     }
     let mut windows = Vec::new();
@@ -1198,10 +1218,10 @@ fn record_windows(
         if i >= MAX_HEAD_RECORDS {
             bail!("the disclosure spans more than {MAX_HEAD_RECORDS} records");
         }
-        let Some(rec) = held(record + i) else { break };
+        let Some(rec) = record.checked_add(i).and_then(held) else { break };
         let content = rec.payload.len().checked_sub(17).filter(|c| *c > 0).ok_or_else(|| anyhow!("a covered record has no content"))?;
         let (chunk, tail) = rest.split_at(rest.len().min(content));
-        let seq = (record + i - hs_records - epoch_start) as u64;
+        let seq = (record + i - floor) as u64;
         // The frame's bytes from offset 0, and the record's last byte: it
         // is application data, not a handshake record that could carry them.
         windows.extend(h2::windows_for(seq, &rec.payload, chunk, &[])?);
@@ -1439,6 +1459,7 @@ mod tests {
             attestation: None,
             refused: false,
             ok_at: std::time::Instant::now(),
+            ok_records: h.app_records,
             late_from: None,
             late_write: false,
             stall_from: None,
@@ -2635,6 +2656,7 @@ mod tests {
             }
             if stale_write {
                 h.last_write = Some(past(std::time::Duration::from_secs(idle + 1)));
+                h.last_req_write = h.last_write;
             }
             let g = goaway_frame(1, 0);
             feed(&mut st, &mut log, &g); // record 2
@@ -2681,6 +2703,99 @@ mod tests {
         let g = goaway_frame(1, 0);
         feed(&mut st, &mut log, &g);
         on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap();
+    }
+
+    /// A refusal received before the request was accepted refuses nothing of
+    /// it: a GOAWAY (or a reset) in a server record that arrived before
+    /// `request_ok` cannot be disclosed for the request, so a client cannot
+    /// keep the provider's idle GOAWAY and release its deposit with it.
+    #[tokio::test]
+    async fn a_refusal_received_before_request_ok_refuses_nothing() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for (ok_records, refused) in [(3usize, true), (2, false)] {
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            for c in [&[1u8; 40][..], &[2; 900]] {
+                feed(&mut st, &mut log, c);
+            }
+            let g = goaway_frame(1, 0);
+            feed(&mut st, &mut log, &g); // record 2
+            // The request was accepted after record 2 arrived (3), or before it (2).
+            st.h2.as_mut().unwrap().req.as_mut().unwrap().ok_records = ok_records;
+            texts(&mut rx);
+            let res = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0);
+            if refused {
+                let err = res.unwrap_err();
+                assert!(err.to_string().contains("before request 1 was accepted"), "{err}");
+                assert!(texts(&mut rx).is_empty(), "nothing attested");
+            } else {
+                res.unwrap();
+            }
+        }
+    }
+
+    /// The cutoff after which a GOAWAY may be an idle close counts from N's
+    /// last write of the head or of a request record: a control record (a
+    /// PING ACK) written shortly before the provider's idle close does not
+    /// move it.
+    #[tokio::test]
+    async fn a_control_record_does_not_move_the_idle_cutoff() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let idle = st_idle_secs(&open_session(300));
+        let past = |d: std::time::Duration| std::time::Instant::now().checked_sub(d).unwrap();
+        let mut log = RelayLog::default();
+        let mut st = open_session(300);
+        for c in [&[1u8; 40][..], &[2; 900]] {
+            feed(&mut st, &mut log, c);
+        }
+        let h = st.h2.as_mut().unwrap();
+        // The last request activity is older than the idle time; a PING ACK
+        // went out a second ago.
+        h.last_req_write = Some(past(std::time::Duration::from_secs(idle + 1)));
+        h.last_write = Some(past(std::time::Duration::from_secs(1)));
+        let g = goaway_frame(1, 0);
+        feed(&mut st, &mut log, &g); // record 2
+        texts(&mut rx);
+        let err = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap_err();
+        assert!(err.to_string().contains("does not refuse"), "{err}");
+    }
+
+    /// `epoch_start` is the client's: a value past the records received, or
+    /// one whose sum with the handshake records overflows, is a client error
+    /// in every disclosure, never a wrap or a panic.
+    #[tokio::test]
+    async fn an_epoch_start_out_of_range_is_refused() {
+        let hs = 2usize;
+        for (e, ok) in [(0usize, true), (1, true), (3, true), (4, false), (usize::MAX - hs, false), (usize::MAX - hs + 1, false), (usize::MAX, false)] {
+            let ku = if e == 0 { 0 } else { 1 };
+            assert_eq!(epoch_floor(ku, hs, e, 5).is_ok(), ok, "epoch_start {e}");
+        }
+        assert_eq!(epoch_floor(1, hs, 3, 5).unwrap(), 5);
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        for e in [usize::MAX - hs + 1, usize::MAX - hs, usize::MAX, 1 << 40] {
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            for c in [&[1u8; 40][..], &[2; 900]] {
+                feed(&mut st, &mut log, c);
+            }
+            let g = goaway_frame(1, 0);
+            feed(&mut st, &mut log, &g);
+            let err = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 1, e).unwrap_err();
+            assert!(err.to_string().contains("epoch_start"), "disclose_reset {e}: {err}");
+            st.h2.as_mut().unwrap().req.as_mut().unwrap().s_k = Some(2);
+            let err = on_disclose_head(&app, &sh, &tx, &mut st, &log, 1, 2, "00", 1, e).unwrap_err();
+            assert!(err.to_string().contains("epoch_start"), "disclose_head {e}: {err}");
+            let q = st.h2.as_mut().unwrap().req.as_mut().unwrap();
+            q.released = true;
+            let err = on_disclose(&app, &sh, &tx, &mut st, &log, Some(1), "00", &[1], 0, 1, e, None, Some(log.server_app_records)).unwrap_err();
+            assert!(err.to_string().contains("epoch_start"), "disclose {e}: {err}");
+        }
     }
 
     /// The idle stall with a late first write: the client holds its proven

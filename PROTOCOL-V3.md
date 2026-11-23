@@ -778,8 +778,9 @@ for that record (§5.1) and that every record of the batch is named.
 server key epoch starts. In a disclosure of server records (π_C3S, and π_WIN under `s_ap_0` for an error
 head or a refusal) C names `key_updates` (at most 16) and `epoch_start` (the index of the epoch's first
 record; both 0 or both above 0), the circuit derives the key and IV from the anchored secret after that many
-updates, and the sequence numbers count from `epoch_start`. N checks only the bounds and that every covered
-record lies in the claimed epoch. A wrong claim cannot help C: the circuit then decrypts N's own ciphertext
+updates, and the sequence numbers count from `epoch_start`. N checks only the bounds (the epoch's first
+record, after the handshake flight, must be one it received; a larger value is refused, never wrapped) and
+that every covered record lies in the claimed epoch. A wrong claim cannot help C: the circuit then decrypts N's own ciphertext
 under a key or nonce the provider did not use, which gives pseudorandom bytes, and those must equal the
 public bytes C disclosed. C knows the secret and can compute that plaintext for each claim, but the number
 of claims is bounded (17 counts, one start per record N holds) and each must parse as the strict grammar of
@@ -1505,9 +1506,11 @@ connection began (handshake flight included).
   is set, else any record N holds; a GOAWAY whose last record arrived before the request's first record was
   written (always so when `S_k` is unset) arrived within the GOAWAY window
   (§5.4.1: `min(30 s, h2.idle_secs / 4)` after `request_ok`, and under `h2.idle_secs` after N's last write
-  to the provider) (then `S_k` := the server records received so far, the interval stays empty), and a GOAWAY
+  of the head or of a request record; control records do not count) (then `S_k` := the server records received so far, the interval stays empty), and a GOAWAY
   after the first write is refused when that write came `h2.idle_secs` or more after N's last write of the head
-  or of a request record (§5.4.1); `i` is held, received and in the named key epoch. Then `attestation` (as for any request; with
+  or of a request record (§5.4.1); the record that ends the refusing frame arrived after `request_ok` (a
+  refusal received before N accepted the request refuses nothing of it); `i` is held, received and in the
+  named key epoch. Then `attestation` (as for any request; with
   no record written, `server_records` and `client_records` are 0), then
   `{"type":"zk_params","proof":"pi_win","purpose":"refusal","n","record","params"}` (`anchor = h2`; per
   covered record its bytes from offset 0 and its last byte = `17`, as for an error head). C checks the
@@ -1847,4 +1850,5 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | an offer is served while it equals the one the node would sign now (no fetch needed); the security comparison runs against that current offer; a withdrawn framing does not end live connections | §2.2, §3.3, §12.1 |
 | limits the table lacked: provider connect and write, proof time, provider bytes before the handshake verifies, CertificateVerify schemes, the pending pool, the client address behind a proxy, `wallet_busy`, the completion margin; an oversized client message is `error` 413 `frame_too_large` without `fault`; `closed` `ended` with or without a deposit outcome | §12.9 |
 | the server's key epoch (`key_updates`, `epoch_start`) is C's claim, and why a wrong claim gains nothing | §7.1 |
+| `epoch_start` beyond the server records received is refused in every disclosure (both framings); a refusal frame received before `request_ok` refuses nothing; the GOAWAY cutoff counts from N's last write of the head or a request record, not of a control record | §7.1, §12.8 |
 | further epoch-0 records of a malicious N: what they can do in each framing | §10 |
