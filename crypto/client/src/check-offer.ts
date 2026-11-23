@@ -11,7 +11,9 @@ import { errText, shown, termSafe } from './term.ts'
 
 /** The protocol version, and the key-schedule protocol this client implements (§4). */
 export const PROTO = 3
-export const TWOPC = 'split-public-2'
+export const TWOPC = 'split-public-3'
+/** Earlier key schedules of protocol v3: a node that offers one is outdated. */
+export const TWOPC_RETIRED = ['split-public-2', 'split-public-1']
 
 /** An offer this client does not use; `code` is the driver's exit code (4, or 6 for an older node). */
 export class OfferRefused extends Error {
@@ -99,6 +101,9 @@ export function checkOffer(offer: any, policy: OfferPolicy): CheckedOffer {
     refuse(`node_protocol_outdated: the offer is for protocol v${shown(offer.v ?? 'unknown')}; this client speaks only v${PROTO} (the node needs an update)`, 6)
   }
   if (offer.v !== PROTO) refuse(`offer_unsupported_version: the offer is for protocol v${shown(offer.v)}; this client speaks only v${PROTO}`)
+  if (typeof offer.twopc === 'string' && TWOPC_RETIRED.includes(offer.twopc)) {
+    refuse(`node_protocol_outdated: the node runs the key-schedule protocol ${offer.twopc}; this client implements ${TWOPC} (the node needs an update)`, 6)
+  }
   if (offer.twopc !== TWOPC) refuse(`offer_unsupported_twopc: the offer names the key-schedule protocol ${shown(offer.twopc)}; this client implements ${TWOPC}`)
   const http = offer.http === undefined ? ['1.1'] : offer.http
   if (!Array.isArray(http) || http.length === 0 || new Set(http).size !== http.length || !http.every((h: unknown) => h === '2' || h === '1.1')) {

@@ -22,7 +22,7 @@
     }
   ],
   "conventions": "a 128-bit value is a u128 whose 16 bytes are little-endian; integers are hex, most significant digit first; byte strings are hex in order; GF(2^64) = GF(2)[x]/(x^64+x^4+x^3+x+1), bit i = coefficient of x^i; field elements are integers mod the P-256 prime",
-  "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input, the key share with N's proof of knowledge, the challenges, the label-check pairs, the stage report hash and the openings hash",
+  "description": "split-public-3: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input, the key share with N's proof of knowledge, the challenges, the label-check pairs, the stage report hash and the openings hash",
   "gate": {
     "a0": "00112233445566778899aabbccddeeff",
     "b0": "fedcba98765432100f1e2d3c4b5a6979",

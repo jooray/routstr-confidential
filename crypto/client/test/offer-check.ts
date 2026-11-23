@@ -100,7 +100,7 @@ console.log('offer-check: ok')
   const tpl = (path: string) =>
     `POST ${path} HTTP/1.1\r\nHost: ${H}\r\nAuthorization: Bearer {KEY:42}\r\nContent-Type: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {LEN}\r\n\r\n`
   const base = (http: string[], chatPath = '/api/v1/chat/completions', imagesPath = '/api/v1/image/generate') => ({
-    v: 3, twopc: 'split-public-2', http, upstream_host: H, head_template: tpl(chatPath),
+    v: 3, twopc: 'split-public-3', http, upstream_host: H, head_template: tpl(chatPath),
     key_length: 42, chat: { cap_keys: ['max_tokens'], fixed_pins: [['n', 1], ['stream', true], ['stream_options', { include_usage: true }]] },
     suffix_keys: ['model', 'max_tokens', 'n', 'stream', 'stream_options'],
     h2: { probe_path: '/api/v1/models', idle_secs: 300 },
@@ -114,6 +114,11 @@ console.log('offer-check: ok')
     assert.equal(c.h2 !== undefined, http.includes('2'))
   }
   assert.equal(checkOffer(base(['1.1'], '/v1/chat/completions'), policy).http[0], '1.1')
+  // An earlier key schedule of v3: the node is outdated (exit code 6); another name is unsupported (4).
+  for (const old of ['split-public-2', 'split-public-1']) {
+    assert.throws(() => checkOffer({ ...base(['2']), twopc: old }, policy), (e: unknown) => e instanceof OfferRefused && /node_protocol_outdated/.test(e.message) && e.code === 6, old)
+  }
+  assert.throws(() => checkOffer({ ...base(['2']), twopc: 'split-proven-1' }, policy), (e: unknown) => e instanceof OfferRefused && /offer_unsupported_twopc/.test(e.message) && e.code === 4)
   // A chat route that only ends in the endpoint: refused for either framing.
   for (const http of [['2'], ['1.1'], ['2', '1.1']]) {
     for (const path of ['/api/v1/admin/chat/completions', '/v2/chat/completions', '/chat/completions', '/api/v1/x/v1/chat/completions']) {

@@ -555,7 +555,7 @@ fn default_protocol() -> u8 {
 }
 
 /// The two-party key schedule this sidecar runs (`PROTOCOL-V3.md` §4).
-const TWOPC_PROTOCOL: &str = "split-public-2";
+const TWOPC_PROTOCOL: &str = "split-public-3";
 
 fn default_key_alphabet() -> String {
     "[A-Za-z0-9_-]".to_string()
@@ -4831,7 +4831,7 @@ mod hardening_tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["protocol"], 3);
-        assert_eq!(v["twopc"], "split-public-2");
+        assert_eq!(v["twopc"], "split-public-3");
         assert_eq!(v["proof_channel"], zkbench::channel::CHANNEL_VERSION);
         assert!(v["commit"].is_string());
         assert_eq!(v["http"], serde_json::json!(["1.1"]));
@@ -4894,7 +4894,7 @@ mod hardening_tests {
         assert_eq!(twopc::VERSION_TAG, format!("routstr-2pc/{}\n", v["twopc"].as_str().unwrap()).as_bytes());
         assert_eq!(v["proof_channel"], zkbench::channel::CHANNEL_VERSION);
         let line = version_line();
-        assert!(line.starts_with("cu-sidecar ") && line.contains(" protocol=3 twopc=split-public-2 proof_channel="), "{line}");
+        assert!(line.starts_with("cu-sidecar ") && line.contains(" protocol=3 twopc=split-public-3 proof_channel="), "{line}");
     }
 
     #[test]

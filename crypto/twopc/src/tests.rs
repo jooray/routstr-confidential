@@ -382,16 +382,19 @@ async fn honest_matches_reference() {
 async fn version_tag_first_and_mismatch_refused() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::TokioAsyncReadCompatExt;
-    assert_eq!(VERSION_TAG, b"routstr-2pc/split-public-2\n");
+    assert_eq!(VERSION_TAG, b"routstr-2pc/split-public-3\n");
     let v2_frame: &[u8] = &[1, 0, 0, 0, 16, 9, 9, 9];
     for role in [Role::C, Role::N] {
-        // The previous variant (same length, last digit differs), another
-        // name, a v2 multiplexer frame, the right text with the wrong end.
+        // The earlier variants (same length, last digit differs: either
+        // form of `split-public-2` sent this tag, and `split-public-1`),
+        // another name, a v2 multiplexer frame, the right text with the
+        // wrong end.
         for other in [
+            &b"routstr-2pc/split-public-2\n"[..],
             &b"routstr-2pc/split-public-1\n"[..],
             &b"routstr-2pc/split-proven-1\n"[..],
             v2_frame,
-            &b"routstr-2pc/split-public-2 "[..],
+            &b"routstr-2pc/split-public-3 "[..],
         ] {
             let (a, mut b) = tokio::io::duplex(1 << 16);
             b.write_all(other).await.unwrap();
@@ -1174,7 +1177,7 @@ fn vectors() -> serde_json::Value {
     });
 
     json!({
-        "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input, the key share with N's proof of knowledge, the challenges, the label-check pairs, the stage report hash and the openings hash",
+        "description": "split-public-3: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input, the key share with N's proof of knowledge, the challenges, the label-check pairs, the stage report hash and the openings hash",
         "conventions": "a 128-bit value is a u128 whose 16 bytes are little-endian; integers are hex, most significant digit first; byte strings are hex in order; GF(2^64) = GF(2)[x]/(x^64+x^4+x^3+x+1), bit i = coefficient of x^i; field elements are integers mod the P-256 prime",
         "xtime": xt,
         "gf64_mul": gf64,
@@ -1483,7 +1486,7 @@ async fn adder_switch_attack_caught() {
         let ks = reference(&srv, &joint, th.0, th.1);
         assert_ne!(&hs.c_hs, ks.client_hs.as_bytes(), "the evaluation is wrong");
     }
-    // `split-public-2`: N's input labels (of ρ) were fixed before the seed,
+    // From `split-public-2` on: N's input labels (of ρ) were fixed before the seed,
     // so the solution can only go into δ. C aborts in stage A1 in every run,
     // with a uniform input and with the input of dead carries alike.
     for cheat_c in [Cheat::None, Cheat::DeadCarries(false)] {

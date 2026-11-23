@@ -40,7 +40,7 @@
 //   --adv MODE [--adv-at N]    an attack on request N (also --adv-h2):
 //       both framings: suffix (another suffix: --adv-suffix-model M = model swap, --adv-body-max-tokens N =
 //                      cap swap, --adv-image-count N), padding, early-record, no-proof, own-keyshare, twopc-tag,
-//                      twopc-tag-old (the 2PC peer speaks the previous variant, split-public-1),
+//                      twopc-tag-old (the 2PC peer speaks the previous variant, split-public-2),
 //                      big-frame (one 9 MiB binary message after `ready`: an `error` 413 frame_too_large
 //                      without `fault`, the client's doing)
 //       framing "2":   hidden-headers, path [--adv-h2-path P], replay-usage
@@ -828,7 +828,7 @@ class Session {
     if (adv === 'twopc-tag' || adv === 'twopc-tag-old') {
       // A 2PC peer of another version: the first bytes on the channel are another tag
       // (another name, or the previous variant, whose tag differs in its last digit).
-      const tag = adv === 'twopc-tag' ? 'routstr-2pc/split-proven-1\n' : 'routstr-2pc/split-public-1\n'
+      const tag = adv === 'twopc-tag' ? 'routstr-2pc/split-proven-1\n' : 'routstr-2pc/split-public-2\n'
       const ws = new WebSocket(this.zkUrl('twopc'))
       ws.binaryType = 'arraybuffer'
       ws.onopen = () => ws.send(new TextEncoder().encode(tag))

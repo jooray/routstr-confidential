@@ -76,7 +76,7 @@
 #   h2-h-no-proof         the records are never proven: held, the provider answers nothing
 #   h2-i-own-keyshare     the client's own key share instead of the joint one
 #   h2-j-twopc-tag        a 2PC peer of another version (twopc_version_mismatch)
-#   h2-j-twopc-tag-old    a 2PC peer of the previous variant, split-public-1 (twopc_version_mismatch)
+#   h2-j-twopc-tag-old    a 2PC peer of the previous variant, split-public-2 (twopc_version_mismatch)
 #   h2-l-big-frame        one 9 MiB binary message right after `ready`, above the sidecar's client
 #                         buffer: `error` 413 frame_too_large, without `fault` (the client's doing)
 #   h2-m-ctl-flood        control records with no request, each proven and written, until the

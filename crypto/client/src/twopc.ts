@@ -1,5 +1,5 @@
 // Bridge between a spawned `cu-2pc` process (the client side of the two-party
-// key schedule `split-public-2`, PROTOCOL-V3.md §4) and the node's `twopc`
+// key schedule `split-public-3`, PROTOCOL-V3.md §4) and the node's `twopc`
 // WebSocket. A peer that speaks another 2PC version ends cu-2pc with status 3
 // and the code `twopc_version_mismatch`, which is in the error it reports.
 //
