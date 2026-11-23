@@ -1192,8 +1192,10 @@ first.) And it relays the ServerHello and the server flight,
 which enter the digests through $th_{SH}$ and $th_{SF}$. N holds $s_{hs}$, so it can open the flight,
 change it and recompute the Finished: C must accept only what U's signature fixes. C's TLS stack
 therefore accepts no message besides the four of the flight, nothing after the signature in
-CertificateVerify and one encoding of the signature, which leaves N two values of $th_{SF}$ for an ECDSA
-signature (s and its negation): a factor 2 on the terms of the last two stages. The stacks released with `split-public-1` ignored bytes after the
+CertificateVerify and one encoding of the signature (an RSA signature must have the length of the
+modulus; one cryptographic library also verifies it with leading zero bytes dropped), which leaves N two
+values of $th_{SF}$ for an ECDSA signature (s and its negation) and one for an RSA signature: a factor 2
+on the terms of the last two stages. The stacks released with `split-public-1` ignored bytes after the
 signature, and N's choice of $th_{SF}$ was unbounded: the error of the last two stages was then a bound on N's
 work, at most about $2^{-111}$ per flight tried, and not a statistical one. $th_{SH}$ is fixed before the first stage runs, when N does not know $IS_{HS}$; that a
 choice of $th_{SH}$ made with $\chi$ known does not raise the later stages' error noticeably is an
@@ -1363,7 +1365,9 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
    more; setups claim slots one at a time, and a refused one closes nothing. The limits are per address,
    not per credential: an attacker spread over many addresses with few unused connections each pays
    nothing for holding slots, but its connections are taken on demand and each re-open costs it a full
-   2PC. An honest pre-warmed connection on a full node can lose its slot, not its deposit. At most eight requests in a
+   2PC. An honest pre-warmed connection on a full node can lose its slot, not its deposit, unless a party
+   that shares its address (one NAT, one VPN exit) holds enough unused connections there to bring the
+   address to the threshold; the count is the node's signed statement, which the client cannot check. At most eight requests in a
    row may be refused on a connection. Control frames of the client, each proven by a $\pi_{WIN}$ with no
    request behind it, are limited per connection (16, and one more per 10 s), so the proofs a client can
    make N verify are bounded by its requests and that allowance. Connections that have not reserved yet are a separate, smaller

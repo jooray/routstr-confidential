@@ -93,7 +93,7 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
    `routstr-2pc/split-public-3\n`. A party that reads anything else stops with `twopc_version_mismatch`
    (`twopc::Error::VersionMismatch`; `cu-2pc` reports it as `{"ev":"error","code":"twopc_version_mismatch",…}`
    on its control channel, prints the code on stderr and exits with status 3). A v2 peer starts with a
-   multiplexer frame header and is refused at its first byte; a `split-public-1` peer differs in the tag's
+   multiplexer frame header and is refused at its first byte; a `split-public-2` or `split-public-1` peer differs in the tag's
    last bytes (tested by the case `h2-j-twopc-tag-old` of `v3-check.sh`).
 2. **Preprocessing** (input independent; in the pre-warm). C sends a 16-byte salt. N draws the garbling
    hash's parameters and a random mask ρ < p as its own circuit input, garbles the circuit and streams the

@@ -1834,7 +1834,7 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 
 1. Gates, all against a real provider with a real key, nothing announced: sidecar + reference client
    (honest cases for both framings; the attacks: hidden request in a body record, TLS padding shift, wrong
-   suffix, wrong path, usage replay across requests, a `Proven`/v2 or `split-public-1` 2PC peer, a v2
+   suffix, wrong path, usage replay across requests, a `Proven`/v2 or `split-public-2` 2PC peer, a v2
    socket); node (the money
    outcome of every case in the node's database, including every deposit outcome); SDK; routstrd (curl
    through the local API: sequential, burst, forced `"1.1"`, fallback from a failing `"2"`); browser
