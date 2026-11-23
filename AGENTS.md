@@ -361,8 +361,8 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
 | measurements | loopback and shaped links (2/50, 2/10 Mbit/s, 40 ms one way) with `bench.sh` + `shape-proxy.py`: `crypto/PROGRESS-CONFIDENTIAL.md` |
 | `routstr-core` (node), `routstr-sdk`, `routstrd` | published on the forks (`confidential-2pc` in routstr-core and routstr-sdk, `confidential-upstream` in routstrd; PRs #855, #112, #155); their state and commands: `routstr-core/docs/confidential-upstream.md`, `routstrd/docs/confidential-upstream.md` |
-| browser library, PWA | library `main` has `split-public-3` (local, not pushed; its `wasm/pkg` is a local build until CI rebuilds it). Deployed: PWA 0.2.11, pinning library `476c360` with `split-public-2` (wasm built by CI) |
-| deployment | routstr.cypherpunk.today runs v3 since 2026-11-12 11:43 UTC; since 2026-11-23 node 0.5.1+ga2fd2f9 (on upstream 56b1de91) and sidecar from `main` c4e5fbf (`split-public-2` with the key-share proof; `split-public-3` is local, not deployed: node, sidecar, clients and PWA change together), offer `http: ["2","1.1"]`, deposit 2000 msat |
+| browser library, PWA | v3 with `split-public-3`: library `main`, pinned by the PWA at `84e6948` (wasm built by CI); PWA 0.2.12 deployed |
+| deployment | routstr.cypherpunk.today runs v3 since 2026-11-12 11:43 UTC; since 2026-11-23 12:13 CET node 0.5.1+g78d8572 (on upstream 56b1de91) and sidecar from `main` fca15fc (`split-public-3`; `h2.idle_secs` 300), offer `http: ["2","1.1"]`, deposit 2000 msat |
 
 Notes that outlive the port: the client needs `cu-2pc` next to `cu-prover`
 (or `CU_2PC`). The sidecar dials the provider only when the ClientHello
@@ -384,7 +384,7 @@ GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the l
 (`patches/README.md`); the library's `scripts/vendor-check.mjs` (a CI step) fails when its vendored crates are
 not this repository's at `crates/vendor/UPSTREAM` plus its patch.
 Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA pins library `main` at
-`476c360` with the wasm built by CI; PWA 0.2.11 is deployed, with a testing guide at `/testing/`.
+`84e6948` with the wasm built by CI; PWA 0.2.12 is deployed, with a testing guide at `/testing/`.
 
 ## Gotchas
 
@@ -531,8 +531,8 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
     meanwhile waits for it); measure with `crypto/tools/v3-topup-bench.sh`
     (`CU_NO_TOPUP=1` for the old behaviour). An old client (channel version 1)
     falls back to one socket per proof.
-  - The browser library and the PWA are on v3 (`main`; PWA 0.2.11 deployed,
-    pinning library `476c360`, whose `wasm/pkg` is the CI build).
+  - The browser library and the PWA are on v3 (`main`; PWA 0.2.12 deployed,
+    pinning library `84e6948`, whose `wasm/pkg` is the CI build).
   - v3 is published (2026-11-12) and in the upstream PRs (core #855, SDK #112,
     routstrd #155); routstr.cypherpunk.today runs it. The SDK release and
     routstrd's `@routstr/sdk` bump are the maintainers' step.
