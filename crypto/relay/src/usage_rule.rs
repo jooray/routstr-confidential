@@ -14,7 +14,7 @@
 //! The top level is an allow-list too: `choices`, `usage`, the labels `id`,
 //! `object`, `model`, `provider`, `service_tier`, `system_fingerprint` (null or
 //! at most 128 characters of `[A-Za-z0-9 ._:/@+-]`) and `created` (an unsigned
-//! integer). `cost` (Venice) may be null, a number or a numeric object. `usage` may hold only numbers, booleans, nulls and nested objects
+//! integer). `cost` (Venice) may be null, a number or a numeric object. `usage` may hold only numbers (of magnitude below 2^53), booleans, nulls and nested objects
 //! of such (keys `[A-Za-z0-9_]{1,64}`, at most 3 levels counting `usage`). Any
 //! other field could carry prompt- or output-derived data to the node.
 //!
@@ -50,11 +50,20 @@ fn numeric_object(v: &Value, depth: u32) -> bool {
             (1..=64).contains(&k.len())
                 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 && match x {
-                    Value::Null | Value::Bool(_) | Value::Number(_) => true,
+                    Value::Null | Value::Bool(_) => true,
+                    Value::Number(_) => plain_number(x),
                     Value::Object(_) => numeric_object(x, depth + 1),
                     _ => false,
                 }
         })
+}
+
+/// A number every implementation reads the same: its magnitude is below
+/// 2^53 (a nested count such as a cache-write count enters the price, and
+/// the node's Python and a JavaScript client would read a larger one
+/// differently).
+fn plain_number(v: &Value) -> bool {
+    v.as_f64().is_some_and(|f| f.abs() < (1u64 << 53) as f64)
 }
 
 /// An unsigned integer every implementation reads the same: at most 2^53 - 1
@@ -100,7 +109,7 @@ pub fn check_usage_event(v: &Value) -> Result<()> {
             let ok = match k.as_str() {
                 "choices" | "usage" => true,
                 "created" => uint(x),
-                "cost" => x.is_null() || x.is_number() || numeric_object(x, 1),
+                "cost" => x.is_null() || plain_number(x) || numeric_object(x, 1),
                 f if LABEL_FIELDS.contains(&f) => is_label(x),
                 _ => false,
             };

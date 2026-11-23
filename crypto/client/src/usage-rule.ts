@@ -9,7 +9,7 @@
  * `provider`, `service_tier`, `system_fingerprint` (null or at most 128
  * characters of `[A-Za-z0-9 ._:/@+-]`) and `created` (an unsigned integer).
  * `cost` (Venice) is null, a number or a numeric object like `usage`.
- * `usage` holds only numbers, booleans, nulls and nested objects of such
+ * `usage` holds only numbers (of magnitude below 2^53), booleans, nulls and nested objects of such
  * (keys `[A-Za-z0-9_]{1,64}`, at most 3 levels counting `usage`). Any other
  * field could carry prompt- or output-derived data to the node.
  * Vectors: crypto/relay/usage-event-vectors.json.
@@ -23,10 +23,13 @@ const uint = (v: unknown) => typeof v === 'number' && Number.isSafeInteger(v) &&
 const LABEL_FIELDS = ['id', 'object', 'model', 'provider', 'service_tier', 'system_fingerprint']
 const LABEL_RE = /^[A-Za-z0-9 ._:/@+-]{0,128}$/
 const USAGE_KEY_RE = /^[A-Za-z0-9_]{1,64}$/
+/** A number every implementation reads the same: magnitude below 2^53. */
+const plainNumber = (x: unknown): boolean => typeof x === 'number' && Number.isFinite(x) && Math.abs(x) < 2 ** 53
+
 /** `depth` counts `usage` itself as 1; at most 3. */
 const numericObject = (v: unknown, depth: number): boolean =>
   isObj(v) && depth <= 3 && Object.entries(v).every(([k, x]) =>
-    USAGE_KEY_RE.test(k) && (x === null || typeof x === 'boolean' || (typeof x === 'number' && Number.isFinite(x)) || (isObj(x) && numericObject(x, depth + 1))))
+    USAGE_KEY_RE.test(k) && (x === null || typeof x === 'boolean' || plainNumber(x) || (isObj(x) && numericObject(x, depth + 1))))
 
 /** Why `ev` is not a usage event, or null. */
 export function usageEventProblem(ev: unknown): string | null {
@@ -34,7 +37,7 @@ export function usageEventProblem(ev: unknown): string | null {
   for (const [k, x] of Object.entries(ev)) {
     const ok = k === 'choices' || k === 'usage' ? true
       : k === 'created' ? uint(x)
-        : k === 'cost' ? x === null || (typeof x === 'number' && Number.isFinite(x)) || numericObject(x, 1)
+        : k === 'cost' ? x === null || plainNumber(x) || numericObject(x, 1)
           : LABEL_FIELDS.includes(k) ? x === null || (typeof x === 'string' && LABEL_RE.test(x))
           : false
     if (!ok) return `the event carries the top-level field ${JSON.stringify(k)}`

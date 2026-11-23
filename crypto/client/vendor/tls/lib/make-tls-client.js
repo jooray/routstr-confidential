@@ -179,6 +179,11 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
             // do nothing -- pass through
         }
         else if (type === PACKET_TYPE.CHANGE_CIPHER_SPEC) {
+            // FORK PATCH (TLS-20): the compatibility ChangeCipherSpec comes
+            // before the peer's Finished only (RFC 8446 §5).
+            if (handshakeDone && connTlsVersion === 'TLS1_3') {
+                throw new Error('ChangeCipherSpec after the TLS 1.3 handshake');
+            }
             logger.debug('received change cipher spec');
             cipherSpecChanged = true;
             return;
@@ -552,7 +557,10 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
         }
     }
     function setAlpn(alpn) {
-        selectedAlpn = alpn || applicationLayerProtocols?.[0];
+        // FORK PATCH (TLS-20): what the server selected, or nothing. (The
+        // original reported the first protocol offered when the server
+        // selected none.)
+        selectedAlpn = alpn;
         if (selectedAlpn && !applicationLayerProtocols?.includes(selectedAlpn)) {
             throw new Error(`Server selected unsupported ALPN: "${selectedAlpn}"`);
         }
@@ -1051,6 +1059,33 @@ export function makeTLSClient({ host, verifyServerCertificate = true, rootCAs, l
                     contentType: 'APPLICATION_DATA'
                 });
             }
+        },
+        // FORK PATCH (v3): best-effort erasure when the connection
+        // ends. Zero the traffic secrets and IVs this client holds (the
+        // current keys and the handshake secrets), drop every key reference
+        // (the AES keys are CryptoKey objects, which cannot be zeroed), and end
+        // the client so no record is read or written with them afterwards.
+        // Copies made elsewhere (by the runtime, by the caller) are untouched.
+        destroySecrets() {
+            for (const set of [keys, handshakeSecrets]) {
+                if (!set) {
+                    continue;
+                }
+                for (const name of ['clientSecret', 'serverSecret', 'masterSecret', 'clientIv', 'serverIv']) {
+                    const v = set[name];
+                    if (v instanceof Uint8Array) {
+                        v.fill(0);
+                    }
+                }
+            }
+            if (earlySecret instanceof Uint8Array) {
+                earlySecret.fill(0);
+            }
+            keys = undefined;
+            handshakeSecrets = undefined;
+            earlySecret = undefined;
+            handshakeDone = false;
+            ended = true;
         },
         end,
     };

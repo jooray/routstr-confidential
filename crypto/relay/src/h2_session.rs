@@ -147,9 +147,11 @@ struct Req {
     /// A GOAWAY in it or later does not refuse the request, and a provider
     /// close from then on is not the provider's answer (`early_close`).
     stall_from: Option<usize>,
-    /// A control record of the client was written after the request's first
-    /// record and before its last: a provider close that follows may be the
-    /// client's doing (an unsolicited SETTINGS ACK is a connection error).
+    /// A control record of the client was written while the request was in
+    /// flight and not yet written in full (before its first record too):
+    /// a provider close or GOAWAY that follows may be the client's doing (an
+    /// unsolicited SETTINGS ACK is a connection error). The connection's
+    /// first SETTINGS ACK does not count (`H2::settings_acked`).
     ctl_written: bool,
     /// The first `PINNED_RECORDS` server application-data records of the
     /// interval (indices `s_k`, `s_k + 1`, ...), for `record_windows`.
@@ -202,6 +204,11 @@ pub(crate) struct H2 {
     last_req_write: Option<std::time::Instant>,
     /// Control records accepted on this connection (`ctl_allowance`).
     ctl_records: u64,
+    /// The connection's first SETTINGS ACK was written. A provider sends its
+    /// SETTINGS at the start of every connection and expects exactly this
+    /// answer, whenever it comes: it is the one control record that cannot
+    /// make a provider close (`Req::ctl_written`).
+    settings_acked: bool,
 }
 
 impl H2 {
@@ -232,6 +239,7 @@ impl H2 {
             last_write: None,
             last_req_write: None,
             ctl_records: 0,
+            settings_acked: false,
         }
     }
 
@@ -347,7 +355,8 @@ pub(crate) fn stalled(last: Option<std::time::Instant>, now: std::time::Instant,
 
 /// Whether the provider's close before a request was written in full is its
 /// own answer (§12.10 row 8) or may be the client's doing: a control record
-/// of the client went out inside the request, or the client held proven
+/// of the client (other than the connection's first SETTINGS ACK) went out
+/// while the request was in flight, or the client held proven
 /// records back for the GOAWAY window or longer before the close.
 fn early_close_is_clients(q: &Req, last_req_write: Option<std::time::Instant>, now: std::time::Instant, window: std::time::Duration) -> bool {
     q.ctl_written || q.stall_from.is_some() || (q.written > 0 && stalled(last_req_write, now, window))
@@ -735,7 +744,13 @@ async fn flush(
         h.last_write = Some(std::time::Instant::now());
         if rec.req_idx > 0 {
             h.last_req_write = h.last_write;
-        } else if let Some(q) = h.req.as_mut().filter(|q| q.written > 0 && !q.released) {
+        } else if matches!(rec.kind, RecKind::Ctl(Ctl::SettingsAck)) && !h.settings_acked {
+            // The answer the provider's own SETTINGS asks for.
+            h.settings_acked = true;
+        } else if let Some(q) = h.req.as_mut().filter(|q| !q.released) {
+            // Also before the request's first record: the queue is written
+            // in order, so a control record ahead of the HEADERS goes out in
+            // the same pass and the provider's reaction falls in the interval.
             q.ctl_written = true;
         }
         write_upstream(tcp_tx, &rec.bytes, deadline).await?;
@@ -1140,6 +1155,9 @@ pub(crate) fn on_disclose_reset(
         }
         if !before_write && q.stall_from.is_some_and(|stall| goaway_record >= stall) {
             bail!("a GOAWAY that arrived after the client held proven records of the request back for {:?} or longer does not refuse it", window);
+        }
+        if q.ctl_written {
+            bail!("a GOAWAY after a control record of the client was written inside the request does not refuse it");
         }
     }
     if q.s_k.is_none() {
@@ -3030,20 +3048,38 @@ mod tests {
         let (mut w, _up) = upstream().await;
         let window = goaway_window(st_idle_secs(&open_session(300)));
         let past = |d: std::time::Duration| std::time::Instant::now().checked_sub(d).unwrap();
-        for (what, stall, ctl) in [("prompt close", false, false), ("stall", true, false), ("control record", false, true)] {
+        for (what, stall, ctl) in [
+            ("prompt close", false, 0),
+            ("stall", true, 0),
+            ("control record inside", false, 1),
+            ("control record first", false, 2),
+            ("the first SETTINGS ACK", false, 3),
+        ] {
             let mut log = RelayLog::default();
             let mut st = open_session(300);
             for c in [&[1u8; 40][..], &[2; 900]] {
                 feed(&mut st, &mut log, c);
             }
-            // HEADERS, (a SETTINGS ACK between the request's records,) DATA.
+            // HEADERS, DATA, and a control record: a PING ACK between the
+            // request's records (1) or ahead of its HEADERS (2), or the
+            // connection's first SETTINGS ACK ahead of the HEADERS (3), which
+            // the provider expects.
             let block = h2::request_block("h", "/api/v1/chat/completions").len();
-            client_bytes(&mut st, &record(9 + block + 1)).unwrap();
-            if ctl {
+            if ctl == 2 {
+                on_ctl(&mut st, "ping_ack").unwrap();
+                client_bytes(&mut st, &record(10 + 8)).unwrap();
+            }
+            if ctl == 3 {
                 on_ctl(&mut st, "settings_ack").unwrap();
                 client_bytes(&mut st, &record(10)).unwrap();
             }
+            client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+            if ctl == 1 {
+                on_ctl(&mut st, "ping_ack").unwrap();
+                client_bytes(&mut st, &record(10 + 8)).unwrap();
+            }
             client_bytes(&mut st, &record(10 + 300)).unwrap();
+            let ctl = ctl == 1 || ctl == 2;
             on_release(&mut st, 1, 1).unwrap();
             pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
             prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
@@ -3057,9 +3093,10 @@ mod tests {
             let g = goaway_frame(1, 0);
             feed(&mut st, &mut log, &g); // record 2
             texts(&mut rx);
-            if stall {
+            if stall || ctl {
                 let err = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap_err();
-                assert!(err.to_string().contains("held proven records"), "{what}: {err}");
+                let want = if stall { "held proven records" } else { "control record of the client" };
+                assert!(err.to_string().contains(want), "{what}: {err}");
                 assert!(texts(&mut rx).is_empty(), "{what}: nothing attested");
             }
             tcp_closed(&mut st, &tx).unwrap();
@@ -3073,6 +3110,7 @@ mod tests {
             }
         }
         // The stall is also seen when nothing arrives before the close.
+        texts(&mut rx);
         let mut st = open_session(300);
         let h = st.h2.as_mut().unwrap();
         h.req.as_mut().unwrap().written = 1;

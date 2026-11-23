@@ -30,7 +30,10 @@
 //     the key change, a message before the ServerHello;
 //   - TLS 1.3 strictness (TLS-19): a ChangeCipherSpec inside a protected
 //     record, an empty handshake record, an RSASSA-PKCS1-v1_5 signature in
-//     CertificateVerify; a P-384 signature with a short r or s verifies.
+//     CertificateVerify; a P-384 signature with a short r or s verifies;
+//   - TLS-20: an RSA-PSS signature has the length of the modulus (one whose
+//     leading zero byte was dropped is refused), no ALPN protocol is reported
+//     when the server selected none, a ChangeCipherSpec after the handshake.
 //
 // Self-contained: imports only the vendored fork and its dependencies.
 
@@ -583,6 +586,66 @@ for (const [what, first] of [
     }
     check(`a P-384 CertificateVerify whose ${what} is shorter than 48 bytes verifies`, c.handshakes() === 1, err)
   }
+}
+
+{
+  // TLS-20. One RSA signature in 256 begins with a zero byte, and WebCrypto on
+  // OpenSSL also verifies it with that byte dropped: a second encoding, so a
+  // second transcript. The fork accepts the full-length form only.
+  const leafRsa = await issue(`CN=${HOST}`, {
+    issuer: root,
+    ca: false,
+    san: [HOST],
+    keyAlg: { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+  })
+  const pss = await crypto.subtle.importKey(
+    'pkcs8',
+    await crypto.subtle.exportKey('pkcs8', leafRsa.keys.privateKey),
+    { name: 'RSA-PSS', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  for (const strip of [false, true]) {
+    const c = await afterServerHello()
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.encryptedExtensions()))
+    await c.client.handleReceivedBytes(await c.server.seal(c.server.certificate([leafRsa])))
+    const data = await getSignatureDataTls13(c.server.transcript, SUITE)
+    let sig: Uint8Array
+    do {
+      sig = new Uint8Array(await crypto.subtle.sign({ name: 'RSA-PSS', saltLength: 32 }, pss, data))
+    } while (sig[0] !== 0)
+    if (strip) sig = sig.slice(1)
+    // rsa_pss_rsae_sha256
+    const cv = c.server.add(hsMsg(0x0f, [0x08, 0x04, ...u16(sig.length), ...Array.from(sig)]))
+    if (strip) {
+      await rejects(
+        'an RSA-PSS signature without its leading zero byte is refused',
+        c.client.handleReceivedBytes(await c.server.seal(cv)),
+        /length of the modulus/,
+      )
+      check('  no handshake completed and the client ended', c.handshakes() === 0 && c.client.hasEnded())
+    } else {
+      let err = ''
+      try {
+        await c.client.handleReceivedBytes(await c.server.seal(cv))
+        await c.client.handleReceivedBytes(await c.server.seal(await c.server.finished()))
+      } catch (e) {
+        err = e instanceof Error ? e.message : String(e)
+      }
+      check('an RSA-PSS signature that begins with a zero byte verifies at its full length', c.handshakes() === 1, err)
+    }
+  }
+}
+{
+  // TLS-20: the server selected no ALPN protocol, and the client says so.
+  const c = await completed()
+  check('no ALPN protocol is reported when the server selected none', c.client.getMetadata().selectedAlpn === undefined)
+  await rejects(
+    'a ChangeCipherSpec after the handshake is refused',
+    c.client.handleReceivedBytes(plain(0x14, [0x01])),
+    /ChangeCipherSpec after the TLS 1.3 handshake/,
+  )
+  check('  the client ended', c.client.hasEnded())
 }
 
 if (failures) {

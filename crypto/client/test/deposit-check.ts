@@ -82,6 +82,9 @@ assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', ...hoard }), { 
 assert.deepEqual(depositProblems(evicted, d({ outcome: 'released', reason: 'evicted_released', ...lone }), { ...ctx, signed: true }), [])
 assert.match(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true }).join(), /below the 5 that charge/)
 assert.match(depositProblems(evicted, d({ reason: 'evicted' }), { ...ctx, signed: true }).join(), /without the signed count/)
+// A threshold of 1 would charge a lone spare for another party's setup.
+assert.match(depositProblems(evicted, d({ reason: 'evicted', evicted: { unused_at_address: 1, charge_from: 1 } }), { ...ctx, signed: true }).join(), /threshold of 1/)
+assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', evicted: { unused_at_address: 2, charge_from: 2 } }), { ...ctx, signed: true, requestOpen: false }), [])
 assert.match(depositProblems(evicted, d({ reason: 'evicted_released', ...lone }), ctx).join(), /which releases it/)
 assert.match(depositProblems(evicted, d({ reason: 'evicted', ...hoard }), { ...ctx, releasedByReceipt: true }).join(), /receipt of this connection released it/)
 assert.match(depositProblems(evicted, d({ reason: 'evicted', ...hoard }), { ...ctx, signed: false }).join(), /without a valid signature/)

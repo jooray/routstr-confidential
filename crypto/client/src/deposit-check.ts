@@ -87,6 +87,7 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
       const e = evictionCounts(d)
       if (!e) problems.push('charged as evicted without the signed count of the address\'s unused connections')
       else if (e.n < e.k) problems.push(`charged as evicted, though its address held ${e.n} unused connection(s), below the ${e.k} that charge (a lone spare is released)`)
+      else if (e.k < 2) problems.push(`charged as evicted at a threshold of ${e.k}: a lone unused connection is never charged for its eviction (the threshold is at least 2)`)
       if (c.openAccepted === true) problems.push('charged as evicted, though the node had accepted a request of it (never evicted)')
     }
     // Row 5: the provider closed the open connection while no request of the
