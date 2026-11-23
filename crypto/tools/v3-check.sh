@@ -79,6 +79,8 @@
 #   h2-j-twopc-tag-old    a 2PC peer of the previous variant, split-public-1 (twopc_version_mismatch)
 #   h2-l-big-frame        one 9 MiB binary message right after `ready`, above the sidecar's client
 #                         buffer: `error` 413 frame_too_large, without `fault` (the client's doing)
+#   h2-m-ctl-flood        control records with no request, each proven and written, until the
+#                         connection's allowance (16, and one more per 10 s) is used up: `error`
 #   h11-c-suffix          the final record is another model's suffix of the same length (π_WIN fails)
 #   h11-c-model-swap      … the suffix of a pricier model (another length: not the suffix alone)
 #   h11-c-cap-swap        … a suffix with a larger max_tokens of the same length (π_WIN fails)
@@ -272,6 +274,7 @@ run_case h2-i-own-keyshare   "refused:2:0:share" 0 none -- --http 2 --adv own-ke
 run_case h2-j-twopc-tag      "refused:2:0:twopc_version_mismatch" 0 none -- --http 2 --adv twopc-tag
 run_case h2-j-twopc-tag-old  "refused:2:0:twopc_version_mismatch" 0 none -- --http 2 --adv twopc-tag-old
 run_case h2-l-big-frame      "refused:2:0:frame_too_large" 0 none -- --http 2 --adv big-frame
+run_case h2-m-ctl-flood      "refused:2:0:more control records" 0 none -- --http 2 --adv ctl-flood
 
 # --- attacks, framing "1.1" ----------------------------------------------------
 run_case h11-c-suffix        "refused:1.1:1:pi_win failed" 0 none -- --http 1.1 --adv suffix

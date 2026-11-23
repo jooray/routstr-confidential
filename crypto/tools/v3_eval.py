@@ -228,7 +228,7 @@ elif kind in ("refused", "withheld"):
             dev.append(f"the sidecar never saw request {n} (wrong check fired)")
     elif any(e.startswith("request n=") for e in evs) and http == "2":
         dev.append("a request was opened on the attacked connection")
-    elif any(e.startswith("credential_written") for e in evs) and "early-record" not in case:
+    elif any(e.startswith("credential_written") for e in evs) and "early-record" not in case and "ctl-flood" not in case:
         dev.append("the head with the credential was written on the attacked connection")
 elif kind == "replay":
     n, _, reason = rest.partition(":")

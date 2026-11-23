@@ -105,6 +105,12 @@
 #   h2-l-big-frame          one 9 MiB binary message right after `ready` (above the sidecar's
 #                           client buffer, below the node's limit): `error` 413 frame_too_large
 #                           without `fault`, the client's doing: D charged (`unused`)
+#   h2-m-ctl-flood          control records with no request until the connection's allowance is
+#                           used up: `error` without `fault`, D charged (`unused`)
+#   h2-m-hold-body          request 1: its HEADERS released, an unsolicited SETTINGS ACK behind it,
+#                           the proven body held back. Whatever the provider does (a GOAWAY and a
+#                           close, a timeout, nothing), the request is an abandoned one: D charged
+#                           (`request_abandoned`), never the provider's refusal (`provider_refused`)
 #  cancel and reuse (a force-stopped request whose credential reference a later one rides on)
 #   h2-k-rst-reuse, h2-k-rst-reuse-same   request 2 released, RST_STREAM, then a HEADERS record for
 #                           the next / the same stream with no `request`: refused before it is queued
@@ -214,7 +220,7 @@ cleanup() {
   # The node stores its provider key in its database (provider row and
   # settings): keep the keys' final balances as evidence and remove it.
   if [ -f "$DB" ]; then
-    sqlite3 -header -separator $'\t' "$DB" \
+    sqlite3 -cmd ".timeout 5000" -header -separator $'\t' "$DB" \
       "select hashed_key, balance, reserved_balance, total_spent, total_requests from api_keys;" > "$OUT/api_keys.tsv" 2>/dev/null || true
     rm -f "$DB" "$DB-wal" "$DB-shm"
   fi
@@ -277,13 +283,13 @@ start_node() {
 # offer has no models; as `venice` (AGENTS.md) the second start prices them.
 start_node
 stop "$NODE_PID"; NODE_PID=""
-sqlite3 "$DB" "delete from upstream_providers where base_url not like '%${CU_HOST_MATCH:-venice}%'; update upstream_providers set provider_type='${CU_PROVIDER_TYPE:-venice}';"
+sqlite3 -cmd ".timeout 5000" "$DB" "delete from upstream_providers where base_url not like '%${CU_HOST_MATCH:-venice}%'; update upstream_providers set provider_type='${CU_PROVIDER_TYPE:-venice}';"
 # An admin token for the one case that changes a setting while the node runs.
 ADMIN_TOKEN="$(openssl rand -hex 24)"
-sqlite3 "$DB" "insert into cli_tokens(id,token,name,created_at) values('v3-node-check','$ADMIN_TOKEN','v3-node-check',strftime('%s','now'));"
+sqlite3 -cmd ".timeout 5000" "$DB" "insert into cli_tokens(id,token,name,created_at) values('v3-node-check','$ADMIN_TOKEN','v3-node-check',strftime('%s','now'));"
 start_node
 if [ -n "${CU_NODE_MODELS:-}" ]; then
-  PROVIDER_ID="$(sqlite3 "$DB" "select id from upstream_providers limit 1;")"
+  PROVIDER_ID="$(sqlite3 -cmd ".timeout 5000" "$DB" "select id from upstream_providers limit 1;")"
   "$PY" -I -c 'import json,sys; [print(json.dumps(m)) for m in json.load(open(sys.argv[1]))]' "$CU_NODE_MODELS" | while IFS= read -r row; do
     curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
       -d "$row" "$NODE/admin/api/upstream-providers/$PROVIDER_ID/models" || { echo "adding a model through the admin API failed" >&2; exit 2; }
@@ -379,14 +385,14 @@ run_case() {
   # The signed offer before the case (rates move with the exchange rate).
   fetch_offer > "$OUT/$id.offer.json"
   key="$(openssl rand -hex 32)"
-  sqlite3 "$DB" "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('$key',$balance,0,0,0);"
+  sqlite3 -cmd ".timeout 5000" "$DB" "insert into api_keys(hashed_key,balance,total_spent,total_requests,reserved_balance) values('$key',$balance,0,0,0);"
   skip="$(log_lines)"
   hs0="$(handshakes)"
   : > "$OUT/$id.out"; : > "$OUT/$id.err"
   case "$hook" in
     topup)
       topup=1000000
-      ( wait_for "$OUT/$id.out" '^REFUSED_WAIT' "$CASE_TIMEOUT" && sqlite3 "$DB" "update api_keys set balance = balance + $topup where hashed_key='$key';" ) & watcher=$! ;;
+      ( wait_for "$OUT/$id.out" '^REFUSED_WAIT' "$CASE_TIMEOUT" && sqlite3 -cmd ".timeout 5000" "$DB" "update api_keys set balance = balance + $topup where hashed_key='$key';" ) & watcher=$! ;;
     offer)
       ( wait_for "$OUT/$id.out" 'receipt 1:' "$CASE_TIMEOUT" && set_idle "$((IDLE + 1))" ) & watcher=$! ;;
     kill-driver)
@@ -489,6 +495,8 @@ run_case h2-f-image-suffix   "attack:2:2:abandoned:pi_win failed" "$B" none -- -
 run_case h2-g-early-record   "attack:2:0:unused:."                "$B" none -- --http 2 --adv early-record
 run_case h2-i-own-keyshare   "attack:2:0:unused:share"            "$B" none -- --http 2 --adv own-keyshare
 run_case h2-l-big-frame      "attack:2:0:unused:frame_too_large"  "$B" none -- --http 2 --adv big-frame
+run_case h2-m-ctl-flood      "attack:2:0:unused:more control records" "$B" none -- --http 2 --adv ctl-flood
+run_case h2-m-hold-body      "attack:2:1:abandoned:."              "$B" none -- --http 2 --adv hold-body
 run_case h11-c-suffix        "attack:1.1:1:abandoned:pi_win failed" "$B" none -- --http 1.1 --adv suffix
 run_case h11-c-model-swap    "attack:1.1:1:abandoned:."             "$B" none -- --http 1.1 --adv suffix --adv-suffix-model "$SWAP_MODEL"
 run_case h11-b-padding       "attack:1.1:1:abandoned:pi_win failed" "$B" none -- --http 1.1 --adv padding
