@@ -17,9 +17,9 @@ const usage = (cached: number, written = 0) => ({
 assert.equal(maxUsageCharge(rates, usage(0)), 1000 + 20)
 assert.equal(maxUsageCharge(rates, usage(1000)), 100 + 20)
 assert.equal(maxUsageCharge(rates, usage(600)), 400 + 60 + 20)
-// Writes at `cache_write` when dearer than `in`; at `in` when the write rate is lower.
+// Writes at the signed `cache_write`, dearer than `in` or cheaper: the node's formula exactly.
 assert.equal(maxUsageCharge(rates, usage(600, 400)), 500 + 60 + 20)
-assert.equal(maxUsageCharge({ ...rates, cache_write: 500 }, usage(600, 400)), 400 + 60 + 20)
+assert.equal(maxUsageCharge({ ...rates, cache_write: 500 }, usage(600, 400)), 200 + 60 + 20)
 // No cached rate in the offer: cached reads cost `in`.
 assert.equal(maxUsageCharge({ in: 1000, out: 2000 }, usage(1000)), 1000 + 20)
 // A cached rate above `in` is capped at `in`.

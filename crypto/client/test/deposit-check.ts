@@ -2,7 +2,7 @@
 // node to (`src/deposit-check.ts`, PROTOCOL-V3.md §12.9, §12.10).
 //   node --experimental-strip-types test/deposit-check.ts
 import assert from 'node:assert/strict'
-import { DEPOSIT_RELEASED_REASONS, depositProblems } from '../src/deposit-check.ts'
+import { DEPOSIT_RELEASED_REASONS, depositProblems, missingDepositProblem } from '../src/deposit-check.ts'
 
 const SID = 'ab'.repeat(32)
 const ctx = { sid: SID, depositMsat: 7000, releasedByReceipt: false }
@@ -48,5 +48,27 @@ assert.match(depositProblems(closed, d({ outcome: 'kept' }), ctx).join(), /an ou
 
 // Several rules at once: each is named.
 assert.equal(depositProblems({ type: 'error', fault: 'node' }, d({ msat: 1, reason: 'node_failure' }), { ...ctx, releasedByReceipt: true }).length, 4)
+
+// A charge needs the node's signature; a release is judged by its content.
+assert.match(depositProblems(closed, d({}), { ...ctx, signed: false }).join(), /without a valid signature/)
+assert.deepEqual(depositProblems(closed, d({}), { ...ctx, signed: true }), [])
+assert.deepEqual(depositProblems(closed, d({ outcome: 'released', reason: 'provider_closed' }), { ...ctx, signed: false }), [])
+
+// Row 5: the provider closed the open connection with no request of the
+// client open. Charged then only after control frames of the client alone.
+const upClosed = { type: 'closed', reason: 'upstream_closed' }
+assert.match(depositProblems(upClosed, d({}), { ...ctx, requestOpen: false }).join(), /row 5/)
+assert.deepEqual(depositProblems({ ...upClosed, after_client_frames: true }, d({}), { ...ctx, requestOpen: false }), [])
+assert.deepEqual(depositProblems(upClosed, d({ reason: 'request_abandoned' }), { ...ctx, requestOpen: true }), [])
+assert.deepEqual(depositProblems({ type: 'closed', reason: 'idle' }, d({ reason: 'idle' }), { ...ctx, requestOpen: false }), [])
+assert.deepEqual(depositProblems(upClosed, d({ outcome: 'released', reason: 'provider_closed' }), { ...ctx, requestOpen: false }), [])
+
+// A last frame with no outcome for a deposit nothing released.
+assert.match(missingDepositProblem(ctx, true, false) ?? '', /no deposit outcome .* 7000 msat/)
+assert.equal(missingDepositProblem(ctx, true, true), null)
+assert.equal(missingDepositProblem(ctx, false, false), null) // the client left first
+assert.equal(missingDepositProblem({ ...ctx, releasedByReceipt: true }, true, false), null)
+assert.equal(missingDepositProblem({ ...ctx, depositMsat: 0 }, true, false), null)
+assert.equal(missingDepositProblem({ ...ctx, sid: '' }, true, false), null) // refused before ready
 
 console.log('deposit-check: ok')

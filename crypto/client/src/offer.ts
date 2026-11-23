@@ -222,11 +222,10 @@ export function tokenCount(v: unknown): number {
  * fee). The node computes its charge from the same disclosed usage: prompt
  * tokens at `in`, less cached reads at `cached_in` (never above `in`) and
  * prompt-cache writes at `cache_write` (`in` when the offer has none), both
- * counted inside `prompt_tokens`. The bound is that formula, or the same with
- * the writes billed at `in` when that is larger (a node that read no write
- * count bills them so). It is never the uncached price for a usage that
- * reports cached reads: a charge that ignores the cache discount is an
- * overcharge (as the SDK's maxChargeMsats).
+ * counted inside `prompt_tokens`. The bound is exactly that formula, in the
+ * node's order of operations: writes billed at `in` where the signed
+ * `cache_write` is lower, or cached reads billed at `in`, are an overcharge
+ * (as the SDK's maxChargeMsats).
  */
 export function maxUsageCharge(rates: any, usage: any): number {
   const inRate = Number(rates.in)
@@ -243,10 +242,7 @@ export function maxUsageCharge(rates: any, usage: any): number {
   )
   const cachedRate = Math.min(Number(rates.cached_in ?? inRate), inRate)
   const writeRate = Number(rates.cache_write ?? inRate)
-  const cost = (c: number, w: number) =>
-    Math.ceil((inRate * (prompt - c - w) + cachedRate * c + writeRate * w + outRate * completion) / 1000)
-  // `cost(cached, 0)` is the uncached price when no cached reads are reported.
-  return Math.max(cost(cached, 0), cost(cached, written))
+  return Math.ceil((inRate * (prompt - cached - written) + cachedRate * cached + writeRate * written + outRate * completion) / 1000)
 }
 
 /** The largest request body a node takes (`body_len`, PROTOCOL-V3.md §12.4). */

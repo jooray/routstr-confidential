@@ -23,6 +23,10 @@ export interface DepositContext {
   depositMsat: number
   /** A receipt of this connection released the deposit. */
   releasedByReceipt: boolean
+  /** The outcome's signature verified (default: not judged). */
+  signed?: boolean
+  /** A `request` of the client is neither refused nor settled (default: not judged). */
+  requestOpen?: boolean
 }
 
 /** The outcome as parsed from `deposit_json` (or `deposit`). */
@@ -54,6 +58,24 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
     if (typeof d.reason === 'string' && DEPOSIT_RELEASED_REASONS.has(d.reason)) {
       problems.push(`charged with reason ${JSON.stringify(d.reason)}, which releases it`)
     }
+    if (c.signed === false) problems.push('charged without a valid signature of the node')
+    // Row 5: the provider closed the open connection while no request of the
+    // client was open, and not after control frames of the client alone.
+    if (frame?.type === 'closed' && frame.reason === 'upstream_closed' && frame.after_client_frames !== true && c.requestOpen === false) {
+      problems.push('charged though the provider closed the connection with no request open (released by §12.10 row 5)')
+    }
   }
   return problems
+}
+
+/**
+ * A connection that reserved a deposit ended with a last frame of the node
+ * (`closed` or `error`) and no deposit outcome, though no receipt released
+ * it (§12.9: the last frame carries the outcome). Null when nothing is
+ * missing: no deposit, before `ready`, released by a receipt, or an outcome
+ * was reported.
+ */
+export function missingDepositProblem(c: DepositContext, sawLastFrame: boolean, reported: boolean): string | null {
+  if (!sawLastFrame || reported || c.releasedByReceipt || !(c.depositMsat > 0) || c.sid === '') return null
+  return `no deposit outcome in the node's last frame for a deposit of ${c.depositMsat} msat`
 }

@@ -51,6 +51,10 @@
 //         released, RST_STREAM, then the next `request`), rst-after-release (RST_STREAM after
 //         body_released, no disclosure, then the next `request`), ctl-headers (a record declared as a
 //         PING ACK that carries a HEADERS frame);
+//       framing "2", resources and money: ctl-flood (control records with no request, one at a time, past
+//         the connection's allowance), hold-body (the HEADERS released, an unsolicited SETTINGS ACK behind
+//         it, the proven body held back until the provider gives up: an abandoned request, never a
+//         provider refusal)
 //         framing "1.1": extra-record (after body_released, one more record carrying a second HTTP
 //         request); a second request inside the body is --private-extra with raw CRLF text
 //       forged refusals (framing "2", `disclose_reset` for a request the provider answered):
@@ -92,7 +96,7 @@ import { padBody, pinnedModel, renderChatSuffix, renderImagesSuffix } from './of
 import { checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { makeReceiptChecker } from './receipt-check.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
-import { depositProblems } from './deposit-check.ts'
+import { depositProblems, missingDepositProblem } from './deposit-check.ts'
 import { errText, shown, termSafe } from './term.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
 import { runZk } from './zkbridge.ts'
@@ -206,6 +210,8 @@ const ADV_MODES: Record<string, Framing[]> = {
   'hidden-headers': ['2'], path: ['2'], 'replay-usage': ['2'], 'not-alone': ['1.1'],
   // A cancelled request whose credential reference a later one reuses, unbilled:
   'rst-reuse': ['2'], 'rst-reuse-same': ['2'], 'rst-before-final': ['2'], 'rst-after-release': ['2'], 'ctl-headers': ['2'],
+  // More control records than a connection may carry; a proven body held back after its HEADERS.
+  'ctl-flood': ['2'], 'hold-body': ['2'],
   // A refusal (`disclose_reset`) claimed for a request the provider answered:
   'refusal-fake': ['2'], 'refusal-after-head': ['2'], 'refusal-probe': ['2'], 'refusal-later': ['2'],
   'extra-record': ['1.1'],
@@ -509,6 +515,12 @@ class Session {
   /** The connection deposit's outcome, as the node reported it (a receipt, or its last frame). */
   deposit: { msat: number; outcome: string; reason: string; signed: boolean } | undefined
   closedReason: string | undefined
+  /** A `request` was sent and is neither refused nor settled. */
+  requestOpen = false
+  /** The node sent a last frame (`closed` or `error`). */
+  lastFrameSeen = false
+  /** The provider closed before the request in flight was written in full (`upstream_closed_early`). */
+  closedEarly = false
   /** When each kind of control frame first arrived (measurements). */
   tFirst: Record<string, number> = {}
   /** Bytes on the session socket: control frames and relayed TLS records, each way. */
@@ -570,6 +582,16 @@ class Session {
     }
     this.ws.onerror = () => this.errRej(new Error('session websocket error'))
     this.ws.onclose = (ev: any) => {
+      // The connection is over: a deposit no receipt released has its
+      // outcome in the node's last frame (§12.9).
+      const missing = NODE_MODE
+        ? missingDepositProblem({ sid: this.sid, depositMsat: DEPOSIT, releasedByReceipt: this.settledOnce }, this.lastFrameSeen, this.deposit !== undefined)
+        : null
+      if (missing) {
+        const dev = { sid: this.sid || null, frame: 'closed', outcome: 'none', reason: 'none', signed: false, problems: [missing] }
+        DEPOSIT_DEVIATIONS.push(dev)
+        console.log('DEPOSIT_DEVIATION ' + JSON.stringify(dev))
+      }
       this.errRej(new Error(`connection closed${ev?.reason ? `: ${shown(ev.reason, 300)}` : ''}`))
     }
     this.ws.onmessage = (ev) => {
@@ -581,8 +603,10 @@ class Session {
         trace('<-', shown(m.type))
         if (typeof m.type === 'string' && this.tFirst[m.type] === undefined) this.tFirst[m.type] = Date.now()
         if (m.type === 'body_released') this.bodyReleased = true
+        if (m.type === 'request_refused' || m.type === 'receipt') this.requestOpen = false
         if (m.type === 'upstream_closed_early') {
-          console.log(`[client ${this.label}] the provider closed before the request was written in full (response_bytes=${shown(m.response_bytes)})`)
+          this.closedEarly = true
+          console.log(`[client ${this.label}] the provider closed before the request was written in full (response_bytes=${shown(m.response_bytes)} client_caused=${m.client_caused === true})`)
         }
         if (m.type === 'closed' || m.type === 'error') this.onLastFrame(m)
         if (m.type === 'error') {
@@ -613,6 +637,7 @@ class Session {
 
   /** The node's last frame (`closed` or `error`): it may carry the deposit's outcome, signed (§12.9). */
   private onLastFrame(m: any): void {
+    this.lastFrameSeen = true
     if (m.type === 'closed') {
       this.closedReason = String(m.reason ?? '')
       console.log(`[client ${this.label}] closed: reason=${shown(m.reason)}`)
@@ -639,7 +664,7 @@ class Session {
     if (!NODE_MODE) return
     // The node's own word against its signed terms (§12.10): a deviation is
     // printed on a line of its own, which the gates' evaluators fail on.
-    const problems = depositProblems(m, d, { sid: this.sid, depositMsat: DEPOSIT, releasedByReceipt })
+    const problems = depositProblems(m, d, { sid: this.sid, depositMsat: DEPOSIT, releasedByReceipt, signed, requestOpen: this.requestOpen })
     if (problems.length) {
       const dev = { sid: this.sid || null, frame: m.type, outcome: shown(d.outcome), reason: shown(d.reason), signed, problems: problems.map((p) => termSafe(p)) }
       DEPOSIT_DEVIATIONS.push(dev)
@@ -664,6 +689,7 @@ class Session {
     const text = JSON.stringify(obj)
     this.bytes.control_sent += text.length
     trace('->', shown((obj as any)?.type))
+    if ((obj as any)?.type === 'request') this.requestOpen = true
     this.ws.send(text)
   }
   sendBytes(b: Uint8Array): void {

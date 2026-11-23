@@ -80,6 +80,8 @@ export function reservationCeiling(offer: any, model: string, maxTokens: number,
  * the reservation, and the bound for it is the number the node announced in
  * `request_ok` before the request was released, never the receipt's own: a
  * node that announced none gets at most the session fee if still due.
+ * Whatever the settlement, a node that announced a reservation never charges
+ * more than it, and every receipt repeats it.
  */
 export function makeReceiptChecker(label: string, terms: () => ReceiptTerms): (receipt: any, q: ReceiptQuery) => void {
   return (receipt, q) => {
@@ -93,10 +95,12 @@ export function makeReceiptChecker(label: string, terms: () => ReceiptTerms): (r
     if ((receipt.session_fee_msat ?? 0) > feeDue || (receipt.abandon_fee_msat ?? 0) > abandonFee) {
       throw new Error(`receipt ${q.n} names larger fees than the signed offer allows for this request`)
     }
-    if (q.reserved !== undefined && receipt.reserved_msats !== undefined && receipt.reserved_msats !== q.reserved) {
+    if (q.reserved !== undefined && receipt.reserved_msats !== q.reserved) {
       throw new Error(`receipt ${q.n} names reserved_msats ${shown(receipt.reserved_msats)}, the node announced ${q.reserved}`)
     }
     const cost = receipt.cost_msats
+    // The announced reservation is the most any settlement of the request costs.
+    const held = q.reserved ?? Infinity
     let bound: number
     if (q.refusal !== undefined) {
       // A stream the provider refused without processing it (§12.10): like a
@@ -112,12 +116,7 @@ export function makeReceiptChecker(label: string, terms: () => ReceiptTerms): (r
       if ([401, 402, 403, 429, 503].includes(q.status)) bound = feeDue
       else if (q.status < 500) bound = Math.max(feeDue, abandonFee)
       else if (q.reserved === undefined) bound = feeDue
-      else {
-        if (receipt.reserved_msats !== q.reserved) {
-          throw new Error(`error receipt ${q.n} names reserved_msats ${shown(receipt.reserved_msats)}, the node announced ${q.reserved}`)
-        }
-        bound = Math.max(feeDue, q.reserved)
-      }
+      else bound = q.reserved
       if (q.image) {
         if (!(receipt.kind === 'images' && receipt.model === q.model && receipt.variant === q.image.variant && receipt.count === q.image.count)) {
           throw new Error(`error receipt ${q.n} does not carry the image request's terms`)
@@ -135,12 +134,17 @@ export function makeReceiptChecker(label: string, terms: () => ReceiptTerms): (r
           `reserved_msats=${shown(receipt.reserved_msats)} announced_reserved_msats=${shown(q.reserved)} balance_msats=${shown(receipt.balance_msats)} want_msats=${want} cost_ok=${ok}`,
       )
       if (!ok) throw new Error(`image receipt ${q.n} is not ${q.image.count} × ${shown(q.image.variant)} at ${q.image.msatPerImage} msat + fee (${want} msat)`)
+      if (want > held) throw new Error(`image receipt ${q.n} charges ${want} msats, more than the ${held} the node announced as reserved`)
       return
     } else {
       // At most the usage at the signed rates (the node may charge less, for cached input) plus the fee.
       const rates = offer?.price_list?.[q.model]
       if (!rates) throw new Error(`the signed offer does not price ${shown(q.model)}`)
       bound = maxUsageCharge(rates, q.usage ?? {}) + feeDue
+    }
+    if (held < bound) {
+      if (Number.isSafeInteger(cost) && cost > held) throw new Error(`receipt ${q.n} charges ${shown(cost)} msats, more than the ${held} the node announced as reserved`)
+      bound = held
     }
     const costOk = Number.isSafeInteger(cost) && cost >= 0 && cost <= bound
     console.log(

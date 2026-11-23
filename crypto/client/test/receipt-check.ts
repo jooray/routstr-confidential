@@ -27,8 +27,31 @@ try {
   assert.throws(() => check(r({ cost_msats: 5001, reserved_msats: 5000 }), q({ reserved: 5000 })), /more than the 5000/)
   assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 9000 }), q({ reserved: 5000 })), /announced 5000/)
   assert.throws(() => check(r({ cost_msats: 100 }), q({ reserved: 5000 })), /announced 5000/)
-  // The session fee when it is more than the reservation.
-  check(r({ cost_msats: 100, reserved_msats: 40 }), q({ reserved: 40 }))
+  // Never more than the announced reservation, whatever the settlement:
+  // a fee, a 4xx, a refusal, usage at the signed rates, images.
+  assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 40 }), q({ reserved: 40 })), /more than the 40/)
+  check(r({ cost_msats: 40, reserved_msats: 40 }), q({ reserved: 40 }))
+  assert.throws(() => check(r({ cost_msats: 300, reserved_msats: 250 }), q({ status: 400, reserved: 250 })), /more than the 250 the node announced/)
+  assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 99 }), q({ status: 429, reserved: 99 })), /more than the 99 the node announced/)
+  {
+    // Usage worth 580 msat at the signed rates (+ the fee), announced 100: 100 is the bound.
+    const big = { prompt_tokens: 80, completion_tokens: 250 }
+    check(r({ cost_msats: 100, reserved_msats: 100 }), q({ status: 200, usage: big, reserved: 100 }))
+    assert.throws(() => check(r({ cost_msats: 580, reserved_msats: 100 }), q({ status: 200, usage: big, reserved: 100 })), /more than the 100 the node announced/)
+    check(r({ cost_msats: 680, reserved_msats: 5000 }), q({ status: 200, usage: big, reserved: 5000 }))
+    assert.throws(() => check(r({ cost_msats: 681, reserved_msats: 5000 }), q({ status: 200, usage: big, reserved: 5000 })), /more than the 680/)
+    // A receipt that names no reservation, when one was announced.
+    assert.throws(() => check(r({ cost_msats: 50 }), q({ status: 200, usage: big, reserved: 5000 })), /announced 5000/)
+    // Prompt-cache writes are billed at the signed `cache_write`, also when it is below `in`.
+    const cheap = { price_list: { m: { in: 1000, cached_in: 100, cache_write: 500, out: 2000 } } }
+    const dear = { price_list: { m: { in: 1000, cached_in: 100, cache_write: 1250, out: 2000 } } }
+    const cu = { prompt_tokens: 1000, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 600, cache_creation_input_tokens: 400 } }
+    const at = (o: any) => makeReceiptChecker('t', () => ({ offer: o, sessionFee: 0, abandonFee: 0 }))
+    at(cheap)(r({ cost_msats: 280 }), q({ status: 200, usage: cu }))
+    assert.throws(() => at(cheap)(r({ cost_msats: 281 }), q({ status: 200, usage: cu })), /more than the 280/)
+    at(dear)(r({ cost_msats: 580 }), q({ status: 200, usage: cu }))
+    assert.throws(() => at(dear)(r({ cost_msats: 581 }), q({ status: 200, usage: cu })), /more than the 580/)
+  }
   // 5xx and nothing announced: the receipt's own number does not raise the bound.
   check(r({ cost_msats: 100, reserved_msats: 9000 }), q({}))
   assert.throws(() => check(r({ cost_msats: 101, reserved_msats: 9000 }), q({})), /more than the 100/)
@@ -58,8 +81,10 @@ try {
   assert.throws(() => check(r({ cost_msats: 1, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000, first: false })), /more than the 0/)
   assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'goaway', reserved: 5000 })), /not the goaway/)
   assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 4000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000 })), /announced 5000/)
-  // An accepted image is the flat price exactly.
+  // An accepted image is the flat price exactly, and within the announced reservation.
   check(ir({ cost_msats: 2100, usage: { flat: true }, msat_per_image: 1000 }), q({ status: 200, image }))
+  check(ir({ cost_msats: 2100, usage: { flat: true }, msat_per_image: 1000, reserved_msats: 2100 }), q({ status: 200, image, reserved: 2100 }))
+  assert.throws(() => check(ir({ cost_msats: 2100, usage: { flat: true }, msat_per_image: 1000, reserved_msats: 2000 }), q({ status: 200, image, reserved: 2000 })), /more than the 2000 the node announced/)
 
   // The reservation ceiling: the node's formula from the signed offer only
   // (`context_lengths`, never the listing's row), as routstr-core's reserve().
