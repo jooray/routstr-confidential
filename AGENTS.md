@@ -379,7 +379,9 @@ confidential mode when it detects more than one.
 `cu-crypto`/`twopc`/`zkbench` plus a wasm patch in `patches/`; TS package at the root).
 `~/projects/routstr-confidential-pwa` (github jooray/routstr-confidential-pwa): the demo PWA, deployed by
 GitHub Actions to https://jooray.github.io/routstr-confidential-pwa/ (pins the library by commit:
-`node scripts/pin-lib.mjs <sha>`). Changes to `crypto/twopc` or `zkbench` here must be re-vendored there.
+`node scripts/pin-lib.mjs <sha>`). Changes to `crypto/twopc`, `zkbench` or `cu-crypto` here must be re-vendored there
+(`patches/README.md`); the library's `scripts/vendor-check.mjs` (a CI step) fails when its vendored crates are
+not this repository's at `crates/vendor/UPSTREAM` plus its patch.
 Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA pins library `main` at
 `476c360` with the wasm built by CI; PWA 0.2.11 is deployed, with a testing guide at `/testing/`.
 
