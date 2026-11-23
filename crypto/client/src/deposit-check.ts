@@ -13,6 +13,7 @@ export const DEPOSIT_RELEASED_REASONS = new Set([
   'node_failure',
   'request_received',
   'provider_refused',
+  'evicted_released',
 ])
 
 /** What the client knows of the connection when the last frame arrives. */
@@ -27,8 +28,8 @@ export interface DepositContext {
   signed?: boolean
   /** A `request` of the client is neither refused nor settled (default: not judged). */
   requestOpen?: boolean
-  /** The open request reached `body_released` (default: not judged). */
-  requestReleased?: boolean
+  /** The node accepted the open request (`request_ok`; default: not judged). */
+  openAccepted?: boolean
 }
 
 /** The outcome as parsed from `deposit_json` (or `deposit`). */
@@ -37,6 +38,17 @@ export interface DepositOutcome {
   msat?: unknown
   outcome?: unknown
   reason?: unknown
+  /** An eviction under slot pressure: the address's evictable unused connections and the count that charges. */
+  evicted?: unknown
+}
+
+/** `evicted: {unused_at_address, charge_from}` of a deposit outcome, if well formed. */
+function evictionCounts(d: DepositOutcome): { n: number; k: number } | undefined {
+  const e = d.evicted as { unused_at_address?: unknown; charge_from?: unknown } | undefined
+  if (!e || typeof e !== 'object') return undefined
+  const n = e.unused_at_address
+  const k = e.charge_from
+  return Number.isSafeInteger(n) && Number.isSafeInteger(k) && (n as number) >= 0 && (k as number) >= 1 ? { n: n as number, k: k as number } : undefined
 }
 
 /**
@@ -62,15 +74,21 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
     }
     if (c.signed === false) problems.push('charged without a valid signature of the node')
     // Row 13: a newer setup closed the connection while it held its slot
-    // unused (§8.4). Legitimate only on that `closed` frame, and never for a
-    // connection whose request the provider had in full.
+    // unused (§8.4). Charged only on that `closed` frame, only when the
+    // node's signed count of its address's unused connections reached the
+    // signed threshold, and never with a request the node had accepted.
     const evictedUnused = frame?.type === 'closed' && frame.reason === 'evicted' && frame.unused === true
     if (d.reason === 'evicted' && !evictedUnused) problems.push('charged as evicted, but the last frame is not `closed` `evicted` with `unused: true`')
     if (evictedUnused && d.reason !== 'evicted') problems.push(`charged with reason ${JSON.stringify(d.reason ?? null).slice(0, 40)} on an eviction (row 13 names "evicted")`)
     if (frame?.type === 'closed' && frame.reason === 'evicted' && frame.unused !== true) {
       problems.push('charged on the eviction of a used connection (it holds no deposit)')
     }
-    if (d.reason === 'evicted' && c.requestReleased === true) problems.push('charged as evicted, though the open request was written in full (never evicted)')
+    if (d.reason === 'evicted') {
+      const e = evictionCounts(d)
+      if (!e) problems.push('charged as evicted without the signed count of the address\'s unused connections')
+      else if (e.n < e.k) problems.push(`charged as evicted, though its address held ${e.n} unused connection(s), below the ${e.k} that charge (a lone spare is released)`)
+      if (c.openAccepted === true) problems.push('charged as evicted, though the node had accepted a request of it (never evicted)')
+    }
     // Row 5: the provider closed the open connection while no request of the
     // client was open, and not after control frames of the client alone.
     if (frame?.type === 'closed' && frame.reason === 'upstream_closed' && frame.after_client_frames !== true && c.requestOpen === false) {

@@ -315,10 +315,11 @@ on both sides and restart both.
 
 **What the deposit prices.** The limits below are per address, so a client with funded credentials on
 several addresses can hold session slots with unused connections. Under slot pressure a newer setup closes
-the oldest unused one past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (below) and charges its deposit, so holding
-all 32 slots costs `32 × CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT` each time others want them, after about a
-minute, not per 10 minutes. Set the deposit to what a blocked slot costs you; with a deposit of 0 the slots
-are free to hold.
+an unused one past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (below), and an address holding
+`CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more pays its deposit for each one taken. One spread over many
+addresses with fewer each pays nothing, but its connections are taken on demand after the minimum age, and
+each re-open costs it a full 2PC. Set the deposit to what a blocked slot costs you; with a deposit of 0 the
+slots are free to hold.
 
 **Denial-of-service limit.** The node refuses a new confidential connection (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
@@ -330,17 +331,19 @@ oldest connection still waiting for its setup is evicted. Beyond the unused ones
 most `CONFIDENTIAL_MAX_ACTIVE_PER_IP` (default 16) connections in all, and the node at most 32: when the
 address or the node is full, the node first closes the connection of that address (or, for a full node, of
 any address) that has idled longest after a settled request (`closed`, reason `evicted`; its deposit was
-already released by that settlement, so its client loses only a handshake). With none, it closes the
-oldest **unused** connection there (no settled request) whose setup is at least
-`CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (default 60, 0 never) seconds old and that is not still setting up (its
-handshake, its 2PC or proof channel moving bytes, a request being reserved, or a first request younger than
-the minimum age plus its body's upload time at 32 kB/s); that connection's deposit is charged (`closed`,
-reason `evicted`, `"unused": true`). A full unused limit of the address yields the same way, to an unused
-connection of that address. The node refuses the setup only when there is none, and closes nothing on a
-timer. The cost to honest clients: a pre-warmed spare older than the minimum age loses its deposit when the
-node or its address is full; the clients then stop pre-warming for that node for 10 minutes. Raise the
-minimum age if your clients sit on links slower than 2/50 Mbit/s (a cold connection there takes about 12 s
-to its first request). PROTOCOL-V3.md §8.4 has the rule. The limits are
+already released by that settlement, so its client loses only a handshake). With none, it closes one
+**unused** connection (no settled request) whose setup is at least `CONFIDENTIAL_EVICT_UNUSED_AFTER_S`
+(default 60, 0 never) seconds old and that has nothing under way (its handshake, its 2PC or proof channel
+moving bytes, a request queued, reserving or in flight): for a full node one of another address, of the
+address holding the most such connections; for a full address its own oldest (`closed`, reason `evicted`,
+`"unused": true`). Its deposit is charged only when its address held at least
+`CONFIDENTIAL_EVICT_CHARGE_FROM` (default 5) such connections, else released (`evicted_released`). Setups
+claim slots one at a time: each closes at most one connection, a refused one none. The node refuses the
+setup only when there is none, and closes nothing on a timer. The cost to honest clients: a pre-warmed spare
+older than the minimum age loses its slot when the node or its address is full, but its deposit only when
+its address holds 5 or more (clients behind one address together); raise the threshold if many honest
+clients share an address, and the minimum age if your clients sit on links slower than 2/50 Mbit/s (a cold
+connection there takes about 12 s to its first request). PROTOCOL-V3.md §8.4 has the rule. The limits are
 only as good as the node's idea of the client address, which depends on how the node is reached:
 
 | Deployment | What to set | Result |

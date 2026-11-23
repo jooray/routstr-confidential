@@ -658,7 +658,7 @@ class Session {
     if (m.type === 'closed') {
       this.closedReason = String(m.reason ?? '')
       this.closedUnused = m.unused === true
-      console.log(`[client ${this.label}] closed: reason=${shown(m.reason)}${m.unused === true ? ' unused=true (closed for a newer setup while unused; the deposit is the cost)' : ''}`)
+      console.log(`[client ${this.label}] closed: reason=${shown(m.reason)}${m.unused === true ? ' unused=true (closed for a newer setup while unused)' : ''}`)
     }
     this.onRequestOutcome(m)
     if (m.deposit === undefined || m.deposit === null) return
@@ -678,7 +678,8 @@ class Session {
     this.deposit = { msat: Number(d.msat), outcome: String(d.outcome), reason: String(d.reason), signed }
     console.log(
       `[client ${this.label}] deposit: outcome=${shown(d.outcome)} reason=${shown(d.reason)} msat=${shown(d.msat)} ` +
-        `balance_msats=${shown(d.balance_msats)} signed=${signed}`,
+        `balance_msats=${shown(d.balance_msats)} signed=${signed}` +
+        (d.evicted ? ` unused_at_address=${shown(d.evicted?.unused_at_address)} charge_from=${shown(d.evicted?.charge_from)}` : ''),
     )
     if (!NODE_MODE) return
     // The node's own word against its signed terms (§12.10): a deviation is
@@ -689,7 +690,7 @@ class Session {
       releasedByReceipt,
       signed,
       requestOpen: this.requestOpen,
-      requestReleased: this.openReq?.bodyReleased === true,
+      openAccepted: this.openReq?.accepted === true,
     })
     if (problems.length) {
       const dev = { sid: this.sid || null, frame: m.type, outcome: shown(d.outcome), reason: shown(d.reason), signed, problems: problems.map((p) => termSafe(p)) }

@@ -56,10 +56,11 @@ the arithmetic. `expect` is one of (H is the framing, "2" or "1.1"):
                                 reservation is charged, the deposit released (`request_received`)
   setup-refused:<status>:<regex>  the setup is refused before the sidecar is dialed: nothing reserved
   legacy                        a protocol-v2 socket gets `error` 426 `upgrade_required`
-  evicted                       an armed connection held unused is closed for a newer setup of the
+  evicted:charged|released      an armed connection held unused is closed for a newer setup of the
                                 same address (`closed` `evicted`, `unused: true`): the deposit is
-                                charged (`evicted`, row 13), signed; the newcomer's request settles
-                                (its output in <case>.new.out, its key in <case>.new.key)
+                                charged (`evicted`) or released (`evicted_released`), signed, with the
+                                address's count; the newcomer's request settles (its output in
+                                <case>.new.out, its key in <case>.new.key)
 In the attack cases a request finalized without a receipt must be stated in the
 connection's last frame, signed (`request_outcome`): the reservation, the abandon
 fee, or a release in full.
@@ -539,10 +540,13 @@ elif kind == "evicted":
         dev.append("the held connection never got a sid")
     if not re.search(r"closed: reason=evicted unused=true", out):
         dev.append("the held connection was not closed `evicted` with `unused: true`")
-    if deposit_of(sid) != [("charged", "evicted", DEP)]:
-        dev.append(f"the held connection's deposit was not charged for /evicted/ (node: {deposit_of(sid)})")
-    if not told or told.groups() != ("charged", "evicted", str(DEP), "true"):
-        dev.append("the held connection's client was not told, signed, that the deposit was charged")
+    want_dep = ("charged", "evicted") if rest == "charged" else ("released", "evicted_released")
+    if deposit_of(sid) != [(*want_dep, DEP)]:
+        dev.append(f"the held connection's deposit was not {want_dep} (node: {deposit_of(sid)})")
+    if not told or told.groups() != (*want_dep, str(DEP), "true"):
+        dev.append(f"the held connection's client was not told, signed, that the deposit was {want_dep[0]}")
+    if not re.search(r"unused_at_address=1 charge_from=" + ("1" if rest == "charged" else "5"), out):
+        dev.append("the deposit outcome does not carry the address's count and the threshold")
     if ((sid or "")[:12], 1) in reserved:
         dev.append("a request was reserved on the held connection")
     if len(new_reqs) != 1 or new_reqs[0].get("status") != 200 or new_reqs[0].get("receipt_sig_ok") is not True:
@@ -561,7 +565,8 @@ elif kind == "evicted":
     newdev = [l for l in new_out.splitlines() if l.startswith("DEPOSIT_DEVIATION ")]
     if newdev:
         dev.append(f"the newcomer's driver reports a deviation: {newdev[0][:200]}")
-    charges.append(DEP)
+    if rest == "charged":
+        charges.append(DEP)
 elif kind == "node-refused":
     http, n, status, reason = rest.split(":", 3)
     n = int(n)

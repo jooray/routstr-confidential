@@ -129,10 +129,12 @@
 #   no-funds                row 1: a setup with an unfunded key (402), sidecar not dialed
 #   low-balance             row 1: funds below D (402 `connection_deposit_unfunded`)
 #   sidecar-down            row 2: the sidecar is gone at the setup: D released (`not_started`)
-#   h2-n-evict-unused       row 13: an armed connection held unused while the address is at its
+#   h2-n-evict-spare        row 13: an armed connection held unused while the address is at its
 #                           unused limit (set to 1 for the case, the minimum age to 8 s): a second
-#                           client's setup closes it (`closed` `evicted`, `unused: true`), D charged
-#                           (`evicted`), signed; the second client's request settles
+#                           client's setup closes it (`closed` `evicted`, `unused: true`); one unused
+#                           connection is below CONFIDENTIAL_EVICT_CHARGE_FROM (5): D released
+#                           (`evicted_released`), signed; the second client's request settles
+#   h2-n-evict-hoard        the same with the threshold at 1: D charged (`evicted`), signed
 #   fb-h2                   row 3: the HTTP/2 open fails (test hook): D released
 #                           (`provider_unreachable`)
 #   sidecar-killed          row 4: the sidecar dies under an open connection: D released
@@ -595,10 +597,15 @@ run_case legacy-v2     "legacy"                              "$B" none -- --lega
 run_case legacy-no-v   "legacy"                              "$B" none -- --legacy-v2-socket --legacy-no-v
 # Slot pressure (§8.4): an unused connection past the minimum age yields its
 # slot to a newer setup and is charged its deposit (row 13, `evicted`).
-if selected h2-n-evict-unused; then
+if selected h2-n-evict-spare || selected h2-n-evict-hoard; then
   set_setting confidential_max_unused_per_ip 1
   set_setting confidential_evict_unused_after_s "$EVICT_AFTER"
-  run_case h2-n-evict-unused "evicted"                       "$B" evict -- --http 2 --arm
+  # A lone spare (1 unused connection at the address, below the default 5): released.
+  run_case h2-n-evict-spare "evicted:released"               "$B" evict -- --http 2 --arm
+  # The same with the threshold at 1: the address counts as hoarding, charged.
+  set_setting confidential_evict_charge_from 1
+  run_case h2-n-evict-hoard "evicted:charged"                "$B" evict -- --http 2 --arm
+  set_setting confidential_evict_charge_from 5
   set_setting confidential_max_unused_per_ip 12
   set_setting confidential_evict_unused_after_s 60
 fi

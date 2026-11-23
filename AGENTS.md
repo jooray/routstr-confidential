@@ -458,11 +458,15 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   never row 8); the clients refuse a receipt whose cost is above
   `request_ok.reserved_msats` and bound a usage charge by the node's exact
   formula. **Added 2026-11-23 (second round):** under slot pressure a setup
-  closes, after the idle used ones, the oldest *unused* connection past
-  `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s; 0 never) that is not still
-  setting up, and charges its deposit (`closed` `evicted`, `unused: true`,
-  row 13; the per-address unused limit yields the same way; only under
-  pressure, never on a timer; `PROTOCOL-V3.md` §8.4, risk 13); the SDK and
+  closes, after the idle used ones, one *unused* connection past
+  `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s; 0 never) with nothing under
+  way, of the address holding the most (another address for a full node),
+  and charges its deposit only when that address held
+  `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more, else releases it
+  (`closed` `evicted`, `unused: true`, deposit `evicted` /
+  `evicted_released` with the signed counts; rows 13 and 13a); setups claim
+  slots under a lock, so a refused setup closes nothing; only under
+  pressure, never on a timer (`PROTOCOL-V3.md` §8.4, risk 13); the SDK and
   browser pools then arm no spare for that node for 10 min. A request the
   node finalized without a receipt is stated on the last frame, signed
   (`request_outcome`, §12.10); the three clients check it. Clients: optional body padding (`confidential.padBucket`,

@@ -1354,11 +1354,12 @@ stream id, interval, attestation and receipt, and N accepts request $n$ only aft
    connections in all (sixteen); when the node or an address is full, a new setup first closes the
    longest-idle connection that already settled a request (it holds no deposit) and is refused only when
    there is none, so cheap, mostly idle connections cannot hold every slot. With no such connection it
-   closes the oldest unused one older than a minimum age (60 s by default) that is not still setting up,
-   and charges that connection's deposit; this happens only when a setup needs the slot. The limits are
-   per address, not per credential, so funded credentials can still hold slots, but each slot then costs
-   a deposit every time others want it, after about a minute, instead of once per 600 s. An honest
-   pre-warmed connection on a full node pays its deposit the same way. At most eight requests in a
+   closes an unused one older than a minimum age (60 s by default) with nothing under way, of the
+   address holding the most, and charges that connection's deposit only when its address holds five or
+   more; setups claim slots one at a time, and a refused one closes nothing. The limits are per address,
+   not per credential: an attacker spread over many addresses with few unused connections each pays
+   nothing for holding slots, but its connections are taken on demand and each re-open costs it a full
+   2PC. An honest pre-warmed connection on a full node can lose its slot, not its deposit. At most eight requests in a
    row may be refused on a connection. Control frames of the client, each proven by a $\pi_{WIN}$ with no
    request behind it, are limited per connection (16, and one more per 10 s), so the proofs a client can
    make N verify are bounded by its requests and that allowance. Connections that have not reserved yet are a separate, smaller

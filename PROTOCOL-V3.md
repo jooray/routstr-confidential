@@ -804,7 +804,8 @@ correlations + 6.4 k per block).
   `h2` not selected, framing `"2"` withdrawn, a sidecar or node failure, the provider closing an open idle
   connection (not after control frames of C on it, `after_client_frames`). Then it is released. A provider that closes **during the handshake** is charged: a client
   can cause that (a bad Finished). A connection a newer setup closed under slot pressure while it was
-  unused (§8.4) is charged. §12.10 has every row.
+  unused (§8.4) is charged when its address held many unused connections, else released. §12.10 has
+  every row.
 - The outcome is reported in `closed.deposit = {"msat", "outcome": "released"|"charged", "reason"}` and,
   when it is released by a settlement, in that request's receipt (`deposit_released_msat`).
 - An idle connection after its first settlement holds no reservation.
@@ -836,48 +837,50 @@ unused-connection limit (`CONFIDENTIAL_MAX_UNUSED_PER_IP`, 12) until its first `
 its address's total (`CONFIDENTIAL_MAX_ACTIVE_PER_IP`, 16) for its life. At most 8 requests in a row may be
 refused on one connection; the ninth refusal ends it (`error` 429).
 
-**Slot pressure.** A setup that finds the node full, its address's total full, or its address's unused
-limit full closes one connection there, in this order, and is refused (503 node, 429 address) only when
+**Slot pressure.** Setups claim slots one at a time. A setup that finds a limit full closes at most one
+connection, one that frees every full limit, and is refused (503 node, 429 address) closing nothing when
 there is none:
 
-1. The longest-idle **used** connection: one that settled a request and has none in flight, so it holds no
-   deposit. Closing it costs its client a new handshake later and no money. (Not for the unused limit: a
-   used connection does not count against it.)
-2. The oldest **unused** connection (no settled request: armed, open and idle, or with a first request that
-   is stalled, below) whose setup is at least `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (default 60 s) old, and
-   that is not still setting up:
-   - its handshake does not run (the ClientHello was relayed and `head_written` not reached, for at most
-     60 s after the ClientHello);
-   - its 2PC and proof channel moved no byte for 15 s, or it is older than the 2PC limit of 180 s;
-   - no `request` of it is queued or being reserved;
-   - a first request in flight has not reached `body_released` and was accepted more than the minimum age
-     plus its `body_len` at 32 kB/s ago (8 MiB: 322 s). A request the provider has in full is never
-     evicted.
+1. Its address's unused limit full: the oldest *evictable unused* connection of that address.
+2. Else its address's total full: the longest-idle **used** connection of that address (one that settled a
+   request and has none in flight, so it holds no deposit), else its oldest evictable unused one.
+3. Else the node full: the longest-idle used connection of any address, else an evictable unused
+   connection of **another** address: of the address that holds the most of them (ties: the oldest
+   connection), its oldest.
 
-   Its deposit is **charged** (§12.10 row 13, reason `evicted`); a stalled first request is released in
-   full. Its last frame is `closed` with reason `evicted` and `"unused": true`.
+An unused connection (no settled request: armed, or open and idle) is *evictable* when its setup is at least
+`CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (default 60 s) old and nothing of it is under way: no `request` queued,
+being reserved or in flight (from its acceptance to its settlement); not its handshake (the ClientHello
+relayed and `head_written` not reached, for at most 60 s after the ClientHello); its 2PC and proof channel
+quiet for 15 s, or the connection older than the 2PC limit of 180 s. Its last frame is `closed` with reason
+`evicted` and `"unused": true`. Its deposit is **charged** (§12.10 row 13, `evicted`) only when its address
+held at least `CONFIDENTIAL_EVICT_CHARGE_FROM` (default 5) evictable unused connections at that moment,
+and **released** (`evicted_released`) otherwise; the signed deposit outcome carries both numbers
+(`evicted: {unused_at_address, charge_from}`). Eviction happens only when a setup needs the slot, never on
+a timer. `CONFIDENTIAL_EVICT_UNUSED_AFTER_S = 0` never closes an unused connection.
 
-Eviction happens only when a setup needs the slot, never on a timer. `CONFIDENTIAL_EVICT_UNUSED_AFTER_S = 0`
-never closes an unused connection.
-
-Why this order and these bounds. Used idle connections go first because closing them is free for their
-clients; the unused ones are what holds slots for a price, and closing them makes that price recur. The
+Why these rules. Used idle connections go first because closing them is free for their clients. Charging
+must make *holding* slots expensive without letting a third party trigger a charge on someone else: so a
+setup never charges an address for less than the threshold, the address holding the most goes first, and
+a full node never closes the asking address's own unused connections (only the per-address limits do). The
+default threshold is above what honest clients hold: the SDK and routstrd keep at most
+`prewarm.maxTotal` (4) armed spares per process, one per pool key, the browser library one per key, and
+connections being opened are under way and not counted. Serial claiming means a setup that will be refused
+evicts nobody, so concurrent setups from one address cannot close several connections for nothing. The
 minimum age (60 s) is five times an honest cold setup and first request on a 2/50 Mbit/s link (about 12 s,
-`crypto/PROGRESS-CONFIDENTIAL.md`), and the protections keep a connection whose setup or first request is still moving out
-of reach. Each protection is bounded (60 s, 180 s, the body's upload time), so a client cannot keep an
-unused connection out of reach by moving bytes: at most until the 2PC limit by a slow 2PC, then 60 s by a
-ClientHello. A first request that the client never releases is evictable once its upload time is over;
-without that bound one cheap request per connection would buy the old price back.
+`crypto/PROGRESS-CONFIDENTIAL.md`). The handshake and 2PC protections are bounded (60 s, 180 s), so moving
+bytes cannot keep an unused connection out of reach for long; a request in flight protects its connection
+until its settlement (it holds a full reservation, and abandoning it costs the deposit, §12.10 row 9).
 
-**What it costs.** Holding a full node with unused connections now costs one deposit per slot each time a
-setup needs it, after at most the protected time (60 s for a connection that does nothing, up to about
-240 s for one that slow-walks its 2PC and handshake), instead of one per slot per 600 s. Setups of others
-still succeed: each takes the oldest held slot. **What an honest client risks:** a pre-warmed spare (armed,
-unused) older than the minimum age is closed and its deposit charged only when the node or its address is
-full; the signed outcome says so (`evicted`, `unused`), and the clients count it as a legitimate charge and
-stop pre-warming for that node for 10 minutes. A client whose cold setup and first request take longer than
-the minimum age plus the protections on a full node can lose the connection and its deposit; the operator
-raises `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` for such links.
+**What it costs.** An address holding `CONFIDENTIAL_EVICT_CHARGE_FROM` or more evictable unused
+connections pays a deposit for each one a setup takes from it, after the minimum age, instead of one per
+slot per 600 s. An attacker spread over many addresses with fewer than that each pays nothing for the slots
+it holds, but its connections are evicted on demand after the minimum age (other setups still succeed), and
+each re-open costs it a full 2PC (about 17.6 MB of traffic). **What an honest client risks:** a pre-warmed
+spare older than the minimum age loses its slot when the node or its address is full, never its deposit
+unless its address holds the threshold or more (several processes behind one address can); the clients
+then stop pre-warming for that node for 10 minutes. The operator raises `CONFIDENTIAL_EVICT_UNUSED_AFTER_S`
+for slow links and the threshold for addresses shared by many honest clients.
 
 **What the limits do not give.** The limits are per address, not per credential. A per-credential limit
 would not change the price (a balance splits into as many credentials as needed). The operator's levers
@@ -925,9 +928,10 @@ connection), bound to the credential only.
   the full-context reservation.
 - Framing `"2"`: the client MAY keep one armed connection per pool key while there is traffic and every
   open connection is busy, so that a burst does not wait for a 2PC.
-- A full node may close an armed connection older than its minimum age for a newer setup and charge its
-  deposit (§8.4; `closed` `evicted`, `"unused": true`). The client then arms no connection for that node
-  for 10 minutes (SDK and browser library: `NODE_FULL_MS`), so it does not re-arm into a full node.
+- A full node may close an armed connection older than its minimum age for a newer setup (§8.4; `closed`
+  `evicted`, `"unused": true`; its deposit released for a lone spare, charged for an address that holds
+  many). The client then arms no connection for that node for 10 minutes (SDK and browser library:
+  `NODE_FULL_MS`), so it does not re-arm into a full node.
 - The pre-warmed proof channel holds correlations for π_NK and the first π_WIN and π_C3S; on a kept
   connection it is **topped up while idle** (below), so later requests prove from preprocessed
   correlations instead of extending online.
@@ -1020,7 +1024,7 @@ the `request_ok.reserved_msats` of its request (§12.4).
 | 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
 | 11 | `upstream_models` may map a public id to another provider prefix for the same name (`someorg/claude-opus-4.5` for `claude-opus-4.5`): the rule of §12.1 binds the name, not the publisher | matters only on a provider where anyone can publish models under their own namespace; closing it needs a per-host list of trusted prefixes, or showing the pinned id to the user. the node offers of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro; 970 mappings) and Cloudflare's `@cf/meta/<id>` all have the form `<prefix>/<public id>` |
 | 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5). (The idle stall, ending an accepted, unwritten request cheaply by waiting for the provider's idle GOAWAY, is closed by the GOAWAY window, §5.4.1; the stall after the HEADERS by the same window, except at a provider whose body timeout is shorter than it.) | as risk 5 |
-| 13 | Session slots are priced, not protected: funded credentials can still hold slots with unused connections, but under slot pressure a newer setup closes the oldest one past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s) and charges its deposit (§8.4), so holding all 32 costs `32 × connection_deposit_msat` each time the slots are wanted, after at most the protected time (60 s to about 240 s), not per 600 s. An honest pre-warmed spare on a full node is charged its deposit the same way | the operator's deposit, minimum age and limits; no per-credential fairness |
+| 13 | Session slots are priced, not fully protected: under slot pressure a newer setup closes an unused connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s), of the address holding the most, and charges its deposit only when that address held `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more (§8.4). An attacker spread over many addresses with fewer each pays nothing for holding slots, but its connections are evicted on demand after the minimum age and each re-open costs it a full 2PC; an honest pre-warmed spare can lose its slot (not its deposit) on a full node | the operator's deposit, minimum age, threshold and limits; no per-credential fairness |
 | 14 | A charge with no settlement is now stated, signed (`request_outcome` on the last frame, §12.10), but only to a client that is still connected when the node finalizes it; a client that left first receives nothing, and the charge is the same. The node's statement is its word: what C checks is that the cost is at most `request_ok.reserved_msats` (at most the published fee for a request never written in full), not that the node's reason is true | C sees the charge in its balance either way; the signed outcome is evidence C keeps |
 | 15 | A provider's fatal alert after its Finished (a handshake it accepted and then rejects) reaches C under `s_ap_0`; N cannot read it, and C's stack ends the connection without failing the steps already under way, so `release_head` can still be sent and N writes the head to a connection the provider is closing | no secret is exposed (the head goes only to the authenticated provider, under `K_0`); the connection then ends as any provider close does (§12.10 rows 5, 8, 9) |
 
@@ -1590,7 +1594,7 @@ After a settled 2xx a framing-`"2"` connection is READY again. Otherwise the con
 | `idle` | no request in flight for the idle limit (the node's `idle_timeout_s`; the sidecar's `h2.idle_secs` behind it) |
 | `max_requests`, `max_lifetime`, `max_bytes` | framing `"2"`: at the settlement that reached `h2.max_requests`, `h2.max_lifetime_s`, or 1 GiB received |
 | `upstream_closed` | the provider closed an open connection with no request in flight; `"after_client_frames": true` when C had control frames written on a connection that carried no request (the close may be C's doing: not row 5 of 12.10) |
-| `evicted` | node only: a newer setup took the slot of this connection (§8.4): an idle, used one (no deposit held), or, with `"unused": true`, one with no settled request past the minimum age (its deposit is charged, §12.10 row 13) |
+| `evicted` | node only: a newer setup took the slot of this connection (§8.4): an idle, used one (no deposit held), or, with `"unused": true`, one with no settled request past the minimum age (its deposit charged, `evicted`, when its address held the threshold or more, else released, `evicted_released`; §12.10 row 13) |
 | `ended` | node only: neither side had a last word (the sidecar's socket ended or was closed by the node without a `closed` or `error`); sent with or without a deposit outcome |
 
 `N → C  {"type":"error","reason"[,"status"][,"code"][,"fault"]}` and the socket closes: every protocol
@@ -1654,7 +1658,7 @@ request the sidecar or N refused (`request_refused`) has none; neither has a req
 | π_C3S | `r` ≤ 16 KiB; the limits of `zkbench::statements` |
 | control message | 256 KiB |
 | client WebSocket message (S) | read up to 17 MiB; above `client_buffer_cap(max_body)`: `error` 413 `frame_too_large`, no `fault` |
-| sessions | 32 per process (S and N); per address: `CONFIDENTIAL_MAX_UNUSED_PER_IP` (12) unused, counted until the first `body_released`, and `CONFIDENTIAL_MAX_ACTIVE_PER_IP` (16) in all; a full node or address evicts its longest-idle used connection first (§8.4) |
+| sessions | 32 per process (S and N); per address: `CONFIDENTIAL_MAX_UNUSED_PER_IP` (12) unused, counted until the first `body_released`, and `CONFIDENTIAL_MAX_ACTIVE_PER_IP` (16) in all; a full node or address closes at most one connection first: its longest-idle used one, else an evictable unused one (§8.4) |
 | pending connections (N) | a socket whose setup is not reserved yet is pending and takes no session slot: 1024 per process, 4 per address; a full pool or address share evicts the oldest connection still waiting for its setup frame, else 429 (address) or 503 (pool) |
 | client address (N) | the peer, or, when the peer is listed in `CONFIDENTIAL_TRUSTED_PROXIES` (`self` adds the host's own addresses), the header `CONFIDENTIAL_CLIENT_IP_HEADER` (default `x-forwarded-for`, its rightmost entry over all lines; another header: its last line). IPv6 addresses count by their /64 |
 | wallet lock (N) | a setup or request waits at most 10 s for the wallet lock before a first-use Cashu token is redeemed; past it 503 with `detail.error = {"type":"wallet_busy","retry_after_s":1}` (a setup: `error`; a request: `request_refused`, §12.10 row 6) |
@@ -1714,7 +1718,8 @@ settled request, first matching row:
 | 10 | no request in flight for `idle_timeout_s` | **charged** | `idle` |
 | 11 | `head_written` not reached within 600 s | **charged** | `setup_timeout` |
 | 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake or after the client's control frames (`after_client_frames`), only refused requests | **charged** | `unused` |
-| 13 | a newer setup closed the connection under slot pressure while it had no settled request (§8.4; `closed` `evicted`, `"unused": true`). Checked after rows 1 to 8 and before rows 9 to 12 | **charged**; a first request in flight is released in full | `evicted` |
+| 13 | a newer setup closed the connection under slot pressure while it had no settled request (§8.4; `closed` `evicted`, `"unused": true`), its address holding at least `CONFIDENTIAL_EVICT_CHARGE_FROM` evictable unused connections. Checked after rows 1 to 8 and before rows 9 to 12 | **charged** | `evicted` |
+| 13a | the same, its address holding fewer | released | `evicted_released` |
 
 A refused request (4xx) by itself costs nothing; the connection stays, and the deposit follows how the
 connection ends. A 5xx refusal (the node could not reserve, `wallet_busy`) marks the connection for row 6;
@@ -1749,6 +1754,7 @@ it cannot walk) stays in rows 8 and 9.
 | `cost_msats` | what the credential paid for it: `msat` when charged, `0` when released |
 | `balance_msats` | the credential's balance afterwards (`null` if the key is gone) |
 | `time` | Unix seconds |
+| `evicted` | rows 13 and 13a only: `{"unused_at_address", "charge_from"}`, the evictable unused connections its address held and the threshold (§8.4). C reports a charge whose count is below the threshold, one without the object, and one after N had accepted a request of the connection |
 
 `deposit_json` is the canonical JSON of `deposit` (keys sorted, no whitespace), `deposit_sig` the node's
 BIP-340 signature over its SHA-256, as for a receipt. Before `ready` the client verifies it with the key of
@@ -1768,7 +1774,7 @@ outcome:
 | `v` | `1`, the format |
 | `sid`, `http`, `n` | the connection, its framing, the request |
 | `outcome` | `"charged"` when `cost_msats` > 0, else `"released"` |
-| `reason` | `request_received` (written in full, no settlement: the reservation), `settlement_failed` (the billing write failed: the reservation), `settled_without_receipt` (charged its usage, but the deposit could not be released, so N sent no receipt), `provider_refused` (the provider answered and closed first: the session fee if still due), `provider_unreachable`, `sidecar_failure` (released in full), `request_abandoned` (the abandon fee, or released in full when the deposit is charged for it), `evicted` (released in full, the deposit is charged, row 13), `unattested` (a usage without an attestation: released), `not_started` (the sidecar never accepted it: released) |
+| `reason` | `request_received` (written in full, no settlement: the reservation), `settlement_failed` (the billing write failed: the reservation), `settled_without_receipt` (charged its usage, but the deposit could not be released, so N sent no receipt), `provider_refused` (the provider answered and closed first: the session fee if still due), `provider_unreachable`, `sidecar_failure` (released in full), `request_abandoned` (the abandon fee, or released in full when the deposit is charged for it), `evicted` (released in full on a connection closed for a newer setup, row 13; N does not evict a connection with a request in flight, so this is a race), `unattested` (a usage without an attestation: released), `not_started` (the sidecar never accepted it: released) |
 | `cost_msats` | what the credential paid for the request; never above `reserved_msats` |
 | `reserved_msats` | what was reserved for it (`request_ok.reserved_msats`) |
 | `balance_msats` | the credential's balance afterwards (`null` if the key is gone) |
@@ -1832,7 +1838,7 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | `split-public-2`, changed in place on 2026-11-22/23: N sends a proof of knowledge of its key-share scalar with `P_N` (+64 bytes N→C, no round trip); builds from before and after do not interoperate under the same tag | §4, §4.1, §12.2 |
 | `split-public-2` (2026-11-22) replaces `split-public-1`: garbling hash `H_g` with N's `hparams`, the check-row hash keyed from the seed, N's input a mask ρ with labels before the seed and δ in the handshake, input-label commitments under C's `in_salt`, the 2PC message list, conformance vectors; the eight outcomes are those after preprocessing; assumption (4) | §4, §4.1, §10, §11, §12.1, §12.2 |
 | privacy: linkability and its off switches, body padding (off by default), residual risks 7-10 | §1, §9.1, §9.3, §10 |
-| slot pressure: a setup closes the oldest unused connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s) that is not still setting up, after the idle used ones, and charges its deposit (`closed` `evicted` `unused: true`, row 13); the unused limit per address yields the same way; clients accept the signed charge and stop pre-warming for that node for 10 minutes | §8.1, §8.4, §9.2, §10, §12.9, §12.10 |
+| slot pressure: setups claim slots one at a time, each closes at most one connection and a refused one none; after the idle used ones, an unused connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s) that is not setting up, of the address holding the most (another address for a full node); its deposit charged (`evicted`) only at `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more unused connections at its address, else released (`evicted_released`), the counts signed (`deposit.evicted`); clients check them and stop pre-warming for that node for 10 minutes | §8.1, §8.4, §9.2, §10, §12.9, §12.10 |
 | a request finalized without a receipt is stated, signed, on the last frame (`request_outcome`: `sid`, `http`, `n`, `outcome`, `reason`, `cost_msats`, `reserved_msats`, `balance_msats`, `time`); clients check it | §10, §12.9, §12.10 |
 | provider check H10: the provider's PING and SETTINGS within the control-record allowance | §5.6, §12.9 |
 | a cancelled request cannot lend its credential reference (the attack and why each form fails) | §5.3.1 |
