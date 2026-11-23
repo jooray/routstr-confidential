@@ -58,8 +58,8 @@ section says it in one place.
 
 ## Side channels
 
-Nothing here is claimed to be constant-time as compiled. No timing was measured and no binary was
-disassembled. What was read in the source (2026-11-23):
+Nothing here is claimed to be constant-time as compiled. No timing side channel was measured. One function
+was disassembled (below). What was read in the source (2026-11-23):
 
 - **Our code.** The sidecar's AES-GCM (`crypto/cu-crypto/src/aesgcm.rs`): the GHASH multiply uses masks, with
   no branch on the hash key or the state; the browser library vendors the same file (checked mechanically,
@@ -67,33 +67,65 @@ disassembled. What was read in the source (2026-11-23):
   masks instead of branches or lookups on label bits. N's key-share proof uses the `p256` crate's
   constant-time point multiplication and scalar arithmetic for the nonce and the scalar, as the key share
   and the ECDHE share do; the crate's claim was not measured here.
-- **The pinned mpz2 selects on secret bits in five places.** In each, both arms do the same amount of work
-  (a value is selected, then the same operations run), so the usual compiled form is a conditional move,
-  but that is not guaranteed.
+- **mpz2 is pinned to a fork with branch-free selects.** The pin is `github.com/jooray/mpz2`, branch
+  `routstr-ct-selects`, commit `eba78e02cb237cf1501ff0d8a492ef5fc849e135`: upstream `eaca5f9` plus four
+  commits that replace every select on a secret bit we found on the paths we use with mask arithmetic,
+  and every load or store at a secret index with a masked pass over the whole vector. The values computed
+  are the same, so no wire byte and no proof byte changes (the twopc byte counts per connection and the
+  proof sizes of `cu-prover --bench` are identical before and after; the conformance vectors are unchanged).
+  The masks are derived from the bit by arithmetic (`Block::mask`, `Block::mask_eq`, `Block::select` in
+  `core/src/block.rs`) and pass through `core::hint::black_box`, so that the optimizer does not turn them back
+  into a branch; that is a barrier against the compiler, not a guarantee. Branch-free in source now:
   - The QuickSilver prover's multiplication check (`zk-core/src/check.rs`, `check_prover`): once per AND
-    gate it selects on the value of each input wire (the low bit of the wire's MAC is the wire's value,
-    not masked). The prover is N in π_NK, where the wires depend on `K_0`, `IV_0` and the provider's API
-    key, and C in π_WIN and π_C3S, where they depend on `c_ap_1` or `s_ap_0`. The key's bits enter the
-    alphabet check of π_NK the same way on every connection.
-  - The KOS sender (`ot-core/src/kos/sender.rs`): 128 selects on the bits of its Δ in the extension and 128
-    in its consistency check. Every Δ is fresh per connection or per proof chain (N's Δ_A, C's Δ_B, C's Δ
-    of the share conversion, the verifier's Δ of a proof).
-  - The Chou–Orlandi receiver (`chou_orlandi/receiver.rs`): the same Δ bits, as base-OT choices.
-  - The OLE receiver (`ole-core/src/lib.rs`): N's random share in the share conversion, fresh and used once.
-  - The Ferret SPCOT receiver (`ferret/spcot/receiver.rs`): the positions of the LPN noise, including a
-    table read at a secret index. The receiver is the prover of a proof, and N for the MAC COTs.
+    gate it selected on the value of each input wire (the low bit of the wire's MAC is the wire's value,
+    not masked); now `mask(bit) & y`. The prover is N in π_NK, where the wires depend on `K_0`, `IV_0` and
+    the provider's API key, and C in π_WIN and π_C3S, where they depend on `c_ap_1` or `s_ap_0`.
+    **Disassembled**: the release `cu-prover` built here (aarch64-apple-darwin, rustc 1.97.1) has no
+    conditional branch in the loop body that computes the per-gate terms: the mask is `sbfx` of the wire's
+    low bit, then `and`. The build before the change had none either (LLVM had compiled the `if` to
+    `cmeq`/`bsl`), which is what the source did not guarantee. Other targets, other compiler versions and
+    the wasm build of the browser library were not disassembled.
+  - The KOS sender (`ot-core/src/kos/sender.rs`): the 128 selects on the bits of its Δ in the extension and
+    the 128 in its consistency check; the check also no longer stops at the first mismatching row (it
+    accumulates the differences and fails once). Every Δ is fresh per connection or per proof chain (N's
+    Δ_A, C's Δ_B, C's Δ of the share conversion, the verifier's Δ of a proof).
+  - The Chou–Orlandi receiver (`chou_orlandi/receiver.rs`): the same Δ bits, as base-OT choices, in the
+    blinded choice (`RistrettoPoint::conditional_select` of `subtle`) and in the decryption.
+  - The OLE receiver (`ole-core/src/lib.rs`): N's random share in the share conversion; the bit becomes a
+    field element through a new `Field::from_bit` (for P-256 crypto-bigint's constant-time select).
+  - The Ferret receiver with regular LPN, the one we use: the SPCOT receiver's select on the bits of each
+    noise position, the store of the punctured leaf and the read of `chis` at the noise position
+    (`ferret/spcot/receiver.rs`); the GGM tree's reconstruction of the punctured path, which cleared and
+    wrote nodes at the secret position and folded one parity chosen by a secret bit (`core/src/ggm.rs`,
+    `new_partial`); the store of the noise into the LPN error vector and the select on the receiver's
+    choice bits (`ferret/receiver.rs`); a `%` on the noise position, now a mask (`ferret/mpcot/receiver.rs`).
+    The receiver is the prover of a proof, and N for the MAC COTs.
 
-  Not secret-dependent: `bit_vartime` of the P-256 field (`fields/src/p256.rs`) is variable only in a public
-  bit index and is not on a path we use (inversion is crypto-bigint's constant-time one; the OLE receiver
-  takes its bits from the OT choices). The Ferret SPCOT sender selects on bits its peer sent.
+  Not changed, and why: the Ferret receiver with uniform LPN (its cuckoo hashing places secret positions
+  with data-dependent loops and indexed accesses) is not on a path we use; both `zkbench` and `twopc`
+  configure regular LPN. The noise positions are drawn with `random_range` (rand's rejection sampling: the
+  number of draws depends on discarded random words, not on the position kept). `bit_vartime` of the P-256
+  field (`fields/src/p256.rs`) is variable only in a public bit index and is not on a path we use. The
+  Ferret SPCOT sender and the COT derandomization select on bits their peer sent. The GF(2^128) multiply is
+  the `clmul` crate's software backend in this build (the `pmull` backend needs `--cfg clmul_armv8`), which
+  uses integer multiplications with masks; it was not changed or disassembled.
+
+  Measured cost (this machine, Apple M2 Max): one cold two-party key schedule, in-process, no link delay,
+  median of 7, twice each: 0.46 s before and after, preprocessing 390-393 ms (C) before, 389-392 ms after;
+  `cu-prover --bench` local, median of 5: π_NK 159.8 / 165.1 ms, π_WIN 163.3 / 164.1 ms, π_C3S
+  203.5 / 207.8 ms (before / after); mpz2's criterion benches: `prover/check` 22.5 / 21.2 ms for 200 000 AND
+  gates, `ggm::reconstruction::1K` 4.61 / 5.21 µs, a Ferret receiver extension with regular LPN 879 / 887 ms
+  (single-threaded) and 862 / 901 ms (multi-threaded).
 - **Who could measure what.** The other party of the protocol sees when a whole message arrives, through a
-  WebSocket and the node's relay. Any signal from the selects above is at most microseconds per proof, one
-  number per proof, far below that jitter; for the long-lived API key it is a constant offset with nothing
-  to compare it to. We know no use of it. An observer **on the same machine** as the party (a shared core
-  or cache) is a different matter: these selects and the table read are a plausible cache or branch-predictor
-  channel, and the API key is the one target that repeated observation helps with, because it is the only
-  long-lived secret that enters them. Such an observer is outside the threat model. Operators should not
-  run the sidecar on hardware shared with tenants they do not trust.
+  WebSocket and the node's relay. Any signal the selects above could have given was at most microseconds
+  per proof, one number per proof, far below that jitter; for the long-lived API key it was a constant
+  offset with nothing to compare it to. We know no use of it. An observer **on the same machine** as the
+  party (a shared core or cache) is a different matter: branches and secret-indexed accesses are a
+  plausible cache or branch-predictor channel, and the API key is the one target that repeated observation
+  helps with, because it is the only long-lived secret that enters them. The fork removes the ones listed
+  above from the source; it does not make the code constant-time as compiled on every target, and the
+  rest of mpz2 and of its dependencies was not reviewed for this. Such an observer stays outside the threat
+  model. Operators should not run the sidecar on hardware shared with tenants they do not trust.
 - The clients are JavaScript (TLS fork, SDK, browser library): no constant-time guarantee; traffic secrets
   are cleared when a connection closes, best effort (§10, risk 9).
 
@@ -113,6 +145,7 @@ disassembled. What was read in the source (2026-11-23):
 5. **π_WIN with the frame and interval rules** (`PROTOCOL-V3.md` §5, §7.1, §12.6–§12.8;
    `crypto/zkbench/src/statements.rs`, `crypto/relay/src/h2.rs`, `h2_session.rs`): that every byte U acts on
    is proven, and that disclosures cannot come from model output.
-6. **The pinned mpz2 revision** (`eaca5f9d9f30167c9525716e8f0aa9e33d886e5e`, `crypto/Cargo.lock`): KOS,
+6. **The pinned mpz2 revision** (`jooray/mpz2` at `eba78e02cb237cf1501ff0d8a492ef5fc849e135`: upstream
+   `eaca5f9d9f30167c9525716e8f0aa9e33d886e5e` plus the branch-free selects above; `crypto/Cargo.lock`): KOS,
    Ferret, the VOLE-based proofs, the OLE, against what the code above relies on.
 7. **Side channels** (above).

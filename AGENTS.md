@@ -511,6 +511,14 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   written shields its connection for 600 s). Clients: optional body padding (`confidential.padBucket`,
   `--pad-bucket`, off by default); routstrd `x-routstr-reuse-scope` narrows the
   reuse scope.
+- **mpz2 is pinned to the fork `github.com/jooray/mpz2`**, branch `routstr-ct-selects` (the rev is in
+  `crypto/twopc/Cargo.toml`, `crypto/zkbench/Cargo.toml` and the library's `crates/client-wasm/Cargo.toml`):
+  upstream `eaca5f9` plus branch-free selects on secret bits, with the same values and bytes
+  (`docs/SECURITY-CLAIMS.md`, "Side channels"). Keep exactly one mpz2 source in each `Cargo.lock`. To move
+  to a newer upstream, rebase the branch onto it, run mpz2's tests and both gates, and repoint all three
+  `Cargo.toml` files (the library re-vendors). A git `insteadOf` that rewrites the fork's https URL to ssh
+  makes cargo's built-in git fail to authenticate; `CARGO_NET_GIT_FETCH_WITH_CLI=true` works around it.
+  `crypto/zkbench/Cargo.lock` is unused (the workspace lock is `crypto/Cargo.lock`) and names an older pin.
 - **Ports.** `v3-check.sh` defaults to 7462 and the node gate to 7461/8431;
   pick others (`CU_V3_PORT`) when several agents work at once, and stop every
   process you start.

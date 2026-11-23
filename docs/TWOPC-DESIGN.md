@@ -430,7 +430,9 @@ Two small facts. N's OLE value b is 256 uniform bits reduced mod p, so each offs
 uniform (statistical distance about 2^-32; for C at most a factor 2 on a guess). mpz2 before revision
 `eaca5f9` computed N's additive share from the bits of the reduced b while the ROT used the unreduced bits;
 for about 2^-30 of connections N's share was wrong and the handshake failed, with no leak. The pin moved to
-`eaca5f9` on 2026-11-22, the upstream fix.
+`eaca5f9` on 2026-11-22, the upstream fix. Since 2026-11-23 the pin is the fork `jooray/mpz2` (branch
+`routstr-ct-selects`, commit `eba78e0`): `eaca5f9` plus branch-free selects on secret bits, the same values
+and the same bytes (`SECURITY-CLAIMS.md`, "Side channels").
 
 A second conversion with the roles swapped and an equality check in the circuit (TLSNotary's measure) is not
 used: a consistent substitution passes it, it would make N an OLE sender towards C and so give N the

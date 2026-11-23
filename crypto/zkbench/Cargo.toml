@@ -5,14 +5,14 @@ edition = "2024"
 
 [dependencies]
 cu-crypto = { path = "../cu-crypto" }
-mpz-circuits = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e", features = ["aes"] }
-mpz-common = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-core = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-memory-core = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-vm-core = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-ot = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e", features = ["ideal"] }
-mpz-zk = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-hash = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e", default-features = false, features = ["sha256"] }
+mpz-circuits = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135", features = ["aes"] }
+mpz-common = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-core = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-memory-core = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-vm-core = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-ot = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135", features = ["ideal"] }
+mpz-zk = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-hash = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135", default-features = false, features = ["sha256"] }
 futures = "0.3"
 tokio = { version = "1.38", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }

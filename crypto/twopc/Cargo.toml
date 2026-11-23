@@ -21,14 +21,14 @@ name = "procbench"
 path = "examples/procbench.rs"
 
 [dependencies]
-mpz-circuits = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e", features = ["sha2"] }
-mpz-common = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-core = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-ot = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-ot-core = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-ole = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-share-conversion = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
-mpz-fields = { git = "https://github.com/tlsnotary/mpz2", rev = "eaca5f9d9f30167c9525716e8f0aa9e33d886e5e" }
+mpz-circuits = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135", features = ["sha2"] }
+mpz-common = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-core = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-ot = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-ot-core = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-ole = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-share-conversion = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
+mpz-fields = { git = "https://github.com/jooray/mpz2", rev = "eba78e02cb237cf1501ff0d8a492ef5fc849e135" }
 
 p256 = { version = "0.13", default-features = false, features = ["arithmetic", "std"] }
 sha2 = { version = "0.10", features = ["compress"] }
