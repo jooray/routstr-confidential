@@ -57,6 +57,12 @@ fn numeric_object(v: &Value, depth: u32) -> bool {
         })
 }
 
+/// An unsigned integer every implementation reads the same: at most 2^53 - 1
+/// (a JavaScript client and the node's settlement hold larger ones inexactly).
+fn uint(v: &Value) -> bool {
+    v.as_u64().is_some_and(|n| n < (1 << 53))
+}
+
 fn empty_text(v: &Value) -> bool {
     v.is_null() || v.as_str() == Some("")
 }
@@ -65,7 +71,7 @@ fn check_choice(c: &Value) -> Result<()> {
     let Some(obj) = c.as_object() else { bail!("R: a usage event's choice is not an object") };
     for (k, v) in obj {
         let ok = match k.as_str() {
-            "index" => v.as_u64().is_some(),
+            "index" => uint(v),
             "finish_reason" => v.is_null() || v.as_str().is_some_and(|s| FINISH_REASONS.contains(&s)),
             "native_finish_reason" => v.is_null() || v.as_str().is_some_and(is_identifier),
             "logprobs" => v.is_null(),
@@ -93,7 +99,7 @@ pub fn check_usage_event(v: &Value) -> Result<()> {
         for (k, x) in obj {
             let ok = match k.as_str() {
                 "choices" | "usage" => true,
-                "created" => x.as_u64().is_some(),
+                "created" => uint(x),
                 "cost" => x.is_null() || x.is_number() || numeric_object(x, 1),
                 f if LABEL_FIELDS.contains(&f) => is_label(x),
                 _ => false,
@@ -112,9 +118,7 @@ pub fn check_usage_event(v: &Value) -> Result<()> {
     for c in choices {
         check_choice(c)?;
     }
-    if v.pointer("/usage/prompt_tokens").and_then(|t| t.as_u64()).is_none()
-        || v.pointer("/usage/completion_tokens").and_then(|t| t.as_u64()).is_none()
-    {
+    if !v.pointer("/usage/prompt_tokens").is_some_and(uint) || !v.pointer("/usage/completion_tokens").is_some_and(uint) {
         bail!("R: usage event missing token counts");
     }
     if !numeric_object(&v["usage"], 1) {
@@ -136,5 +140,22 @@ mod tests {
             let got = check_usage_event(&t["event"]).is_ok();
             assert_eq!(got, t["ok"].as_bool().unwrap(), "vector {}", t["name"]);
         }
+    }
+
+    /// Counts above 2^53 - 1 are refused, as the clients refuse them
+    /// (`Number.isSafeInteger`): one rule in every implementation.
+    #[test]
+    fn integers_above_the_safe_range_are_refused() {
+        let event = |prompt: u64, created: u64, index: u64| {
+            serde_json::json!({"choices":[{"index":index,"delta":{}}],"created":created,"usage":{"prompt_tokens":prompt,"completion_tokens":1}})
+        };
+        let max = (1u64 << 53) - 1;
+        assert!(check_usage_event(&event(max, max, max)).is_ok());
+        assert!(check_usage_event(&event(max + 1, 0, 0)).is_err());
+        assert!(check_usage_event(&event(1, max + 1, 0)).is_err());
+        assert!(check_usage_event(&event(1, 0, max + 1)).is_err());
+        let mut e = event(1, 0, 0);
+        e["usage"]["completion_tokens"] = serde_json::json!(u64::MAX);
+        assert!(check_usage_event(&e).is_err());
     }
 }

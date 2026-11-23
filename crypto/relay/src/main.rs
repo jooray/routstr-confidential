@@ -917,6 +917,12 @@ const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// earlier accept, so it ends a session that is never released first, and
 /// the second from its receipt of `body_released`.
 const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// Framing "1.1": a provider that answers a request from its head alone and
+/// closes (§12.10 row 8) does so while the client is still sending. A close
+/// that comes this long or longer after N's last write of the head or of a
+/// body record is not counted as the provider's answer: the client may have
+/// held the rest of the body back until the provider gave up on it.
+const EARLY_ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 /// Largest TLS 1.3 record on the wire: header + 2^14 plaintext + 256 expansion.
 const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
 /// Limits on a π_C3S disclosure (the verifier decrypts every covered record in
@@ -2199,9 +2205,15 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                             let response_bytes = st
                                 .recv_at_head
                                 .map_or(0, |at| log.recv_len.saturating_sub(at));
-                            let _ = to_client.send(Message::Text(
-                                serde_json::json!({"type":"upstream_closed_early","n":1,"response_bytes":response_bytes}).to_string().into(),
-                            ));
+                            let mut msg = serde_json::json!({"type":"upstream_closed_early","n":1,"response_bytes":response_bytes});
+                            if h2_session::stalled(st.last_write, std::time::Instant::now(), EARLY_ANSWER_WINDOW) {
+                                // The client sent nothing of the request for
+                                // the window before the provider closed: its
+                                // answer may be to the stall (a body timeout),
+                                // and the node settles an abandoned request.
+                                msg["client_caused"] = true.into();
+                            }
+                            let _ = to_client.send(Message::Text(msg.to_string().into()));
                             side(&mut st, format!("upstream closed early; {response_bytes} response bytes after the credential record"));
                             bail!("upstream closed the connection before the request was complete (nothing billed)");
                         }
@@ -2454,6 +2466,9 @@ struct Session {
     /// arrives after it (before the body is complete) is the provider's
     /// early answer, not its post-handshake tickets.
     recv_at_head: Option<usize>,
+    /// Framing "1.1": when N last wrote the head or a body record to the
+    /// upstream (`EARLY_ANSWER_WINDOW`).
+    last_write: Option<std::time::Instant>,
     /// The record completing the body, withheld from the upstream until π_WIN.
     held: Option<Vec<u8>>,
     /// SHA-256 of every byte written to the upstream (for the attestation).
@@ -3070,6 +3085,7 @@ async fn relay_body(
         } else {
             write_upstream(tcp_tx, &r.bytes(), st.deadline).await?;
             st.sent.update(&r.bytes());
+            st.last_write = Some(std::time::Instant::now());
         }
         log.client_body_record(r);
     }
@@ -3104,6 +3120,7 @@ async fn write_head(
     let (len, commit) = (a.record.len(), hex::encode(a.c_commit));
     st.state = SessionState::Body;
     st.recv_at_head = Some(log.recv_len);
+    st.last_write = Some(std::time::Instant::now());
     info!(record_len = len, "credential record + KeyUpdate written to upstream");
     side(st, format!("credential_written len={len} c_commit={commit}"));
     let _ = to_client.send(Message::Text(serde_json::json!({"type":"head_written"}).to_string().into()));

@@ -30,6 +30,17 @@ pub(crate) const H2_CONN_SOFT_BYTES: usize = 1 << 30;
 pub(crate) const H2_CONN_MAX_BYTES: usize = H2_CONN_SOFT_BYTES + 2 * MAX_SERVER_BYTES;
 /// Most control records queued unproven.
 const MAX_QUEUED_CTL: usize = 16;
+/// Control records a connection may carry in all (`ctl_allowance`): this many
+/// at once, and one more every `CTL_REFILL` since the connection head was
+/// written. Each costs N a π_WIN (and, when the client runs it on a socket of
+/// its own, a fresh proof setup) with no request and no reservation behind
+/// it, so their number is bounded apart from `h2.max_requests`. An honest
+/// client sends one SETTINGS ACK per SETTINGS of the provider, one PING ACK
+/// per PING and at most one RST_STREAM per request; a provider that pings
+/// more often than every `CTL_REFILL` for longer than the burst lasts is not
+/// served (keep-alive pings are tens of seconds apart).
+pub(crate) const CTL_BURST: u64 = 16;
+pub(crate) const CTL_REFILL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Most records an error head may span (a response head is about 1 kB).
 const MAX_HEAD_RECORDS: usize = 8;
 /// Server records kept from the start of a request's interval, beyond the
@@ -123,6 +134,16 @@ struct Req {
     /// refusal. Control records do not count as activity, since a client can
     /// have them written at will and a provider need not count them.
     late_write: bool,
+    /// The index of the first server record that arrived while the request
+    /// was written in part and N had written none of its records for the
+    /// GOAWAY window (`goaway_window`): the client held proven records back.
+    /// A GOAWAY in it or later does not refuse the request, and a provider
+    /// close from then on is not the provider's answer (`early_close`).
+    stall_from: Option<usize>,
+    /// A control record of the client was written after the request's first
+    /// record and before its last: a provider close that follows may be the
+    /// client's doing (an unsolicited SETTINGS ACK is a connection error).
+    ctl_written: bool,
     /// The first `PINNED_RECORDS` server application-data records of the
     /// interval (indices `s_k`, `s_k + 1`, ...), for `record_windows`.
     pinned: Vec<Record>,
@@ -172,6 +193,8 @@ pub(crate) struct H2 {
     /// When N last wrote the connection head or a record of a request (not a
     /// control record): what a provider's idle timer certainly counts.
     last_req_write: Option<std::time::Instant>,
+    /// Control records accepted on this connection (`ctl_allowance`).
+    ctl_records: u64,
 }
 
 impl H2 {
@@ -201,6 +224,7 @@ impl H2 {
             app_records: 0,
             last_write: None,
             last_req_write: None,
+            ctl_records: 0,
         }
     }
 
@@ -269,6 +293,12 @@ impl H2 {
                 q.late_from = Some(index);
             }
         }
+        let last_req_write = self.last_req_write;
+        if let Some(q) = self.req.as_mut().filter(|q| q.written > 0 && !q.released && q.stall_from.is_none()) {
+            if stalled(last_req_write, now, window) {
+                q.stall_from = Some(index);
+            }
+        }
         if let Some(q) = self.req.as_mut().filter(|q| q.interval_open) {
             q.recv.update(&r.header);
             q.recv.update(&r.payload);
@@ -291,6 +321,27 @@ impl H2 {
         let idle = tokio::time::Instant::now() + std::time::Duration::from_secs(self.cfg.idle_secs);
         self.conn_end.map_or(idle, |end| end.min(idle))
     }
+}
+
+/// Control records a connection may have carried in all, `age` after its
+/// head was written: `CTL_BURST`, and one more per `CTL_REFILL`.
+pub(crate) fn ctl_allowance(age: std::time::Duration) -> u64 {
+    CTL_BURST + age.as_secs() / CTL_REFILL.as_secs()
+}
+
+/// N wrote no record of the request for `window` or longer (`last` is its
+/// last write of one): a client that holds proven records back, not a
+/// provider that answers a request it is being sent.
+pub(crate) fn stalled(last: Option<std::time::Instant>, now: std::time::Instant, window: std::time::Duration) -> bool {
+    last.is_some_and(|w| now.saturating_duration_since(w) >= window)
+}
+
+/// Whether the provider's close before a request was written in full is its
+/// own answer (§12.10 row 8) or may be the client's doing: a control record
+/// of the client went out inside the request, or the client held proven
+/// records back for the GOAWAY window or longer before the close.
+fn early_close_is_clients(q: &Req, last_req_write: Option<std::time::Instant>, now: std::time::Instant, window: std::time::Duration) -> bool {
+    q.ctl_written || q.stall_from.is_some() || (q.written > 0 && stalled(last_req_write, now, window))
 }
 
 /// Most records one request may arrive in: its HEADERS, and DATA frames that
@@ -476,6 +527,8 @@ pub(crate) fn on_request(
         ok_at: std::time::Instant::now(),
         late_from: None,
         late_write: false,
+        stall_from: None,
+        ctl_written: false,
         pinned: Vec::new(),
     });
     // The per-request limit: up to the release, then
@@ -569,6 +622,11 @@ pub(crate) fn client_bytes(st: &mut Session, data: &[u8]) -> Result<()> {
             if h.queue.iter().filter(|x| matches!(x.kind, RecKind::Ctl(_))).count() >= MAX_QUEUED_CTL {
                 bail!("too many unproven control records");
             }
+            let allowed = ctl_allowance(h.head_at.map_or(std::time::Duration::ZERO, |t| t.elapsed()));
+            if h.ctl_records >= allowed {
+                bail!("more control records than a connection may carry ({allowed} so far: {CTL_BURST}, and one more every {} s)", CTL_REFILL.as_secs());
+            }
+            h.ctl_records += 1;
             (RecKind::Ctl(c), 0)
         } else {
             let q = h
@@ -667,6 +725,8 @@ async fn flush(
         h.last_write = Some(std::time::Instant::now());
         if rec.req_idx > 0 {
             h.last_req_write = h.last_write;
+        } else if let Some(q) = h.req.as_mut().filter(|q| q.written > 0 && !q.released) {
+            q.ctl_written = true;
         }
         write_upstream(tcp_tx, &rec.bytes, deadline).await?;
         st.sent.update(&rec.bytes);
@@ -1062,6 +1122,9 @@ pub(crate) fn on_disclose_reset(
         if !before_write && q.late_write {
             bail!("a GOAWAY after a request whose first record was written no sooner than the provider's idle time after the last request activity does not refuse it");
         }
+        if !before_write && q.stall_from.is_some_and(|stall| goaway_record >= stall) {
+            bail!("a GOAWAY that arrived after the client held proven records of the request back for {:?} or longer does not refuse it", window);
+        }
     }
     if q.s_k.is_none() {
         // Nothing of the request reached the provider: its interval is empty,
@@ -1295,13 +1358,18 @@ fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
 pub(crate) fn tcp_closed(st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) -> Result<()> {
     let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     h.tcp_closed = true;
+    let (last_req_write, window) = (h.last_req_write, goaway_window(h.cfg.idle_secs));
     match &h.req {
         None => h.closing = Some("upstream_closed"),
         Some(q) if !q.released => {
             let (n, response_bytes, refused, disclosed) = (q.n, q.recv_bytes, q.refused, q.usage.is_some());
-            let _ = to_client.send(Message::Text(
-                serde_json::json!({"type":"upstream_closed_early","n":n,"response_bytes":response_bytes}).to_string().into(),
-            ));
+            let mut msg = serde_json::json!({"type":"upstream_closed_early","n":n,"response_bytes":response_bytes});
+            if early_close_is_clients(q, last_req_write, std::time::Instant::now(), window) {
+                // Not the provider's answer to a request it was being sent
+                // (§12.10 row 8): the node settles it as an abandoned one.
+                msg["client_caused"] = true.into();
+            }
+            let _ = to_client.send(Message::Text(msg.to_string().into()));
             if !refused && !disclosed {
                 h.closed_early = true;
                 st.deadline = Some(tokio::time::Instant::now() + REFUSAL_GRACE);
@@ -1370,6 +1438,8 @@ mod tests {
             ok_at: std::time::Instant::now(),
             late_from: None,
             late_write: false,
+            stall_from: None,
+            ctl_written: false,
             pinned: Vec::new(),
         });
         st.h2 = Some(Box::new(h));
@@ -2792,6 +2862,109 @@ mod tests {
         early.h2.as_mut().unwrap().req = None;
         early.state = SessionState::AwaitHead;
         assert!(on_request(&app, &tx, &mut early, 2, None, "m".into(), 20, 400, None, None).is_err());
+    }
+
+    /// Control records are bounded for the whole connection, not only while
+    /// queued: a burst, and one more per `CTL_REFILL` of the connection's age.
+    #[test]
+    fn control_records_are_bounded_per_connection() {
+        assert_eq!(ctl_allowance(std::time::Duration::ZERO), CTL_BURST);
+        assert_eq!(ctl_allowance(std::time::Duration::from_secs(3600)), CTL_BURST + 360);
+        let mut st = session_with_request(5000, "sfx");
+        let h = st.h2.as_mut().unwrap();
+        h.req = None;
+        h.head_at = Some(std::time::Instant::now());
+        let mut send = |st: &mut Session| -> Result<()> {
+            on_ctl(st, "ping_ack")?;
+            client_bytes(st, &record(18))?;
+            // Proven and written: the record leaves the queue.
+            let h = st.h2.as_mut().unwrap();
+            h.queue.clear();
+            h.held = 0;
+            Ok(())
+        };
+        for _ in 0..CTL_BURST {
+            send(&mut st).unwrap();
+        }
+        let err = send(&mut st).unwrap_err();
+        assert!(err.to_string().contains("more control records than a connection may carry"), "{err}");
+        // 25 s after the head: two more, not three.
+        let mut st = session_with_request(5000, "sfx");
+        let h = st.h2.as_mut().unwrap();
+        h.req = None;
+        h.head_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(25));
+        for _ in 0..CTL_BURST + 2 {
+            send(&mut st).unwrap();
+        }
+        assert!(send(&mut st).is_err());
+    }
+
+    /// A client that has its HEADERS written and then holds the proven body
+    /// back (or has a control record written inside the request) does not get
+    /// the provider's close counted as the provider's answer, and a GOAWAY
+    /// that arrives after the stall does not refuse the request. A close
+    /// while the request is being written still counts.
+    #[tokio::test]
+    async fn a_close_after_the_client_held_the_body_back_is_not_the_providers_answer() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let window = goaway_window(st_idle_secs(&open_session(300)));
+        let past = |d: std::time::Duration| std::time::Instant::now().checked_sub(d).unwrap();
+        for (what, stall, ctl) in [("prompt close", false, false), ("stall", true, false), ("control record", false, true)] {
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            for c in [&[1u8; 40][..], &[2; 900]] {
+                feed(&mut st, &mut log, c);
+            }
+            // HEADERS, (a SETTINGS ACK between the request's records,) DATA.
+            let block = h2::request_block("h", "/api/v1/chat/completions").len();
+            client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+            if ctl {
+                on_ctl(&mut st, "settings_ack").unwrap();
+                client_bytes(&mut st, &record(10)).unwrap();
+            }
+            client_bytes(&mut st, &record(10 + 300)).unwrap();
+            on_release(&mut st, 1, 1).unwrap();
+            pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+            prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+            let q = st.h2.as_ref().unwrap().req.as_ref().unwrap();
+            assert_eq!((q.written, q.released, q.s_k), (1, false, Some(2)), "{what}: only the HEADERS is written");
+            assert_eq!(q.ctl_written, ctl, "{what}");
+            if stall {
+                st.h2.as_mut().unwrap().last_req_write = Some(past(window + std::time::Duration::from_secs(1)));
+            }
+            // The provider's GOAWAY (NO_ERROR, below the stream) and its close.
+            let g = goaway_frame(1, 0);
+            feed(&mut st, &mut log, &g); // record 2
+            texts(&mut rx);
+            if stall {
+                let err = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap_err();
+                assert!(err.to_string().contains("held proven records"), "{what}: {err}");
+                assert!(texts(&mut rx).is_empty(), "{what}: nothing attested");
+            }
+            tcp_closed(&mut st, &tx).unwrap();
+            let m = &texts(&mut rx)[0];
+            assert_eq!(m["type"], "upstream_closed_early", "{what}");
+            assert!(m["response_bytes"].as_u64().unwrap() > 0, "{what}");
+            assert_eq!(m.get("client_caused").and_then(|v| v.as_bool()), (stall || ctl).then_some(true), "{what}");
+            if !stall && !ctl {
+                // The provider's own refusal is still disclosed after its close.
+                on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap();
+            }
+        }
+        // The stall is also seen when nothing arrives before the close.
+        let mut st = open_session(300);
+        let h = st.h2.as_mut().unwrap();
+        h.req.as_mut().unwrap().written = 1;
+        h.req.as_mut().unwrap().recv_bytes = 30;
+        h.last_req_write = Some(past(window + std::time::Duration::from_secs(1)));
+        tcp_closed(&mut st, &tx).unwrap();
+        assert_eq!(texts(&mut rx)[0]["client_caused"], true);
+        assert!(stalled(Some(past(std::time::Duration::from_secs(31))), std::time::Instant::now(), EARLY_ANSWER_WINDOW));
+        assert!(!stalled(Some(past(std::time::Duration::from_secs(5))), std::time::Instant::now(), EARLY_ANSWER_WINDOW));
+        assert!(!stalled(None, std::time::Instant::now(), EARLY_ANSWER_WINDOW));
     }
 
     #[test]
