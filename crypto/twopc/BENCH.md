@@ -185,6 +185,21 @@ v2's, so the thresholds still sit where they should. Re-measured for this circui
 Nothing beats the v2 setting by more than the noise (about 0.1 s), and opening either gate early costs up
 to 2 s: a small OT message then waits behind megabytes of tables in the transport's buffers. Left as it is.
 
+The gates have no time limit, and N starts garbling only once C's salt and the first bytes of its OT traffic
+arrived (an honest C sends both at once after the version tag). A client that sends nothing after the tag
+gets no garbling and no table byte; before this change N garbled at once and sent all 11.8 MB of tables
+20 s and 40 s after the tag. For an honest client the bytes per channel and the message order are the same
+(`tests::honest_wire_recorded`), and the cold session times did not change (medians of 5, same machine, one
+build after the other):
+
+| link | before | after |
+|---|---|---|
+| loopback, unlimited | 0.45 s | 0.45 s |
+| 40 ms, 2 up / 50 down | 7.04 s | 7.04 s |
+| 40 ms, 7 up / 50 down | 4.71 s | 4.59 s |
+| 25 ms, 100 symmetric | 2.71 s | 2.63 s |
+| 40 ms, 2 up / 10 down | 15.78 s | 15.72 s |
+
 What is left on the 2/10 link: 16.4 MB at 10 Mbit/s is 13.1 s; the rest is 1.1 s before the first table byte
 (the OT bootstrap), 0.7 s of turn-arounds (between the table parts, and d bits → seed → rows) and 0.8 s of
 key share, ECtF and stages. The rows cannot be sent earlier: they depend on C's seed, which C sends only

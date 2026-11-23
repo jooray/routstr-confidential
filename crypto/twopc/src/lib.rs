@@ -470,11 +470,13 @@ pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-3\n";
 /// past the first part (484 184 bytes with mpz2 rev 8f89783, for this
 /// circuit's 960 988 COTs as for v2's 1.31 million; measured with
 /// `TWOPC_TRACE=1`), i.e. past the small N→C Ferret message between the two
-/// parts. Either gate also opens when N's MAC COTs are complete, or after
-/// `TABLES_MAX_WAIT`. Re-measured for this circuit (`BENCH.md`, "Table
-/// scheduling"): other thresholds were equal within noise or slower.
+/// parts. Either gate also opens when N's MAC COTs are complete. There is no
+/// time limit: a gate opens only on C's progress, so a client that uploads
+/// nothing gets no tables (the preprocessing then ends by the caller's
+/// timeout, or by an error when C closes). Re-measured for this circuit
+/// (`BENCH.md`, "Table scheduling"): other thresholds were equal within noise
+/// or slower.
 const TABLES_GATE: [u64; 2] = [64 * 1024, 500_000];
-const TABLES_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 const TAG_KS: &[u8] = b"routstr-twopc-v2 key-share commit";
 const TAG_OPEN: &[u8] = b"routstr-twopc-ag open";
@@ -617,6 +619,9 @@ pub struct Party {
     timings: Vec<StepTiming>,
     #[cfg(test)]
     pub(crate) cheat: Cheat,
+    /// Test: set when N's garbling job starts.
+    #[cfg(test)]
+    pub(crate) garbled: Arc<std::sync::atomic::AtomicBool>,
     /// Test: this party's ECtF output (little-endian).
     #[cfg(test)]
     pub(crate) ectf_share: Option<[u8; 32]>,
@@ -1028,6 +1033,8 @@ impl Party {
             #[cfg(test)]
             cheat: Cheat::None,
             #[cfg(test)]
+            garbled: Default::default(),
+            #[cfg(test)]
             ectf_share: None,
         })
     }
@@ -1158,7 +1165,13 @@ impl Party {
         #[allow(unused_mut)]
         let mut rho = random_fp_le(&mut self.rng);
 
-        let garble = tokio::task::spawn_blocking(move || {
+        // The garbling job. It starts only once C sent what an honest C sends
+        // first (`send_fut`): a client that stays silent costs no garbling.
+        #[cfg(test)]
+        let garbled = self.garbled.clone();
+        let garble_job = move || {
+            #[cfg(test)]
+            garbled.store(true, std::sync::atomic::Ordering::Relaxed);
             let hg = gc::HashG::new(&hparams);
             let in_keys = SecretBlocks((0..lay.n_in).map(|_| Block::random(&mut grng)).collect());
             #[cfg(test)]
@@ -1168,7 +1181,7 @@ impl Party {
             }
             let (k, tables) = gc::garble(&sp.circ, &hg, delta, &in_keys, &mut grng);
             (SecretBlocks(k), tables)
-        });
+        };
 
         #[allow(unused_mut)]
         let mut kos_delta_cheat = false;
@@ -1207,24 +1220,39 @@ impl Party {
         // first part of the tables waits until C is uploading (N's OT setup
         // messages have arrived) and the second until C is past the first
         // part (`TABLES_GATE`). The download then overlaps C's upload.
+        //
+        // Nothing of this starts before C sent what an honest C sends first:
+        // its salt (the first message on C→N, read here, used for the
+        // input-label commitments below) and the first bytes of its OT
+        // traffic, which it sends at once without waiting for N. Garbling
+        // starts only then, and the tables follow only C's progress (no time
+        // limit), so a client that sends nothing after the version tag gets
+        // no garbling and no table byte. An honest C's bytes and their order
+        // on the wire are the same as with an immediate start.
         let mac_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let gate = |threshold: u64| {
             let counters = counters.clone();
             let mac_done = mac_done.clone();
             async move {
-                let t0 = Instant::now();
-                while counters.ch_recv(CH_COTB) < threshold
-                    && !mac_done.load(std::sync::atomic::Ordering::Relaxed)
-                    && t0.elapsed() < TABLES_MAX_WAIT
-                {
+                while counters.ch_recv(CH_COTB) < threshold && !mac_done.load(std::sync::atomic::Ordering::Relaxed) {
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
             }
         };
         let mut gates = vec![gate(TABLES_GATE[0]), gate(TABLES_GATE[1])].into_iter();
+        let ot_started = {
+            let counters = counters.clone();
+            async move {
+                while counters.ch_recv(CH_COTA) + counters.ch_recv(CH_COTB) + counters.ch_recv(CH_SC) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+        };
         let send_fut = async {
+            let in_salt: [u8; 16] = c2n.recv_exact(16).await?.try_into().expect("16 bytes");
+            ot_started.await;
             #[allow(unused_mut)]
-            let (k, mut tables) = garble.await.map_err(perr("garbling task"))?;
+            let (k, mut tables) = tokio::task::spawn_blocking(garble_job).await.map_err(perr("garbling task"))?;
             #[cfg(test)]
             if let Cheat::CorruptGate(s) | Cheat::CorruptControlBits(s) = cheat {
                 let r = lay.shapes[s].ands.clone();
@@ -1254,7 +1282,7 @@ impl Party {
                 }
                 tab.send(&gc::tables_to_bytes(part)).await?;
             }
-            Ok::<_, Error>(k)
+            Ok::<_, Error>((k, in_salt))
         };
         let cot_a_fut = async {
             let keys = rcot_send!(&mut kos_a, ctx_a, N_COTA);
@@ -1266,11 +1294,9 @@ impl Party {
             Ok::<_, Error>((Zeroizing::new(r), SecretBlocks(m)))
         };
         let sc_fut = sc.preprocess(ctx_sc);
-        let (k, cota, macs, scr) = futures::join!(send_fut, cot_a_fut, cot_b_fut, sc_fut);
-        let k = k?;
-        let cota = cota?;
-        let (r_bits, r_macs) = macs?;
-        scr?;
+        // The first failure ends all four (a client whose OT traffic fails
+        // gets no further table byte).
+        let ((k, in_salt), cota, (r_bits, r_macs), ()) = futures::try_join!(send_fut, cot_a_fut, cot_b_fut, sc_fut)?;
         if cota.len() != N_COTA || r_bits.len() != lay.n_mac {
             return Err(Error::Protocol("cot count".into()));
         }
@@ -1310,7 +1336,7 @@ impl Party {
 
         // Before the seed: the labels of ρ on N's input wires, then the
         // commitments to both labels of every other input wire (under C's
-        // salt, the first message C sent).
+        // salt, the first message C sent, read before garbling started).
         #[allow(unused_mut)]
         let mut late = false;
         #[cfg(test)]
@@ -1340,7 +1366,6 @@ impl Party {
             n2c.send(&gl).await?;
             gl.zeroize();
         }
-        let in_salt: [u8; 16] = c2n.recv_exact(16).await?.try_into().expect("16 bytes");
         #[allow(unused_mut)]
         let mut coms = Vec::with_capacity(32 * lay.open_in.len());
         #[allow(unused_variables)]

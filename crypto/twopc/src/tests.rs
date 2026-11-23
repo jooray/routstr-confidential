@@ -1708,3 +1708,221 @@ async fn ectf_c_forces_degenerate_share() {
     }
     assert!((4..=28).contains(&aborts), "{aborts} aborts in {runs} runs");
 }
+
+/// What N sent to a client that stopped after `sent` (the version tag, maybe
+/// more), within `wait`: the parsed frames, whether N garbled, and N's
+/// preprocessing result once the client then closed.
+async fn n_against(sent: Vec<u8>, wait: Duration) -> (Vec<(u8, Vec<u8>, Instant)>, bool, Result<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    let (a, b) = tokio::io::duplex(1 << 20);
+    let (mut rd, mut wr) = tokio::io::split(b);
+    wr.write_all(&sent).await.unwrap();
+    let got = tokio::spawn(async move {
+        let mut chunks = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(k) => chunks.push((Instant::now(), buf[..k].to_vec())),
+            }
+        }
+        chunks
+    });
+    let mut n = Party::new(Role::N, a.compat()).await.unwrap();
+    let garbled = n.garbled.clone();
+    let pre = tokio::spawn(async move { n.preprocess().await });
+    tokio::time::sleep(wait).await;
+    let did_garble = garbled.load(std::sync::atomic::Ordering::Relaxed);
+    // The client goes away: N's preprocessing ends (no hang).
+    wr.shutdown().await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(10), pre).await.expect("N's preprocessing ends once C closes").unwrap();
+    let (tag, frames) = parse_frames(&got.await.unwrap());
+    assert_eq!(tag, VERSION_TAG);
+    (frames, did_garble, r)
+}
+
+/// A client that sends nothing after the version tag, or only its salt,
+/// costs N no garbling and gets no table byte (and nothing at all on the
+/// tables channel), however long it waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn silent_client_gets_no_garbling_and_no_tables() {
+    let mut salt_only = VERSION_TAG.to_vec();
+    salt_only.extend_from_slice(&[CH_C2N as u8, 0, 0, 0, 20, 0, 0, 0, 16]);
+    salt_only.extend_from_slice(&[7u8; 16]);
+    for (what, sent) in [("tag only", VERSION_TAG.to_vec()), ("tag and salt", salt_only)] {
+        let (frames, garbled, r) = n_against(sent, Duration::from_secs(3)).await;
+        assert!(!garbled, "{what}: N garbled for a silent client");
+        let tab: usize = frames.iter().filter(|f| f.0 as usize == CH_TAB).map(|f| f.1.len()).sum();
+        assert_eq!(tab, 0, "{what}: N sent {tab} bytes on the tables channel");
+        // What N did send: its own OT setup messages only (a few KB).
+        let all: usize = frames.iter().map(|f| f.1.len()).sum();
+        assert!(all < 64 * 1024, "{what}: N sent {all} bytes");
+        assert!(r.is_err(), "{what}: preprocessing must fail");
+    }
+}
+
+/// A client that sends its salt and starts its OT traffic but uploads less
+/// than the first table gate gets no table byte (garbling may start).
+#[tokio::test(flavor = "multi_thread")]
+async fn client_below_the_first_gate_gets_no_tables() {
+    let mut sent = VERSION_TAG.to_vec();
+    sent.extend_from_slice(&[CH_C2N as u8, 0, 0, 0, 20, 0, 0, 0, 16]);
+    sent.extend_from_slice(&[7u8; 16]);
+    // A few hundred bytes on the MAC-COT channel (not valid OT messages).
+    sent.extend_from_slice(&[CH_COTB as u8, 0, 0, 1, 0]);
+    sent.extend_from_slice(&[0u8; 256]);
+    let (frames, _, r) = n_against(sent, Duration::from_secs(3)).await;
+    let tab: usize = frames.iter().filter(|f| f.0 as usize == CH_TAB).map(|f| f.1.len()).sum();
+    assert_eq!(tab, 0, "N sent {tab} bytes on the tables channel");
+    assert!(r.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The honest wire, recorded: what crosses the transport in each direction,
+// parsed back into multiplexer frames.
+// ---------------------------------------------------------------------------
+
+/// A transport between C and N that records every byte each way (with the
+/// time it passed) and forwards it unchanged.
+pub(crate) fn tapped_pair() -> (
+    crate::testutil::Endpoint,
+    crate::testutil::Endpoint,
+    std::sync::Arc<std::sync::Mutex<[Vec<(Instant, Vec<u8>)>; 2]>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    let log = std::sync::Arc::new(std::sync::Mutex::new([Vec::new(), Vec::new()]));
+    let (c, c_proxy) = tokio::io::duplex(4 << 20);
+    let (n, n_proxy) = tokio::io::duplex(4 << 20);
+    let (c_rx, c_tx) = tokio::io::split(c_proxy);
+    let (n_rx, n_tx) = tokio::io::split(n_proxy);
+    for (dir, mut rx, mut tx) in [(0usize, c_rx, n_tx), (1usize, n_rx, c_tx)] {
+        let log = log.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let k = match rx.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => k,
+                };
+                log.lock().unwrap()[dir].push((Instant::now(), buf[..k].to_vec()));
+                if tx.write_all(&buf[..k]).await.is_err() {
+                    break;
+                }
+            }
+            let _ = tx.shutdown().await;
+        });
+    }
+    (c.compat(), n.compat(), log)
+}
+
+/// One direction of a recorded run: the tag, then `(channel, payload, time
+/// the frame's last byte passed)` per multiplexer frame.
+pub(crate) fn parse_frames(chunks: &[(Instant, Vec<u8>)]) -> (Vec<u8>, Vec<(u8, Vec<u8>, Instant)>) {
+    let mut bytes = Vec::new();
+    let mut at = Vec::new();
+    for (t, c) in chunks {
+        bytes.extend_from_slice(c);
+        at.push((bytes.len(), *t));
+    }
+    let time_of = |end: usize| at.iter().find(|(e, _)| *e >= end).map(|x| x.1).unwrap();
+    let tag = bytes[..VERSION_TAG.len()].to_vec();
+    let mut i = VERSION_TAG.len();
+    let mut frames = Vec::new();
+    while i + 5 <= bytes.len() {
+        let ch = bytes[i];
+        let len = u32::from_be_bytes(bytes[i + 1..i + 5].try_into().unwrap()) as usize;
+        let p = bytes[i + 5..i + 5 + len].to_vec();
+        i += 5 + len;
+        frames.push((ch, p, time_of(i)));
+    }
+    assert_eq!(i, bytes.len(), "the transport carries whole frames");
+    (tag, frames)
+}
+
+/// The shape of one direction: per channel the payload bytes, and on the
+/// framed channels (n2c, c2n, tab) the sequence of message lengths.
+pub(crate) fn wire_shape(frames: &[(u8, Vec<u8>, Instant)]) -> Vec<String> {
+    let mut per: Vec<Vec<u8>> = vec![Vec::new(); N_CH];
+    for (ch, p, _) in frames {
+        per[*ch as usize].extend_from_slice(p);
+    }
+    let mut out = Vec::new();
+    for (ch, b) in per.iter().enumerate() {
+        if ch >= CH_N2C {
+            let mut msgs = Vec::new();
+            let mut i = 0;
+            while i + 4 <= b.len() {
+                let l = u32::from_be_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+                msgs.push(l);
+                i += 4 + l;
+            }
+            out.push(format!("ch{ch} {} bytes, messages {:?}", b.len(), msgs));
+        } else {
+            out.push(format!("ch{ch} {} bytes", b.len()));
+        }
+    }
+    out
+}
+
+/// An honest run through the recording transport: the shape of each
+/// direction (per channel the bytes, on the framed channels the message
+/// lengths in order) and the order the table scheduling depends on.
+/// `TWOPC_WIRE_SHAPE=<file>` writes the shape out, to compare two builds.
+#[tokio::test(flavor = "multi_thread")]
+async fn honest_wire_recorded() {
+    let srv = server();
+    let th = ths();
+    let (io_c, io_n, log) = tapped_pair();
+    let share = srv.share;
+    let run = move |role: Role, io| async move {
+        let mut p = Party::new(role, io).await.unwrap();
+        p.preprocess().await.unwrap();
+        let ks = p.key_share().await.unwrap();
+        p.handshake(&share, th.0).await.unwrap();
+        p.application(th.1).await.unwrap();
+        p.close().await;
+        ks
+    };
+    let (c, n) = tokio::join!(tokio::spawn(run(Role::C, io_c)), tokio::spawn(run(Role::N, io_n)));
+    assert_eq!(c.unwrap(), n.unwrap());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let log = log.lock().unwrap();
+    let (tag_c, up) = parse_frames(&log[0]);
+    let (tag_n, down) = parse_frames(&log[1]);
+    assert_eq!(tag_c, VERSION_TAG);
+    assert_eq!(tag_n, VERSION_TAG);
+    let (su, sd) = (wire_shape(&up), wire_shape(&down));
+    for l in &su {
+        eprintln!("C->N {l}");
+    }
+    for l in &sd {
+        eprintln!("N->C {l}");
+    }
+    // The framed channels carry the messages of PROTOCOL-V3.md §12.2 in
+    // this order (lengths fixed by the circuit).
+    assert_eq!(su[CH_C2N], "ch4 730 bytes, messages [16, 32, 32, 97, 32, 65, 129, 65, 65, 157]");
+    assert_eq!(su[CH_TAB], "ch5 0 bytes, messages []");
+    assert_eq!(sd[CH_TAB], "ch5 11795961 bytes, messages [32, 6461009, 5334908]");
+    assert!(sd[CH_N2C].starts_with("ch3 4193953 bytes, messages [120108, 4096, 81920, 32, 704, 705488, 8,"), "{}", sd[CH_N2C]);
+    // N's first table byte passed after C's salt and after the first
+    // 64 KiB of C's MAC-COT upload (the first gate).
+    let first_tab = down.iter().find(|f| f.0 as usize == CH_TAB).expect("tables").2;
+    let salt_at = up.iter().find(|f| f.0 as usize == CH_C2N).unwrap().2;
+    let mut cotb = 0;
+    let gate_at = up
+        .iter()
+        .find(|f| {
+            if f.0 as usize == CH_COTB {
+                cotb += f.1.len() as u64;
+            }
+            cotb >= TABLES_GATE[0]
+        })
+        .unwrap()
+        .2;
+    assert!(salt_at <= first_tab && gate_at <= first_tab);
+    if let Ok(path) = std::env::var("TWOPC_WIRE_SHAPE") {
+        std::fs::write(path, format!("{}\n{}\n", su.join("\n"), sd.join("\n"))).unwrap();
+    }
+}

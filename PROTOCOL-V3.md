@@ -1286,9 +1286,9 @@ LSB first.
 | # | Direction, channel | Message | Bytes | Condition |
 |---|---|---|---|---|
 | P0 | both | version tag `routstr-2pc/split-public-3\n` | 27 | first bytes |
-| P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n`, sent before anything else; N reads it only when it builds P6 |
+| P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n`, sent before anything else (its OT messages follow at once, without waiting for N); N starts garbling only once it has this salt and at least one byte of C's OT traffic, and uses the salt in P6 |
 | P2 | N→C, tables | `hparams` | 32 | the first message on the tables channel, right before tables part 1 and behind the same wait (P3) |
-| P3 | N→C, tables | tables part 1 (stages A1 to A3), part 2 (B1, B2) | 24 B + 5 bits per AND gate | part 1 once N received 64 KiB of C's MAC-COT bytes, part 2 once it received 500 000; each also once the MAC COTs are complete, and at the latest 20 s after N started waiting (scheduling only: C sends P7 after everything of P2 to P6 arrived, whatever the order) |
+| P3 | N→C, tables | tables part 1 (stages A1 to A3), part 2 (B1, B2) | 24 B + 5 bits per AND gate | part 1 once N received 64 KiB of C's MAC-COT bytes, part 2 once it received 500 000; each also once the MAC COTs are complete; there is no time limit, so a client that uploads nothing gets no table byte (scheduling only: C sends P7 after everything of P2 to P6 arrived, whatever the order) |
 | P4 | N→C, `n2c` | d bits (masks of the base wires, AND products) | ⌈`mac_fixed`/8⌉ | after the MAC COTs |
 | P5 | N→C, `n2c` | `gl`: the 256 labels of ρ | 4 096 | before the seed |
 | P6 | N→C, `n2c` | `in_com`: 2 560 pairs of 16-byte commitments | 81 920 | before the seed; needs P1 |
