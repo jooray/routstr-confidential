@@ -1,10 +1,13 @@
-# twopc benchmark (two-party key schedule, `split-public-2`)
+# twopc benchmark (two-party key schedule, `split-public-3`)
+
+The numbers below were measured on `split-public-2` (2026-11-22). `split-public-3` (2026-11-23) is its
+final form under a new tag and offer value: the same bytes, the last digit of the 27-byte tag aside.
 
 Protocol v3's key schedule (`PROTOCOL-V3.md` §4, `docs/TWOPC-DESIGN.md`, `docs/TWOPC-NODE-GARBLING.md`):
 node-only authenticated garbling with three-halves tables and 64-bit check rows, as in v2, over the split
 circuit (key-pad states and outer compressions only, `IS_k` public).
 
-`split-public-2` changes against `split-public-1` (section "split-public-2 against split-public-1" below has
+`split-public-3` changes against `split-public-1` (section "split-public-3 against split-public-1" below has
 the measurements): the garbling hash is `AES_k(Y) ⊕ σ(Y)`, `Y = X ⊕ U(τ)`, with N's per-session parameters
 (32 bytes before the tables) instead of mpz2's fixed-key TCCR, so a gate costs N 6 AES calls and C 3 instead
 of 12 and 6; the check rows are keyed by row parameters from C's seed; N's garbled input is a random mask ρ
@@ -36,7 +39,7 @@ AND gates at the end of each stage (A1, A2, A3, B1, B2): 87 674 / 196 696 / 262 
 
 ## Bytes per run
 
-| | v2 | v3 (`split-public-1`) | | v3 (`split-public-2`) |
+| | v2 | v3 (`split-public-1`) | | v3 (`split-public-3`) |
 |---|---|---|---|---|
 | client up | 1.21 MB | 1.13 MB | −7 % | **1.13 MB** (+25 B) |
 | client down | 22.12 MB | 16.38 MB | −26 % | **16.47 MB** (+82 006 B, +0.5 %) |
@@ -53,7 +56,7 @@ By phase, C's view (v2's phases A and B correspond to `handshake` and `applicati
 | `application` stages (v2: phase B) | 238 | 24 077 | 240 | 20 498 |
 
 (The v3 rows above are `split-public-1`'s, computed from the message sizes plus framing: the last report of a
-call and N's first labels cross the step boundary in the measured per-step counters below. `split-public-2`
+call and N's first labels cross the step boundary in the measured per-step counters below. `split-public-3`
 moves N's 4 096 bytes of input labels into preprocessing and adds 32 bytes of δ to the handshake; the next
 section has its measured counters.)
 
@@ -65,10 +68,10 @@ Where v3's bytes go (computed from the circuit; OT traffic measured):
 | check rows and Y_N (8 B per AND gate and per entering wire), N→C | 3 864 984 |
 | mask commitment bits, N→C | 120 108 |
 | label-check pairs (32 B per reported output wire), N→C | 80 896 |
-| online labels and corrections, N→C | 45 056 (`split-public-2`: 4 096 of them in preprocessing, + 32 δ) |
-| hash parameters, N→C (`split-public-2`) | 32 |
-| input-label commitments, N→C (`split-public-2`: 2 560 wires × 2 × 16 B) | 81 920 |
-| reports, d bits, seed, key share, C→N | 674 (`split-public-2`: 690, the 16-byte salt) |
+| online labels and corrections, N→C | 45 056 (`split-public-3`: 4 096 of them in preprocessing, + 32 δ) |
+| hash parameters, N→C (`split-public-3`) | 32 |
+| input-label commitments, N→C (`split-public-3`: 2 560 wires × 2 × 16 B) | 81 920 |
+| reports, d bits, seed, key share, C→N | 674 (`split-public-3`: 690, the 16-byte salt) |
 | MAC COTs (Ferret over KOS, C sender, Δ_B): C→N / N→C | 1.09 MB / 0.45 MB |
 | COTs for C's input (KOS, N sender, Δ_A): C→N / N→C | 12 kB / 4 kB |
 
@@ -187,7 +190,7 @@ What is left on the 2/10 link: 16.4 MB at 10 Mbit/s is 13.1 s; the rest is 1.1 s
 key share, ECtF and stages. The rows cannot be sent earlier: they depend on C's seed, which C sends only
 after the tables and commitments arrived.
 
-## `split-public-2` against `split-public-1`
+## `split-public-3` against `split-public-1`
 
 Apple M2 Max, 2026-11-22, `examples/bench.rs --runs 3` built from both commits one after the other on the same
 machine (medians of 3). Payload (`message_sizes()`): N→C 15 907 762 → 15 989 746 B (+81 984: 32 hash
@@ -195,7 +198,7 @@ parameters, 81 920 commitments, 32 δ), C→N 674 → 690 B (+16 salt); 4 more f
 
 Transport bytes per session including the tag, mux headers and OT traffic:
 
-| | `split-public-1` | `split-public-2` | |
+| | `split-public-1` | `split-public-3` | |
 |---|---|---|---|
 | C received | 16 384 987 | 16 466 993 | +82 006 (payload +81 984, +12 frame prefixes, the rest mux headers) |
 | C sent | 1 134 221 | 1 134 246 | +25 (16 + 4 + one 5-byte mux header) |
@@ -204,7 +207,7 @@ Transport bytes per session including the tag, mux headers and OT traffic:
 
 Wall time, C's view, ms (cold session in seconds):
 
-| link | step | `split-public-1` | `split-public-2` |
+| link | step | `split-public-1` | `split-public-3` |
 |---|---|---|---|
 | local | cold session | 0.48 s | 0.46 s |
 | local | preprocess / ECtF / `handshake` stages / `application` stages | 391 / 5.1 / 37.9 / 30.3 | 393 / 5.3 / 30.8 / 25.3 |
@@ -223,7 +226,7 @@ Live, through a loopback sidecar against the real provider (`driver.ts --sidecar
 (`split-public-1`: 16 384 987 / 1 134 397); cu-2pc preprocess 432 ms, ECtF 0.4 ms, `handshake` stages 25 ms,
 `application` stages 22 ms.
 
-## The key-share proof (`split-public-2`, changed in place 2026-11-22/23)
+## The key-share proof (added to `split-public-2` in place, 2026-11-22/23)
 
 N's key-share message is `P_N ‖ e ‖ s` (129 bytes) instead of `P_N` (65): a Schnorr proof of knowledge of
 N's scalar, which C verifies before it opens its commitment (`PROTOCOL-V3.md` §4.1). The numbers in the

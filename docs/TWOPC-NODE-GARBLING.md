@@ -1,6 +1,6 @@
 # Node-only authenticated garbling: the construction
 
-Status (2026-11-22): this is the garbling layer of the two-party key schedule `split-public-2` (protocol v3,
+Status (2026-11-23): this is the garbling layer of the two-party key schedule `split-public-3` (protocol v3,
 `PROTOCOL-V3.md` §4), implemented in `crypto/twopc` (`lib.rs`, `gc.rs`, `circuits.rs`). The protocol around it
 (what is computed, the stages, who learns what, the security model and its limits) is in
 `docs/TWOPC-DESIGN.md`; measurements are in `crypto/twopc/BENCH.md`. This file describes how one garbler and
@@ -54,7 +54,7 @@ anchor h2 hashes). Rows per session: 479 022 AND outputs and 4 096 entering wire
 
 ## 3. Preprocessing (input independent; runs in the pre-warm)
 
-1. **Version tag.** The first bytes each party writes are `routstr-2pc/split-public-2\n`. A peer that sent
+1. **Version tag.** The first bytes each party writes are `routstr-2pc/split-public-3\n`. A peer that sent
    anything else is refused (`twopc_version_mismatch`).
 2. **C's salt.** C's first message is `in_salt`, 16 random bytes, the salt of N's input-label commitments
    (step 6).
@@ -193,7 +193,7 @@ accepts iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   of stage A1). Under these assumptions the bound per connection is
   `5·2^-63 + (6·(n_0 + n_1 + n_2) + 12·(n_3 + n_4))·2^-128 + ε_QS ≤ 2^-60.6` for a connection whose server
   share N did not choose (ε_QS: the product check's error; 12 = 6 preimages times 2 flights; the second
-  term is about 2^-106). **Argued**, new in `split-public-2`, no
+  term is about 2^-106). **Argued**, new since `split-public-2`, no
   review. Tests: `adder_switch_attack_caught`, `gl_precedes_seed`, `in_com_precedes_seed`,
   `delta_out_of_range_rejected`; for the flights C accepts, the TLS-17, TLS-18 and TLS-20 tests of the three
   client stacks.
@@ -223,7 +223,7 @@ accepts iff `π(Y_N ⊕ Y_C ⊕ K_tot) = 0`.
   between the tweaks of two wires, so for any two row wires N could compute, without knowing the salt, a
   pair of labels (each derived from the other wire's label and the salt-free tweak difference) that left
   the sum unchanged for every salt when C held them. It did not affect correctness, which does not rest on
-  the row hash (the bullets above), and no exploit was found. `split-public-2` keys the outer cipher
+  the row hash (the bullets above), and no exploit was found. `split-public-3` keys the outer cipher
   instead, so such a pair changes the sum (`swapped_labels_fail_the_row_sum`).
 - **Stage separation.** Each stage has its own χ_s and its own tweak space, and C takes each stage's rows and
   check keys once (`stage already used`).
@@ -293,7 +293,7 @@ the salt and the challenge known. This file argued, heuristically and for this c
 label leads to a pseudo-random label behind the next AND gate and so to an abort. The argument skipped the
 step from "the check passes" to "every gate is consistent", which needs N not to adapt the pointer bits to
 the challenge; a label of N's choice after the seed is such an adaptation. No attack through these labels
-was shown for this circuit; `split-public-2` removes the question by the commitments.
+was shown for this circuit; the commitments (since `split-public-2`) remove the question.
 
 Tests: `third_label_for_c_input_detected`, `wrong_input_commitment_is_a_selective_abort`, `in_com_precedes_seed`,
 `garbage_garbler_input_label_detected`, `wrong_digest_label_from_garbler_detected`,
@@ -442,12 +442,14 @@ a malicious N, be checkable in QuickSilver, and leak nothing usable to the other
 - A third variant was never built: `IS_k` to N only, N proves the digests under Δ_B. It would put the
   compression-function assumptions on N's side only and cost about the same as `PublicIs`.
 - **`split-public-1`** (the `PublicIs` protocol as deployed from 2026-11-12; tag
-  `routstr-2pc/split-public-1`): the circuit and stages of `split-public-2`, with mpz2's fixed-key TCCR as
+  `routstr-2pc/split-public-1`): the circuit and stages of `split-public-3`, with mpz2's fixed-key TCCR as
   the garbling hash (12 AES calls per AND gate for N, 6 for C), check rows hashed with a salt from C's seed
   XORed into the tweak (§4: the salt cancels between two wires), N's input labels sent in the handshake after
   the challenge (§4: a prepared N passed stage A1 with a wrong sum with probability about 2^-23 per
   connection), and the input labels of C and of the digests not committed (§5). 16.38 MB down, 1.13 MB up.
-  `split-public-2` (2026-11-22) changes these four points, adds 81 984 B to the download and 16 B to the
+  `split-public-2` (2026-11-22) changed these four points, added 81 984 B to the download and 16 B to the
   upload, and no round trip. On 2026-11-22/23 it changed in place: N sends a proof of knowledge of its
   key-share scalar with its point (64 B more in the download, no round trip; §4). A build from before
-  that change does not interoperate with one after it, although the tag is the same.
+  that change did not interoperate with one after it, although the tag was the same.
+- **`split-public-3`** (2026-11-23): the final `split-public-2` under a new tag and offer value, byte for
+  byte otherwise, so that every older peer is refused at the tag.

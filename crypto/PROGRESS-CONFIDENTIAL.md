@@ -777,3 +777,14 @@ Tests: `cargo test --release -p twopc` 55 unit tests (new: `key_share_proof_refu
 `v3-routstrd-check.sh` 11 cases. The patch of the browser library applies to the changed crate and
 `client-wasm` passes `cargo check --target wasm32-unknown-unknown` with it (in a scratch copy; the library
 itself is not updated here).
+
+## `split-public-3` (2026-11-23): the final `split-public-2` under a new name
+
+`split-public-2` changed its key-share message in place (the section above), so two builds with one tag
+did not interoperate. The format that freezes has a name of its own: tag `routstr-2pc/split-public-3\n`,
+offer `twopc: "split-public-3"`. Every other byte is that of the final `split-public-2`, so the
+measurements above hold. A peer that sends the tag of `split-public-2` or `split-public-1` is refused at
+the tag (`twopc_version_mismatch`), before any preprocessing; a client that reads an offer naming either
+reports `node_protocol_outdated`. The conformance file gained vectors for `chi`, the label-check pair, the
+stage report hash and the openings hash (no byte on the wire changed for them). Gate cases:
+`h2-j-twopc-tag-old` now sends the tag of `split-public-2`.

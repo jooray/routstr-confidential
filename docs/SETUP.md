@@ -401,7 +401,7 @@ error (`error` 413 `frame_too_large`, no `fault`), so its deposit is charged.
 
 **Versions and health.** `cu-sidecar --version`, `cu-prover --version` and `cu-2pc --version` print the crate
 version, the git commit they were built from (`unknown` outside a checkout; a container build without `.git`
-passes it as `CU_BUILD_COMMIT`), protocol `3`, the 2PC tag `split-public-2` and the proof-channel version.
+passes it as `CU_BUILD_COMMIT`), protocol `3`, the 2PC tag `split-public-3` and the proof-channel version.
 `GET /healthz` on the sidecar (the same token rule as its other routes) returns JSON with the same version
 fields, `http` as served now, the state of framing `"2"` (`h2_withdrawn`, seconds left, consecutive failed
 opens) and the number of active, armed and provider-connected sessions; no secrets and no session ids. Use it
@@ -465,7 +465,7 @@ do not compress. Leave it off.
 curl -s 'https://<node>/v1/confidential/offer?v=3' | jq '{v, http, h2, twopc, connection_deposit_msat, idle_timeout_s, upstream_host, models: (.price_list|keys)}'
 ```
 
-`v` must be `3`, `twopc` `"split-public-2"`, and `http` what your offer file lists (without `"2"` while the
+`v` must be `3`, `twopc` `"split-public-3"`, and `http` what your offer file lists (without `"2"` while the
 sidecar has withdrawn it). Then run requests through routstrd as in section 1, or with the reference
 client below (`--http 2 --requests 3`, then `--http 1.1`). On the sidecar, each connection logs the 2PC,
 `ClientHello checked: canonical, one P-256 share, the joint key`, `credential record + KeyUpdate written

@@ -506,10 +506,14 @@ each of these keys, the two pad states $IS_k$ and $OS_k$, and then only the **ou
 inner state $IS_k$ is a **public output**: both parties compute the inner digest $f(IS_k, m)$ in the
 clear, N sends the labels of the digest's input wires, and C pins them by pointer checks against
 opened, authenticated masks. $OS_k$ never leaves the circuit. The protocol calls the current version of
-this key schedule `split-public-2`; the offer names it, and the first message of the 2PC channel in each
+this key schedule `split-public-3`; the offer names it, and the first message of the 2PC channel in each
 direction is a version tag. Its predecessor `split-public-1`, deployed from November 2026, has the same
 circuit; it differs in the garbling hash, the check-row hash and the order in which N's input is fixed,
-and it had a weaker soundness bound in the first stage (section 5).
+and it had a weaker soundness bound in the first stage (section 5). Between the two, `split-public-2`
+(2026-11-22) had every change described here; a day later its key-share message gained N's proof of
+knowledge under the unchanged tag, so two builds with one tag did not interoperate. `split-public-3` is
+that final format, byte for byte, under a new tag, so that every older peer is refused at its first
+bytes.
 
 **Stages.** It is one circuit, evaluated in five stages. C runs a consistency check on each stage
 before it uses or reveals any output of that stage, and each stage's public output must reach N before
@@ -1195,7 +1199,7 @@ work, at most about $2^{-111}$ per flight tried, and not a statistical one. $th_
 choice of $th_{SH}$ made with $\chi$ known does not raise the later stages' error noticeably is an
 assumption (it holds if $f$ keyed by its chaining input behaves as a random function). Under these assumptions a wrong evaluation passes the
 checks of the five stages with probability at most about $2^{-60.6}$ per connection whose server share
-N did not choose. This argument is ours, new in `split-public-2`, and has had no
+N did not choose. This argument is ours, new since `split-public-2`, and has had no
 review. A server share N chose itself gives N every value of that connection, which then ends at C's
 check of CertificateVerify.
 
@@ -1206,8 +1210,8 @@ its input so that the violations cancel and $E = 0$. This succeeds when the carr
 guessed, which depends on C's share. With the check code of the implementation we measured a success
 probability of about $2^{-23}$ per connection for a node that prepares this. The sum is then wrong, so
 $Z$ is wrong: C's handshake keys do not match U's, C fails on U's first encrypted record, and the later
-stages do not run. We know of no way to use this against $c_{ap,1}$ or $s_{ap,0}$. `split-public-2`
-removes it by the masked input: the labels on N's input wires are fixed before the seed, and the
+stages do not run. We know of no way to use this against $c_{ap,1}$ or $s_{ap,0}$. Since `split-public-2` the masked input
+removes it: the labels on N's input wires are fixed before the seed, and the
 solution of N's linear system could only go into $\delta$. A test runs the attack in both message orders;
 it passes the check in the old order and is caught in the new one.
 
@@ -1223,7 +1227,7 @@ Correctness does not rest on the row hash: the argument above uses only pointer 
 version of this paper said that a label of this kind changes the sum except with probability $2^{-64}$.
 That was false for pairs of wires: the salt cancels between the tweaks of two wires, and N could compute,
 without the salt, labels for two row wires that left the sum unchanged for every salt. It did not affect correctness, and no exploit
-was found; in `split-public-2` such a pair changes the sum.
+was found; since `split-public-2` such a pair changes the sum.
 
 *Label-check pairs.* When C reports an output label to N, the report itself must not become a channel.
 A bare hash of the reported labels would let N test candidates offline. Instead N commits in
@@ -1511,14 +1515,14 @@ the relay's pinned copy), and uses the full 64-bit sequence number in the nonce.
 ## 6.2 Component costs
 
 All component figures are from an Apple M2 Max, release builds (2PC: `crypto/twopc/BENCH.md`,
-2026-11-11 and, for `split-public-2`, 2026-11-22; $\pi_{NK}$ and $\pi_{C3S}$: `crypto/zkbench/BENCH-v2.md`, 2026-10-10, unchanged statements).
+2026-11-11 and, for `split-public-3`, 2026-11-22, measured as `split-public-2`, which has the same bytes; $\pi_{NK}$ and $\pi_{C3S}$: `crypto/zkbench/BENCH-v2.md`, 2026-10-10, unchanged statements).
 "Local" has no delay. Network figures use an emulated link with a rate per direction and a fixed
 one-way delay. The v2 columns are v2's own measurements on the same machine. Memory was measured on
 macOS only.
 
 **Two-party key schedule.**
 
-| | v2 (garbled in full) | v3 (`split-public-2`) |
+| | v2 (garbled in full) | v3 (`split-public-3`) |
 |---|---|---|
 | Garbled AND gates | 656,179 | 479,022 |
 | Garbled SHA-256 compressions | 31 | 22 |
@@ -1531,12 +1535,12 @@ macOS only.
 | Peak memory per additional concurrent run, N | 300 MiB | 240 MiB |
 
 The CPU and memory rows are `split-public-1`'s (2026-11-11) and were not measured again; the other v3
-rows are `split-public-2`'s. Of the 16.5 MB C downloads, 11.8 MB are the three-halves tables and 3.9 MB
+rows are `split-public-3`'s. Of the 16.5 MB C downloads, 11.8 MB are the three-halves tables and 3.9 MB
 the 64-bit check rows; the mask commitments, the label-check pairs (81 kB), the input-label commitments
 (82 kB) and the correlated OT are the rest. Of the 1.13 MB it uploads, 1.09 MB is its part of Ferret, in
-which C is the sender. `split-public-2` moves 82,048 bytes more to C and 16 bytes more from C than
+which C is the sender. `split-public-3` moves 82,048 bytes more to C and 16 bytes more from C than
 `split-public-1`, and adds no round trip. Locally the handshake stages take 31 ms and the application
-stages 25 ms at C (`split-public-1`: 38 and 30 ms; the garbling hash of `split-public-2` needs half the
+stages 25 ms at C (`split-public-1`: 38 and 30 ms; the garbling hash of `split-public-3` needs half the
 AES calls). The split adds round trips on the request path: at 80 ms round-trip time the handshake
 stages take 0.32 s and the application stages 0.21 s, against 0.13 s and 0.15 s for v2's two phases. On a connection that carries many requests this is paid once.
 
@@ -1575,7 +1579,7 @@ for an armed connection, from the request on an open one; author measurements, 2
 | Cold: C sends / receives | 2.63 MB / 17.97 MB | about the same |
 | Request on an open connection: C sends / receives | 86 kB / 12-15 kB (plus a 610 kB top-up between requests) | n/a |
 
-These runs used `split-public-1`; `split-public-2` adds 82 kB to the cold download. Of the cold
+These runs used `split-public-1`; `split-public-3` adds 82 kB to the cold download. Of the cold
 17.97 MB, 16.38 MB are the 2PC and about 1.6 MB the proof channel's correlations; of the
 2.63 MB sent, 1.13 MB are the 2PC and 1.5 MB the proof channel. A request on an open connection would
 need about 560 k fresh correlations for $\pi_{WIN}$ and $\pi_{C3S}$. Without a top-up the channel
@@ -1646,7 +1650,7 @@ emulated link, median of 3 runs. The dual-execution column is the first implemen
 | Client sends / receives | 21.1 / 21.1 MB | 1.21 / 22.12 MB | 1.13 / 16.38 MB |
 
 The v3 column is `split-public-1` (2026-11-11). Measured again on 2026-11-22 in one session,
-`split-public-2` took 0.46 s locally, 7.09 s at 2/50 and 15.71 s at 2/10 Mbit/s, against 0.48, 7.15 and
+`split-public-3` (then named `split-public-2`) took 0.46 s locally, 7.09 s at 2/50 and 15.71 s at 2/10 Mbit/s, against 0.48, 7.15 and
 15.67 s for `split-public-1`, and C received 16.47 MB. On a 2 Mbit/s uplink with a fast downlink C's
 Ferret upload is the critical path (1.09 MB, about 4.4 s), so the smaller circuit gains little there and
 the extra online round trips cost 0.3 s. Where the download is the bottleneck (10 Mbit/s) v3 saves

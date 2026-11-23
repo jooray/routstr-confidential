@@ -46,7 +46,7 @@ No trusted hardware, no enclave attestation, no model-weight proofs, no hiding o
 
 ```
 crypto/cu-crypto    Rust  TLS 1.3 key schedule, GCM record math (GHASH), RFC 8448 + NIST vectors
-crypto/twopc        Rust  two-party key schedule split-public-2 (ECtF + node-only authenticated garbling),
+crypto/twopc        Rust  two-party key schedule split-public-3 (ECtF + node-only authenticated garbling),
                           cu-2pc binary for the client
 crypto/zkbench      Rust  mpz2 VOLE-ZK circuits: π_NK, π_WIN, π_C3S; cu-prover, the pre-warmed proof channel
 crypto/relay        Rust  cu-sidecar: connection state machine, TCP relay, handshake verification, the
@@ -85,7 +85,7 @@ A connection has one of two framings.
 Negotiation:
 
 1. **The operator states it.** The sidecar offer file lists `"http": ["2", "1.1"]` in the operator's order of preference; `"2"` needs an `h2` block (`probe_path`, `max_requests`, `max_lifetime_s`). Nothing is probed or assumed. Absent: `["1.1"]`. `crypto/tools/provider-profile-check.py --h2` checks what framing `"2"` needs from a provider (H1–H8, `PROTOCOL-V3.md` §5.6) and is what an operator runs before listing `"2"`.
-2. **The node signs it.** `GET /v1/confidential/offer` carries `v: 3`, `http`, `h2`, `twopc: "split-public-2"`, `connection_deposit_msat`, `idle_timeout_s` and everything v2's offer had (`upstream_host`, `head_template`, the `chat` block, `images`, `price_list`, fees, `max_tokens_cap`).
+2. **The node signs it.** `GET /v1/confidential/offer` carries `v: 3`, `http`, `h2`, `twopc: "split-public-3"`, `connection_deposit_msat`, `idle_timeout_s` and everything v2's offer had (`upstream_host`, `head_template`, the `chat` block, `images`, `price_list`, fees, `max_tokens_cap`).
 3. **The client chooses.** It verifies the offer (signature with a pinned node key, trusted upstream hostname, `v == 3`, a key schedule it implements, the `h2` block in range, the deposit at most its configured maximum) and takes the first entry of `http` it supports. `confidential.http` can force `"2"` or `"1.1"`; the default is `auto`.
 4. **Fallback.** If an HTTP/2 connection fails before the body of its first request was released (handshake, ALPN, the connection head, the provider closing), the client marks `"2"` bad for this node for 10 minutes and serves the request on `"1.1"` on the same node, when the offer lists it. After a body was released there is no retry elsewhere. The sidecar itself stops offering `"2"` after 5 consecutive early failures and offers it again after 10 minutes.
 
@@ -104,11 +104,11 @@ One state machine for both framings (`PROTOCOL-V3.md` §3).
 
 HTTP/2 rules for what C may write (`PROTOCOL-V3.md` §5.1): one frame per TLS record, no TLS padding; only SETTINGS ACK, PING ACK, WINDOW_UPDATE on stream 0, RST_STREAM on the current stream, and per request one HEADERS and its DATA frames; no KeyUpdate from C, no header block that changes the dynamic table, no second stream while one is open. Anything else ends the connection. Requests are sequential; parallel requests use separate connections.
 
-## Key schedule: `split-public-2`
+## Key schedule: `split-public-3`
 
 The construction is v2's node-only authenticated garbling (N garbles with three-halves tables, its wire masks are authenticated to C by IT-MACs over Ferret COTs, C checks every AND gate with a 64-bit row before it uses an output). The change is in what is garbled. `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))`, and every HMAC message of the TLS 1.3 key schedule is public. The circuit computes only the pad states of the four secret keys, the outer compressions and the three anchors. The inner state `IS_k` is a public output of its stage and both parties compute the inner digest in the clear; `OS_k` never leaves the circuit.
 
-| | v2 | v3 (`split-public-2`) |
+| | v2 | v3 (`split-public-3`) |
 |---|---|---|
 | Garbled SHA-256 compressions | 31 | 22 |
 | Node → client | 22.12 MB | 16.47 MB |
@@ -119,7 +119,7 @@ The construction is v2's node-only authenticated garbling (N garbles with three-
 | Online round trips | 1 + 1 | 3 + 1.5 |
 | Node peak memory per run | 517 MiB | 457 MiB |
 
-New and mandatory: **label-check pairs**. For every output wire C reports to N, N sends in preprocessing the salted hashes of both candidate labels, and C checks its label against the pair before it reveals anything. A cheating node learns at most 3 bits per connection about fresh, single-use values (eight observable outcomes), under v2's conditions. Both parties see `IS_k`, so the argument uses two assumptions beyond "HMAC-SHA256 is a PRF": the compression function keyed by its chaining input is a PRF, and `OS_k` is pseudorandom given `IS_k`. `split-public-2` (2026-11-22) replaces `split-public-1`: the garbling hash is the one the three-halves paper recommends, keyed per session by N, the check rows are keyed from C's seed, and N fixes its own circuit input (a random mask; its share follows as a public correction) and commits to every other input label before C's challenge. In `split-public-1` N sent its input labels after the challenge, and a prepared node passed the first stage with a wrong sum with probability about 2^-23 per connection; the handshake then failed. There is no published proof and no external review (`TWOPC-DESIGN.md`, `SECURITY-CLAIMS.md`).
+New and mandatory: **label-check pairs**. For every output wire C reports to N, N sends in preprocessing the salted hashes of both candidate labels, and C checks its label against the pair before it reveals anything. A cheating node learns at most 3 bits per connection about fresh, single-use values (eight observable outcomes), under v2's conditions. Both parties see `IS_k`, so the argument uses two assumptions beyond "HMAC-SHA256 is a PRF": the compression function keyed by its chaining input is a PRF, and `OS_k` is pseudorandom given `IS_k`. `split-public-3` is the current variant (2026-11-23: the final `split-public-2` of 2026-11-22 under a new tag, after that variant's key-share message had changed in place for a day). Against `split-public-1`: the garbling hash is the one the three-halves paper recommends, keyed per session by N, the check rows are keyed from C's seed, and N fixes its own circuit input (a random mask; its share follows as a public correction) and commits to every other input label before C's challenge. In `split-public-1` N sent its input labels after the challenge, and a prepared node passed the first stage with a wrong sum with probability about 2^-23 per connection; the handshake then failed. There is no published proof and no external review (`TWOPC-DESIGN.md`, `SECURITY-CLAIMS.md`).
 
 ## Money
 
@@ -183,7 +183,7 @@ v3 only. There is no v2 fallback in clients or nodes.
 - A v3 node offers `v: 3`. To a socket with `v=2` (or none) it answers `{"type":"error","status":426,"reason":"upgrade_required","min_v":3,…}` and closes.
 - A v3 client that reads an offer with `v < 3` does not use the node for confidential requests and reports `node_protocol_outdated` (routstrd: logged once per node per day, and in the error body when no other node can serve the request). It requests offers as `/v1/confidential/offer?v=3`, so an old node's access log shows that v3 clients are asking.
 - The node's Nostr listing carries `confidential: 3`, so clients can filter before fetching offers.
-- The 2PC channel starts with the tag `routstr-2pc/split-public-2`; a peer with another key schedule, `split-public-1` included, ends with `twopc_version_mismatch`.
+- The 2PC channel starts with the tag `routstr-2pc/split-public-3`; a peer with another key schedule, `split-public-2` and `split-public-1` included, ends with `twopc_version_mismatch`, and a client refuses an offer that names either as `node_protocol_outdated`.
 
 Operator: update the node and the sidecar together; add `http` (and `h2`, after `provider-profile-check.py --h2` passes) to the sidecar offer file; set the deposit and the idle timeout or keep the defaults. Client: update routstrd (or the SDK, or the web library) and `cu-2pc`/`cu-prover`; no configuration change is needed. Steps: `SETUP.md`; side by side with v2: `V2-V3-ONE-PAGER.md`.
 
@@ -212,7 +212,7 @@ Both the node and the sidecar validate the `setup` and every `request` (model; `
 
 ## Known limits
 
-- **No external review** of π_WIN, the HTTP/2 frame rules, the usage interval rule or `split-public-2` (`docs/SECURITY-CLAIMS.md`: each claim's status and the order of review). The garbler-only 2PC has no published proof. A cheating node can learn at most 3 bits per connection about single-use values (argued, in an idealized abort model; mpz2 documents the share conversion as semi-honest, and the argument for a malicious party is ours).
+- **No external review** of π_WIN, the HTTP/2 frame rules, the usage interval rule or `split-public-3` (`docs/SECURITY-CLAIMS.md`: each claim's status and the order of review). The garbler-only 2PC has no published proof. A cheating node can learn at most 3 bits per connection about single-use values (argued, in an idealized abort model; mpz2 documents the share conversion as semi-honest, and the argument for a malicious party is ours).
 - **Five providers ran end to end** (Venice, the deployed one; Numes, xKiro, OpenRouter, Cloudflare Workers AI through a node; others fail the profile: `docs/PROVIDERS.md`). The design is for any OpenAI-compatible upstream that meets the provider profile; framing `"2"` additionally needs H1–H8. A provider that changes its HTTP/2 behaviour breaks framing `"2"`; this is detected (the sidecar stops offering it, clients fall back to `"1.1"`).
 - **Linkability.** Requests on one HTTP/2 connection are linkable for the provider. `reuseScope` separates them at the cost of more connections.
 - N holds `K_0`, so it can write any number of epoch-0 records, not only the proven head. π_NK binds the head's content and length, not the exact wire bytes, which C cannot see. N could write another head of the same length (another account, another path for the probe, a header that changes how the provider handles the connection). Epoch 0 carries no client data, and with framing `"2"` C's own header blocks are proven in full.

@@ -1,16 +1,18 @@
-# The two-party key schedule (`split-public-2`, protocol v3)
+# The two-party key schedule (`split-public-3`, protocol v3)
 
-Status (2026-11-22): implemented in `crypto/twopc` on the branch `split-public-2`, as the only two-party key
-schedule of protocol v3 (`PROTOCOL-V3.md` §4 is the normative text). It replaces `split-public-1` (deployed
-from 2026-11-12) with a hard switch; the circuit and the stages are the same, the garbling hash, the check-row
+Status (2026-11-23): implemented in `crypto/twopc`, as the only two-party key
+schedule of protocol v3 (`PROTOCOL-V3.md` §4 is the normative text). Against `split-public-1` (deployed
+from 2026-11-12) the circuit and the stages are the same, the garbling hash, the check-row
 hash and the handling of the input labels are new ("Changes from `split-public-1`", below). Tested against the
 reference key schedule and against a cheating party on either side (`cargo test --release -p twopc`: 55 unit
 tests, 4 tests of the `cu-2pc` binary), and run end to end through a loopback sidecar against api.venice.ai.
 The construction has no published proof and has had no external review. It is not compatible with v2 or with
-`split-public-1` on purpose: the first bytes on the 2PC channel are a version tag, and such a peer is refused.
-`split-public-2` changed in place on 2026-11-22/23: N's key-share message gained a proof of knowledge of its
-scalar (step 3 below). A build from before that change does not interoperate with one after it, although the
-tag is the same.
+an earlier variant on purpose: the first bytes on the 2PC channel are a version tag, and such a peer is refused.
+History: `split-public-2` replaced `split-public-1` on 2026-11-22 with a hard switch. On 2026-11-22/23 its
+key-share message gained N's proof of knowledge (step 3 below) under the unchanged tag, so for a day two builds
+with the same tag did not interoperate. `split-public-3` (2026-11-23) is byte-identical to the final
+`split-public-2` except for the tag and the offer value; the new name lets every older peer be refused at
+the tag.
 Construction details: `docs/TWOPC-NODE-GARBLING.md`. Measurements:
 `crypto/twopc/BENCH.md`. Framings, proofs and money: `PROTOCOL-V3.md`.
 
@@ -63,7 +65,7 @@ enters the next stage as an input whose labels N supplies. `OS_k` never leaves t
 | design | garbled AND gates | garbled compressions |
 |---|---|---|
 | v2 (whole key schedule in the circuit) | 656 179 | 31 |
-| **`split-public-1`, `split-public-2`** | **479 022** | **22** |
+| **`split-public-1`, `split-public-3`** | **479 022** | **22** |
 
 ## Stages
 
@@ -88,7 +90,7 @@ It is one circuit because `OS_k` must cross from a stage to the next without eit
 ## Session flow
 
 1. **Version tag.** The first bytes each party writes on the 2PC channel are the ASCII tag
-   `routstr-2pc/split-public-2\n`. A party that reads anything else stops with `twopc_version_mismatch`
+   `routstr-2pc/split-public-3\n`. A party that reads anything else stops with `twopc_version_mismatch`
    (`twopc::Error::VersionMismatch`; `cu-2pc` reports it as `{"ev":"error","code":"twopc_version_mismatch",…}`
    on its control channel, prints the code on stderr and exits with status 3). A v2 peer starts with a
    multiplexer frame header and is refused at its first byte; a `split-public-1` peer differs in the tag's
@@ -192,7 +194,7 @@ pairs for the outputs C reports; C's report authenticated by a hash of its label
   input, N could choose its input so that the violations cancel in the check; a prepared node passed with a
   wrong sum with probability about 2^-23 per connection. Z was then wrong, C failed on the provider's first
   encrypted record and the later stages never ran; no use against a traffic secret is known.
-  `split-public-2` sends the labels of the mask ρ before the seed and only δ after it
+  `split-public-3` sends the labels of the mask ρ before the seed and only δ after it
   (`adder_switch_attack_caught`).
 - *Digest labels.* N sends them, and N knows `IS_k`. A label for another digest bit fails the pointer check
   whatever C's secrets are, because C computed the digest itself. A value that is not one of the wire's two
@@ -451,7 +453,7 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 | soundness of the consistency check | statistical: ≤ 2^-60.6 per connection, k·2^-60.6 over k connections, for a connection whose server share N did not choose; argued, under DDH in P-256 (C's share is hidden from N only computationally; the reduction is not written out; a sketch of it extracts the discrete logarithm of N's key share from N's proof of knowledge by rewinding and needs SHA-256 in that proof, HKDF-Extract and the hash of mpz2's base OT as random oracles), a client TLS stack that accepts at most two server flights per signature of U, and the random-function behaviour of `f` for the transcript hash N relays before stage A2 (`TWOPC-NODE-GARBLING.md` §4). In `split-public-1` stage A1 had only about 2^-23 against a prepared node, with a failed handshake as the outcome |
 | distinct inner digests under one key (assumption 3) | assumed: compression-function collision resistance under a known chaining value |
 | the chained multi-output composition with public `IS_k` | **not written** (hybrids over both directions and every value revealed together) |
-| N's input is fixed before the challenge, the other input labels are committed before it | argued (`TWOPC-NODE-GARBLING.md` §4, §5); new in `split-public-2`; in `split-public-1` neither held |
+| N's input is fixed before the challenge, the other input labels are committed before it | argued (`TWOPC-NODE-GARBLING.md` §4, §5); new since `split-public-2`; in `split-public-1` neither held |
 | Ferret/KOS against a malicious receiver (N for the MAC COTs under Δ_B; C for the 256 COTs under Δ_A), KOS consistency-check leakage of a few Δ bits with negligible probability | assumed from mpz2 |
 | N's proof of knowledge of its key-share scalar | Schnorr with the Fiat–Shamir transform: a proof of knowledge in the random-oracle model, extraction by rewinding (forking lemma), zero knowledge with a programmed oracle; standard results, applied here to one connection at a time. No statement for interleaved key shares, no straight-line extraction. Tests: `key_share_proof_refused_before_the_opening`, `key_share_proof_checks`, `key_share_proof_vector` |
 | ECtF | mpz2 documents it as semi-honest. Malicious N: limited to input substitution, view simulatable, every effective deviation ends the handshake before B1 (argued above, ROT-hybrid model, HKDF-Extract as a random oracle, strong DH in P-256). Malicious C: 3 outcomes, ≤ log2 3 bits per connection (argued above, by enumeration of this code's error paths; base-OT security assumed) |
@@ -464,7 +466,7 @@ Every session uses fresh scalars, shares, labels, Δ_A and Δ_B.
 Done once more when `split-public-1` became the only variant. Nothing was found broken at the time. Each row
 names the test that exercises it. Two answers did not hold up (2026-11-22): the row on online labels that N
 chooses with the salt known (a label chosen after the challenge lets N adapt pointer bits to it, so its
-effect is not limited to an abort), and the soundness of stage A1 (Security model, above). `split-public-2` commits those labels and
+effect is not limited to an abort), and the soundness of stage A1 (Security model, above). `split-public-3` commits those labels and
 fixes N's input before the challenge.
 
 | question | finding |
@@ -483,7 +485,7 @@ fixes N's input before the challenge.
 
 `crypto/twopc/BENCH.md` has the tables. Per connection the client uploads 1.13 MB and downloads 16.47 MB
 (tables 11.8 MB, check rows 3.9 MB, input-label commitments 82 kB); v2 moved 1.21 MB and 22.1 MB per request.
-`split-public-2` adds 82 048 B of payload to the download and 16 B to the upload against `split-public-1`,
+`split-public-3` adds 82 048 B of payload to the download and 16 B to the upload against `split-public-1`,
 and no round trip (64 of these bytes are the key-share proof, added in place on 2026-11-22/23). A cold key schedule takes 7.1 s on a 2/50 Mbit/s link with 80 ms round-trip time (v2:
 7.4 s) and 15.7 s with a 10 Mbit/s downlink (v2: 20.1 s). The halved AES count per gate (N 6, C 3, from 12
 and 6) shortens the online stages: locally 31 and 25 ms instead of 38 and 30 ms. Each stage after A1 costs one round trip that v2 did not have: from C's side `handshake` takes 3
@@ -491,19 +493,20 @@ instead of 1 and `application` 1.5 instead of 1 (N's B1 labels need no message f
 
 ## Changes from `split-public-1`
 
-`split-public-1` (deployed from 2026-11-12) and `split-public-2` (2026-11-22) have the same circuit, stages,
-ECtF, OT layers, 64-bit rows, label-check pairs and anchors. `split-public-2` changes:
+`split-public-1` (deployed from 2026-11-12) and `split-public-3` have the same circuit, stages,
+ECtF, OT layers, 64-bit rows, label-check pairs and anchors. `split-public-3` changes (all but the last two
+rows since `split-public-2`, 2026-11-22):
 
-| | `split-public-1` | `split-public-2` |
+| | `split-public-1` | `split-public-3` |
 |---|---|---|
 | garbling hash | mpz2's fixed-key TCCR, 12 AES calls per AND gate for N, 6 for C | `AES_k(Y) ⊕ σ(Y)`, `Y = X ⊕ U(τ)`, N's 32-byte parameters per session, sent before the tables; 6 and 3 AES calls |
 | check rows | TCCR with C's salt XORed into the tweak (the salt cancels between two wires) | `lo64(AES_{k_r}(H_g(X, 2^63 \| τ) ⊕ U_r(τ)))`, `k_r`, `U_r` from SHA-256 of C's seed and N's parameters |
 | N's circuit input | its share `x_N`, labels sent in the handshake after the challenge | a random mask ρ < p, labels sent before the challenge; the share follows as `δ = x_N − ρ mod p` |
 | other input labels (C's share, the digests) | pointer bit checked only | committed before the challenge under C's 16-byte salt, each label checked |
 | stage A1 against a prepared N | wrong sum passes with about 2^-23 per connection | within the 2^-60.6 bound (argued) |
-| N's key share | `P_N` | `P_N` and a proof of knowledge of `a_N` (added in place on 2026-11-22/23; before that as in `split-public-1`) |
+| N's key share | `P_N` | `P_N` and a proof of knowledge of `a_N` (added to `split-public-2` in place on 2026-11-22/23) |
 | bytes | 16.38 MB down, 1.13 MB up | +82 048 B down, +16 B up, no added round trip |
-| tag, offer | `routstr-2pc/split-public-1`, `"split-public-1"` | `routstr-2pc/split-public-2`, `"split-public-2"`; the two do not interoperate |
+| tag, offer | `routstr-2pc/split-public-1`, `"split-public-1"` | `routstr-2pc/split-public-3`, `"split-public-3"` (2026-11-22 to 23: `split-public-2`); no two variants interoperate |
 
 ## History: v2 and `Proven`
 
@@ -521,5 +524,5 @@ ECtF, OT layers, 64-bit rows, label-check pairs and anchors. `split-public-2` ch
   (the circuit and the HKDF message blocks), `ectf.rs`, `mux.rs`, and the `cu-2pc` binary (C's side, spawned
   by the clients).
 - `crypto/relay`: the sidecar runs N's side (`run_twopc_n`).
-- The browser library vendors `crypto/twopc` (`crates/vendor/twopc` there, with `split-public-2`); a change
+- The browser library vendors `crypto/twopc` (`crates/vendor/twopc` there, with `split-public-3`); a change
   to `crypto/twopc` has to be re-vendored.

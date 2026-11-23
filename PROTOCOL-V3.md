@@ -86,7 +86,7 @@ current one, and a framing withdrawn meanwhile does not end a live connection (�
 
 - `v: 3` (exactly; no list).
 - `http`, `h2`: copied from the sidecar.
-- `twopc: "split-public-2"`: the key-schedule protocol (§4).
+- `twopc: "split-public-3"`: the key-schedule protocol (§4).
 - `connection_deposit_msat`, `idle_timeout_s` (§8).
 - everything v2's offer has: `upstream_host`, `head_template` (framing `"1.1"`), `chat`, `images`,
   `price_list`, `session_fee_msat`, `abandon_fee_msat`, `max_tokens_cap`, …
@@ -236,14 +236,22 @@ C's disclosure (its anchor is the end of the connection). Abort rules: §12.10.
 (§12.9 says when each applies). `done` is the normal end of a `"1.1"` connection. The `deposit` object is §8's outcome. Any protocol
 violation or failed proof: `{"type":"error","status","reason"}` and the socket closes.
 
-## 4. Two-party key schedule: `split-public-2`
+## 4. Two-party key schedule: `split-public-3`
 
 Base: v2's node-only authenticated garbling (`docs/TWOPC-NODE-GARBLING.md`): N garbles with three-halves
 tables, its wire masks are authenticated to C by IT-MACs over Ferret COTs, C checks every AND gate with a
-64-bit row before it uses an output. ECtF is unchanged. `split-public-2` replaces `split-public-1` (the
-variant of v3 from 2026-11-12) with a hard switch: the same circuit and stages, a new garbling hash and
-check-row hash, N's circuit input fixed before the challenge, and commitments to the other input labels
-(§4.1).
+64-bit row before it uses an output. ECtF is unchanged. `split-public-3` is the variant this document
+specifies and the only one a v3 node or client runs. Against `split-public-1` (the variant of v3 from
+2026-11-12) it has the same circuit and stages, a new garbling hash and check-row hash, N's circuit input
+fixed before the challenge, commitments to the other input labels, and N's proof of knowledge of its
+key-share scalar (§4.1).
+
+History: `split-public-2`. It replaced `split-public-1` on 2026-11-22 with everything named above except
+the proof of knowledge. That proof was added on 2026-11-22/23 under the unchanged tag and offer value, so
+for a day two builds that both called themselves `split-public-2` did not interoperate (they failed at the
+key share with a message-length error, after the preprocessing). `split-public-3` (2026-11-23) is
+byte-identical to the final `split-public-2` except for the tag and the offer value. The new name exists
+so that every older peer is refused at the tag, before any preprocessing.
 
 Change: `HMAC(k, m) = f(OS_k, pad(f(IS_k, m)))`, `f` the SHA-256 compression function. Every inner digest
 moved out of the circuit has a public message (a fixed HKDF label and a transcript hash); the extraction
@@ -274,9 +282,11 @@ One circuit, five stages, a consistency check per stage before C uses any output
 - The variant with zero-knowledge proofs of the inner digests (`Proven` in the prototype) is not part of
   v3 and is removed from the code.
 - **Version tag.** The first message of the 2PC channel in each direction is the ASCII tag
-  `routstr-2pc/split-public-2\n` (27 bytes). A peer that reads another tag, including
-  `routstr-2pc/split-public-1\n`, ends with `twopc_version_mismatch`; the offer names the variant as
-  `twopc: "split-public-2"`, and a client refuses an offer whose `twopc` it does not implement (§2.3).
+  `routstr-2pc/split-public-3\n` (27 bytes). A peer that reads another tag, including
+  `routstr-2pc/split-public-2\n` and `routstr-2pc/split-public-1\n`, ends with `twopc_version_mismatch`;
+  the offer names the variant as `twopc: "split-public-3"`, and a client refuses an offer whose `twopc` it
+  does not implement (§2.3): one that names `split-public-2` or `split-public-1` as outdated
+  (`node_protocol_outdated`, as an offer with `v` below 3), any other as unsupported.
 
 Security statement (informal; no proof, external review outstanding, as for v2):
 
@@ -330,7 +340,7 @@ Security statement (informal; no proof, external review outstanding, as for v2):
   so A3 is done before C sends its Finished. B1 and B2 run after the server Finished (they need `th_SF`);
   N has `K_0` only after it verified the handshake inputs it fed in.
 
-### 4.1 What `split-public-2` specifies
+### 4.1 What `split-public-3` specifies
 
 Parties: C = evaluator, OLE sender, MAC key Δ_B; N = garbler, OLE receiver, garbling offset Δ_A. Conventions:
 a 128-bit value is a `u128` whose 16 bytes are little-endian (`hi` = bits 64..127, `lo` = bits 0..63; bit 0 of
@@ -1039,7 +1049,7 @@ the `request_ok.reserved_msats` of its request (§12.4).
 |---|---|---|
 | 1 | Requests on one HTTP/2 connection are linkable for the provider | by design; `reuseScope`, §9.1 |
 | 2 | π_WIN, the frame rules and the interval rule of §5.4 are new | no external review |
-| 3 | `split-public-2`: staged check, label-check pairs, both parties see `IS_k`, N's input fixed and the other input labels committed before the challenge | no published proof, no external review; assumptions in §4. Open: the staged use of the garbled circuit (not covered by the garbling theorem), the random-oracle step of the ECtF argument, the soundness argument of §4.1 |
+| 3 | `split-public-3`: staged check, label-check pairs, both parties see `IS_k`, N's input fixed and the other input labels committed before the challenge | no published proof, no external review; assumptions in §4. Open: the staged use of the garbled circuit (not covered by the garbling theorem), the random-oracle step of the ECtF argument, the soundness argument of §4.1 |
 | 4 | A provider that changes HTTP/2 behaviour (table size, KeyUpdate) breaks framing `"2"` | detected, §2.1 auto-disable, §2.3 fallback |
 | 5 | A fabricated error head would need a binary frame header at byte 0 of a server record in the interval (with only stream-0, own-stream WINDOW_UPDATE and probe-stream frames before the head, §5.4) | smaller than v2's equivalent |
 | 6 | 3 bits per connection instead of 2.8 per request (idealized abort model, §4) | fewer connections than requests; with one request per connection it is slightly more |
@@ -1123,8 +1133,10 @@ Residual: risk 12.
 - There is no v2 fallback in clients or nodes. The v2 code is archived on the branches `v2` (this repo)
   and `confidential-v2` (routstr-core, routstr-sdk, routstrd).
 - The key-schedule variant is a separate switch inside v3: `v` stays 3. A client refuses an offer whose
-  `twopc` is not `"split-public-2"` (§2.3), and on the 2PC channel a `split-public-1` peer is refused at
-  its tag with `twopc_version_mismatch`. Node, sidecar and client releases change together.
+  `twopc` is not `"split-public-3"` (§2.3; `split-public-2` and `split-public-1` as `node_protocol_outdated`),
+  and on the 2PC channel a peer of either earlier variant is refused at its tag with
+  `twopc_version_mismatch`. A wire change of the key schedule gets a new tag and offer value, never the
+  old ones. Node, sidecar and client releases change together.
 
 ## 12. Wire format
 
@@ -1156,7 +1168,7 @@ hex, except inside `params`, where they are arrays of numbers. `http` is always 
 Also required for `"2"`: host under 127 bytes, key at most 119 bytes. Framing `"1.1"` serves chat always and
 images when `endpoints.images` exists.
 
-**S** `GET /offer`: the file's content with `v: 3`, `twopc: "split-public-2"`, `notary_pubkey`,
+**S** `GET /offer`: the file's content with `v: 3`, `twopc: "split-public-3"`, `notary_pubkey`,
 `node_settles`, and `http` as currently served: `"2"` is left out while it is withdrawn (§2.1; the `h2`
 block stays). An offer file that names `v` other than 3 is refused at startup.
 
@@ -1189,11 +1201,11 @@ unchanged in meaning:
 
 A node without a signing key serves the offer without `sig_payload` and `sig`; clients refuse it (the reference driver accepts it only with `--no-verify-offer` and `ROUTSTR_CONFIDENTIAL_INSECURE_TESTING=1`).
 
-Client checks before a `setup` (§2.3): `v == 3`; `twopc == "split-public-2"`; `http` non-empty, known
+Client checks before a `setup` (§2.3): `v == 3`; `twopc == "split-public-3"`; `http` non-empty, known
 values, the chosen framing listed; for `"2"` the `h2` block in range and `probe_path` a trusted API base
 plus `/models`; `connection_deposit_msat` at most the client's maximum (reference driver: 100 000 msat);
-the v2 checks (signature, host, chat block, head template, images block). An offer with `v < 3`:
-`node_protocol_outdated`.
+the v2 checks (signature, host, chat block, head template, images block). An offer with `v < 3`, or with
+`twopc` `"split-public-2"` or `"split-public-1"`: `node_protocol_outdated`.
 
 **N** The node's Nostr listing (kind 38421) carries the tag `["confidential","3"]` while a sidecar is
 configured (§11), and each confidential model in `GET /v1/models` has
@@ -1254,7 +1266,7 @@ The 2PC channel begins with the version tag of §4 in each direction. The client
 status 3 and code `twopc_version_mismatch` on another tag; the sidecar ends the connection with an `error`
 whose `code` is `twopc_version_mismatch`.
 
-**2PC channel messages** (`split-public-2`). After the tag the channel is a multiplexer: each chunk has a
+**2PC channel messages** (`split-public-3`). After the tag the channel is a multiplexer: each chunk has a
 5-byte header (1 byte channel, 4 bytes big-endian length). The protocol channels `n2c`, `c2n` and the
 tables channel carry messages framed with a 4-byte big-endian length each; the OT channels (KOS, Ferret,
 the OLEs of ECtF) carry mpz2's own messages beside them. Chunk boundaries depend on timing, so transport
@@ -1263,7 +1275,7 @@ LSB first.
 
 | # | Direction, channel | Message | Bytes | Condition |
 |---|---|---|---|---|
-| P0 | both | version tag `routstr-2pc/split-public-2\n` | 27 | first bytes |
+| P0 | both | version tag `routstr-2pc/split-public-3\n` | 27 | first bytes |
 | P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n`, sent before anything else; N reads it only when it builds P6 |
 | P2 | N→C, tables | `hparams` | 32 | the first message on the tables channel, right before tables part 1 and behind the same wait (P3) |
 | P3 | N→C, tables | tables part 1 (stages A1 to A3), part 2 (B1, B2) | 24 B + 5 bits per AND gate | part 1 once N received 64 KiB of C's MAC-COT bytes, part 2 once it received 500 000; each also once the MAC COTs are complete, and at the latest 20 s after N started waiting (scheduling only: C sends P7 after everything of P2 to P6 arrived, whatever the order) |
@@ -1314,15 +1326,9 @@ of `x_N`) to before the seed, P7 waits for P2 to P6, and N's message of K carrie
 +82 048 bytes N→C, +16 bytes C→N, no added
 round trip (measured: the time from ECtF to the end of stage A3 is unchanged, `crypto/twopc/BENCH.md`).
 
-**`split-public-2` changed in place on 2026-11-22/23.** As first deployed on 2026-11-22, N's message of K
-was `P_N` alone (65 bytes). The proof of knowledge was added under the same tag and the same offer value,
-because every node and client was redeployed together. A build from before that change does not
-interoperate with one after it, although both send `routstr-2pc/split-public-2\n`: the pair fails at K
-with a message-length error (the client's `cu-2pc` reports an error without the code
-`twopc_version_mismatch`), before any TLS byte is sent but after the preprocessing was moved, and the
-connection ends unused (§12.10 row 12: the deposit is charged). A wire change of a key-schedule variant
-normally gets its own tag (§11); this one did not, by the operator's decision, and every deployment of
-`split-public-2` must be of a build after the change. `pi_win` and `pi_c3s` run once per `zk_params` on the channel
+**Against `split-public-2`.** The bytes are those of `split-public-2` as it ended (with the proof in K);
+only P0 and the offer value differ. `split-public-2` as first deployed on 2026-11-22 had `P_N` alone in K
+(65 bytes) under the same tag; that is why the name was retired (§4). `pi_win` and `pi_c3s` run once per `zk_params` on the channel
 (`cu-prover --channel`; the earlier `--multi` is the only mode) or on a socket of their own; `pi_nk` once
 per connection.
 
@@ -1867,7 +1873,8 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | request-offer age (prices end 10 min after the offer stops being served); security-relevant offer changes retire live connections | §3.3 |
 | `after_client_frames`; `evicted`; the per-address total and the eviction of idle used connections; 8 refused requests in a row; recurring cost | §8, §12.9, §12.10 |
 | the `split-public-1` statement: the inner-digest message rule, assumption (3), the idealized 3-bit model, label-check pairs augment the report hash | §4 |
-| `split-public-2`, changed in place on 2026-11-22/23: N sends a proof of knowledge of its key-share scalar with `P_N` (+64 bytes N→C, no round trip); builds from before and after do not interoperate under the same tag | §4, §4.1, §12.2 |
+| `split-public-3` (2026-11-23): the final `split-public-2` under a new tag and offer value, so that an older peer is refused at the tag; clients refuse an offer naming `split-public-2` or `split-public-1` as outdated | §4, §11, §12.2 |
+| `split-public-2`, changed in place on 2026-11-22/23: N sends a proof of knowledge of its key-share scalar with `P_N` (+64 bytes N→C, no round trip); builds from before and after did not interoperate under the same tag | §4, §4.1, §12.2 |
 | `split-public-2` (2026-11-22) replaces `split-public-1`: garbling hash `H_g` with N's `hparams`, the check-row hash keyed from the seed, N's input a mask ρ with labels before the seed and δ in the handshake, input-label commitments under C's `in_salt`, the 2PC message list, conformance vectors; the eight outcomes are those after preprocessing; assumption (4) | §4, §4.1, §10, §11, §12.1, §12.2 |
 | privacy: linkability and its off switches, body padding (off by default), residual risks 7-10 | §1, §9.1, §9.3, §10 |
 | slot pressure: setups claim slots one at a time, each closes at most one connection and a refused one none; after the idle used ones, an unused connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s) that is not setting up, of the address holding the most (another address for a full node); its deposit charged (`evicted`) only at `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more unused connections at its address, else released (`evicted_released`), the counts signed (`deposit.evicted`); clients check them and stop pre-warming for that node for 10 minutes | §8.1, §8.4, §9.2, §10, §12.9, §12.10 |
