@@ -355,6 +355,11 @@ class H2Client:
         self.closed = False
         self.window_updates = 0
         self.pings = 0
+        # When (``tr.now()``) each frame of the provider arrived that needs a
+        # control record of the client (a SETTINGS or a PING without ACK: the
+        # sidecar's control-record allowance, H10), and when the head went out.
+        self.ctl_needed: list[float] = []
+        self.head_at: float | None = None
         self.hpack_error: str | None = None
         self.blocks = 0
         self._cont: tuple[int, int, bytes] | None = None
@@ -394,6 +399,7 @@ class H2Client:
                 ident, value = struct.unpack(">HI", payload[i : i + 6])
                 params[ident] = value
             self.peer_settings.append(params)
+            self.ctl_needed.append(self.tr.now())
             if S_HEADER_TABLE_SIZE in params:
                 self.header_table_size = params[S_HEADER_TABLE_SIZE]
             if S_INITIAL_WINDOW_SIZE in params:
@@ -407,6 +413,7 @@ class H2Client:
         elif t == PING:
             if not flags & ACK:
                 self.pings += 1
+                self.ctl_needed.append(self.tr.now())
                 self.tr.send(frame(PING, ACK, 0, payload))
         elif t == WINDOW_UPDATE:
             inc = int.from_bytes(payload[:4], "big") & 0x7FFFFFFF
@@ -464,6 +471,7 @@ class H2Client:
     # ---- sending
 
     def open(self, probe_path: str, reset_probe: bool = True) -> None:
+        self.head_at = self.tr.now()
         self.tr.send(conn_head(self.host, probe_path, self.key, reset_probe))
         self.streams[1] = StreamResp(1)
 
@@ -682,11 +690,16 @@ class MockH2:
 
     def __init__(self, key: str, app: Callable, *, close_on_ku: bool = False, table_size: int | None = None,
                  dynamic_responses: bool = False, forget_after_idle: bool = False, stall: bool = False,
-                 reflect_header: bool = False, dead: bool = False, window: int = 65535) -> None:
+                 reflect_header: bool = False, dead: bool = False, window: int = 65535,
+                 ping_every: float | None = None, ping_burst: tuple[float, int] | None = None) -> None:
         self.key, self.app = key, app
         self.close_on_ku, self.table_size, self.dynamic_responses = close_on_ku, table_size, dynamic_responses
         self.forget_after_idle, self.stall, self.reflect_header, self.dead = forget_after_idle, stall, reflect_header, dead
         self.window = window
+        # PING frames of the provider: one every ``ping_every`` s, and
+        # ``ping_burst = (at, n)``: n at once ``at`` s in (H10).
+        self.ping_every, self.ping_burst = ping_every, ping_burst
+        self.next_ping = ping_every
         self.clock = 0.0
         self.last_send = 0.0
         self.inbuf = b""
@@ -717,6 +730,13 @@ class MockH2:
             self.closed = True
 
     def recv(self, timeout: float) -> bytes:
+        if self.preface and not self.closed and not self.dead:
+            while self.next_ping is not None and self.clock >= self.next_ping:
+                self.out += frame(PING, 0, 0, b"\0" * 8)
+                self.next_ping += self.ping_every or 0
+            if self.ping_burst is not None and self.clock >= self.ping_burst[0]:
+                self.out += frame(PING, 0, 0, b"\1" * 8) * self.ping_burst[1]
+                self.ping_burst = None
         if self.out and not self.dead:
             out, self.out = self.out, b""
             return out

@@ -180,9 +180,14 @@ Check yours before offering it, with the offer file you will deploy and the vari
 ```sh
 T=crypto/tools/provider-profile-check.py
 python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --model <a cheap chat model>            # A1-A14: every item must pass
-python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --model <...> --h2                      # H1-H8: before you offer HTTP/2
+python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --model <...> --h2                      # H1-H8, H10: before you offer HTTP/2
 python3 -I $T --offer my-offer.json --key-env MY_PROVIDER_KEY --image-model <...> --images            # I1-I10: before you offer images
 ```
+
+`--h2` also counts the provider's PING and SETTINGS frames on the connection it idles (H10). The client
+answers each with a control record, and the sidecar allows a connection 16 control records and one more per
+10 s. A provider that pings more often than that would get your clients' HTTP/2 connections ended, so H10
+fails it (the criterion: PROTOCOL-V3.md §5.6). Venice, 2026-11-23: one SETTINGS (at the start) and no PING in 390 s of idle; H10 passes.
 
 **Framings: the `http` list and the `h2` block.** The offer file says how clients talk to your provider.
 Nothing is probed or assumed: you state it.

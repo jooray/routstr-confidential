@@ -701,10 +701,23 @@ Checked by `provider-profile-check.py --h2`; an operator offers `"2"` only when 
 | H7 | no response path reflects the `authorization` value (same list as item 8) |
 | H8 | the streamed usage event and `[DONE]` end the stream as §5.4 parses them |
 | H9 | an error response's HEADERS frame lies in a record that starts at a frame boundary (the frames before it in the record being of the kinds §5.4 allows); the same for the records from a request's interval to a refusal of its stream (§5.4.1) |
+| H10 | the provider's SETTINGS and PING frames, each of which needs a control record of C (SETTINGS ACK, PING ACK), stay within S's control-record allowance (§12.6) over the connection's life |
 
-A provider on framing `"2"` must also not need more control frames of the client than §12.6 allows (16, and
-one more per 10 s): a PING or SETTINGS more often than every 10 s for minutes on end uses the allowance up
-and ends the connection.
+**H10 in detail.** S lets a connection carry 16 control records, and one more per 10 s since `head_written`,
+with at most 16 unproven at once (§12.6, `CTL_BURST`, `CTL_REFILL`, `MAX_QUEUED_CTL` in
+`crypto/relay/src/h2_session.rs`; the profile tool keeps a copy). A provider that sends PING or SETTINGS
+more often than every 10 s for long enough uses the allowance up, and S then ends honest clients'
+connections. The tool counts the provider's SETTINGS and PING frames without ACK on the connection it idles
+for H5 (its whole life, the provider's first SETTINGS included) and fails H10 when any of these holds:
+
+1. the k-th such frame arrives at an age t after the head with k above 16 + ⌊t / 10 s⌋;
+2. more than 16 arrive within 5 s (more control records than may wait unproven);
+3. the count so far plus the idle rate times the rest of `h2.max_lifetime_s` exceeds
+   16 + ⌊`h2.max_lifetime_s` / 10 s⌋ − 8 (8 records left for C's own RST_STREAM frames).
+
+The rate is measured over the idle time (`--h2-idle`, default `h2.idle_secs`), so H10 is only as good as
+that window: a provider whose PING rate rises later is not seen. Venice (2026-11-23): one SETTINGS, at the
+start, and no PING in 390 s of idle; H10 passes.
 
 H9 is not checked by the profile tool (it sees no record boundaries); the clients check it on every error
 head and the gates exercise it. A provider that splits a frame across records right before an error head
@@ -1601,7 +1614,7 @@ earlier (row 1) reserved nothing and carries none. When neither side had a last 
 | wallet lock (N) | a setup or request waits at most 10 s for the wallet lock before a first-use Cashu token is redeemed; past it 503 with `detail.error = {"type":"wallet_busy","retry_after_s":1}` (a setup: `error`; a request: `request_refused`, §12.10 row 6) |
 | completion margin (N) | `CONFIDENTIAL_RESERVE_MARGIN_TOKENS` (default 16) tokens beyond `max_tokens` in every chat reservation (§12.10) |
 | refused requests | 8 in a row per connection; the ninth ends it (`error` 429) |
-| control records (S, framing `"2"`) | 16 unproven at once; over the connection 16 and one more per 10 s since `head_written` (§12.6) |
+| control records (S, framing `"2"`) | 16 unproven at once; over the connection 16 and one more per 10 s since `head_written` (§12.6); a provider must stay within it (§5.6, H10) |
 | `/zk` sockets per connection | 6 |
 
 ### 12.10 Money (N)

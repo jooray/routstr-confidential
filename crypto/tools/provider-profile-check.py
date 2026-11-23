@@ -5,7 +5,7 @@ Run against the real provider with a real key (costs a fraction of a cent):
 
     VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py            # A1-A14
     VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --images   # I1-I10 (paid)
-    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8
+    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8, H10
     python3 -I crypto/tools/provider-profile-check.py --self-test   # offline, mocked
 
 Any other argument (a mistyped mode, ``--h2`` with ``--images``, an option
@@ -122,6 +122,10 @@ Framing "2" (``--h2``, PROTOCOL-V3.md section 5.6):
   H8  the event stream of a 200 ends the way the usage disclosure parses it:
       ``data: <usage JSON>\n\ndata: [DONE]\n\n`` up to END_STREAM, LF only,
       only the frames section 5.4 allows in between, within 16 KiB
+  H10 the provider's SETTINGS and PING frames (each needs a control record of
+      the client: SETTINGS ACK, PING ACK) stay within the sidecar's
+      control-record allowance, counted on the connection that idles for H5
+      and extrapolated to the offer's ``h2.max_lifetime_s`` (``h10_problem``)
 """
 
 from __future__ import annotations
@@ -1298,7 +1302,67 @@ H2_NAMES = {
     "H6": "H6 a body of the node's limit passes flow control",
     "H7": "H7 no response reflects the credential",
     "H8": "H8 the usage event and [DONE] end the stream as the disclosure parses it",
+    "H10": "H10 the provider's SETTINGS and PING stay within the control-record allowance",
 }
+H2_MAX_LIFETIME = int(_H2.get("max_lifetime_s", 3600))
+
+# The sidecar's control-record allowance (crypto/relay/src/h2_session.rs:
+# CTL_BURST, CTL_REFILL, MAX_QUEUED_CTL, ctl_allowance; PROTOCOL-V3.md
+# section 12.6). A copy: change both together.
+CTL_BURST = 16
+CTL_REFILL_S = 10
+MAX_QUEUED_CTL = 16
+# Records of the allowance H10 leaves to the client's own control frames
+# (RST_STREAM of a cancelled request) over the connection's life.
+H10_HEADROOM = 8
+# A burst: more than MAX_QUEUED_CTL frames within this many seconds would
+# queue more control records than may wait unproven (one π_WIN takes about
+# a second on loopback, more on a slow link).
+H10_BURST_WINDOW_S = 5.0
+
+
+def ctl_allowance(age_s: float) -> int:
+    """Control records a connection may have carried ``age_s`` after its head."""
+    return CTL_BURST + int(max(0.0, age_s) // CTL_REFILL_S)
+
+
+def h10_problem(times: list[float], head_at: float, idle: tuple[float, float], lifetime_s: float) -> tuple[str | None, str]:
+    """Whether the provider's frames that need a client control record
+    (``times``, absolute, the same clock as ``head_at``) exhaust the
+    allowance. ``idle`` is the idle window (start, end) the rate is measured
+    on. Returns (problem or None, evidence). The criterion, all three:
+
+    1. observed: the k-th such frame at age t never exceeds ``ctl_allowance(t)``;
+    2. burst: at most ``MAX_QUEUED_CTL`` within any ``H10_BURST_WINDOW_S``;
+    3. projected: the count so far plus the idle rate times the rest of the
+       connection's life (``h2.max_lifetime_s``) stays within
+       ``ctl_allowance(lifetime) - H10_HEADROOM``.
+    """
+    ts = sorted(t - head_at for t in times)
+    i0, i1 = idle
+    span = max(i1 - i0, 1e-9)
+    in_idle = sum(1 for t in times if i0 <= t <= i1)
+    rate = in_idle / span
+    end_age = max(ts[-1] if ts else 0.0, i1 - head_at)
+    projected = len(ts) + rate * max(0.0, lifetime_s - end_age)
+    allowed = ctl_allowance(lifetime_s) - H10_HEADROOM
+    ev = (f"{len(ts)} frames needing a control record ({in_idle} in {span:.0f} s idle: "
+          f"{rate * 600:.1f} per 10 min, the allowance refills {600 // CTL_REFILL_S} per 10 min); "
+          f"projected {projected:.0f} over {lifetime_s:.0f} s against {allowed} "
+          f"({CTL_BURST} + 1 per {CTL_REFILL_S} s, {H10_HEADROOM} left for the client)")
+    for k, t in enumerate(ts, 1):
+        if k > ctl_allowance(t):
+            return f"frame {k} at {t:.0f} s after the head is over the allowance of {ctl_allowance(t)}; " + ev, ev
+    j = 0
+    for k, t in enumerate(ts):
+        while ts[j] < t - H10_BURST_WINDOW_S:
+            j += 1
+        if k - j + 1 > MAX_QUEUED_CTL:
+            return (f"{k - j + 1} frames within {H10_BURST_WINDOW_S:.0f} s at {t:.0f} s, more than the "
+                    f"{MAX_QUEUED_CTL} control records that may wait unproven; " + ev), ev
+    if projected > allowed:
+        return "the idle rate uses the allowance up before h2.max_lifetime_s; " + ev, ev
+    return None, ev
 
 
 # What a request without a credential gets (402: a provider that then asks for payment).
@@ -1446,7 +1510,7 @@ def run_h2() -> int:
 
     guarded(["H1"], p_h1)
     if res.get("H1", ("", ""))[0] == "FAIL":
-        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8"):
+        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10"):
             put(it, "FAIL", "not checked: no HTTP/2 connection (H1)")
         return _h2_verdict(res)
 
@@ -1467,12 +1531,12 @@ def run_h2() -> int:
     probe = state.get("probe")
     ctl = state.get("control")
     if probe is not None and probe.status in H2_UNAUTH:
-        for it in ("H2", "H3", "H5", "H6", "H8"):
+        for it in ("H2", "H3", "H5", "H6", "H8", "H10"):
             put(it, "FAIL", f"the key is refused: probe GET {H2_PROBE} with the literal credential -> {probe.status}")
     elif ctl is not None and 400 <= ctl.status < 500 and ctl.status not in H2_UNAUTH:
         # Not the provider's HTTP/2: the plain request itself is refused (the
         # model, the body). Nothing can be concluded from such a run.
-        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8"):
+        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10"):
             put(it, "INCONCLUSIVE", f"the check's own chat request is refused: {ctl.status} {snip(ctl.text, 70)} (name a chat model of this provider with --model)")
         for c in conns:
             c.tr.close()
@@ -1571,6 +1635,7 @@ def run_h2() -> int:
         if a.closed or a.goaway:
             put("H5", "FAIL", f"indexed -> {r1.status}; the provider closed the idle connection within {idle_s:.0f} s{_goaway(a)}")
             return
+        state["idle_end"] = a.tr.now()
         r2 = h2_request(a, PATH, h2_body(), f"chat by index after {idle_s:.0f} s idle")
         state["r2"] = r2
         ok = r1.status == 200 and r2.status == 200 and h2_stream_ok(r2, CHEAP) and r_no.status in H2_UNAUTH
@@ -1582,6 +1647,21 @@ def run_h2() -> int:
             put("H5", "PASS" if ok else "FAIL", ev + ("" if r_no.status in H2_UNAUTH else "; the control was not refused, so the index proves nothing"))
 
     guarded(["H5"], p_idle)
+
+    # ---- H10: the provider's frames that need a client control record, on
+    # connection A (its whole life; the rate from its idle time).
+    if a is not None and "idle_from" in state:
+        end = state.get("idle_end", a.tr.now())
+        if end - state["idle_from"] < min(60.0, H2_IDLE / 2) and not (a.closed or a.goaway):
+            put("H10", "INCONCLUSIVE", f"idle only {end - state['idle_from']:.0f} s")
+        else:
+            prob, ev = h10_problem(a.ctl_needed, a.head_at or 0.0, (state["idle_from"], end), float(H2_MAX_LIFETIME))
+            ev += f" ({a.pings} PING, {len(a.peer_settings)} SETTINGS)"
+            if prob is None and H2_IDLE < H2_OFFER_IDLE:
+                put("H10", "INCONCLUSIVE", ev + f"; idled less than the offer's h2.idle_secs {H2_OFFER_IDLE}")
+            else:
+                put("H10", "FAIL" if prob else "PASS", prob + f" ({a.pings} PING, {len(a.peer_settings)} SETTINGS)" if prob else ev)
+    put("H10", "INCONCLUSIVE", "not checked: no connection reached its idle time (H5)")
 
     # ---- H4: every response header block, with an empty dynamic table.
     blocks = sum(c.blocks for c in conns)
@@ -1659,9 +1739,9 @@ def _h2_verdict(res: dict) -> int:
             print(f'  keep "http": ["1.1"] in the offer file for {HOST}.')
         elif inc:
             print(f'offer "2": not yet, because the check is incomplete ({why(inc)})')
-            print('  run it again; add "2" only after a run in which H1-H8 all pass.')
+            print('  run it again; add "2" only after a run in which H1-H8 and H10 all pass.')
         else:
-            print(f'offer "2": yes. {HOST} does what framing "2" needs (H1-H8).')
+            print(f'offer "2": yes. {HOST} does what framing "2" needs (H1-H8, H10).')
             print(f'  "http": ["2", "1.1"] with "h2": {{"probe_path": {json.dumps(H2_PROBE)}, "idle_secs": at most {H2_IDLE:.0f}}}; '
                   f"the sidecar's --max-body at most {H2_BODY_BYTES}.")
     return 1 if fails else (2 if inc else 0)
@@ -1917,9 +1997,9 @@ def self_test() -> int:
     global QUIET, H2_IMAGES, H2_IDLE, H2_BODY_BYTES, H2_PROBE
     QUIET, H2_IMAGES, H2_BODY_BYTES, H2_PROBE = True, True, 300_000, H2_PROBE or "/v1/models"
     H2_IDLE = float(H2_OFFER_IDLE)
-    hs = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8"]
+    hs = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10"]
     h2_scenarios = [
-        ("h2: healthy provider passes H1-H8", MockProvider(),
+        ("h2: healthy provider passes H1-H8, H10", MockProvider(),
          lambda v, rc: rc == 0 and all(v.get(k) == "PASS" for k in hs)),
         ("h2: ALPN h2 not selected fails H1, nothing passes", MockProvider(h2_alpn=False),
          lambda v, rc: rc == 1 and v.get("H1") == "FAIL" and not any(x == "PASS" for x in v.values())),
@@ -1945,6 +2025,14 @@ def self_test() -> int:
          lambda v, rc: rc == 1 and v.get("H7") == "FAIL"),
         ("h2: credential in an error body fails H7", MockProvider(reflect_body=True),
          lambda v, rc: rc == 1 and v.get("H7") == "FAIL"),
+        ("h2: a PING every 30 s passes H10", MockProvider(h2={"ping_every": 30.0}),
+         lambda v, rc: rc == 0 and v.get("H10") == "PASS"),
+        ("h2: a PING every 5 s exhausts the allowance while idle: fails H10", MockProvider(h2={"ping_every": 5.0}),
+         lambda v, rc: rc == 1 and v.get("H10") == "FAIL" and v.get("H5") == "PASS"),
+        ("h2: a PING every 9 s exhausts it before h2.max_lifetime_s: fails H10", MockProvider(h2={"ping_every": 9.0}),
+         lambda v, rc: rc == 1 and v.get("H10") == "FAIL" and v.get("H5") == "PASS"),
+        ("h2: 17 PINGs at once fail H10 (more than may wait unproven)", MockProvider(h2={"ping_burst": (200.0, 17)}),
+         lambda v, rc: rc == 1 and v.get("H10") == "FAIL"),
         ("h2: CRLF event stream fails H8", MockProvider(crlf=True),
          lambda v, rc: rc == 1 and v.get("H8") == "FAIL"),
         ("h2: multi-line usage event fails H8", MockProvider(pretty=True),

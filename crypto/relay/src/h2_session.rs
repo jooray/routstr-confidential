@@ -39,6 +39,9 @@ const MAX_QUEUED_CTL: usize = 16;
 /// per PING and at most one RST_STREAM per request; a provider that pings
 /// more often than every `CTL_REFILL` for longer than the burst lasts is not
 /// served (keep-alive pings are tens of seconds apart).
+/// `crypto/tools/provider-profile-check.py` keeps a copy of `CTL_BURST`,
+/// `CTL_REFILL` and `MAX_QUEUED_CTL` for its check H10 (PROTOCOL-V3.md §5.6):
+/// change both together.
 pub(crate) const CTL_BURST: u64 = 16;
 pub(crate) const CTL_REFILL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Most records an error head may span (a response head is about 1 kB).
