@@ -289,12 +289,12 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 **Checks.**
 - `crypto/tools/v3-check.sh` (**the sidecar + reference client gate**; real
   provider, no node; `CU_V3_PORT` picks the sidecar port): the offline
-  self-checks, then 56 cases (54 without the two paid images), both framings: honest (one, several, error
+  self-checks, then 57 cases (55 without the two paid images), both framings: honest (one, several, error
   head, 200 kB body, decoy model, armed, refused-then-good, image), a v2
   socket, every attack (hidden HEADERS, TLS padding, suffix/model/cap swap,
   path, usage replay, image suffix, early record, no proof, own key share,
   2PC version tag (`h2-j-twopc-tag`; `h2-j-twopc-tag-old` for a `split-public-2` peer), forged refusals `h2-r-refusal-*`, a 9 MiB client message
-  `h2-l-big-frame`: `error` 413 `frame_too_large` without `fault`; control records past the connection's allowance `h2-m-ctl-flood`), and the forced failure of "2" (fallback, withdrawal,
+  `h2-l-big-frame`: `error` 413 `frame_too_large` without `fault`; control records past the connection's allowance `h2-m-ctl-flood`; a 2PC client silent after its tag and salt gets no table byte `h2-n-silent-2pc`), and the forced failure of "2" (fallback, withdrawal,
   return). `v3_eval.py` judges each case from the driver's output and the
   sidecar's own run files; exit ≠ 0 on any deviation. Two paid images
   (`CU_NO_IMAGES=1` skips them).
@@ -308,7 +308,12 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   `h2-l-big-frame` (the oversized client message: deposit charged, `unused`),
   `h2-m-ctl-flood` (control records past the connection's allowance: `unused`)
   and `h2-m-hold-body` (the HEADERS released, the proven body held back: an
-  abandoned request whatever the provider does; driver `--adv ctl-flood|hold-body`).
+  abandoned request whatever the provider does; driver `--adv ctl-flood|hold-body`),
+  `h2-n-silent-2pc` (`--adv silent-2pc`: no table byte, deposit `unused`), and
+  the eviction cases `h2-n-evict-lone` (a lone spare goes only once no address
+  holds more) and `h2-n-evict-own` (a hoarder's setup closes its own oldest),
+  on a node restarted with 3 slots (`CU_TEST_MAX_SESSIONS`) that trusts
+  loopback as its proxy (driver `--client-ip`).
 - `crypto/tools/v3-routstrd-check.sh`: sidecar, node, stub mint and a
   scratch routstrd; curl through the local API (sequential, burst, forced
   "1.1"). Needs the SDK and routstrd checkouts built.
@@ -458,32 +463,52 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   before the provider closed (the node then settles an abandoned request,
   never row 8); the clients refuse a receipt whose cost is above
   `request_ok.reserved_msats` and bound a usage charge by the node's exact
-  formula. **Added 2026-11-23 (second round):** under slot pressure a setup
-  closes, after the idle used ones, one *unused* connection past
-  `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s; 0 never) with nothing under
-  way, of the address holding the most (another address for a full node),
-  and charges its deposit only when that address held
-  `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more, else releases it
-  (`closed` `evicted`, `unused: true`, deposit `evicted` /
-  `evicted_released` with the signed counts; rows 13 and 13a); setups claim
-  slots under a lock, so a refused setup closes nothing; only under
-  pressure, never on a timer (`PROTOCOL-V3.md` §8.4, risk 13); the SDK and
-  browser pools then arm no spare for that node for 10 min. A request the
+  formula. **Added 2026-11-23 (second round), changed in the fourth:**
+  under slot pressure a setup closes, after the idle used ones, one *unused*
+  connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s; 0 never; in the
+  signed offer as `evict_unused_after_s`, a connection keeps its offer's
+  value) with nothing under way, of the address holding the most, or the
+  asking address's own oldest when it holds as many as any (a setup never
+  closes a connection of an address holding fewer than its own), and
+  **always charges its deposit** (`closed` `evicted`, `unused: true`,
+  deposit `evicted` with `evicted: {unused_at_address}`; row 13; the
+  threshold `CONFIDENTIAL_EVICT_CHARGE_FROM` and `evicted_released` are
+  gone, a stored value of the setting is ignored); setups claim slots under
+  a lock, so a refused setup closes nothing, and close nothing while the
+  node's last sidecar fetch failed; only under pressure, never on a timer
+  (`PROTOCOL-V3.md` §8.4, risk 13); the SDK and browser pools then arm no
+  spare for that node for 10 min. A framing-"1.1" request 1 that has no
+  ClientHello 15 s after its acceptance does not hold the slot (evicting it
+  releases the request). `CU_TEST_MAX_SESSIONS` lowers the node's 32 slots
+  for the node gate only (`h2-n-evict-lone`, `h2-n-evict-own` run the node
+  with 3 and trust loopback as the proxy, so the driver's `--client-ip`
+  names each client's address). A request the
   node finalized without a receipt is stated on the last frame, signed
   (`request_outcome`, §12.10); the three clients check it. **Added
   2026-11-23 (third round):** a control record written while a request is
   in flight marks it at any position, before its first record too (the
   connection's first SETTINGS ACK excepted: every client sends it with its
   first request), and a GOAWAY does not refuse a marked request; an unused
-  connection is not evicted in the 15 s after `head_written`;
-  `CONFIDENTIAL_EVICT_CHARGE_FROM` is at least 2 and the clients report an
-  eviction charge at a threshold of 1; every number in a usage event is
-  below 2^53 (sidecar, three clients, `cu_h2.py`: five copies of the rule,
-  one vector file); the SDK and the browser library report a control
-  socket that ended without the node's last frame while the node held
-  money. What the eviction rules do not give is in §8.4 (the address is
-  not a party; the signed count is the node's word; a request accepted and
-  never written shields its connection for 600 s). Clients: optional body padding (`confidential.padBucket`,
+  connection is not evicted in the 15 s after `head_written`; every number
+  in a usage event is below 2^53 (sidecar, three clients, `cu_h2.py`: five
+  copies of the rule, one vector file). **Fourth round (2026-11-23):** the
+  node garbles only after the client's salt and first OT messages, and
+  sends tables only as the client's MAC-COT upload progresses (no time
+  fallback; `h2-n-silent-2pc` in both gates, `--adv silent-2pc`); a PING
+  ACK owed to the provider (a server record since the previous one, at most
+  2 per request) does not mark a request, and the clients hold a later
+  SETTINGS ACK until `body_released`; the three clients hold a
+  `request_outcome` to the node's ceiling per reason
+  (`crypto/conformance/request-outcome-vectors.json`, copied to the SDK and
+  library fixtures), to the frame and the deposit outcome beside it, and all
+  three report a control socket that ended without the node's last frame
+  while the node held money (also after a socket error or a malformed
+  frame); a failed settlement before `body_released` releases the request.
+  What the eviction rules do not give is in §8.4 (the address is not a
+  party: behind a NAT, VPN or Tor exit another party's spares count toward
+  it, so an honest spare there can be charged first, one deposit; the
+  signed count is the node's word; a framing-"2" request accepted and never
+  written shields its connection for 600 s). Clients: optional body padding (`confidential.padBucket`,
   `--pad-bucket`, off by default); routstrd `x-routstr-reuse-scope` narrows the
   reuse scope.
 - **Ports.** `v3-check.sh` defaults to 7462 and the node gate to 7461/8431;

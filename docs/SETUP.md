@@ -316,12 +316,14 @@ host, or through an encrypted tunnel (WireGuard, or a TLS terminator in front of
 on both sides and restart both.
 
 **What the deposit prices.** The limits below are per address, so a client with funded credentials on
-several addresses can hold session slots with unused connections. Under slot pressure a newer setup closes
-an unused one past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (below), and an address holding
-`CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more pays its deposit for each one taken. One spread over many
-addresses with fewer each pays nothing, but its connections are taken on demand after the minimum age, and
-each re-open costs it a full 2PC. Set the deposit to what a blocked slot costs you; with a deposit of 0 the
-slots are free to hold.
+several addresses can hold session slots with unused connections. Every connection that ends without a
+settled request is charged its deposit (unused, idle, 600 s without a head, or evicted), so holding a slot
+unused costs one deposit. Under slot pressure a newer setup closes an unused one past
+`CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (below) and charges its deposit, also when the setup is the same
+client's. The node does no handshake work for a client that does not run the 2PC itself: it garbles only
+after the client's salt and first OT messages, and streams the tables only as the client's own upload
+progresses. Set the deposit to what a blocked slot costs you; with a deposit of 0 the slots are free to
+hold.
 
 **Denial-of-service limit.** The node refuses a new confidential connection (HTTP 429, WebSocket close
 1013) from a client address that already has `CONFIDENTIAL_MAX_UNUSED_PER_IP` (default 12, 0 disables)
@@ -335,17 +337,20 @@ address or the node is full, the node first closes the connection of that addres
 any address) that has idled longest after a settled request (`closed`, reason `evicted`; its deposit was
 already released by that settlement, so its client loses only a handshake). With none, it closes one
 **unused** connection (no settled request) whose setup is at least `CONFIDENTIAL_EVICT_UNUSED_AFTER_S`
-(default 60, 0 never) seconds old and that has nothing under way (its handshake, its 2PC or proof channel
-moving bytes, a request queued, reserving or in flight): for a full node one of another address, of the
-address holding the most such connections; for a full address its own oldest (`closed`, reason `evicted`,
-`"unused": true`). Its deposit is charged only when its address held at least
-`CONFIDENTIAL_EVICT_CHARGE_FROM` (default 5) such connections, else released (`evicted_released`). Setups
-claim slots one at a time: each closes at most one connection, a refused one none. The node refuses the
-setup only when there is none, and closes nothing on a timer. The cost to honest clients: a pre-warmed spare
-older than the minimum age loses its slot when the node or its address is full, but its deposit only when
-its address holds 5 or more (clients behind one address together); raise the threshold if many honest
-clients share an address, and the minimum age if your clients sit on links slower than 2/50 Mbit/s (a cold
-connection there takes about 12 s to its first request). PROTOCOL-V3.md §8.4 has the rule. The limits are
+((default 60, 0 never; published in the signed offer as `evict_unused_after_s`) seconds old and that has
+nothing under way (its handshake, its 2PC or proof channel moving bytes, a request queued, reserving or in
+flight; a framing-"1.1" request 1 that still has no ClientHello 15 s after its acceptance does not count):
+for a full address its own oldest; for a full node the oldest of the address holding the most such
+connections, or the asking address's own oldest when it holds as many as any (`closed`, reason `evicted`,
+`"unused": true`). Its deposit is charged. Setups claim slots one at a time: each closes at most one
+connection, a refused one none, and none while the node's last attempt to reach the sidecar failed. The
+node refuses the setup only when there is none, and closes nothing on a timer. The cost to honest clients:
+a pre-warmed spare older than the minimum age is closed, and its deposit charged, when the node or its
+address is full and its address holds the most such connections (or no address holds more than one and it
+is the oldest). Clients behind one address (a NAT, a VPN, a Tor exit) count together, so there another
+party's spares can make an honest spare the first one closed: one deposit per spare. Raise the minimum age
+if your clients sit on links slower than 2/50 Mbit/s (a cold connection there takes about 12 s to its
+first request). PROTOCOL-V3.md §8.4 has the rule and what each side pays. The limits are
 only as good as the node's idea of the client address, which depends on how the node is reached:
 
 | Deployment | What to set | Result |

@@ -810,8 +810,7 @@ abandon fee for an unused session. v3:
 | The provider closed the open, idle connection before any request | released (`provider_closed`) | the node |
 | The same, but the client had control frames written on it first (`after_client_frames`) | **charged** (`unused`): the close may be the client's doing | the client |
 | The connection was evicted while used (a newer setup needed its slot; an idle connection that already settled a request) | already released by that settlement | nobody |
-| The connection was evicted while unused (the node or the address was full, no idle used connection was left, and it was past the minimum age, 60 s by default, with nothing under way), its address holding 5 or more such connections | **charged** (`evicted`) | the client: its address hoarded slots |
-| The same, its address holding fewer (a lone pre-warmed spare) | released (`evicted_released`) | nobody: the slot is lost, not the deposit |
+| The connection was evicted while unused (the node or the address was full, no idle used connection was left, and it was past the minimum age, 60 s by default, with nothing under way; the address holding the most such connections goes first, the asking address's own when it holds as many as any) | **charged** (`evicted`) | the client: the deposit is the price of the handshake its connection did not use |
 | The node refused a request with a 5xx and accepted none of the connection's requests after it, or a billing write failed (a 5xx refusal followed by an accepted request that is then abandoned is the abandoned row) | released (`node_failure`) | the node |
 | A request was written in full and never settled | released; that request's reservation is charged | the client, through the reservation |
 | The provider answered a request and closed before its body was complete | released; the request keeps the session fee | the client, through the session fee |
@@ -835,8 +834,9 @@ amount instead of a full-context reservation. On the node's side, a
 deposit below the real cost of a handshake leaves a cheap way to make it
 work; the per-address limits (12 unused, 16 in all), the session slots
 (a full node or address evicts its longest-idle used connection, then its
-oldest unused one past the minimum age, charging its deposit only for an
-address holding many, before it refuses) and the cap of 8 refused requests in a row bound that. One
+oldest unused one past the minimum age of the address holding the most,
+charging its deposit, before it refuses; the node garbles and sends tables
+only as far as the client's own 2PC traffic goes) and the cap of 8 refused requests in a row bound that. One
 handshake costs the node about 0.40 s of CPU, 457 MiB peak memory and
 16.5 MB of upload in a single run (`crypto/twopc/BENCH.md`); a request on
 an open connection about 1 MB of proof-channel download and two proof
