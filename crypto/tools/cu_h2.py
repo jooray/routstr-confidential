@@ -544,7 +544,8 @@ _USAGE_KEY_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
 
 
 def _number(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    """A number every implementation reads the same: magnitude below 2^53."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and abs(v) < 2**53
 
 
 def _numeric_object(v, depth: int) -> bool:
