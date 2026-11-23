@@ -1,6 +1,28 @@
 {
+  "chi": [
+    {
+      "chi": "b6954aef2a70cbbb76fd34c3e0a08e3c",
+      "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "what": "dvzk"
+    },
+    {
+      "chi": "8a4462c59a40a6caace4471a54f7fcf6",
+      "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "what": "check0"
+    },
+    {
+      "chi": "477b487673c46801ea688158e722af05",
+      "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "what": "check4"
+    },
+    {
+      "chi": "bb81e2c1fe91ccb472d6723584145a34",
+      "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "what": "check-salt"
+    }
+  ],
   "conventions": "a 128-bit value is a u128 whose 16 bytes are little-endian; integers are hex, most significant digit first; byte strings are hex in order; GF(2^64) = GF(2)[x]/(x^64+x^4+x^3+x+1), bit i = coefficient of x^i; field elements are integers mod the P-256 prime",
-  "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input and the key share with N's proof of knowledge",
+  "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input, the key share with N's proof of knowledge, the challenges, the label-check pairs, the stage report hash and the openings hash",
   "gate": {
     "a0": "00112233445566778899aabbccddeeff",
     "b0": "fedcba98765432100f1e2d3c4b5a6979",
@@ -228,6 +250,29 @@
     "s": "6fe8447ae3b901b261287222db0abf7e9274c0c674d1591fa84e47b0e7103f94",
     "seed": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
   },
+  "label_check_pair": [
+    {
+      "hash": "8922d5369fbe013659083c035cec82c8",
+      "label": "ffeeddccbbaa99887766554433221100",
+      "o": 0,
+      "p": 0,
+      "pair_salt": "bb81e2c1fe91ccb472d6723584145a34"
+    },
+    {
+      "hash": "f9485a589b54c20a880661e27b026312",
+      "label": "feeeddccbbaa99887766554433221100",
+      "o": 0,
+      "p": 1,
+      "pair_salt": "bb81e2c1fe91ccb472d6723584145a34"
+    },
+    {
+      "hash": "bfe1d569f687905aad12de9bf1a68ff3",
+      "label": "ffeeddccbbaa99887766554433221100",
+      "o": 2527,
+      "p": 1,
+      "pair_salt": "bb81e2c1fe91ccb472d6723584145a34"
+    }
+  ],
   "masked_input": [
     {
       "delta": "dea89a799915db0d2aefde4e23cc4e4737b5d99594f09a348d0841ceebb5f1bc",
@@ -257,6 +302,15 @@
       "x_n": "e0feb47bc25203668e093aca1cd4bac79b31dba0dc70a8bd6093497bf788d18c"
     }
   ],
+  "openings_hash": {
+    "hash": "6c03cc79c375155128312e2385d1854d3bd937fe2a6264bc39957e8462a02336",
+    "macs": [
+      "ffeeddccbbaa99887766554433221100",
+      "feeeddccbbaa99887766554433221100",
+      "00112233445566778899aabbccddeeff"
+    ],
+    "tag": "routstr-twopc-ag open"
+  },
   "row": [
     {
       "aes_in": "7e299be3d86c2b81c4e40a55293043fa",
@@ -351,6 +405,16 @@
       "y": "0123456789abcdeffedcba9876543210"
     }
   ],
+  "stage_report_hash": {
+    "hash": "baa6a00758f1b316f03e55a05684014c94d9a38c31545ad1d65a66587f957483",
+    "labels": [
+      "ffeeddccbbaa99887766554433221100",
+      "feeeddccbbaa99887766554433221100",
+      "00112233445566778899aabbccddeeff"
+    ],
+    "stage": 3,
+    "tag": "routstr-twopc-split output labels"
+  },
   "xtime": [
     {
       "a": "8000000000000000",

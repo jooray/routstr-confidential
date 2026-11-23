@@ -1141,8 +1141,40 @@ fn vectors() -> serde_json::Value {
         "joint": hex::encode(joint),
     });
 
+    // The challenges, the label-check pairs, the stage report hash and the
+    // openings hash.
+    let seed1 = hex32(SEED1);
+    let chi_cases: Vec<_> = ["dvzk", "check0", "check4", "check-salt"]
+        .iter()
+        .map(|what| json!({"seed": SEED1, "what": what, "chi": hex::encode(chi(&seed1, what.as_bytes()).to_bytes())}))
+        .collect();
+    let pair_salt = chi(&seed1, b"check-salt").to_bytes();
+    let pair_cases: Vec<_> = [(0usize, false, X), (0, true, X ^ 1), (2527, true, X)]
+        .iter()
+        .map(|&(o, p, x)| {
+            json!({
+                "pair_salt": hex::encode(pair_salt), "o": o, "p": p as u8, "label": hex::encode(bu(x).to_bytes()),
+                "hash": hex::encode(pair_hash(&pair_salt, o, p, bu(x))),
+            })
+        })
+        .collect();
+    let labels = [bu(X), bu(X ^ 1), bu(!X)];
+    let hash_over = |mut h: Sha256| -> String {
+        for l in &labels {
+            h.update(l.as_bytes());
+        }
+        hex::encode(h.finalize())
+    };
+    let labels_hex: Vec<_> = labels.iter().map(|l| hex::encode(l.to_bytes())).collect();
+    let report = json!({
+        "tag": String::from_utf8_lossy(TAG_OUT), "stage": 3, "labels": labels_hex, "hash": hash_over(report_hasher(3)),
+    });
+    let openings = json!({
+        "tag": String::from_utf8_lossy(TAG_OPEN), "macs": labels_hex, "hash": hash_over(open_hasher()),
+    });
+
     json!({
-        "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input and the key share with N's proof of knowledge",
+        "description": "split-public-2: the garbling hash H_g, the check-row hash, the row parameters, one three-halves gate, the input-label commitments, the masked input, the key share with N's proof of knowledge, the challenges, the label-check pairs, the stage report hash and the openings hash",
         "conventions": "a 128-bit value is a u128 whose 16 bytes are little-endian; integers are hex, most significant digit first; byte strings are hex in order; GF(2^64) = GF(2)[x]/(x^64+x^4+x^3+x+1), bit i = coefficient of x^i; field elements are integers mod the P-256 prime",
         "xtime": xt,
         "gf64_mul": gf64,
@@ -1154,6 +1186,10 @@ fn vectors() -> serde_json::Value {
         "input_label_commitment": com_cases,
         "masked_input": mi,
         "key_share": key_share,
+        "chi": chi_cases,
+        "label_check_pair": pair_cases,
+        "stage_report_hash": report,
+        "openings_hash": openings,
     })
 }
 
