@@ -96,7 +96,7 @@ import { padBody, pinnedModel, renderChatSuffix, renderImagesSuffix } from './of
 import { checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { makeReceiptChecker } from './receipt-check.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
-import { depositProblems, missingDepositProblem } from './deposit-check.ts'
+import { depositProblems, missingDepositProblem, missingLastFrameProblem } from './deposit-check.ts'
 import { requestOutcomeProblems, type OpenRequest } from './request-outcome.ts'
 import { errText, shown, termSafe } from './term.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
@@ -281,6 +281,10 @@ let OFFER_SIG: string | undefined
 let SESSION_FEE = 0
 /** The signed offer's fee for a request that is dropped before its body is released (msats, ≥ SESSION_FEE). */
 let ABANDON_FEE = 0
+/** The signed offer's `abandon_fee_msat` alone (the node's abandon ceiling is max(it, the session fee if still due)). */
+let ABANDON_FEE_ONLY = 0
+/** The signed offer's `evict_unused_after_s` (undefined: an older node's offer has none). */
+let EVICT_AFTER_S: number | undefined
 /** The signed offer's connection deposit (msats; a sidecar's own offer has none). */
 let DEPOSIT = 0
 /** The framings of the offer this client supports, in the operator's order. */
@@ -366,6 +370,8 @@ async function fetchOffer(): Promise<void> {
   }
   SESSION_FEE = parsed.session_fee_msat ?? 0
   ABANDON_FEE = Math.max(parsed.abandon_fee_msat ?? 0, SESSION_FEE)
+  ABANDON_FEE_ONLY = parsed.abandon_fee_msat ?? 0
+  EVICT_AFTER_S = Number.isSafeInteger(parsed.evict_unused_after_s) && parsed.evict_unused_after_s >= 0 ? parsed.evict_unused_after_s : undefined
   console.log(
     `[client] offer session_fee_msat=${SESSION_FEE} abandon_fee_msat=${ABANDON_FEE} connection_deposit_msat=${DEPOSIT} ` +
       `idle_timeout_s=${shown(parsed.idle_timeout_s)} rate_surcharge_pct=${shown(parsed.rate_surcharge_pct ?? 0)}`,
@@ -526,6 +532,11 @@ class Session {
   requestOutcome: { n: unknown; outcome: string; reason: string; cost_msats: unknown; signed: boolean } | undefined
   /** The node sent a last frame (`closed` or `error`). */
   lastFrameSeen = false
+  /** The client closed the session socket itself (`close()`). */
+  closedByClient = false
+  /** When the client sent its `setup` (ms), and whether it wrote its ClientHello (a relayed TLS record). */
+  tSetupSent = 0
+  helloSent = false
   /** The provider closed before the request in flight was written in full (`upstream_closed_early`). */
   closedEarly = false
   /** When each kind of control frame first arrived (measurements). */
@@ -591,9 +602,15 @@ class Session {
     this.ws.onclose = (ev: any) => {
       // The connection is over: a deposit no receipt released has its
       // outcome in the node's last frame (§12.9).
-      const missing = NODE_MODE
-        ? missingDepositProblem({ sid: this.sid, depositMsat: DEPOSIT, releasedByReceipt: this.settledOnce }, this.lastFrameSeen, this.deposit !== undefined)
-        : null
+      // Without a last frame at all (and not the client's own close, even after
+      // a socket error or a malformed frame): nothing signed says what became
+      // of the money the node holds.
+      const open = this.openReq?.accepted ? this.openReq.n : undefined
+      const missing = !NODE_MODE
+        ? null
+        : !this.lastFrameSeen && !this.closedByClient
+          ? missingLastFrameProblem({ sid: this.sid, depositMsat: DEPOSIT, releasedByReceipt: this.settledOnce, openAccepted: open })
+          : missingDepositProblem({ sid: this.sid, depositMsat: DEPOSIT, releasedByReceipt: this.settledOnce }, this.lastFrameSeen, this.deposit !== undefined)
       if (missing) {
         const dev = { sid: this.sid || null, frame: 'closed', outcome: 'none', reason: 'none', signed: false, problems: [missing] }
         DEPOSIT_DEVIATIONS.push(dev)
@@ -605,7 +622,14 @@ class Session {
       const d = ev.data
       if (typeof d === 'string') {
         this.bytes.control_recv += d.length
-        const m = JSON.parse(d)
+        let m: any
+        try {
+          m = JSON.parse(d)
+          if (m === null || typeof m !== 'object') throw new Error('not an object')
+        } catch {
+          this.errRej(new Error('the node sent a malformed control frame'))
+          return
+        }
         process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
         trace('<-', shown(m.type))
         if (typeof m.type === 'string' && this.tFirst[m.type] === undefined) this.tFirst[m.type] = Date.now()
@@ -679,7 +703,7 @@ class Session {
     console.log(
       `[client ${this.label}] deposit: outcome=${shown(d.outcome)} reason=${shown(d.reason)} msat=${shown(d.msat)} ` +
         `balance_msats=${shown(d.balance_msats)} signed=${signed}` +
-        (d.evicted ? ` unused_at_address=${shown(d.evicted?.unused_at_address)} charge_from=${shown(d.evicted?.charge_from)}` : ''),
+        (d.evicted ? ` unused_at_address=${shown(d.evicted?.unused_at_address)}` : ''),
     )
     if (!NODE_MODE) return
     // The node's own word against its signed terms (§12.10): a deviation is
@@ -691,6 +715,10 @@ class Session {
       signed,
       requestOpen: this.requestOpen,
       openAccepted: this.openReq?.accepted === true,
+      framing: this.framing,
+      helloSent: this.helloSent,
+      evictAfterS: EVICT_AFTER_S,
+      ageS: this.tSetupSent ? (Date.now() - this.tSetupSent) / 1000 : undefined,
     })
     if (problems.length) {
       const dev = { sid: this.sid || null, frame: m.type, outcome: shown(d.outcome), reason: shown(d.reason), signed, problems: problems.map((p) => termSafe(p)) }
@@ -719,11 +747,21 @@ class Session {
       )
     }
     if (!NODE_MODE) return
+    let deposit: any
+    try {
+      deposit = m.deposit === undefined || m.deposit === null ? undefined : JSON.parse(typeof m.deposit_json === 'string' ? m.deposit_json : JSON.stringify(m.deposit))
+    } catch {
+      deposit = undefined
+    }
+    const sessionFee = this.settledOnce ? 0 : SESSION_FEE
     const problems = requestOutcomeProblems(o, signed, {
       sid: this.sid,
       framing: this.framing,
       open: this.openReq,
-      feeMsat: Math.max(this.settledOnce ? 0 : SESSION_FEE, ABANDON_FEE),
+      sessionFeeMsat: sessionFee,
+      abandonFeeMsat: Math.max(sessionFee, ABANDON_FEE_ONLY),
+      frame: m,
+      deposit: deposit !== null && typeof deposit === 'object' ? deposit : undefined,
     })
     if (problems.length) {
       const dev = { sid: this.sid || null, frame: 'request_outcome', outcome: shown(o?.outcome), reason: shown(o?.reason), signed, problems: problems.map((p) => termSafe(p)) }
@@ -753,11 +791,14 @@ class Session {
       this.requestOpen = true
       // A `request` while one is open is a protocol error the node refuses
       // (one request at a time): the open one is still the one at stake.
-      this.openReq ??= { n: Number((obj as any).n), accepted: false, bodyReleased: false }
+      this.openReq ??= { n: Number((obj as any).n), accepted: false, bodyReleased: false, disclosed: false }
     }
+    if (['disclose', 'disclose_head', 'disclose_reset', 'accept'].includes((obj as any)?.type) && this.openReq) this.openReq.disclosed = true
+    if ((obj as any)?.type === 'setup') this.tSetupSent = Date.now()
     this.ws.send(text)
   }
   sendBytes(b: Uint8Array): void {
+    this.helloSent = true
     this.bytes.relay_sent += b.length
     if (this.wsOpen) this.ws.send(b)
     else this.outbox.push(b)
@@ -777,6 +818,7 @@ class Session {
     }
   }
   close(): void {
+    this.closedByClient = true
     this.zkchan?.close()
     this.twopc?.close()
     try {

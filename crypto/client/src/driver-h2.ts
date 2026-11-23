@@ -89,6 +89,10 @@ export class H2Conn {
   initialWindow = 65535
   connCredit = 65535
   private unackedSettings = 0
+  /** A SETTINGS ACK was written (the sidecar exempts only the connection's first inside a request). */
+  private settingsAckSent = false
+  /** SETTINGS ACKs held until the open request's body is released. */
+  private acksAfterRelease = 0
   private requestOpen = false
   goaway = false
   /** The last-stream-id of the provider's GOAWAY: a stream above it is not processed (RFC 9113 §6.8). */
@@ -145,7 +149,23 @@ export class H2Conn {
     if (m.type === 'body_released' && this.cur && m.n === this.cur.n) {
       this.cur.released = true
       this.cur.tReleased = Date.now()
+      this.flushHeldAcks()
     }
+  }
+
+  /** Send `k` SETTINGS ACKs. */
+  private ackSettings(k: number): void {
+    for (; k > 0; k--) {
+      this.settingsAckSent = true
+      void this.sendCtl('settings_ack', new Uint8Array(0))
+    }
+  }
+
+  /** The SETTINGS ACKs held while a request's records were written. */
+  private flushHeldAcks(): void {
+    const k = this.acksAfterRelease
+    this.acksAfterRelease = 0
+    this.ackSettings(k)
   }
 
   /** §12.6: the provider's HEADER_TABLE_SIZE so far; before the first request and whenever a later SETTINGS carries it. */
@@ -178,10 +198,21 @@ export class H2Conn {
         this.updateRelease()
         this.ctx.log({ ev: 'h2_settings', initial_window: this.initialWindow, header_table_size: this.tableSize })
         if (carried && this.settingsSeenSent) this.sendSettingsSeen()
-        // Acknowledged with the next request's records (one π_WIN for both)
-        // when none is open, else at once.
-        if (this.requestOpen) void this.sendCtl('settings_ack', new Uint8Array(0))
-        else this.unackedSettings++
+        // The connection's first SETTINGS is acknowledged with the next
+        // request's records (one π_WIN for both; the sidecar exempts that
+        // one). A later one is acknowledged at once while no request is open,
+        // else once the open request's body is released: a control record
+        // inside a request marks it (a later provider close counts against
+        // the client).
+        if (this.requestOpen) {
+          if (cur?.released) this.ackSettings(1)
+          else this.acksAfterRelease++
+        } else if (!this.settingsAckSent && this.unackedSettings === 0) {
+          this.unackedSettings = 1
+        } else {
+          this.ackSettings(this.unackedSettings + 1)
+          this.unackedSettings = 0
+        }
         break
       }
       case FRAME.PING:
@@ -470,10 +501,8 @@ export class H2Conn {
     if (!adv && ok.suffix !== b.canonicalSuffix) throw new Error('node expects a different pinned suffix than ours')
     // Any SETTINGS acknowledgement and the records go as one π_WIN batch.
     this.requestOpen = true
-    while (this.unackedSettings > 0) {
-      this.unackedSettings--
-      void this.sendCtl('settings_ack', new Uint8Array(0))
-    }
+    this.ackSettings(this.unackedSettings)
+    this.unackedSettings = 0
     if (adv === 'ctl-headers') {
       // A record declared as a PING ACK (inner length 18) whose content is a
       // HEADERS frame for the next stream naming the credential by index: the
@@ -574,6 +603,7 @@ export class H2Conn {
     this.plain.clear()
     this.cur = undefined
     this.requestOpen = false
+    this.flushHeldAcks()
 
     const bytes1 = s.allBytes()
     const delta: Record<string, number> = {}

@@ -140,6 +140,10 @@ export function checkOffer(offer: any, policy: OfferPolicy): CheckedOffer {
     deposit = d
     const idle = offer.idle_timeout_s
     if (!(Number.isSafeInteger(idle) && idle >= 10 && (!h2 || idle <= h2.idle_secs))) refuse('offer_malformed: idle_timeout_s')
+    // The minimum age before an unused connection may be evicted (absent from
+    // an older node's offer).
+    const evict = offer.evict_unused_after_s
+    if (evict !== undefined && !(Number.isSafeInteger(evict) && evict >= 0)) refuse('offer_malformed: evict_unused_after_s')
   }
   return { http: [...http], h2, deposit }
 }

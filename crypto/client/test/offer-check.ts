@@ -149,5 +149,10 @@ console.log('offer-check: ok')
   assert.equal(checkOffer(node, { ...policy, nodeMode: true }).deposit, 2000)
   assert.throws(() => checkOffer(node, { ...policy, nodeMode: true, maxDeposit: 1999 }), /max-deposit/)
   assert.throws(() => checkOffer({ ...node, idle_timeout_s: 301 }, { ...policy, nodeMode: true }), /idle_timeout_s/)
+  // The eviction age: optional (an older node's offer has none), else a non-negative integer.
+  assert.equal(checkOffer({ ...node, evict_unused_after_s: 60 }, { ...policy, nodeMode: true }).deposit, 2000)
+  assert.equal(checkOffer({ ...node, evict_unused_after_s: 0 }, { ...policy, nodeMode: true }).deposit, 2000)
+  assert.throws(() => checkOffer({ ...node, evict_unused_after_s: -1 }, { ...policy, nodeMode: true }), /evict_unused_after_s/)
+  assert.throws(() => checkOffer({ ...node, evict_unused_after_s: '60' }, { ...policy, nodeMode: true }), /evict_unused_after_s/)
   console.log('route and trusted-host checks ok')
 }

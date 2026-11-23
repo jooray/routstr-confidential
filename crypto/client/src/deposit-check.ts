@@ -13,6 +13,8 @@ export const DEPOSIT_RELEASED_REASONS = new Set([
   'node_failure',
   'request_received',
   'provider_refused',
+  // An older node released the deposit of an evicted lone spare under this
+  // reason; the current one always charges an evicted unused connection.
   'evicted_released',
 ])
 
@@ -30,6 +32,14 @@ export interface DepositContext {
   requestOpen?: boolean
   /** The node accepted the open request (`request_ok`; default: not judged). */
   openAccepted?: boolean
+  /** The connection's framing (default: not judged). */
+  framing?: string
+  /** The client wrote its ClientHello (default: not judged). */
+  helloSent?: boolean
+  /** The signed offer's `evict_unused_after_s` (undefined: the offer has none, an older node). */
+  evictAfterS?: number
+  /** Seconds from the client's `setup` to the last frame (default: not judged). */
+  ageS?: number
 }
 
 /** The outcome as parsed from `deposit_json` (or `deposit`). */
@@ -38,17 +48,16 @@ export interface DepositOutcome {
   msat?: unknown
   outcome?: unknown
   reason?: unknown
-  /** An eviction under slot pressure: the address's evictable unused connections and the count that charges. */
+  /** An eviction under slot pressure: the evictable unused connections its address held. */
   evicted?: unknown
 }
 
-/** `evicted: {unused_at_address, charge_from}` of a deposit outcome, if well formed. */
-function evictionCounts(d: DepositOutcome): { n: number; k: number } | undefined {
-  const e = d.evicted as { unused_at_address?: unknown; charge_from?: unknown } | undefined
+/** `evicted.unused_at_address` of a deposit outcome, if well formed (an older node also sent `charge_from`, ignored). */
+function evictionCount(d: DepositOutcome): number | undefined {
+  const e = d.evicted as { unused_at_address?: unknown } | undefined
   if (!e || typeof e !== 'object') return undefined
   const n = e.unused_at_address
-  const k = e.charge_from
-  return Number.isSafeInteger(n) && Number.isSafeInteger(k) && (n as number) >= 0 && (k as number) >= 1 ? { n: n as number, k: k as number } : undefined
+  return Number.isSafeInteger(n) && (n as number) >= 1 ? (n as number) : undefined
 }
 
 /**
@@ -74,9 +83,10 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
     }
     if (c.signed === false) problems.push('charged without a valid signature of the node')
     // Row 13: a newer setup closed the connection while it held its slot
-    // unused (§8.4). Charged only on that `closed` frame, only when the
-    // node's signed count of its address's unused connections reached the
-    // signed threshold, and never with a request the node had accepted.
+    // unused (§8.4), always charged. Only on that `closed` frame, only past
+    // the signed offer's `evict_unused_after_s`, and never with a request
+    // the node had accepted, except a framing-"1.1" request 1 whose
+    // ClientHello the client had not written.
     const evictedUnused = frame?.type === 'closed' && frame.reason === 'evicted' && frame.unused === true
     if (d.reason === 'evicted' && !evictedUnused) problems.push('charged as evicted, but the last frame is not `closed` `evicted` with `unused: true`')
     if (evictedUnused && d.reason !== 'evicted') problems.push(`charged with reason ${JSON.stringify(d.reason ?? null).slice(0, 40)} on an eviction (row 13 names "evicted")`)
@@ -84,11 +94,14 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
       problems.push('charged on the eviction of a used connection (it holds no deposit)')
     }
     if (d.reason === 'evicted') {
-      const e = evictionCounts(d)
-      if (!e) problems.push('charged as evicted without the signed count of the address\'s unused connections')
-      else if (e.n < e.k) problems.push(`charged as evicted, though its address held ${e.n} unused connection(s), below the ${e.k} that charge (a lone spare is released)`)
-      else if (e.k < 2) problems.push(`charged as evicted at a threshold of ${e.k}: a lone unused connection is never charged for its eviction (the threshold is at least 2)`)
-      if (c.openAccepted === true) problems.push('charged as evicted, though the node had accepted a request of it (never evicted)')
+      if (evictionCount(d) === undefined) problems.push('charged as evicted without the signed count of the address\'s unused connections')
+      if (c.evictAfterS === 0) problems.push('charged as evicted, though the signed offer says unused connections are never evicted (evict_unused_after_s 0)')
+      else if (c.evictAfterS !== undefined && c.ageS !== undefined && c.ageS < c.evictAfterS) {
+        problems.push(`charged as evicted ${Math.floor(c.ageS)} s after the setup, before the signed offer's evict_unused_after_s of ${c.evictAfterS} s`)
+      }
+      if (c.openAccepted === true && !(c.framing === '1.1' && c.helloSent === false)) {
+        problems.push('charged as evicted, though the node had accepted a request of it (never evicted)')
+      }
     }
     // Row 5: the provider closed the open connection while no request of the
     // client was open, and not after control frames of the client alone.
@@ -109,4 +122,26 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
 export function missingDepositProblem(c: DepositContext, sawLastFrame: boolean, reported: boolean): string | null {
   if (!sawLastFrame || reported || c.releasedByReceipt || !(c.depositMsat > 0) || c.sid === '') return null
   return `no deposit outcome in the node's last frame for a deposit of ${c.depositMsat} msat`
+}
+
+/**
+ * The session socket ended without the node's last frame (`closed` or
+ * `error`) and not by the client's own close, though the node holds money of
+ * the connection: a deposit no receipt released, or a request it accepted
+ * and did not settle. Whatever the node did with them, it said nothing
+ * signed (§12.9: the outcomes travel on the last frame). Null when nothing is
+ * held. Detection only; a lost network path looks the same.
+ */
+export function missingLastFrameProblem(c: {
+  sid: string
+  depositMsat: number
+  releasedByReceipt: boolean
+  /** The request the node accepted and did not settle, if any. */
+  openAccepted?: number
+}): string | null {
+  if (c.sid === '') return null
+  const held: string[] = []
+  if (c.depositMsat > 0 && !c.releasedByReceipt) held.push(`the deposit of ${c.depositMsat} msat`)
+  if (c.openAccepted !== undefined) held.push(`the reservation of request ${c.openAccepted}`)
+  return held.length ? `the socket ended without the node's last frame: no signed outcome for ${held.join(' and ')} (check the balance)` : null
 }

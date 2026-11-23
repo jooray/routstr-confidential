@@ -2,7 +2,7 @@
 // node to (`src/deposit-check.ts`, PROTOCOL-V3.md §12.9, §12.10).
 //   node --experimental-strip-types test/deposit-check.ts
 import assert from 'node:assert/strict'
-import { DEPOSIT_RELEASED_REASONS, depositProblems, missingDepositProblem } from '../src/deposit-check.ts'
+import { DEPOSIT_RELEASED_REASONS, depositProblems, missingDepositProblem, missingLastFrameProblem } from '../src/deposit-check.ts'
 
 const SID = 'ab'.repeat(32)
 const ctx = { sid: SID, depositMsat: 7000, releasedByReceipt: false }
@@ -72,25 +72,41 @@ assert.equal(missingDepositProblem({ ...ctx, depositMsat: 0 }, true, false), nul
 assert.equal(missingDepositProblem({ ...ctx, sid: '' }, true, false), null) // refused before ready
 
 // Row 13: closed for a newer setup while unused. Charged when signed, on
-// `closed` `evicted` `unused: true`, with the node's count at or above its
-// threshold, no releasing receipt and no request the node had accepted;
-// released (`evicted_released`) below the threshold.
+// `closed` `evicted` `unused: true`: always charged, with the node's signed
+// count of its address's unused connections, no releasing receipt, past the
+// signed offer's minimum age, and no request the node had accepted (except a
+// framing-"1.1" request 1 whose ClientHello the client had not written).
 const evicted = { type: 'closed', reason: 'evicted', unused: true }
-const hoard = { evicted: { unused_at_address: 5, charge_from: 5 } }
-const lone = { evicted: { unused_at_address: 1, charge_from: 5 } }
+const hoard = { evicted: { unused_at_address: 5 } }
+const lone = { evicted: { unused_at_address: 1 } }
 assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', ...hoard }), { ...ctx, signed: true, requestOpen: false }), [])
-assert.deepEqual(depositProblems(evicted, d({ outcome: 'released', reason: 'evicted_released', ...lone }), { ...ctx, signed: true }), [])
-assert.match(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true }).join(), /below the 5 that charge/)
+assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true, requestOpen: false }), [])
+// An older node's fields: a released lone spare, and a charge_from beside the count.
+assert.deepEqual(depositProblems(evicted, d({ outcome: 'released', reason: 'evicted_released', evicted: { unused_at_address: 1, charge_from: 5 } }), { ...ctx, signed: true }), [])
+assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', evicted: { unused_at_address: 5, charge_from: 5 } }), { ...ctx, signed: true }), [])
 assert.match(depositProblems(evicted, d({ reason: 'evicted' }), { ...ctx, signed: true }).join(), /without the signed count/)
-// A threshold of 1 would charge a lone spare for another party's setup.
-assert.match(depositProblems(evicted, d({ reason: 'evicted', evicted: { unused_at_address: 1, charge_from: 1 } }), { ...ctx, signed: true }).join(), /threshold of 1/)
-assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', evicted: { unused_at_address: 2, charge_from: 2 } }), { ...ctx, signed: true, requestOpen: false }), [])
+assert.match(depositProblems(evicted, d({ reason: 'evicted', evicted: { unused_at_address: 0 } }), { ...ctx, signed: true }).join(), /without the signed count/)
 assert.match(depositProblems(evicted, d({ reason: 'evicted_released', ...lone }), ctx).join(), /which releases it/)
 assert.match(depositProblems(evicted, d({ reason: 'evicted', ...hoard }), { ...ctx, releasedByReceipt: true }).join(), /receipt of this connection released it/)
 assert.match(depositProblems(evicted, d({ reason: 'evicted', ...hoard }), { ...ctx, signed: false }).join(), /without a valid signature/)
 assert.match(depositProblems(evicted, d({ reason: 'evicted', ...hoard }), { ...ctx, requestOpen: true, openAccepted: true }).join(), /had accepted a request/)
+// Framing "1.1": request 1 comes before the 2PC and the ClientHello; without the ClientHello it does not hold the slot.
+assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true, requestOpen: true, openAccepted: true, framing: '1.1', helloSent: false }), [])
+assert.match(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true, openAccepted: true, framing: '1.1', helloSent: true }).join(), /had accepted a request/)
+assert.match(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true, openAccepted: true, framing: '2', helloSent: false }).join(), /had accepted a request/)
+// The signed offer's minimum age (absent: an older node, not judged).
+assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true, evictAfterS: 60, ageS: 61 }), [])
+assert.match(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true, evictAfterS: 60, ageS: 30 }).join(), /before the signed offer's evict_unused_after_s of 60 s/)
+assert.match(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true, evictAfterS: 0, ageS: 900 }).join(), /never evicted/)
+assert.deepEqual(depositProblems(evicted, d({ reason: 'evicted', ...lone }), { ...ctx, signed: true, ageS: 1 }), [])
 assert.match(depositProblems(closed, d({ reason: 'evicted', ...hoard }), ctx).join(), /not `closed` `evicted`/)
 assert.match(depositProblems({ type: 'closed', reason: 'evicted' }, d({ reason: 'evicted', ...hoard }), ctx).join(), /used connection/)
 assert.match(depositProblems(evicted, d({ reason: 'unused' }), ctx).join(), /on an eviction/)
+
+// The socket ended without the node's last frame while the node held money.
+assert.equal(missingLastFrameProblem({ sid: '', depositMsat: 7000, releasedByReceipt: false }), null)
+assert.equal(missingLastFrameProblem({ sid: SID, depositMsat: 7000, releasedByReceipt: true }), null)
+assert.match(String(missingLastFrameProblem({ sid: SID, depositMsat: 7000, releasedByReceipt: false })), /the deposit of 7000 msat/)
+assert.match(String(missingLastFrameProblem({ sid: SID, depositMsat: 0, releasedByReceipt: true, openAccepted: 3 })), /the reservation of request 3/)
 
 console.log('deposit-check: ok')
