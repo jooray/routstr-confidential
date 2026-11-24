@@ -21,8 +21,63 @@
 //! The vectors in `usage-event-vectors.json` are the conformance test for
 //! every implementation (sidecar, reference driver, SDK, browser library).
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
+
+/// The event's JSON text parsed, refusing a key repeated in any object. A
+/// parser keeps one of the values (serde_json and JavaScript the last), but
+/// the raw text goes to the node: a shadowed member would reach it unchecked.
+pub fn parse_event(text: &str) -> Result<Value> {
+    use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+    /// A JSON value walked only to find a repeated key.
+    struct NoDup;
+    impl<'de> Deserialize<'de> for NoDup {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = NoDup;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a JSON value")
+                }
+                fn visit_bool<E>(self, _: bool) -> std::result::Result<NoDup, E> {
+                    Ok(NoDup)
+                }
+                fn visit_i64<E>(self, _: i64) -> std::result::Result<NoDup, E> {
+                    Ok(NoDup)
+                }
+                fn visit_u64<E>(self, _: u64) -> std::result::Result<NoDup, E> {
+                    Ok(NoDup)
+                }
+                fn visit_f64<E>(self, _: f64) -> std::result::Result<NoDup, E> {
+                    Ok(NoDup)
+                }
+                fn visit_str<E>(self, _: &str) -> std::result::Result<NoDup, E> {
+                    Ok(NoDup)
+                }
+                fn visit_unit<E>(self) -> std::result::Result<NoDup, E> {
+                    Ok(NoDup)
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> std::result::Result<NoDup, A::Error> {
+                    while a.next_element::<NoDup>()?.is_some() {}
+                    Ok(NoDup)
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> std::result::Result<NoDup, A::Error> {
+                    let mut seen = std::collections::HashSet::new();
+                    while let Some(k) = a.next_key::<String>()? {
+                        if !seen.insert(k) {
+                            return Err(A::Error::custom("a key is repeated"));
+                        }
+                        a.next_value::<NoDup>()?;
+                    }
+                    Ok(NoDup)
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+    serde_json::from_str::<NoDup>(text).map_err(|e| anyhow!("R: usage event: {e}"))?;
+    Ok(serde_json::from_str(text)?)
+}
 
 /// The OpenAI `finish_reason` values: a fixed vocabulary.
 pub const FINISH_REASONS: &[&str] = &["stop", "length", "tool_calls", "content_filter", "function_call"];
@@ -146,7 +201,12 @@ mod tests {
         let vectors = all["vectors"].as_array().unwrap();
         assert!(vectors.len() >= 20);
         for t in vectors {
-            let got = check_usage_event(&t["event"]).is_ok();
+            // A vector is an event, or the event's text (`raw`) when what is
+            // checked is the text itself (a repeated key).
+            let got = match t["raw"].as_str() {
+                Some(raw) => parse_event(raw).and_then(|v| check_usage_event(&v)).is_ok(),
+                None => check_usage_event(&t["event"]).is_ok(),
+            };
             assert_eq!(got, t["ok"].as_bool().unwrap(), "vector {}", t["name"]);
         }
     }

@@ -197,6 +197,10 @@ pub(crate) struct H2 {
     head_prompt: bool,
     /// A client record was written to the provider on this connection.
     client_written: bool,
+    /// A control record of the client that may make the provider close was
+    /// written: not the connection's first SETTINGS ACK, not a PING ACK that
+    /// may answer a PING of the provider (`flush`).
+    risky_ctl_written: bool,
     /// The client reported the provider's SETTINGS (`settings_seen`).
     settings_seen: bool,
     /// The first request's response began (told to the offer guard once).
@@ -257,6 +261,7 @@ impl H2 {
             head_at: None,
             head_prompt: false,
             client_written: false,
+            risky_ctl_written: false,
             settings_seen: false,
             responded: false,
             responded_told: false,
@@ -291,13 +296,15 @@ impl H2 {
             && self.head_at.is_some_and(|t| now.saturating_duration_since(t) < H2_OPEN_WINDOW)
     }
 
-    /// The client had a record written to the provider while the connection
-    /// had carried no request: only control frames, whose effect on the
-    /// provider (an unsolicited SETTINGS ACK is a connection error for some
-    /// servers) is the client's. A provider close then is not "the provider
-    /// closed the open, idle connection" (§12.10 row 5).
+    /// The client had a control record written to the provider while the
+    /// connection had carried no request, one whose effect on the provider
+    /// (an unsolicited SETTINGS ACK is a connection error for some servers)
+    /// is the client's. A provider close then is not "the provider closed the
+    /// open, idle connection" (§12.10 row 5). The connection's first SETTINGS
+    /// ACK and a PING ACK after a server record do not count: the provider
+    /// asks for the one, and ignores a PING ACK it did not ask for.
     pub(crate) fn client_frames_before_request(&self) -> bool {
-        self.client_written && self.requests == 0
+        self.risky_ctl_written && self.requests == 0
     }
 
     /// No request in flight: an expired deadline is the idle limit.
@@ -399,7 +406,7 @@ fn recent_ctl_outside(at: Option<std::time::Instant>, now: std::time::Instant, w
 
 /// Most records one request may arrive in: its HEADERS, and DATA frames that
 /// average at least 4 KiB (a client sends full records and one for the suffix).
-fn max_records(body_len: usize) -> usize {
+pub(crate) fn max_records(body_len: usize) -> usize {
     3 + body_len / 4096
 }
 
@@ -802,6 +809,9 @@ async fn flush(
                 h.ping_ack_mark = h.app_records;
             }
             let owed = ping && after_server_record;
+            if !owed {
+                h.risky_ctl_written = true;
+            }
             if h.req.as_ref().is_none_or(|q| q.released) {
                 // No request in flight, or one written in full: nothing to
                 // mark now, but the next request accepted or first written
@@ -964,6 +974,11 @@ pub(crate) async fn proof_done(
         }
         _ => bail!("{proof} verified with nothing waiting for it"),
     }
+}
+
+/// A π_WIN on the client's records is in flight (framing "2").
+pub(crate) fn records_proof_in_flight(st: &Session) -> bool {
+    st.h2.as_ref().is_some_and(|h| matches!(h.win, Some(WinInflight::Records(_))))
 }
 
 /// `disclose`: the tail of a successful streamed completion (A.6).
@@ -1718,10 +1733,57 @@ mod tests {
         h.req = None;
         h.requests = 0;
         assert!(!h.client_frames_before_request());
-        h.client_written = true;
+        h.risky_ctl_written = true;
         assert!(h.client_frames_before_request());
         h.requests = 1;
         assert!(!h.client_frames_before_request());
+    }
+
+    /// On a connection without a request, the first SETTINGS ACK and a PING
+    /// ACK after a server record are not flagged; a second SETTINGS ACK, or a
+    /// PING ACK with no server record since the previous one, is.
+    #[tokio::test]
+    async fn the_answers_a_provider_asks_for_are_not_flagged() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let mut log = RelayLog::default();
+        let bare = || {
+            let mut st = open_session(300);
+            let h = st.h2.as_mut().unwrap();
+            (h.req, h.requests) = (None, 0);
+            st
+        };
+        let mut st = bare();
+        let write_ctl = |st: &mut Session, what: &str, len: usize| {
+            on_ctl(st, what).unwrap();
+            client_bytes(st, &record(len)).unwrap();
+        };
+        for c in [&[1u8; 40][..], &[2; 900]] {
+            feed(&mut st, &mut log, c);
+        }
+        write_ctl(&mut st, "settings_ack", 10);
+        write_ctl(&mut st, "ping_ack", 18);
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        let h = st.h2.as_ref().unwrap();
+        assert!(h.queue.is_empty() && h.client_written);
+        assert!(!h.client_frames_before_request(), "the first SETTINGS ACK and an owed PING ACK");
+        // A PING ACK with no server record since the previous one.
+        write_ctl(&mut st, "ping_ack", 18);
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        assert!(st.h2.as_ref().unwrap().client_frames_before_request());
+        // A second SETTINGS ACK.
+        let mut st = bare();
+        feed(&mut st, &mut log, &[1u8; 40]);
+        for _ in 0..2 {
+            write_ctl(&mut st, "settings_ack", 10);
+        }
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        assert!(st.h2.as_ref().unwrap().client_frames_before_request());
     }
 
     #[test]
@@ -2503,6 +2565,57 @@ mod tests {
         assert!(h2::parse_usage_tail(&forged, 5).is_ok());
         let err = on_disclose(&app, &sh, &tx, &mut st, &log, Some(2), &hex::encode(&forged), &lens, 0, 0, 0, None, Some(n)).unwrap_err();
         assert!(err.to_string().contains("interval"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_disclosure_that_overtakes_the_records_proof_waits_for_it() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let block = [0x20, 0x8d, 0x00, 0x04, b'd', b'a', b't', b'e', 0x03, b'x', b'y', b'z'];
+        let head = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &block);
+        for what in ["disclose_head", "accept"] {
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            for c in [&[1u8; 40][..], &[2; 900], &[3; 30]] {
+                feed(&mut st, &mut log, c);
+            }
+            send_request(&mut st, 300);
+            on_release(&mut st, 1, 2).unwrap();
+            pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+            prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+            // A PING ACK after the request, in a batch of its own, still in
+            // flight when the provider's error head arrives.
+            on_ctl(&mut st, "ping_ack").unwrap();
+            client_bytes(&mut st, &record(18)).unwrap();
+            pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+            assert!(records_proof_in_flight(&st));
+            feed(&mut st, &mut log, &head);
+            texts(&mut rx);
+            let msg = if what == "accept" {
+                serde_json::json!({"type":"accept","n":1,"server_records":log.server_app_records})
+            } else {
+                serde_json::json!({"type":"disclose_head","n":1,"record":3,"r":hex::encode(&head),"key_updates":0,"epoch_start":0})
+            };
+            let msg: ClientMsg = serde_json::from_value(msg).unwrap();
+            handle_control(msg, &app, &sh, &tx, &mut st, &mut log, &mut w).await.unwrap();
+            assert!(texts(&mut rx).is_empty(), "{what}: nothing before the proof is done");
+            assert!(st.deferred.is_some());
+            // The proof's result arrives: the disclosure is handled then.
+            prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+            let r = run_deferred(&app, &sh, &tx, &mut st, &mut log, &mut w).await;
+            assert!(st.deferred.is_none());
+            let m = texts(&mut rx);
+            if what == "accept" {
+                // A chat request does not settle on accept: refused as before.
+                assert!(r.is_err(), "{what}");
+            } else {
+                r.unwrap();
+                assert_eq!(m.iter().map(|x| x["type"].as_str().unwrap()).collect::<Vec<_>>(), vec!["attestation", "zk_params"]);
+                assert_eq!(m[1]["purpose"], "error_head");
+            }
+        }
     }
 
     #[tokio::test]

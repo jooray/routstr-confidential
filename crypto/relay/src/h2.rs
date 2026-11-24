@@ -369,7 +369,7 @@ pub fn usage_event(text: &str) -> Result<serde_json::Value> {
     if ev.contains('\n') {
         bail!("R: more than one event before data: [DONE]");
     }
-    let v: serde_json::Value = serde_json::from_str(ev).map_err(|_| anyhow!("R: usage event not JSON"))?;
+    let v = crate::usage_rule::parse_event(ev)?;
     // §5.4: `choices` is [] or one choice with no content (usage_rule).
     crate::usage_rule::check_usage_event(&v)?;
     Ok(v)

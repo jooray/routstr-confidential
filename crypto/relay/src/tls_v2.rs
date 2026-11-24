@@ -129,8 +129,8 @@ fn ext_bytes(ty: u16, body: &[u8]) -> Vec<u8> {
 /// library's fork share `utils/client-hello.js` and call it with the same
 /// options (one suite, TLS 1.3 only, secp256r1, the default signature
 /// algorithms, one ALPN protocol, no `psk_key_exchange_modes`, a random
-/// 32-byte session id). The browser library has no framing "2" yet, so it
-/// sends only the `http/1.1` form. No stack sends a hello without ALPN.
+/// 32-byte session id), in both forms (`h2` and `http/1.1`). No stack sends
+/// a hello without ALPN.
 ///
 /// Why canonical and not "anything that offers the joint share": what a
 /// client can vary in its ClientHello it can use to make the provider (or

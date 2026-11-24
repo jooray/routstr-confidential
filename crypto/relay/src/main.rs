@@ -395,8 +395,9 @@ impl ImagesEndpoint {
         if !matches!(self.response_shape.as_str(), "venice" | "openai") {
             bail!("images response_shape {:?} is not venice or openai", self.response_shape);
         }
-        if !(1..=10).contains(&self.max_count) {
-            bail!("images max_count {} outside 1..=10", self.max_count);
+        // The clients and the node refuse a count above 4 (§12.4).
+        if !(1..=4).contains(&self.max_count) {
+            bail!("images max_count {} outside 1..=4", self.max_count);
         }
         if self.max_response_bytes == 0 || self.max_response_bytes > MAX_SERVER_BYTES {
             bail!("images max_response_bytes outside 1..={MAX_SERVER_BYTES}");
@@ -665,6 +666,12 @@ fn check_head_template(t: &str, host: &str, key_len: usize, routes: &[&str]) -> 
         bail!("Content-Length is not {{LEN}}");
     }
     placeholder_head(t, key_len, 1)?;
+    // The head goes out as one record (π_NK proves one), whatever the body's
+    // length: rendered with the longest Content-Length it must still fit.
+    let (longest, _) = placeholder_head(t, key_len, usize::MAX)?;
+    if longest.len() + 1 > cu_crypto::aesgcm::MAX_INNER_PLAINTEXT {
+        bail!("renders a head of up to {} bytes, more than one TLS record holds", longest.len());
+    }
     Ok(())
 }
 
@@ -2285,6 +2292,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         }
                         if st.h2.is_some() && matches!(proof.as_str(), "pi_win" | "pi_c3s") {
                             h2_session::proof_done(&app, &shared, &to_client, &mut st, &log, &mut tcp_tx, &proof, proven.as_ref()).await?;
+                            run_deferred(&app, &shared, &to_client, &mut st, &mut log, &mut tcp_tx).await?;
                             continue;
                         }
                         match proof.as_str() {
@@ -2538,6 +2546,12 @@ struct Session {
     /// Set while a failure would not be the client's doing (reaching the
     /// upstream): the error frame then carries it as `fault`.
     fault: Option<&'static str>,
+    /// Framing "2": a `disclose_head`, `disclose_reset` or `accept` that
+    /// arrived while a π_WIN on the client's records was still in flight
+    /// here. The client may learn that proof's verdict before this session
+    /// does (the verifier answers the prover first), so its disclosure can
+    /// overtake the proof's result; it is handled once the proof is done.
+    deferred: Option<ClientMsg>,
 }
 
 fn side(st: &mut Session, ev: String) {
@@ -2756,6 +2770,24 @@ fn session_id(nonce_c: &str, escrow: Option<&str>, escrow_e: u64) -> Result<(Str
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A disclosure deferred while the client records' π_WIN was in flight
+/// (`Session::deferred`), handled once no such proof is.
+async fn run_deferred(
+    app: &Arc<AppState>,
+    shared: &Arc<SessionShared>,
+    to_client: &mpsc::UnboundedSender<Message>,
+    st: &mut Session,
+    log: &mut RelayLog,
+    tcp_tx: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    if h2_session::records_proof_in_flight(st) {
+        return Ok(());
+    }
+    let Some(msg) = st.deferred.take() else { return Ok(()) };
+    handle_control(msg, app, shared, to_client, st, log, tcp_tx).await?;
+    h2_session::pump(shared, to_client, st, log, tcp_tx).await
+}
+
 async fn handle_control(
     msg: ClientMsg,
     app: &Arc<AppState>,
@@ -2769,6 +2801,15 @@ async fn handle_control(
         let _ = to_client.send(Message::Text(v.to_string().into()));
     };
 
+    if matches!(msg, ClientMsg::DiscloseHead { .. } | ClientMsg::DiscloseReset { .. } | ClientMsg::Accept { .. })
+        && h2_session::records_proof_in_flight(st)
+    {
+        if st.deferred.is_some() {
+            bail!("a second disclosure while one waits for the client records' proof");
+        }
+        st.deferred = Some(msg);
+        return Ok(());
+    }
     match msg {
         // Handled once, before the upstream connection exists (handle_setup).
         ClientMsg::Setup { .. } => bail!("duplicate setup"),
@@ -3109,6 +3150,11 @@ async fn relay_body(
         }
         st.body_bytes += content;
         st.body_records += 1;
+        // As in framing "2" (`h2_session::max_records`): records that average
+        // at least 4 KiB and one for the suffix, not a write per few bytes.
+        if st.body_records > h2_session::max_records(st.body_len) {
+            bail!("the request body arrives in more than {} records", h2_session::max_records(st.body_len));
+        }
         if st.body_bytes == st.body_len {
             // The final record is the pinned suffix and nothing else, so one
             // whole-record π_WIN window proves it. The upstream cannot start
@@ -3820,7 +3866,7 @@ fn validate_r(r: &[u8]) -> Result<serde_json::Value> {
         None => bail!("R: no data event before the terminator"),
     };
     let ev = before[start..].trim();
-    let v: serde_json::Value = serde_json::from_str(ev).context("R: usage event not JSON")?;
+    let v = usage_rule::parse_event(ev)?;
     // §5.4: `choices` is [] or one choice with no content (usage_rule).
     usage_rule::check_usage_event(&v)?;
     Ok(v)
@@ -4545,6 +4591,7 @@ mod hardening_tests {
             swap("\r\nConnection", "\nConnection"),
             swap("\r\n\r\n", "\r\n\r\nX: {y}\r\n\r\n"),
             good.replace("\r\nContent-Type: application/json", ""),
+            swap("POST /api/v1/chat/completions", &format!("POST /{}/api/v1/chat/completions", "a".repeat(16 * 1024))),
         ] {
             assert!(check_head_template(&bad, "api.venice.ai", 42, CHAT_ROUTES).is_err(), "{bad:?}");
         }
@@ -4704,6 +4751,11 @@ mod hardening_tests {
         ep.head_template = ep.head_template.replace("Connection: close", "Connection: keep-alive");
         assert!(ep.validate("api.venice.ai", 42).is_err());
         assert!(venice_images().validate("api.other.ai", 42).is_err());
+        for (count, ok) in [(0, false), (1, true), (4, true), (5, false), (10, false)] {
+            let mut ep = venice_images();
+            ep.max_count = count;
+            assert_eq!(ep.validate("api.venice.ai", 42).is_ok(), ok, "max_count {count}");
+        }
         for idle in [0, 29, 601] {
             let mut ep = venice_images();
             ep.response_idle_s = idle;
@@ -5115,6 +5167,16 @@ mod hardening_tests {
         let mut buf = body_record(300);
         buf.extend(body_record(suffix.len() + 5));
         assert!(relay_body(&mut st, &mut RelayLog::default(), &mut buf, &mut w).await.is_err());
+        // The body in more records than a client writes (at most 3 here):
+        // two and the suffix pass, four and the suffix are refused.
+        let (mut st, suffix) = new();
+        let mut buf = [body_record(150), body_record(150), body_record(suffix.len())].concat();
+        relay_body(&mut st, &mut RelayLog::default(), &mut buf, &mut w).await.unwrap();
+        assert!(st.held.is_some());
+        let (mut st, suffix) = new();
+        let mut buf = [body_record(75), body_record(75), body_record(75), body_record(75), body_record(suffix.len())].concat();
+        let e = relay_body(&mut st, &mut RelayLog::default(), &mut buf, &mut w).await.unwrap_err();
+        assert!(e.to_string().contains("more than 3 records"), "{e}");
     }
 
     #[test]
