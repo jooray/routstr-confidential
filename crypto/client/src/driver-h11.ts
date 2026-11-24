@@ -10,6 +10,8 @@
 // Everything a connection has in both framings (setup, 2PC, handshake, π_NK)
 // is the driver's `Session`.
 
+import { randomBytes } from 'node:crypto'
+
 import { concat, hex } from './advice.ts'
 import { certChainProblem, noteDepositRelease, openRequest, takeReceipt, type Ctx, type ReqBody } from './ctx.ts'
 import { checkPiWinFinalRecord } from './h2.ts'
@@ -65,6 +67,20 @@ export class H11 {
     const tBody = Date.now()
     const priv = b.body.subarray(0, b.body.length - b.suffix.length)
     s.inBody = true
+    if (adv === 'bad-record') {
+      // One record of random bytes (a valid record header, a payload no key
+      // decrypts) as the first body record, which the node relays unproven;
+      // the rest of the body is never sent. The provider must reject it
+      // (RFC 8446 §5.2, bad_record_mac) and close: its alert counts as
+      // response bytes, but it is no answer to the request, and nothing of it
+      // can be disclosed. The request must end as an abandoned one.
+      const len = Math.min(priv.length, 200) + 17
+      const rec = concat(Uint8Array.from([0x17, 0x03, 0x03, len >> 8, len & 0xff]), randomBytes(len))
+      s.sendBytes(rec)
+      const t0 = Date.now()
+      while (!s.peerError && s.closedReason === undefined && Date.now() - t0 < 150000) await sleep(100)
+      throw new Error(`refused: ${String(s.peerError?.reason ?? s.closedReason ?? 'not ended')}`)
+    }
     if (adv === 'not-alone') {
       // The suffix shares its record with the last private bytes.
       const cut = Math.max(1, priv.length - 8)
@@ -94,16 +110,26 @@ export class H11 {
       return { adv: { withheld: s.responseBytes.length === 0 && !hasOutput && !s.tFirst.body_released, response_bytes: s.responseBytes.length, has_model_output: hasOutput } }
     }
 
-    // π_WIN, sent by the node on its own once the final record is there.
-    const zp = await s.waitT('zk_params:pi_win:records', 30000)
-    let shape = { windows: zp.params?.PiWin?.windows?.length ?? 0, ctBytes: 0 }
-    if (!adv) shape = checkPiWinFinalRecord(zp, { anchor: s.ap.h1, seq: finalSeq, wire: finalRecord, suffix: b.suffix })
-    let t = Date.now()
-    await s.proof('pi_win', 'prove', zp.params, { Secret: Array.from(s.ap.clientAp1) })
-    this.pushProof({ proof: 'pi_win', purpose: 'records', n: 1, records: 1, ...shape, ms: Date.now() - t }, 'pi_win')
-    ctx.log({ ev: 'pi_win_ok', first_seq: finalSeq })
-    const rel = await s.waitT('body_released', 60000)
-    if (rel.n !== 1) throw new Error('body_released names another request')
+    // π_WIN, sent by the node on its own once the final record is there. A
+    // provider that answers the head alone and closes first (a 401, a 429)
+    // makes the node attest at once (`upstream_closed_early`): the request
+    // then settles only by its disclosed error head (§12.8, §12.10).
+    let early: any
+    const zp = await s.waitT(['zk_params:pi_win:records', 'attestation'], 30000)
+    if (zp.type === 'attestation') {
+      early = zp
+    } else {
+      let shape = { windows: zp.params?.PiWin?.windows?.length ?? 0, ctBytes: 0 }
+      if (!adv) shape = checkPiWinFinalRecord(zp, { anchor: s.ap.h1, seq: finalSeq, wire: finalRecord, suffix: b.suffix })
+      const t = Date.now()
+      await s.proof('pi_win', 'prove', zp.params, { Secret: Array.from(s.ap.clientAp1) })
+      this.pushProof({ proof: 'pi_win', purpose: 'records', n: 1, records: 1, ...shape, ms: Date.now() - t }, 'pi_win')
+      ctx.log({ ev: 'pi_win_ok', first_seq: finalSeq })
+      const rel = await s.waitT(['body_released', 'attestation'], 60000)
+      if (rel.type === 'attestation') early = rel
+      else if (rel.n !== 1) throw new Error('body_released names another request')
+    }
+    if (early && !s.closedEarly) throw new Error('an attestation before body_released without upstream_closed_early')
     const tReleased = Date.now()
     if (adv === 'extra-record') {
       // One more record after the proven final one, carrying a second request.
@@ -115,8 +141,8 @@ export class H11 {
     }
 
     // The provider closes after its response; the node then attests on its own.
-    const attMsg = await s.waitT('attestation', 600000)
-    const attJson = await this.checkAttestation(attMsg)
+    const attMsg = early ?? (await s.waitT('attestation', 600000))
+    const attJson = await this.checkAttestation(attMsg, !!early)
     await this.drained()
 
     // Interim 1xx heads are skipped; the final head is the status.
@@ -125,6 +151,12 @@ export class H11 {
     const statusLine = Buffer.from(resp.subarray(finalHead, finalHead + 64)).toString('latin1')
     const status = Number(/^HTTP\/1\.\d (\d{3})/.exec(statusLine)?.[1] ?? 0)
     if (finalHead > 0 && status >= 400) throw new Error('an interim 1xx head precedes the error head; it cannot be disclosed')
+    if (early && status < 400) {
+      // Nothing of a closed connection can be disclosed but an error head (an
+      // alert, a partial answer): the request ends as an abandoned one.
+      throw new Error(`the provider closed before the request was complete, with no error head to disclose (status ${status || 'none'})`)
+    }
+    if (early) console.log(`[client ${s.label}] the provider answered ${status} before the body was complete and closed: disclosing its error head`)
     if (status >= 400) console.log(`[client ${s.label}] upstream error ${status}: ${ctx.shown(Buffer.from(resp).toString('utf8').split('\r\n\r\n')[1], 200)}`)
 
     const wait = (types: string[], ms: number) => s.waitT(types, ms)
@@ -227,7 +259,7 @@ export class H11 {
    * the head-record commitment π_NK proved, and counts and a hash we can
    * recompute from our own records. Returns the signed bytes.
    */
-  private async checkAttestation(m: any): Promise<string> {
+  private async checkAttestation(m: any, early = false): Promise<string> {
     const { s, ctx } = this
     // The signed bytes, or the attestation as we serialize it: the receipt must hash exactly what we verified.
     const attJson: string = m.a_json ?? JSON.stringify(m.a)
@@ -242,7 +274,9 @@ export class H11 {
     for (let i = 0; i < 1000 && s.recvRecords < a.server_records; i++) await sleep(5)
     if (a.server_records !== s.recvRecords) throw new Error(`attestation counts ${ctx.shown(a.server_records)} upstream records, we received ${s.recvRecords}`)
     if (a.sha256_recv !== s.recvHash.copy().digest('hex')) throw new Error('attestation hashes different upstream bytes than we received')
-    if (a.client_records !== s.bodyRecords.length) throw new Error(`attestation counts ${ctx.shown(a.client_records)} body records, we sent ${s.bodyRecords.length}`)
+    // After an early close the node relayed only the body records that reached it before.
+    const recordsOk = early ? Number.isSafeInteger(a.client_records) && a.client_records >= 0 && a.client_records <= s.bodyRecords.length : a.client_records === s.bodyRecords.length
+    if (!recordsOk) throw new Error(`attestation counts ${ctx.shown(a.client_records)} body records, we sent ${s.bodyRecords.length}`)
     ctx.writePrivate(`${s.runDir}/attestation-1.json`, JSON.stringify(a, null, 2))
     ctx.log({ ev: 'attestation', n: 1, server_records: a.server_records })
     return attJson

@@ -2052,8 +2052,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_TIMEOUT);
                         continue;
                     }
-                    if h2_session::closed_early_unsettled(&st) {
-                        // No refusal was disclosed after the provider's early close.
+                    if h2_session::closed_early_unsettled(&st) || (st.closed_early11 && st.state != SessionState::Settled) {
+                        // No answer was disclosed and proven after the provider's early close.
                         bail!("{}", h2_session::CLOSED_EARLY);
                     }
                     bail!("session time limit ({}s) reached", SESSION_TIMEOUT.as_secs())
@@ -2097,6 +2097,9 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 h2_session::client_bytes(&mut st, &data)?;
                                 h2_session::pump(&shared, &to_client, &mut st, &log, &mut tcp_tx).await?;
                             }
+                            // The provider is gone: what the client still sends
+                            // of the body goes nowhere.
+                            SessionState::Attested | SessionState::Settled if st.closed_early11 => {}
                             SessionState::Body => {
                                 if !st.held_client.is_empty() {
                                     // The partial record left over from the head write.
@@ -2206,7 +2209,8 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 .recv_at_head
                                 .map_or(0, |at| log.recv_len.saturating_sub(at));
                             let mut msg = serde_json::json!({"type":"upstream_closed_early","n":1,"response_bytes":response_bytes});
-                            if h2_session::stalled(st.last_write, std::time::Instant::now(), EARLY_ANSWER_WINDOW) {
+                            let client = h2_session::stalled(st.last_write, std::time::Instant::now(), EARLY_ANSWER_WINDOW);
+                            if client {
                                 // The client sent nothing of the request for
                                 // the window before the provider closed: its
                                 // answer may be to the stall (a body timeout),
@@ -2214,8 +2218,22 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 msg["client_caused"] = true.into();
                             }
                             let _ = to_client.send(Message::Text(msg.to_string().into()));
-                            side(&mut st, format!("upstream closed early; {response_bytes} response bytes after the credential record"));
-                            bail!("upstream closed the connection before the request was complete (nothing billed)");
+                            side(&mut st, format!("upstream closed early; {response_bytes} response bytes after the credential record, client_caused={client}"));
+                            // The response bytes alone settle nothing: they may
+                            // be a TLS alert for a record the client corrupted.
+                            // The provider's error head can, once the client
+                            // discloses it (π_C3S, head mode): the session is
+                            // attested and waits for it. Without one (or with
+                            // no response byte, or a close the client may have
+                            // caused) the request ends as an abandoned one.
+                            if response_bytes == 0 || client || st.state != SessionState::Body || st.handshake.is_none() {
+                                bail!("{}", h2_session::CLOSED_EARLY);
+                            }
+                            st.closed_early11 = true;
+                            st.held = None;
+                            let grace = tokio::time::Instant::now() + h2_session::REFUSAL_GRACE;
+                            st.deadline = Some(grace);
+                            deadline.as_mut().reset(grace);
                         }
                         let mut att_chain: Option<String> = None;
                         if let (Some(sid), Some(hs)) = (st.sid.as_ref(), st.handshake.as_ref()) {
@@ -2249,6 +2267,10 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                     Ev::ZkDone { proof, ok, err, params: proven } => {
                         info!(proof, ok, ?err, "zk result");
                         side(&mut st, format!("zk proof={} ok={} err={:?}", proof, ok, err));
+                        if st.closed_early11 && proof == "pi_win" {
+                            // The final body record has nowhere to go.
+                            continue;
+                        }
                         if !ok {
                             // Nothing can change a settled session: a late
                             // failure (a proof connection dropping) only ends
@@ -2308,7 +2330,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                                 if st.state == SessionState::Settled {
                                     continue;
                                 }
-                                if !st.released {
+                                if !st.released && !st.closed_early11 {
                                     bail!("π_C3S before the request was released: the suffix (model, caps) is not proven");
                                 }
                                 let same = same_params(proven.as_ref(), shared.params.lock().unwrap().get(proof.as_str()));
@@ -2489,6 +2511,12 @@ struct Session {
     win_requested: bool,
     released: bool,
     disclosed: bool,
+    /// Framing "1.1": the provider closed before the final body record was
+    /// written, after it had sent response bytes, and the close was not
+    /// marked as possibly the client's doing. The session waits
+    /// `h2_session::REFUSAL_GRACE` for the one answer that can settle the
+    /// request: a disclosed error head (`disclose_head`).
+    closed_early11: bool,
     attestation: Option<serde_json::Value>,
     usage: Option<serde_json::Value>,
     run_dir: Option<std::path::PathBuf>,
@@ -2875,6 +2903,9 @@ fn disclose_11(
             let error_head = r.starts_with(b"HTTP/1.");
             if error_head != head {
                 bail!("an error head is disclosed with disclose_head, a usage tail with disclose");
+            }
+            if st.closed_early11 && !error_head {
+                bail!("the provider closed before the request was complete: only its error head can be disclosed");
             }
             if st.images_count.is_some() && !error_head {
                 bail!("an image session discloses only an error head (a success is accepted)");

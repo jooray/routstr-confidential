@@ -261,5 +261,19 @@ for (const kind of ['goaway', 'rst_stream'] as const) {
   await r
 }
 
+// 8. The provider answers the request's HEADERS with an error head before the
+//    body is released and closes (`upstream_closed_early`): the head is still
+//    disclosed, the only answer that settles the request after such a close.
+{
+  const { conn, wire, bus, releases } = requestRig(0)
+  const r = conn.request(1).catch((e: Error) => e)
+  await opened(conn)
+  ok(releases.join() === '1', `only the HEADERS record is released (${releases})`)
+  conn.onFrame(fr(FRAME.HEADERS, FLAG.END_HEADERS | FLAG.END_STREAM, 3, status429))
+  bus.emit({ type: 'upstream_closed_early', n: 1, response_bytes: 60 })
+  const out = await within(r, 5000, 'error head, then an early close')
+  ok(out?.status === 429 && wire.includes('disclose_head') && !conn.cur?.released, `an error head before an early close is disclosed (got: ${out?.message ?? JSON.stringify(out?.status)})`)
+}
+
 console.log(`h2-conn-test: ${checks} checks passed`)
 process.exit(0)

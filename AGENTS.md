@@ -289,12 +289,12 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 **Checks.**
 - `crypto/tools/v3-check.sh` (**the sidecar + reference client gate**; real
   provider, no node; `CU_V3_PORT` picks the sidecar port): the offline
-  self-checks, then 57 cases (55 without the two paid images), both framings: honest (one, several, error
+  self-checks, then 60 cases (58 without the two paid images), both framings: honest (one, several, error
   head, 200 kB body, decoy model, armed, refused-then-good, image), a v2
   socket, every attack (hidden HEADERS, TLS padding, suffix/model/cap swap,
   path, usage replay, image suffix, early record, no proof, own key share,
   2PC version tag (`h2-j-twopc-tag`; `h2-j-twopc-tag-old` for a `split-public-2` peer), forged refusals `h2-r-refusal-*`, a 9 MiB client message
-  `h2-l-big-frame`: `error` 413 `frame_too_large` without `fault`; control records past the connection's allowance `h2-m-ctl-flood`; a 2PC client silent after its tag and salt gets no table byte `h2-n-silent-2pc`), and the forced failure of "2" (fallback, withdrawal,
+  `h2-l-big-frame`: `error` 413 `frame_too_large` without `fault`; control records past the connection's allowance `h2-m-ctl-flood`; a 2PC client silent after its tag and salt gets no table byte `h2-n-silent-2pc`; a record the provider must reject, the rest held, `h2-t-bad-tag`, `h2-t-bad-tag-2`, `h11-t-bad-record`: the sidecar settles nothing and ends it as an early close with no answer), and the forced failure of "2" (fallback, withdrawal,
   return). `v3_eval.py` judges each case from the driver's output and the
   sidecar's own run files; exit ≠ 0 on any deviation. Two paid images
   (`CU_NO_IMAGES=1` skips them).
@@ -309,8 +309,12 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   `h2-m-ctl-flood` (control records past the connection's allowance: `unused`)
   and `h2-m-hold-body` (the HEADERS released, the proven body held back: an
   abandoned request whatever the provider does; driver `--adv ctl-flood|hold-body`),
-  `h2-n-silent-2pc` (`--adv silent-2pc`: no table byte, deposit `unused`), and
-  the eviction cases `h2-n-evict-lone` (a lone spare goes only once no address
+  `h2-n-silent-2pc` (`--adv silent-2pc`: no table byte, deposit `unused`),
+  the early closes the client causes `h2-t-bad-tag`, `h2-t-bad-tag-2`,
+  `h11-t-bad-record` (`--adv bad-tag|bad-record`: a record with a wrong GCM
+  tag, or of random bytes, the rest held; the provider's alert and close are
+  no answer: deposit charged `request_abandoned`, or the abandon fee kept),
+  and the eviction cases `h2-n-evict-lone` (a lone spare goes only once no address
   holds more) and `h2-n-evict-own` (a hoarder's setup closes its own oldest),
   on a node restarted with 3 slots (`CU_TEST_MAX_SESSIONS`) that trusts
   loopback as its proxy (driver `--client-ip`).
@@ -343,7 +347,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   offline checks, the client root store against `gen-client-roots.py`, every copy of a vector of
   `crypto/conformance/` byte-identical, a secret scan. `CU_CI_SKIP_CARGO=1` skips the Rust tests.
 - Unit tests:
-  - `crypto`: `cargo test --release -p cu-sidecar` (135), `-p zkbench`, `-p twopc` (55 unit tests, 4 of the `cu-2pc` binary)
+  - `crypto`: `cargo test --release -p cu-sidecar` (138), `-p zkbench`, `-p twopc` (55 unit tests, 4 of the `cu-2pc` binary)
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
   - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`, `bun test tests/bun` (vitest
     reports those two files as failed: it cannot load `bun:test`)
@@ -361,7 +365,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 | Part | State |
 |---|---|
 | `crypto/zkbench`, `crypto/twopc` | done: `pi_nk`, `pi_win`, `pi_c3s`; `split-public-3` with the version tag (its predecessor `split-public-2`, 2026-11-22: new garbling hash and row hash, N's input a mask fixed before the seed, input-label commitments; 2026-11-22/23, in place under the tag of `split-public-2`: N's key share carries a Schnorr proof of knowledge of its scalar; 2026-11-23: that final format renamed `split-public-3`, no other byte changed, `ks_prove`/`ks_verify` in `lib.rs`; 55 unit tests; `v3-check.sh` 53 cases without images); it replaced `split-public-1` on 2026-11-22 |
-| `crypto/relay` (sidecar) | done; 135 unit tests; `v3-check.sh` clean in one run (51 cases without images, 2026-11-13). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause; a provider refusal of a stream is proven (`disclose_reset`) |
+| `crypto/relay` (sidecar) | done; 138 unit tests; `v3-check.sh` clean in one run (51 cases without images, 2026-11-13). Canonical ClientHello; a failed HTTP/2 open counts only what no client can cause; a provider refusal of a stream is proven (`disclose_reset`) |
 | `crypto/client` (reference driver) | done for both framings; run live against the sidecar by `v3-check.sh` and against a node by the node gate |
 | `provider-profile-check.py` | A1–A13, `--images` I1–I9 and `--h2` H1–H8 pass against Venice (2026-11-12; H5 with 300 s idle, H6 with 8 MiB) |
 | measurements | loopback and shaped links (2/50, 2/10 Mbit/s, 40 ms one way) with `bench.sh` + `shape-proxy.py`: `crypto/PROGRESS-CONFIDENTIAL.md` |
@@ -508,7 +512,21 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   party: behind a NAT, VPN or Tor exit another party's spares count toward
   it, so an honest spare there can be charged first, one deposit; the
   signed count is the node's word; a framing-"2" request accepted and never
-  written shields its connection for 600 s). Clients: optional body padding (`confidential.padBucket`,
+  written shields its connection for 600 s). **Added 2026-11-24:** an early
+  provider close settles a request only with a proven answer
+  (`PROTOCOL-V3.md` §5.4.2): the client can make a provider close at will (a
+  record with a wrong GCM tag, which π_WIN does not cover; in "1.1" an
+  unproven body record), so `upstream_closed_early` settles nothing by its
+  `response_bytes`, and the node's `provider_refused` path (row 8) is gone.
+  After it the sidecar waits 60 s for `disclose_reset` or `disclose_head`
+  (framing "1.1": it attests at once and takes `disclose_head` only), none
+  after a `client_caused` close; without one the request is abandoned (the
+  abandon fee, or the deposit on the connection's first request). A 5xx
+  error head settled before `body_released` costs the abandon fee. A control
+  record written outside a request marks the next request accepted or first
+  written within the GOAWAY window. An honest client whose provider closes
+  early with nothing provable pays the abandon fee or the deposit (risk 16).
+  Clients: optional body padding (`confidential.padBucket`,
   `--pad-bucket`, off by default); routstrd `x-routstr-reuse-scope` narrows the
   reuse scope.
 - **mpz2 is pinned to the fork `github.com/jooray/mpz2`**, branch `routstr-ct-selects` (the rev is in

@@ -84,6 +84,11 @@
 #                         client's OT traffic started, and streams tables only on its progress)
 #   h2-m-ctl-flood        control records with no request, each proven and written, until the
 #                         connection's allowance (16, and one more per 10 s) is used up: `error`
+#   h2-t-bad-tag, h2-t-bad-tag-2  the HEADERS record of request 1 (2) goes out with a wrong GCM tag,
+#                         the proven body held back: the provider rejects the record (its TLS alert
+#                         counts as response bytes) and closes; nothing of it can be disclosed, the
+#                         sidecar settles nothing and ends the connection as an early close with no
+#                         answer (after its 60 s grace): the node settles an abandoned request
 #   h11-c-suffix          the final record is another model's suffix of the same length (π_WIN fails)
 #   h11-c-model-swap      … the suffix of a pricier model (another length: not the suffix alone)
 #   h11-c-cap-swap        … a suffix with a larger max_tokens of the same length (π_WIN fails)
@@ -93,6 +98,8 @@
 #   h11-g-early-record    the ClientHello before request 1
 #   h11-h-no-proof        the final record is never proven: held, the provider answers nothing
 #   h11-i-own-keyshare    the client's own key share instead of the joint one
+#   h11-t-bad-record      a record of random bytes as the first body record, the rest not sent: the
+#                         same as h2-t-bad-tag (the sidecar attests, waits 60 s for an error head)
 # Fallback (§2.1, §2.3; the sidecar's test hooks, only with a sidecar started here):
 #   fb-1 … fb-5           every framing-"2" open is made to fail: `--http auto` falls
 #                         back to "1.1" on the same sidecar and settles there
@@ -279,6 +286,8 @@ run_case h2-j-twopc-tag-old  "refused:2:0:twopc_version_mismatch" 0 none -- --ht
 run_case h2-l-big-frame      "refused:2:0:frame_too_large" 0 none -- --http 2 --adv big-frame
 run_case h2-m-ctl-flood      "refused:2:0:more control records" 0 none -- --http 2 --adv ctl-flood
 run_case h2-n-silent-2pc     "silent2pc" 0 none -- --http 2 --adv silent-2pc
+run_case h2-t-bad-tag        "closedearly:2:1" 60 none -- --http 2 --adv bad-tag
+run_case h2-t-bad-tag-2      "closedearly:2:2" 60 none -- --http 2 --requests 2 --adv bad-tag --adv-at 2
 
 # --- attacks, framing "1.1" ----------------------------------------------------
 run_case h11-c-suffix        "refused:1.1:1:pi_win failed" 0 none -- --http 1.1 --adv suffix
@@ -290,6 +299,7 @@ run_case h11-f-image-suffix  "refused:1.1:1:pi_win failed" 0 none -- --http 1.1 
 run_case h11-g-early-record  "refused:1.1:0:." 0 none -- --http 1.1 --adv early-record
 run_case h11-h-no-proof      "withheld:1.1:1" 0 none -- --http 1.1 --adv no-proof
 run_case h11-i-own-keyshare  "refused:1.1:0:share" 0 none -- --http 1.1 --adv own-keyshare
+run_case h11-t-bad-record    "closedearly:1.1:1" 60 none -- --http 1.1 --adv bad-record
 
 # --- forced failure of framing "2": fallback, withdrawal, return -----------------
 if [ "$OWN_SIDECAR" = 1 ] && [ "$HTTP_LIST" != 1.1 ] && { [ -z "${CU_CASES:-}" ] || [[ " $CU_CASES " == *" fb-"* ]]; }; then

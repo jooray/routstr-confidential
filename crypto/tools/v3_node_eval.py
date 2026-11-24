@@ -645,6 +645,13 @@ else:  # attack
         dev.append("the attack was NOT refused")
     elif not re.search(reason, f"{adv.get('reason', '')} {adv.get('code') or ''}", re.I):
         dev.append(f"refused for the wrong reason (want /{reason}/)")
+    if adv and adv.get("mode") in ("bad-tag", "bad-record"):
+        # The case exercises a provider close with response bytes (its alert)
+        # that the sidecar does not mark as the client's: the node alone must
+        # refuse to take it for the provider's refusal.
+        ce = adv.get("closed_early") or {}
+        if not (isinstance(ce.get("response_bytes"), int) and ce["response_bytes"] > 0) or ce.get("client_caused"):
+            dev.append(f"the provider's close was not an unmarked early close with response bytes ({ce})")
     if how == "unused" and adv and adv.get("fault"):
         dev.append(f"the attack on the connection ended with fault {adv.get('fault')!r} (it is the client's doing)")
     if len(reqs) != max(n - 1, 0):

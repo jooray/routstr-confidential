@@ -1021,7 +1021,7 @@ first.
 | A connection is armed or opened and never carries a settled request | deposit charged |
 | A request is refused at its `request` message | nothing reserved; the connection stays ready |
 | Abort of a reserved request before its body is released (including a failed $\pi_{WIN}$) | U received no complete request; reservation released (less $f_a$); the connection ends |
-| U sent response bytes and closed the connection before the body was released (a refusal) | reservation released (less $f_s$ if still due) |
+| U closed the connection before the body was released | settled only by an answer C discloses within 60 s (an error head by its status, any 5xx then as another 4xx; a refusal as below); without one, as an abort (less $f_a$, or the deposit on the first request): N cannot read U's bytes, and C can make U close at will with a record whose GCM tag is wrong |
 | U refused the stream unprocessed (`REFUSED_STREAM`, or GOAWAY below it; disclosed, before or after the release) | reservation released (less $f_s$ if still due); the deposit released; the connection ends, C retries elsewhere |
 | Usage disclosed (chat) or `accept` (images) | charged per section 4.8; in framing "2" the connection is ready again |
 | U returned a 429, 503, 401, 402 or 403 (head disclosed) | reservation released (less $f_s$ if still due); the connection ends |

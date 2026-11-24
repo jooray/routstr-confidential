@@ -61,6 +61,12 @@
 //         provider refusal)
 //         framing "1.1": extra-record (after body_released, one more record carrying a second HTTP
 //         request); a second request inside the body is --private-extra with raw CRLF text
+//       an early close the client causes: bad-tag (framing "2": the request's HEADERS record goes out with
+//         one bit of its GCM tag flipped, the proven body held back), bad-record (framing "1.1": one
+//         record of random bytes as the first body record, the rest of the body not sent), ctl-between
+//         (framing "2": after a settled request, an unsolicited SETTINGS ACK, then the next request at
+//         once). The provider rejects the record (a fatal alert, a GOAWAY with an error code) and
+//         closes; nothing of it is provable, so the request ends as an abandoned one
 //       forged refusals (framing "2", `disclose_reset` for a request the provider answered):
 //         refusal-fake (a RST_STREAM(REFUSED_STREAM) it never sent: π_WIN fails), refusal-after-head
 //         (its true bytes up to the response head, then a reset), refusal-probe (a reset of the probe
@@ -219,6 +225,11 @@ const ADV_MODES: Record<string, Framing[]> = {
   'rst-reuse': ['2'], 'rst-reuse-same': ['2'], 'rst-before-final': ['2'], 'rst-after-release': ['2'], 'ctl-headers': ['2'],
   // More control records than a connection may carry; a proven body held back after its HEADERS.
   'ctl-flood': ['2'], 'hold-body': ['2'],
+  // A record the provider must reject (a wrong GCM tag, or garbage), the rest of the request held:
+  // the provider's alert and close are no answer to the request.
+  'bad-tag': ['2'], 'bad-record': ['1.1'],
+  // An unsolicited SETTINGS ACK written between two requests, the next request's HEADERS right behind it.
+  'ctl-between': ['2'],
   // A refusal (`disclose_reset`) claimed for a request the provider answered:
   'refusal-fake': ['2'], 'refusal-after-head': ['2'], 'refusal-probe': ['2'], 'refusal-later': ['2'],
   'extra-record': ['1.1'],
@@ -547,6 +558,10 @@ class Session {
   helloSent = false
   /** The provider closed before the request in flight was written in full (`upstream_closed_early`). */
   closedEarly = false
+  /** That frame, as the node sent it (`response_bytes`, `client_caused`). */
+  closedEarlyMsg: any
+  /** (attacks) Applied once to the next record this client writes, on the wire only. */
+  tamperNext: ((record: Uint8Array) => Uint8Array) | undefined
   /** When each kind of control frame first arrived (measurements). */
   tFirst: Record<string, number> = {}
   /** Bytes on the session socket: control frames and relayed TLS records, each way. */
@@ -655,6 +670,7 @@ class Session {
         }
         if (m.type === 'upstream_closed_early') {
           this.closedEarly = true
+          this.closedEarlyMsg = { response_bytes: m.response_bytes, client_caused: m.client_caused === true }
           console.log(`[client ${this.label}] the provider closed before the request was written in full (response_bytes=${shown(m.response_bytes)} client_caused=${m.client_caused === true})`)
         }
         if (m.type === 'closed' || m.type === 'error') this.onLastFrame(m)
@@ -989,7 +1005,9 @@ class Session {
         const record = concat(packet.header, packet.content)
         if (this.inBody) this.bodyRecords.push(record)
         this.h2?.onWrite(record)
-        this.sendBytes(record)
+        const tamper = this.tamperNext
+        this.tamperNext = undefined
+        this.sendBytes(tamper ? tamper(record) : record)
       },
       onRead: (rec: { content: Uint8Array }, ctx?: { type?: string; contentType?: string }) => {
         this.h2?.onRead(ctx)

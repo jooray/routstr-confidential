@@ -494,6 +494,14 @@ export class H2Conn {
       await this.wait('error', 15000)
       throw new Error('the node took 48 control records on one connection')
     }
+    if (adv === 'ctl-between') {
+      // An unsolicited SETTINGS ACK (a connection error for common servers)
+      // with no request open, written before the next `request`; the
+      // request's records follow at once. The provider's GOAWAY and close may
+      // land inside the request's interval: no answer to it.
+      await this.sendCtl('settings_ack', new Uint8Array(0))
+      await this.until(() => this.out.size === 0, 'the control record to be proven', 30000)
+    }
     // `request`, then its answer; only then the records (§12.4). A refused
     // request leaves the connection READY and its number unused.
     const { ok, refused, reserved } = await openRequest(s, ctx, n, b, bodyLen, ctx.refuseFirst && n === 1, (o) => this.sendOrdered(o), (t, ms) => this.wait(t, ms))
@@ -529,6 +537,27 @@ export class H2Conn {
       if (!s.closedEarly) this.sendOrdered({ type: 'release', n: cur.n, upto: 1 << 30 })
       await this.until(() => !!s.peerError || s.closedReason !== undefined, 'the connection to end', 90000)
       throw new Error(`refused: ${String(s.peerError?.reason ?? s.closedReason ?? '')}`)
+    }
+    if (adv === 'bad-tag') {
+      // The HEADERS record goes out with one bit of its GCM tag flipped (π_WIN
+      // proves the record's ciphertext, not its tag), the proven body is held
+      // back. The provider must reject the record (RFC 8446 §5.2,
+      // bad_record_mac) and close: its alert counts as response bytes, but it
+      // is no answer to the request, and nothing of it can be disclosed. The
+      // request must end as an abandoned one, never as the provider's refusal.
+      this.releaseCap = 1
+      this.tx = this.tx.then(() => {
+        s.tamperNext = (r: Uint8Array) => {
+          const t = r.slice()
+          t[t.length - 1] ^= 0x01
+          return t
+        }
+      })
+      for (const p of plan) cur.seqs.push(await this.sendRecord(p.content, p.pub, undefined, p.raw))
+      cur.dataLens = plan.slice(1).map((p) => p.data)
+      this.updateRelease()
+      await this.until(() => !!s.peerError || s.closedReason !== undefined, 'the connection to end', 150000).catch(() => {})
+      throw new Error(`refused: ${String(s.peerError?.reason ?? s.closedReason ?? 'not ended')}`)
     }
     for (const p of plan) cur.seqs.push(await this.sendRecord(p.content, p.pub, undefined, p.raw))
     cur.dataLens = plan.slice(1).map((p) => p.data)

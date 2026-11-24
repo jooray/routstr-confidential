@@ -34,6 +34,9 @@
 #   CU_UPSTREAM      provider host:port (default api.venice.ai:443)
 #   CU_TRUSTED_HOSTS the driver's trusted provider hosts, comma-separated (default the host of CU_UPSTREAM)
 #   CU_UPSTREAM_BASE the provider's API base for the node (default https://api.venice.ai/api/v1)
+#   CU_UPSTREAM_DIAL host:port the sidecar dials instead of CU_UPSTREAM (a proxy in front of the
+#                    provider, e.g. shape-proxy.py --delay-ms; the provider is still verified as
+#                    the host of CU_UPSTREAM)
 #   CU_MODEL         chat model (default mistral-small-3-2-24b-instruct)
 #   CU_SWAP_MODEL    the model of the model-swap attacks (default deepseek-v4-pro)
 #   CU_IMAGE_MODEL   image model (default venice-sd35; its first offered variant, one image)
@@ -111,6 +114,12 @@
 #                           the proven body held back. Whatever the provider does (a GOAWAY and a
 #                           close, a timeout, nothing), the request is an abandoned one: D charged
 #                           (`request_abandoned`), never the provider's refusal (`provider_refused`)
+#   h2-t-bad-tag, h2-t-bad-tag-2  request 1 (2): its HEADERS record written with a wrong GCM tag, the
+#                           proven body held back. The provider rejects the record (a TLS alert, counted
+#                           as response bytes) and closes; nothing of it is provable: an abandoned
+#                           request, D charged (`request_abandoned`) or A kept, never `provider_refused`
+#   h11-t-bad-record        request 1: a record of random bytes as the first body record, the rest
+#                           not sent: the same, D charged (`request_abandoned`)
 #  cancel and reuse (a force-stopped request whose credential reference a later one rides on)
 #   h2-k-rst-reuse, h2-k-rst-reuse-same   request 2 released, RST_STREAM, then a HEADERS record for
 #                           the next / the same stream with no `request`: refused before it is queued
@@ -249,9 +258,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# CU_UPSTREAM_DIAL: the sidecar dials this address instead (a delaying proxy in
+# front of the provider, `shape-proxy.py`), and verifies the provider by the
+# host of CU_UPSTREAM.
+if [ -n "${CU_UPSTREAM_DIAL:-}" ]; then
+  DIAL_HOST="${CU_UPSTREAM:-api.venice.ai:443}"
+  DIAL_ARGS=(--upstream "$CU_UPSTREAM_DIAL" --host "${DIAL_HOST%:*}")
+else
+  DIAL_ARGS=(--upstream "${CU_UPSTREAM:-api.venice.ai:443}")
+fi
 start_sidecar() {
   CU_TEST_H2_FAIL_FILE="$FAIL_FILE" CU_TEST_H2_RETRY_SECS="$RETRY_SECS" \
-    "$BIN" --listen "127.0.0.1:$SPORT" --upstream "${CU_UPSTREAM:-api.venice.ai:443}" --key-env "$KEY_ENV" \
+    "$BIN" --listen "127.0.0.1:$SPORT" "${DIAL_ARGS[@]}" --key-env "$KEY_ENV" \
     --offer "${CU_V3_OFFER:-$CRYPTO/relay/offer.venice.json}" --node-settles --runs-dir "$OUT/sidecar-runs" >> "$OUT/sidecar.log" 2>&1 &
   SIDECAR_PID=$!
   for _ in $(seq 1 50); do
@@ -570,6 +588,9 @@ run_case h2-i-own-keyshare   "attack:2:0:unused:share"            "$B" none -- -
 run_case h2-l-big-frame      "attack:2:0:unused:frame_too_large"  "$B" none -- --http 2 --adv big-frame
 run_case h2-m-ctl-flood      "attack:2:0:unused:more control records" "$B" none -- --http 2 --adv ctl-flood
 run_case h2-m-hold-body      "attack:2:1:abandoned:."              "$B" none -- --http 2 --adv hold-body
+run_case h2-t-bad-tag        "attack:2:1:abandoned:before the request was complete" "$B" none -- --http 2 --adv bad-tag
+run_case h2-t-bad-tag-2      "attack:2:2:abandoned:before the request was complete" "$B" none -- --http 2 --requests 2 --adv bad-tag --adv-at 2
+run_case h11-t-bad-record    "attack:1.1:1:abandoned:before the request was complete" "$B" none -- --http 1.1 --adv bad-record
 run_case h11-c-suffix        "attack:1.1:1:abandoned:pi_win failed" "$B" none -- --http 1.1 --adv suffix
 run_case h11-c-model-swap    "attack:1.1:1:abandoned:."             "$B" none -- --http 1.1 --adv suffix --adv-suffix-model "$SWAP_MODEL"
 run_case h11-b-padding       "attack:1.1:1:abandoned:pi_win failed" "$B" none -- --http 1.1 --adv padding

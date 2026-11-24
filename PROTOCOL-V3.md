@@ -590,7 +590,8 @@ every case above with exact money (`h2-k-*`, `h11-k-extra-record`, `h11-k-pipeli
   fabricated head still needs a frame header (with its zero bytes) at byte 0 of a record, which JSON text
   never has (risk 5). The prefix frames carry nothing of C's: the request's stream has nothing before its
   response head. What remains a provider requirement (§5.6, H9): a response head lies in a record that
-  starts at a frame boundary.
+  starts at a frame boundary. An error head also settles a request whose provider answered it before the
+  body was written in full and then closed (§5.4.2), unless S marked that close `client_caused`.
 - `disclose_reset` (§5.4.1): the provider refused the request's stream without processing it. `R` runs
   from **byte 0 of server record `i`**, `i` no later than `S_k`, to the end of the refusing frame:
   `RST_STREAM` on the request's stream with `REFUSED_STREAM` (7), or GOAWAY (stream 0) with `NO_ERROR` and
@@ -625,7 +626,7 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   `W = min(30 s, h2.idle_secs / 4)` after N sent `request_ok`, and less than `h2.idle_secs` after N's last
   write to the provider (the head or a client record). The times are N's own observations, the record
   holding the GOAWAY's last byte is the one judged, and a later GOAWAY is refused (`error`; the request
-  then ends as §12.10 rows 8 and 9 say). Why: a provider ends an idle connection no sooner than
+  then ends as §12.10 row 9 says). Why: a provider ends an idle connection no sooner than
   `h2.idle_secs` after its last activity (H5; the node's `idle_timeout_s` is at most that), so a GOAWAY
   inside the window is the provider's own decision (a shutdown, a restart), never an idle close that C
   provoked by holding an accepted request unwritten. W is far above what an honest client needs between
@@ -670,8 +671,9 @@ like any other: after `body_released`, the whole reservation. C therefore proves
 - **The stall after the HEADERS is closed the same way.** A C that has its HEADERS written (so the interval
   is open and the provider's next frame counts as response bytes), holds the proven body back, and waits
   for the provider's timeout or provokes a connection error with a control frame gets neither a refusal
-  (the rule above; a GOAWAY with an error code never counts) nor row 8 of §12.10: S marks the provider's
-  close `client_caused` (§12.9) and the request costs what an abandoned one costs. Tests:
+  (the rule above; a GOAWAY with an error code never counts) nor an error head: S marks the provider's
+  close `client_caused` (§12.9), takes no error head after it, and the request costs what an abandoned
+  one costs (§5.4.2). Tests:
   `a_close_after_the_client_held_the_body_back_is_not_the_providers_answer` (S), the node gate's
   `h2-m-hold-body`.
 - **A control record inside a request.** S marks a request once a control record of C (SETTINGS ACK, PING
@@ -691,22 +693,74 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   sent another SETTINGS, and an unsolicited SETTINGS ACK is a connection error (PROTOCOL_ERROR) for
   common servers. RST_STREAM is accepted only after the request is complete, so it is written after all of
   the request's records and never falls under this rule. Test:
-  `owed_ping_acks_are_bounded_and_need_a_server_record_each` (S). A control record written before the request was
-  accepted does not mark it: the provider's reaction to it arrives one round trip later, before C's
-  records can be proven and written, so it falls outside the interval and the request ends as an
-  abandoned one. What remains: a provider whose own body timeout is shorter than `W` (framing `"1.1"`:
-  30 s) closes before S calls the wait a stall, and the request then ends in row 8. The gain is the
-  difference between the deposit (or the abandon fee) and the session fee, once per connection, and a
-  minimal real request releases the deposit for its few msat of usage anyway.
+  `owed_ping_acks_are_bounded_and_need_a_server_record_each` (S). A control record of the same kinds
+  written while no request is in flight, or after the request in flight was written in full, marks the
+  next request that N accepts, or whose first record N writes, less than `W` after it: the provider's
+  reaction arrives one round trip later, which may be after that request's first record when C is close to
+  N and the provider far away (a PING ACK after a server record does not count here either). Test:
+  `a_control_record_between_requests_marks_the_next_one_within_the_window` (S). None of this decides
+  money by itself any more: an early close settles a request only with a disclosed answer (§5.4.2), and a
+  connection error the client provoked (GOAWAY with an error code, a close with only a TLS alert) has none.
+  What remains: a provider whose own body timeout is shorter than `W` (framing `"1.1"`: 30 s) answers a
+  held body before S calls the wait a stall; if that answer is an error head (a 408), it settles the
+  request by its status (any other 4xx: the abandon fee), which releases the deposit. That is the price
+  of a request the provider rejected, the same as a complete body the provider refuses.
 - **The provider closes right after its GOAWAY** (the usual case). N then keeps the request open for
-  60 s for a `disclose_reset` alone (no other disclosure, nothing written); without it the request ends
-  as before (§12.10 rows 8, 9).
+  60 s for its disclosure (nothing more of it is written); without it the request ends as an abandoned one
+  (§5.4.2, §12.10 row 9).
 - **What it costs C.** The session fee if still due, never more (§12.10); the connection closes, and C
   runs the request again, on a new connection (clients class it as not processed: SDK
   `StreamNotProcessedError`, retried; the browser library the same).
 - **What remains a provider requirement** (§5.6, H9): the records from `i` to the refusal start at frame
   boundaries and hold no KeyUpdate; a refusal behind more than 8 records or 16 KiB from `i` cannot be
   disclosed (then §12.10 applies as before: the request is charged by what N saw).
+
+### 5.4.2 The provider closes before the request is written in full
+
+S cannot read what the provider sends (it is under `s_ap_0`), so "the provider sent bytes and closed" says
+nothing about who caused the close. C can cause it at will: π_WIN proves the CTR ciphertext of C's records,
+not their GCM tag (`zkbench::statements`: the provider checks the tag), and in framing `"1.1"` the body
+records before the final one are relayed unproven. A record with a wrong tag, or one of random bytes, makes
+a TLS 1.3 provider send a fatal alert (`bad_record_mac`, one record of about 24 bytes under `s_ap_0`, which
+S counts as response bytes) and close, or close without one. An unsolicited SETTINGS ACK can make it send
+GOAWAY(PROTOCOL_ERROR) and close. Until 2026-11-24 the node took such a close with response bytes and
+without `client_caused` for the provider's refusal (§12.10 row 8: the deposit released, the session fee
+kept), so a client could end any request, and its connection, for the session fee (0 by default, and 0 for
+every request after the first).
+
+The rule: **an early close settles a request only with a proven answer.** After `upstream_closed_early`
+S waits 60 s (`REFUSAL_GRACE`) for one disclosure and takes nothing else:
+
+- framing `"2"`: `disclose_reset` (§5.4.1), or `disclose_head` (π_WIN under `s_ap_0` over the error head
+  the provider sent on the request's stream before it closed, §5.4), the latter not after a close S
+  marked `client_caused` (§12.9). An error head disclosed before the close goes on to its settlement.
+- framing `"1.1"`: when the provider sent response bytes and S did not mark the close `client_caused`, S
+  sends the attestation at once and takes `disclose_head` (π_C3S head mode, as after a complete request,
+  §12.8); `disclose` and `accept` are refused, and what C still sends of the body goes nowhere. With no
+  response byte, or a marked close, the connection ends at once.
+
+A disclosed answer is settled as any disclosure (§12.10: an error head by its status, a refusal like a
+429), which is a settlement and releases the deposit. Without one the request is an abandoned one (§12.10
+row 9: the abandon fee, or on a connection with no settlement the deposit, the reservation released in
+full), whatever `response_bytes` and `client_caused` say. The node no longer reads either.
+
+*What an honest client pays.* When the provider answers a request before its body is complete and closes,
+an honest client discloses the error head and pays what that status costs (429/503/401/402/403: the
+session fee if still due; any other status: the abandon fee, a 5xx too, since the provider never had the
+complete request). When the provider closes early with nothing an honest client can prove (only a TLS
+alert, a GOAWAY with an error code, an error head that does not start a record at a frame boundary, H9),
+the honest client pays the abandon fee, or the deposit on the connection's first request. That is the
+trade: N cannot tell such a close from one the client caused, the client is the party that could have
+caused it, and the amount is bounded by the deposit (or the abandon fee) of one connection.
+
+*Why a client cannot make a provable answer out of its own fault.* A refusal needs `REFUSED_STREAM` on its
+stream or a GOAWAY with `NO_ERROR` below it (§5.4.1): a compliant provider answers a bad record or a
+protocol error with an alert or a GOAWAY with an error code, neither of which is disclosable, and a GOAWAY
+after a control record of the client is refused anyway. An error head is the provider's HTTP answer to the
+pinned request head (its framing decides where a frame starts, risk 5); a client can provoke one only by
+what the provider rejects in the body, which costs what the same rejection costs after a complete body.
+Tests: `an_error_head_settles_a_request_after_the_providers_early_close` (S), the gates' `h2-t-bad-tag`,
+`h2-t-bad-tag-2`, `h11-t-bad-record`.
 
 ### 5.5 Why the credential cannot be read back
 
@@ -930,6 +984,11 @@ sends no table byte before C uploaded 64 KiB of its MAC-COT traffic (§12.2).
   bounds an armed connection's life), or evicted. Holding k slots unused for up to 600 s therefore costs k·D.
   A party that uses each connection for one request pays the session fee and that request's usage instead,
   and its connection then counts as used: it is closed before any unused connection, at no cost to anyone.
+- *Ending a request early.* A request the client ends before its body is written in full costs the abandon
+  fee, or D on a connection with no settlement, however it ends: the client leaves, a proof fails, or a
+  record the provider must reject (a wrong GCM tag, random bytes, an unsolicited SETTINGS ACK) makes the
+  provider close. A provider's close counts as its answer only when C discloses that answer (§5.4.2), so
+  holding a slot behind an accepted request and then provoking a close still costs D.
   An armed connection also costs its client the 2PC: about 1.1 MB up and 16.4 MB down, plus about 1.5 MB
   each way for the proof channel.
 - *Evicting its own connections.* A party's setup that closes its own connection pays D for it. The node
@@ -1104,10 +1163,11 @@ the `request_ok.reserved_msats` of its request (§12.4).
 | 9 | Compromise scope: one `c_ap_1`/`s_ap_0` pair protects up to `h2.max_requests` requests (C may not KeyUpdate under π_WIN's rules). A live compromise of C exposes the connection's current and later traffic; a later forensic compromise of retained secrets exposes the whole recorded connection, not one request | best effort only: clients clear the traffic secrets they hold (zero the arrays, drop the references) when a connection closes and keep them out of logs. That is not cryptographic erasure: the clients are JavaScript, and copies the runtime made (garbage-collected buffers, heap snapshots, swap, core dumps) may remain. The levers are the connection's scope: operators keep `h2.max_requests` and `h2.max_lifetime_s` in proportion, and a user who needs one request per secret pair uses `reuse: none` or framing `"1.1"`. A per-request ratchet needs a new anchor protocol |
 | 10 | The credential lives in the provider's HPACK decoder state for the connection's life (provider, CDN or gateway memory, crash dumps) | v3 does not reduce provider-side exposure; requests by index still decode to the full field at the provider |
 | 11 | `upstream_models` may map a public id to another provider prefix for the same name (`someorg/claude-opus-4.5` for `claude-opus-4.5`): the rule of §12.1 binds the name, not the publisher | matters only on a provider where anyone can publish models under their own namespace; closing it needs a per-host list of trusted prefixes, or showing the pinned id to the user. the node offers of the provider runs of 2026-11-12 (Numes, OpenRouter, xKiro; 970 mappings) and Cloudflare's `@cf/meta/<id>` all have the form `<prefix>/<public id>` |
-| 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5). (The idle stall, ending an accepted, unwritten request cheaply by waiting for the provider's idle GOAWAY, is closed by the GOAWAY window, §5.4.1; the stall after the HEADERS by the same window, except at a provider whose body timeout is shorter than it.) | as risk 5 |
+| 12 | A refusal (`disclose_reset`) rests on the provider's frame boundaries like an error head (risk 5). (The idle stall, ending an accepted, unwritten request cheaply by waiting for the provider's idle GOAWAY, is closed by the GOAWAY window, §5.4.1; the stall after the HEADERS by the same window, except at a provider whose body timeout is shorter than it, where a disclosed timeout head (a 408) settles the request for the abandon fee and releases the deposit.) | as risk 5 |
 | 13 | Session slots are priced, not fully protected: under slot pressure a newer setup closes an unused connection past the minimum age (`evict_unused_after_s`, 60 s), of the address holding the most (the asking address's own when it holds as many as any), and its deposit is always charged (§8.4). Holding a slot unused costs one deposit D in any case (an unused connection ends charged); an honest pre-warmed spare older than the minimum age can be closed on a full node and pay D. Limits (§8.4): behind a shared address (NAT, VPN, Tor exit) another party's unused connections count toward the same address, so an honest spare there can be the oldest of the largest holder and be charged first (one D per spare); the count in the signed outcome is the node's statement, which C cannot check; a framing-`"2"` request accepted and never written shields its connection for 600 s at the price of one deposit | the operator's deposit, minimum age and limits; no per-credential fairness |
 | 14 | A charge with no settlement is now stated, signed (`request_outcome` on the last frame, §12.10), but only to a client that is still connected when the node finalizes it; a client that left first receives nothing, and the charge is the same. The node's statement is its word: what C checks is that the cost is at most `request_ok.reserved_msats` (at most the published fee for a request never written in full), not that the node's reason is true | C sees the charge in its balance either way; the signed outcome is evidence C keeps |
-| 15 | A provider's fatal alert after its Finished (a handshake it accepted and then rejects) reaches C under `s_ap_0`; N cannot read it, and C's stack ends the connection without failing the steps already under way, so `release_head` can still be sent and N writes the head to a connection the provider is closing | no secret is exposed (the head goes only to the authenticated provider, under `K_0`); the connection then ends as any provider close does (§12.10 rows 5, 8, 9) |
+| 15 | A provider's fatal alert after its Finished (a handshake it accepted and then rejects) reaches C under `s_ap_0`; N cannot read it, and C's stack ends the connection without failing the steps already under way, so `release_head` can still be sent and N writes the head to a connection the provider is closing | no secret is exposed (the head goes only to the authenticated provider, under `K_0`); the connection then ends as any provider close does (§12.10 rows 5, 9) |
+| 16 | An early provider close settles a request only with a disclosed answer (§5.4.2): an honest client whose provider closes before the body is complete with nothing provable (only a TLS alert, a GOAWAY with an error code, an error head that does not start a record at a frame boundary) pays the abandon fee, or the deposit on the connection's first request, because N cannot tell that close from one the client caused with a record the provider rejects | bounded by one deposit (or abandon fee) per such close; the operator's deposit and abandon fee |
 
 v2's residual risks carry over unchanged (π_NK does not bind other epoch-0 records; provider reflection;
 ECtF semi-honest in mpz2's documentation, with our argument for malicious parties in
@@ -1578,7 +1638,8 @@ connection began (handshake flight included).
   is the plaintext from byte 0 of server record `i ≥ S_k` to the end of one HEADERS frame of the stream with
   END_HEADERS; before it only the frames §5.4 allows; at most 16 KiB and 8 records, the block decodable with
   an empty dynamic table, `:status` first, 400..599. Allowed once the request's first
-  record was written and no client record is unproven. `attestation`, then
+  record was written and no client record is unproven, also after the provider closed before
+  `body_released` (N waits 60 s for it, §5.4.2), but not after a close S marked `client_caused`. `attestation`, then
   `{"type":"zk_params","proof":"pi_win","purpose":"error_head","n","record","params"}` (`anchor = h2`; per
   record the frame's bytes from offset 0 and the last byte = `17`). C discloses an error head also when
   the provider reset the stream after it (RFC 9113 §8.1: a server that answers before the request is
@@ -1602,8 +1663,8 @@ connection began (handshake flight included).
   `{"type":"zk_params","proof":"pi_win","purpose":"refusal","n","record","params"}` (`anchor = h2`; per
   covered record its bytes from offset 0 and its last byte = `17`, as for an error head). C checks the
   windows like an error head's and proves with `s_ap_0`. Allowed before or after `body_released`; when the
-  provider closed the connection before `body_released`, N waits 60 s for it (and takes nothing else) after
-  `upstream_closed_early`. The settlement `usage` is `{"refused":"rst_stream","error_code":7,"choices":[]}`
+  provider closed the connection before `body_released`, N waits 60 s for it or an error head (and takes
+  nothing else) after `upstream_closed_early`. The settlement `usage` is `{"refused":"rst_stream","error_code":7,"choices":[]}`
   or `{"refused":"goaway","error_code":0,"last_stream_id":L,"choices":[]}`; the connection then closes
   (`closed`, `error_settled`).
 
@@ -1618,6 +1679,9 @@ on its own. After it:
   `r` is the response head (`HTTP/1.1 <status> …\r\n\r\n`) starting the first covered record, `skip` the
   body bytes after it → `{"type":"zk_params","proof":"pi_c3s","purpose":"error_head","n":1,"params"}`.
   A `disclose` whose `r` is a response head is refused.
+- The provider closed before the final body record was written (§5.4.2): `upstream_closed_early`; with
+  response bytes and without `client_caused`, N sends the `attestation` at once (`client_records`: the body
+  records relayed before the close, at most the ones C wrote) and takes only `disclose_head`, for 60 s.
 
 **Attestation** (S): `{"type":"attestation","n","a":{…},"sig":<ed25519 over the serialized a>}`.
 
@@ -1693,18 +1757,23 @@ gets `{"type":"error","status":413,"code":"frame_too_large"}` **without `fault`*
 handshake, and the connection ends as after any client protocol error (§12.10: row 12, or row 9 with a
 request accepted and not released).
 `{"type":"upstream_closed_early","n","response_bytes"[,"client_caused":true]}` precedes the `error` when the
-provider closed before the request was fully written (N relays it). S adds `client_caused` when the close
-may be the client's doing, and the request is then an abandoned one, not the provider's refusal (§12.10).
+provider closed before the request was fully written (N relays it). It settles nothing: the request is
+settled only by an answer C discloses within 60 s (§5.4.2), else it is an abandoned one (§12.10 row 9).
+S adds `client_caused` when the close may be the client's doing; S then takes no error head for it.
 Framing `"2"`: a control record of the client other than the connection's first SETTINGS ACK and an owed
 PING ACK (at most 2 per request, each after a server record, §5.4.1) was written
-while the request was in flight and not yet written in full (before its first record too, §5.4.1), or S had
+while the request was in flight and not yet written in full (before its first record too, §5.4.1), or less than
+`W` before N accepted the request or wrote its first record, while no request was in flight or the one in
+flight was written in full, or S had
 written no record of the request for the GOAWAY window `W` (§5.4.1) or longer when a server
 record or the close arrived, while the request was written in part (the client holds back records S has
 proven; an honest client releases them as the provider's flow-control window allows, within
 milliseconds). Framing `"1.1"`: S had written neither the head nor a body record for 30 s or longer when
 the provider closed (a provider that refuses a request from its head answers while the client still
-sends). Framing `"2"`: N then keeps the request for 60 s, for a
-`disclose_reset` alone (§12.8); without one the `error` follows.
+sends). N then keeps the request for 60 s for its disclosure (§12.8: framing `"2"` `disclose_reset` or
+`disclose_head`, framing `"1.1"` `disclose_head` after the attestation; no error head after a
+`client_caused` close, and in framing `"1.1"` no wait after one or after a close with no response byte);
+without one the `error` follows.
 
 **N** sends its own `error` frames as `{"type":"error","status","reason","detail"[,"fault":"node"]}`: a
 refused setup (12.3; the socket then closes), a protocol error in a `request` (12.4), a time limit (408),
@@ -1761,15 +1830,14 @@ request the sidecar or N refused (`request_refused`) has none; neither has a req
 | refused (`request_refused`) | never made, or released in full |
 | accepted, the connection ends before `body_released` (a failed π_WIN, the client leaves, the time limit) | released; the abandon fee is kept, except when the deposit is charged for it (below) |
 | accepted, the connection ends before `body_released` with the sidecar's `fault` (`"upstream"`, `"node"`) or with its socket lost | released in full: not the client's doing |
-| before `body_released`, the provider answered and closed (`upstream_closed_early` with response bytes and without `client_caused`) | released; the session fee is kept if still due |
-| before `body_released`, the provider closed after the client held the request back or had a control frame written inside it (`upstream_closed_early` with `client_caused`, §12.9) | as an accepted request the client left: released; the abandon fee is kept, or the deposit is charged for it |
+| before `body_released`, the provider closed (`upstream_closed_early`) and no answer was disclosed within 60 s (§5.4.2), whatever `response_bytes` and `client_caused` say | as an accepted request the client left: released; the abandon fee is kept, or the deposit is charged for it |
 | after `body_released` with no settlement | charged in full |
 | settled 2xx | usage at the frozen rates (chat) or `msat_per_image × count` (images), plus the session fee if still due |
 | settled chat 2xx whose usage event lacks `prompt_tokens` or `completion_tokens` as non-negative integers | charged its reservation |
 | settled with a settlement of the wrong kind for the request (a flat image settlement of a chat request or for another model; token usage on an image request) | charged its reservation |
 | the settlement could not be written (the node's billing write failed) | after `body_released`: charged its reservation; before it (a disclosed error head or refusal): released in full. No receipt; the connection ends with the node's `error` (500, `settlement_failed`, `fault: "node"`, §12.9) and the deposit row 6 |
 | settled refusal (`disclose_reset`, framing `"2"`; before or after `body_released`) | the session fee if still due, the rest released; never more |
-| settled error head | 429/503 and 401/402/403: the session fee if still due; any other 4xx: the abandon fee; other 5xx: the reservation, at most the `reserved_msats` announced in `request_ok` (none announced: the session fee if still due); images: never more than `msat_per_image × count` + max(session fee if still due, abandon fee) |
+| settled error head | 429/503 and 401/402/403: the session fee if still due; any other 4xx: the abandon fee; other 5xx: the reservation, at most the `reserved_msats` announced in `request_ok` (none announced: the session fee if still due), but the abandon fee when it is settled before `body_released` (the provider never had the complete request); images: never more than `msat_per_image × count` + max(session fee if still due, abandon fee) |
 
 The session fee is "still due" until the connection's first settlement.
 
@@ -1798,8 +1866,8 @@ settled request, first matching row:
 | 5 | the provider closed the open, idle connection before any request (`closed`, `upstream_closed`, without `after_client_frames`) | released | `provider_closed` |
 | 6 | the node refused a request of this connection with a 5xx **and accepted none after it**, or a settlement's billing write failed | released | `node_failure` |
 | 7 | a request was written in full (`body_released`) and never settled | released (the reservation is charged) | `request_received` |
-| 8 | the provider answered a request and closed before its body was complete (response bytes in the request's interval, and S did not mark the close `client_caused`, §12.9) | released (the request keeps the session fee) | `provider_refused` |
-| 9 | a request was accepted and the connection ended before its `body_released` for any other reason (N cannot see a GOAWAY: undisclosed, it lands here when the provider sent nothing in the interval, or when its close was `client_caused`) | **charged**; the reservation is released in full | `request_abandoned` |
+| 8 | not used since 2026-11-24 (§5.4.2): a node before it released the deposit when the provider closed before a request's body was complete with response bytes and no `client_caused`; a provider's answer before the body was complete now settles only when disclosed (a settlement, none of these rows) | released (the request kept the session fee) | `provider_refused` |
+| 9 | a request was accepted and the connection ended before its `body_released` for any other reason, an early provider close with no disclosed answer included (whatever its response bytes) | **charged**; the reservation is released in full | `request_abandoned` |
 | 10 | no request in flight for `idle_timeout_s` | **charged** | `idle` |
 | 11 | `head_written` not reached within 600 s | **charged** | `setup_timeout` |
 | 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake or after the client's control frames (`after_client_frames`), only refused requests | **charged** | `unused` |
@@ -1825,7 +1893,7 @@ particular a GOAWAY that ends the connection **before `body_released`** is a pro
 longer costs the deposit (row 9) once C discloses it, also after the provider closed the TCP connection
 (N waits 60 s). When it reached N before any record of the request was written, that GOAWAY must have
 reached N within the GOAWAY window (§5.4.1); a later one (an idle close the client may have waited for) stays in row 9. A GOAWAY C cannot disclose (an error code, which C's own frames may have caused; frames
-it cannot walk) stays in rows 8 and 9.
+it cannot walk) stays in row 9.
 
 ```
 {"type":"closed"|"error", …,
@@ -1862,7 +1930,7 @@ outcome:
 | `v` | `1`, the format |
 | `sid`, `http`, `n` | the connection, its framing, the request |
 | `outcome` | `"charged"` when `cost_msats` > 0, else `"released"` |
-| `reason` | `request_received` (written in full, no settlement: the reservation), `settlement_failed` (the billing write failed: the reservation after `body_released`, released in full before it), `settled_without_receipt` (charged what its settlement says, but the deposit could not be released, so N sent no receipt; only after C disclosed the answer, before or after `body_released`: an error head may be settled before it, a 5xx at the reservation), `provider_refused` (the provider answered and closed first: the session fee if still due), `provider_unreachable`, `sidecar_failure` (released in full), `request_abandoned` (the abandon fee, or released in full when the deposit is charged for it), `evicted` (released in full on a connection closed for a newer setup, row 13: a framing-`"1.1"` request 1 without a ClientHello, else a race), `unattested` (a usage without an attestation: released), `not_started` (the sidecar never accepted it: released) |
+| `reason` | `request_received` (written in full, no settlement: the reservation), `settlement_failed` (the billing write failed: the reservation after `body_released`, released in full before it), `settled_without_receipt` (charged what its settlement says, but the deposit could not be released, so N sent no receipt; only after C disclosed the answer, before or after `body_released`: an error head may be settled before it, a 5xx at the reservation), `provider_refused` (a node before 2026-11-24 only: the provider sent bytes and closed first: the session fee if still due; clients still accept it from such a node), `provider_unreachable`, `sidecar_failure` (released in full), `request_abandoned` (the abandon fee, or released in full when the deposit is charged for it), `evicted` (released in full on a connection closed for a newer setup, row 13: a framing-`"1.1"` request 1 without a ClientHello, else a race), `unattested` (a usage without an attestation: released), `not_started` (the sidecar never accepted it: released) |
 | `cost_msats` | what the credential paid for the request; never above `reserved_msats` |
 | `reserved_msats` | what was reserved for it (`request_ok.reserved_msats`) |
 | `balance_msats` | the credential's balance afterwards (`null` if the key is gone) |
@@ -1973,5 +2041,6 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | the 2PC channel: P2 and P8 as the code sends them, the abort bytes of stage B2, no abort byte in K; the conformance file gains `chi`, the label-check pair, the stage report hash and the openings hash | §12.2 |
 | eviction (2026-11-23): an evicted unused connection's deposit is always charged (`evicted_released` and `CONFIDENTIAL_EVICT_CHARGE_FROM` are gone, `deposit.evicted` is `{unused_at_address}`); the asking address's own oldest goes when it holds as many evictable unused connections as any; a framing-`"1.1"` request 1 without a ClientHello does not hold the slot; no eviction while the sidecar is unreachable; the offer's `evict_unused_after_s`; what holding, self-eviction and griefing cost | §8.4, §9.2, §10 risk 13, §12.1, §12.9, §12.10 |
 | the request outcome: the ceiling per reason (shared vectors), the cross-checks against the frame and the deposit outcome, a failed settlement before `body_released` releases in full; all three clients report a missing last frame | §12.10 |
+| an early provider close (2026-11-24) settles a request only with a disclosed answer: `upstream_closed_early` settles nothing by its response bytes (row 8 is no longer used); after it S takes `disclose_head` as well as `disclose_reset` for 60 s (framing `"1.1"`: attested at once, `disclose_head` only), not after a `client_caused` close; a control record written outside a request marks the next one accepted or first written within `W`; a 5xx error head settled before `body_released` costs the abandon fee | §5.4.1, §5.4.2, §8.4, §10 risk 16, §12.8–§12.10 |
 | C's TLS stack: an RSA signature must have the length of the modulus (TLS-20) | `FORK-NOTES.md`, `docs/TWOPC-NODE-GARBLING.md` §4 |
 | the shipped Venice offer: `h2.idle_secs` 300 (was 390) | §2.1, `docs/SETUP.md` |

@@ -203,8 +203,12 @@ pub(crate) struct H2 {
     responded: bool,
     responded_told: bool,
     /// The provider closed before the request in flight was released: only
-    /// a `disclose_reset` may still settle it, until the session deadline.
+    /// a proven answer (`disclose_reset`, or `disclose_head` for an error
+    /// head) may still settle it, until the session deadline.
     pub(crate) closed_early: bool,
+    /// That close was marked as possibly the client's doing (`client_caused`
+    /// in `upstream_closed_early`): an error head no longer settles it.
+    closed_early_client: bool,
     /// Server application-data records received (as `RelayLog::server_app_records`).
     app_records: usize,
     /// When N last wrote to the provider (the head, a client record).
@@ -223,6 +227,14 @@ pub(crate) struct H2 {
     /// provider follows at least one server record (its PING) since the
     /// previous one.
     ping_ack_mark: usize,
+    /// When N last wrote a control record of the client that may make a
+    /// provider end the connection (not the first SETTINGS ACK, not a PING
+    /// ACK after a server record) while no request was in flight or after
+    /// the request in flight was written in full. A request accepted, or
+    /// first written, within the GOAWAY window of it is marked like one
+    /// inside which such a record was written (`Req::ctl_written`): the
+    /// provider's reaction can arrive after the request's first record.
+    ctl_outside_at: Option<std::time::Instant>,
 }
 
 impl H2 {
@@ -249,12 +261,14 @@ impl H2 {
             responded: false,
             responded_told: false,
             closed_early: false,
+            closed_early_client: false,
             app_records: 0,
             last_write: None,
             last_req_write: None,
             ctl_records: 0,
             settings_acked: false,
             ping_ack_mark: 0,
+            ctl_outside_at: None,
         }
     }
 
@@ -375,6 +389,12 @@ pub(crate) fn stalled(last: Option<std::time::Instant>, now: std::time::Instant,
 /// records back for the GOAWAY window or longer before the close.
 fn early_close_is_clients(q: &Req, last_req_write: Option<std::time::Instant>, now: std::time::Instant, window: std::time::Duration) -> bool {
     q.ctl_written || q.stall_from.is_some() || (q.written > 0 && stalled(last_req_write, now, window))
+}
+
+/// A control record that may make the provider end the connection was
+/// written outside a request (`H2::ctl_outside_at`) less than `window` ago.
+fn recent_ctl_outside(at: Option<std::time::Instant>, now: std::time::Instant, window: std::time::Duration) -> bool {
+    at.is_some_and(|t| now.saturating_duration_since(t) < window)
 }
 
 /// Most records one request may arrive in: its HEADERS, and DATA frames that
@@ -531,6 +551,7 @@ pub(crate) fn on_request(
     }
     let stream = h2::request_stream(n);
     let block = h2::request_block(&app.offer.upstream_host, &path);
+    let ctl_before = recent_ctl_outside(h.ctl_outside_at, std::time::Instant::now(), goaway_window(h.cfg.idle_secs));
     h.requests = n;
     h.req = Some(Req {
         n,
@@ -562,7 +583,7 @@ pub(crate) fn on_request(
         late_from: None,
         late_write: false,
         stall_from: None,
-        ctl_written: false,
+        ctl_written: ctl_before,
         owed_ping_acks: 0,
         pinned: Vec::new(),
     });
@@ -729,6 +750,7 @@ async fn flush(
         let deadline = st.deadline;
         let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
         let (last_req_write, idle) = (h.last_req_write, std::time::Duration::from_secs(h.cfg.idle_secs));
+        let (ctl_outside_at, window) = (h.ctl_outside_at, goaway_window(h.cfg.idle_secs));
         let now = std::time::Instant::now();
         let Some(front) = h.queue.front() else { break };
         // Nothing goes to a provider that closed the connection.
@@ -752,6 +774,11 @@ async fn flush(
                 q.late_write = last_req_write.is_some_and(|w| now >= w + idle);
                 q.s_k = Some(log.server_app_records);
                 q.interval_open = true;
+                // A control record written outside a request just before: the
+                // provider's reaction to it may arrive inside this interval.
+                if recent_ctl_outside(ctl_outside_at, now, window) {
+                    q.ctl_written = true;
+                }
             }
         }
         let rec = h.queue.pop_front().expect("front exists");
@@ -774,8 +801,17 @@ async fn flush(
             if ping {
                 h.ping_ack_mark = h.app_records;
             }
-            if let Some(q) = h.req.as_mut().filter(|q| !q.released) {
-                if ping && after_server_record && q.owed_ping_acks < OWED_PING_ACKS {
+            let owed = ping && after_server_record;
+            if h.req.as_ref().is_none_or(|q| q.released) {
+                // No request in flight, or one written in full: nothing to
+                // mark now, but the next request accepted or first written
+                // within the GOAWAY window is (`H2::ctl_outside_at`). A PING
+                // ACK after a server record may answer a keep-alive PING.
+                if !owed {
+                    h.ctl_outside_at = Some(now);
+                }
+            } else if let Some(q) = h.req.as_mut() {
+                if owed && q.owed_ping_acks < OWED_PING_ACKS {
                     q.owed_ping_acks += 1;
                 } else {
                     // Also before the request's first record: the queue is
@@ -1052,10 +1088,12 @@ pub(crate) fn on_disclose_head(
     if h.win.is_some() || h.queue.iter().any(|x| !x.proven) {
         bail!("disclose_head while client records are unproven");
     }
-    // A provider that closed before the request was complete: a refusal
-    // (`disclose_reset`) is the only disclosure left (§12.10, row 8).
-    if h.closed_early {
-        bail!("disclose_head after the provider closed before the request was complete");
+    // A provider that closed before the request was complete: its error head
+    // (a response from the request's head alone) still settles the request,
+    // unless the close may be the client's doing (`client_caused`), whose
+    // provider's answer is no answer to the request (§12.9, §12.10).
+    if h.closed_early && h.closed_early_client {
+        bail!("disclose_head after a provider close the client may have caused (it held the request back, or had a control frame written around it)");
     }
     let q = h.req.as_mut().filter(|q| q.n == n).ok_or_else(|| anyhow!("disclose_head names no request in flight"))?;
     let s_k = q.s_k.ok_or_else(|| anyhow!("disclose_head before any of the request reached the upstream"))?;
@@ -1076,6 +1114,9 @@ pub(crate) fn on_disclose_head(
     q.usage = Some(serde_json::json!({ "error_status": status, "choices": [] }));
     q.settle_on = Some("pi_win");
     h.win = Some(WinInflight::ErrorHead);
+    if h.closed_early {
+        st.deadline = Some(tokio::time::Instant::now() + REFUSAL_GRACE);
+    }
     let params = Params::PiWin(p);
     attest(app, st, to_client)?;
     shared.set_params("pi_win", params.clone());
@@ -1086,7 +1127,7 @@ pub(crate) fn on_disclose_head(
 }
 
 /// How long a request whose provider closed before it was released waits for
-/// its refusal to be disclosed and proven (`disclose_reset`).
+/// its answer to be disclosed and proven (`disclose_reset`, `disclose_head`).
 pub(crate) const REFUSAL_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long after `request_ok` a GOAWAY may refuse a request none of whose
@@ -1428,10 +1469,14 @@ fn settle(app: &Arc<AppState>, st: &mut Session, to_client: &mpsc::UnboundedSend
 /// with nothing at stake; a released request may still be disclosed.
 ///
 /// A request not yet released: `upstream_closed_early` tells the node how
-/// much the provider sent in its interval. A refusal already disclosed goes
-/// on to its settlement; otherwise the client has `REFUSAL_GRACE` to
-/// disclose one (the provider's GOAWAY usually comes right before its close)
-/// and nothing else, and the session then ends as before (§12.10 rows 8, 9).
+/// much the provider sent in its interval. The response bytes alone settle
+/// nothing: they may be no answer to the request at all (a TLS alert for a
+/// record the client corrupted, the reaction to a control frame). Only a
+/// proven answer does: a refusal (`disclose_reset`) or an error head
+/// (`disclose_head`; not after a close marked `client_caused`), disclosed
+/// within `REFUSAL_GRACE` or already under way, goes on to its settlement;
+/// otherwise the session ends with `CLOSED_EARLY` and the node settles an
+/// abandoned request (§12.10 row 9).
 pub(crate) fn tcp_closed(st: &mut Session, to_client: &mpsc::UnboundedSender<Message>) -> Result<()> {
     let h = st.h2.as_mut().ok_or_else(|| anyhow!("not a framing-2 connection"))?;
     h.tcp_closed = true;
@@ -1439,33 +1484,32 @@ pub(crate) fn tcp_closed(st: &mut Session, to_client: &mpsc::UnboundedSender<Mes
     match &h.req {
         None => h.closing = Some("upstream_closed"),
         Some(q) if !q.released => {
-            let (n, response_bytes, refused, disclosed) = (q.n, q.recv_bytes, q.refused, q.usage.is_some());
+            let (n, response_bytes) = (q.n, q.recv_bytes);
             let mut msg = serde_json::json!({"type":"upstream_closed_early","n":n,"response_bytes":response_bytes});
-            if early_close_is_clients(q, last_req_write, std::time::Instant::now(), window) {
-                // Not the provider's answer to a request it was being sent
-                // (§12.10 row 8): the node settles it as an abandoned one.
+            let client = early_close_is_clients(q, last_req_write, std::time::Instant::now(), window);
+            if client {
+                // Not the provider's answer to a request it was being sent:
+                // the node settles it as an abandoned one.
                 msg["client_caused"] = true.into();
             }
             let _ = to_client.send(Message::Text(msg.to_string().into()));
-            if !refused && !disclosed {
-                h.closed_early = true;
-                st.deadline = Some(tokio::time::Instant::now() + REFUSAL_GRACE);
-            }
-            side(st, format!("upstream closed early; request n={n}, {response_bytes} response bytes"));
-            if disclosed && !refused {
-                bail!("{CLOSED_EARLY}");
-            }
+            h.closed_early = true;
+            h.closed_early_client = client;
+            st.deadline = Some(tokio::time::Instant::now() + REFUSAL_GRACE);
+            side(st, format!("upstream closed early; request n={n}, {response_bytes} response bytes, client_caused={client}"));
         }
         Some(_) => {}
     }
     Ok(())
 }
 
-/// How a session ends whose provider closed before its request was complete.
-pub(crate) const CLOSED_EARLY: &str = "upstream closed the connection before the request was complete (nothing billed)";
+/// How a session ends whose provider closed before its request was complete
+/// and no answer to it (a refusal, an error head) was disclosed and proven.
+pub(crate) const CLOSED_EARLY: &str =
+    "upstream closed the connection before the request was complete, and no answer to it was disclosed and proven (an abandoned request)";
 
 /// The session deadline passed: true when that is the end of a request whose
-/// provider closed early and whose refusal was not disclosed in time.
+/// provider closed early and whose answer was not disclosed and proven in time.
 pub(crate) fn closed_early_unsettled(st: &Session) -> bool {
     st.h2.as_ref().is_some_and(|h| h.closed_early && h.req.is_some())
 }
@@ -2669,8 +2713,8 @@ mod tests {
         assert_eq!(m[1]["purpose"], "refusal");
         // The provider closes while the proof runs: the settlement goes on.
         tcp_closed(&mut st, &tx).unwrap();
-        assert!(!st.h2.as_ref().unwrap().closed_early);
         prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        assert!(!closed_early_unsettled(&st));
         let m = texts(&mut rx);
         let u = m.iter().find(|x| x["type"] == "usage").unwrap();
         assert_eq!(u["usage"], serde_json::json!({"refused": "goaway", "error_code": 0, "last_stream_id": 1, "choices": []}));
@@ -2959,8 +3003,7 @@ mod tests {
     }
 
     /// The provider sends GOAWAY and closes before the client could disclose
-    /// it: the session waits for `disclose_reset` alone (an error head is not
-    /// taken then), and settles it.
+    /// it: the session waits for the disclosure, and settles it.
     #[tokio::test]
     async fn a_refusal_is_disclosed_after_the_providers_close() {
         let app = app_state(true);
@@ -2982,8 +3025,6 @@ mod tests {
         feed(&mut st, &mut log, &g);
         tcp_closed(&mut st, &tx).unwrap();
         assert!(closed_early_unsettled(&st));
-        let head = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &[0x8c]);
-        assert!(on_disclose_head(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&head), 0, 0).is_err());
         texts(&mut rx);
         on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap();
         // Released further meanwhile: nothing goes to a closed provider.
@@ -3232,10 +3273,13 @@ mod tests {
         assert_eq!(texts(&mut rx)[0]["type"], "upstream_closed_early");
         assert!(st.h2.as_ref().unwrap().closed_early && closed_early_unsettled(&st));
         assert!(st.deadline.unwrap() <= tokio::time::Instant::now() + REFUSAL_GRACE);
-        // An error head disclosure already running is ended by the close (row 8).
+        // An error head disclosure already running goes on to its settlement,
+        // within the same deadline.
         let mut st = open_session(300);
         st.h2.as_mut().unwrap().req.as_mut().unwrap().usage = Some(serde_json::json!({"error_status": 500}));
-        assert!(tcp_closed(&mut st, &tx).is_err());
+        tcp_closed(&mut st, &tx).unwrap();
+        assert!(st.h2.as_ref().unwrap().closed_early);
+        assert!(st.deadline.unwrap() <= tokio::time::Instant::now() + REFUSAL_GRACE);
         // A released one may still be disclosed.
         let mut st = open_session(300);
         st.h2.as_mut().unwrap().req.as_mut().unwrap().released = true;
@@ -3259,5 +3303,143 @@ mod tests {
         want.update(&[0x17, 3, 3, 0, 20]);
         want.update(&[1; 20]);
         assert_eq!(q.recv.hash(), want.hash());
+    }
+
+    /// The provider answers a request from its HEADERS alone with an error
+    /// head and closes before the body was written: the error head, disclosed
+    /// after the close, settles the request by its status. Response bytes
+    /// alone settle nothing: a close with no disclosure ends as an abandoned
+    /// request (`CLOSED_EARLY`), and a close the client may have caused (a
+    /// control record written around the request) takes no error head.
+    #[tokio::test]
+    async fn an_error_head_settles_a_request_after_the_providers_early_close() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        // 0: the head is disclosed after the close; 1: nothing is disclosed;
+        // 2: a SETTINGS ACK (not the connection's first) went out inside the
+        // request; 3: the same SETTINGS ACK went out just before the request,
+        // with no request in flight.
+        for case in 0..4 {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (mut w, mut up) = upstream().await;
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            for c in [&[1u8; 40][..], &[2; 900]] {
+                feed(&mut st, &mut log, c);
+            }
+            let settings_ack = |st: &mut Session| {
+                on_ctl(st, "settings_ack").unwrap();
+                client_bytes(st, &record(10)).unwrap();
+            };
+            st.h2.as_mut().unwrap().settings_acked = true;
+            if case == 3 {
+                // Written with no request in flight (as after a settled one).
+                let q = st.h2.as_mut().unwrap().req.take();
+                settings_ack(&mut st);
+                st.h2.as_mut().unwrap().queue.back_mut().unwrap().proven = true;
+                pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+                assert!(st.h2.as_ref().unwrap().ctl_outside_at.is_some());
+                st.h2.as_mut().unwrap().requests = 0;
+                let h = st.h2.as_mut().unwrap();
+                h.req = q;
+                // Accepted within the window of it: marked from the start.
+                let now = std::time::Instant::now();
+                assert!(recent_ctl_outside(h.ctl_outside_at, now, goaway_window(h.cfg.idle_secs)));
+                h.req.as_mut().unwrap().ctl_written = true;
+            }
+            let block = h2::request_block("h", "/api/v1/chat/completions").len();
+            client_bytes(&mut st, &record(9 + block + 1)).unwrap();
+            if case == 2 {
+                settings_ack(&mut st);
+            }
+            client_bytes(&mut st, &record(10 + 300)).unwrap();
+            on_release(&mut st, 1, 1).unwrap();
+            pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+            prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+            assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().s_k, Some(2), "case {case}");
+            // The provider's error head (a 400) on the request's stream, then its close.
+            let head = h2::frame(h2::HEADERS, h2::END_HEADERS, 3, &[0x8c]);
+            feed(&mut st, &mut log, &head); // record 2
+            texts(&mut rx);
+            tcp_closed(&mut st, &tx).unwrap();
+            let m = &texts(&mut rx)[0];
+            assert_eq!(m["type"], "upstream_closed_early", "case {case}");
+            assert!(m["response_bytes"].as_u64().unwrap() > 0, "case {case}");
+            assert_eq!(m.get("client_caused").and_then(|v| v.as_bool()), (case >= 2).then_some(true), "case {case}");
+            assert!(closed_early_unsettled(&st), "case {case}");
+            let res = on_disclose_head(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&head), 0, 0);
+            match case {
+                0 => {
+                    res.unwrap();
+                    let m = texts(&mut rx);
+                    assert_eq!(m[0]["type"], "attestation");
+                    assert_eq!(m[1]["purpose"], "error_head");
+                    prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+                    let m = texts(&mut rx);
+                    let u = m.iter().find(|x| x["type"] == "usage").unwrap();
+                    assert_eq!(u["usage"]["error_status"], 400);
+                    assert!(!closed_early_unsettled(&st));
+                    assert_eq!(st.h2.as_ref().unwrap().closing, Some("error_settled"));
+                }
+                1 => {
+                    drop(res);
+                    // Nothing disclosed: the deadline ends it as an abandoned request.
+                    assert!(st.deadline.unwrap() <= tokio::time::Instant::now() + REFUSAL_GRACE);
+                }
+                _ => {
+                    let err = res.unwrap_err();
+                    assert!(err.to_string().contains("client may have caused"), "case {case}: {err}");
+                    assert!(texts(&mut rx).is_empty(), "case {case}: nothing attested");
+                    assert!(closed_early_unsettled(&st), "case {case}");
+                }
+            }
+            // The body never reached the provider.
+            let got = read_some(&mut up).await;
+            assert!(got.len() < 400, "case {case}: {} bytes written", got.len());
+        }
+    }
+
+    /// A control record that may make the provider end the connection,
+    /// written while no request was in flight (or after one was written in
+    /// full), marks the next request accepted or first written within the
+    /// GOAWAY window of it; later, or for the exempt kinds, it marks nothing.
+    #[tokio::test]
+    async fn a_control_record_between_requests_marks_the_next_one_within_the_window() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let past = |d: std::time::Duration| std::time::Instant::now().checked_sub(d).unwrap();
+        let window = goaway_window(30);
+        for (kind, age, marked) in [
+            ("settings_ack", std::time::Duration::ZERO, true),
+            ("settings_ack", window + std::time::Duration::from_secs(1), false),
+            ("ping_ack_after_record", std::time::Duration::ZERO, false),
+            ("ping_ack", std::time::Duration::ZERO, true),
+        ] {
+            let mut log = RelayLog::default();
+            let mut st = open_session(300);
+            st.h2.as_mut().unwrap().cfg.idle_secs = 30;
+            st.h2.as_mut().unwrap().settings_acked = true;
+            // No request in flight: the connection between two requests.
+            let h = st.h2.as_mut().unwrap();
+            h.req = None;
+            h.requests = 0;
+            if kind == "ping_ack_after_record" {
+                feed(&mut st, &mut log, &[7u8; 17]);
+            }
+            let frame = if kind == "settings_ack" { "settings_ack" } else { "ping_ack" };
+            on_ctl(&mut st, frame).unwrap();
+            client_bytes(&mut st, &record(if frame == "settings_ack" { 10 } else { 18 })).unwrap();
+            st.h2.as_mut().unwrap().queue.back_mut().unwrap().proven = true;
+            pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+            if let Some(t) = st.h2.as_mut().unwrap().ctl_outside_at.as_mut() {
+                *t = past(age);
+            }
+            st.h2.as_mut().unwrap().settings_seen = true;
+            st.state = SessionState::Body;
+            on_request(&app, &tx, &mut st, 1, None, "m".into(), 10, 300, None, None).unwrap();
+            assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().ctl_written, marked, "{kind} {age:?}");
+        }
     }
 }

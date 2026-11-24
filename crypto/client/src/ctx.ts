@@ -228,6 +228,7 @@ export async function advOutcome(s: any, ctx: Ctx, e: unknown, extra: Record<str
     status: pe?.status,
     fault: pe?.fault,
     local: String((e as Error)?.message ?? e).slice(0, 200),
+    ...(s.closedEarlyMsg ? { closed_early: s.closedEarlyMsg } : {}),
     ...extra,
   }
 }

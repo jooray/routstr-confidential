@@ -28,6 +28,12 @@ Arguments: case expect driver_rc driver_out driver_err sidecar_runs_dir
   forged:<n>:<regex>     (framing "2") a provider refusal (`disclose_reset`) claimed for request n,
                          which the provider answered, is refused for that reason (by the frame
                          rules, or by a failed π_WIN); request n was released and is never settled
+  closedearly:H:<n>      the attack on request n has the provider reject a record of it (a wrong
+                         tag, garbage) and close before the request was complete: the sidecar
+                         reports `upstream_closed_early` with response bytes (the provider's
+                         alert) and without `client_caused`, takes no disclosure for it, settles
+                         nothing, and ends the connection with its early-close `error` (the node
+                         then settles an abandoned request); the request is never released
   legacy                 a protocol-v2 setup is answered with `upgrade_required`
   silent2pc              the 2PC channel got the tag and the salt, then nothing for 20 s or more:
                          the driver's SILENT_2PC line shows no table byte and under 64 KiB in all
@@ -244,6 +250,29 @@ elif kind in ("refused", "withheld"):
         dev.append("a request was opened on the attacked connection")
     elif any(e.startswith("credential_written") for e in evs) and "early-record" not in case and "ctl-flood" not in case:
         dev.append("the head with the credential was written on the attacked connection")
+elif kind == "closedearly":
+    http, n = rest.split(":")
+    n = int(n)
+    evidence += f" adv={json.dumps(adv)[:300] if adv else None}"
+    sid = sids[-1] if sids else None
+    evs = sidecar_events(sid) or []
+    ce = (adv or {}).get("closed_early") or {}
+    if rc != 0 or not adv:
+        dev.append("CRASH or attack not refused (driver exit != 0 or no ADV line)")
+    elif adv.get("refused") is not True or adv.get("http") != http:
+        dev.append(f"the connection did not end in an error on framing {http}")
+    elif not re.search("no answer to it was disclosed", adv.get("reason", "")):
+        dev.append("the sidecar did not end the connection as an early close with no answer")
+    if adv and adv.get("fault"):
+        dev.append(f"the end carries fault {adv.get('fault')!r} (it is the client's doing)")
+    if not (isinstance(ce.get("response_bytes"), int) and ce["response_bytes"] > 0) or ce.get("client_caused"):
+        dev.append(f"no unmarked early close with response bytes ({ce})")
+    if not any(e.startswith("upstream closed early") for e in evs):
+        dev.append("the sidecar's log has no early close")
+    if any(e.startswith((f"request n={n} released", f"request n={n} settled")) or "final body record released" in e or e.startswith("usage handed") for e in evs):
+        dev.append(f"request {n} was released or settled")
+    if http == "2" and len(reqs) != n - 1:
+        dev.append(f"expected {n - 1} honest request(s) before the attack")
 elif kind == "replay":
     n, _, reason = rest.partition(":")
     n = int(n)
