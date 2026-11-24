@@ -89,7 +89,7 @@ changes; without a call the client behaves as before. **This patch is only in
 the reference client's copy**: the SDK fork and the web library do not have it
 yet.
 
-## Security patches (TLS-01 … TLS-19)
+## Security patches (TLS-01 … TLS-21)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -192,7 +192,20 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
   48 bytes (about one in 128) failed to verify. The full text of both is in
   the SDK copy of this file.
 
-Offline check of TLS-15 to TLS-19: `npm run tls-records-check`
+- **TLS-21, the outer type of a protected record** (`make-tls-client.js`
+  `processPacketInner`). Under TLS 1.3 a protected record has the outer
+  type application_data (23), always (RFC 8446 §5.2). Once the server's
+  ChangeCipherSpec had arrived, the fork opened a record of any outer type
+  (handshake, alert); the sidecar counts records of outer type 23 only, so a
+  KeyUpdate sent with outer type 22 shifted every record index the client
+  names in a disclosure (`server_records`, `epoch_start`, the error head's
+  record) and the request could not be settled. Such a record now fails the
+  connection, as OpenSSL refuses it.
+- **TLS-20** (an RSA signature has the length of the modulus; the ALPN
+  report; no ChangeCipherSpec after the handshake): the full text is in the
+  SDK copy of this file.
+
+Offline check of TLS-15 to TLS-21: `npm run tls-records-check`
 (`test/tls-fork-records-check.ts`).
 
 ## Runtime dependencies

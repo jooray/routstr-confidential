@@ -31,6 +31,37 @@ const numericObject = (v: unknown, depth: number): boolean =>
   isObj(v) && depth <= 3 && Object.entries(v).every(([k, x]) =>
     USAGE_KEY_RE.test(k) && (x === null || typeof x === 'boolean' || plainNumber(x) || (isObj(x) && numericObject(x, depth + 1))))
 
+/**
+ * The usage event's JSON text parsed, refusing a key repeated in any object
+ * (throws). A parser keeps one of the values (JavaScript the last), but the
+ * raw text is what the node receives: a shadowed member would reach it
+ * unchecked. Vectors: the `raw` cases of usage-event-vectors.json.
+ */
+export function parseUsageEvent(text: string): unknown {
+  const ev = JSON.parse(text)
+  // A walk over valid JSON: each object's keys, decoded, at most once.
+  const stack: { keys: Set<string> | null; wantKey: boolean }[] = []
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    const top = stack[stack.length - 1]
+    if (c === '"') {
+      let j = i + 1
+      while (text[j] !== '"') j += text[j] === '\\' ? 2 : 1
+      if (top?.keys && top.wantKey) {
+        const key = JSON.parse(text.slice(i, j + 1)) as string
+        if (top.keys.has(key)) throw new Error(`the usage event repeats the key ${JSON.stringify(key)}`)
+        top.keys.add(key)
+        top.wantKey = false
+      }
+      i = j
+    } else if (c === '{') stack.push({ keys: new Set(), wantKey: true })
+    else if (c === '[') stack.push({ keys: null, wantKey: false })
+    else if (c === '}' || c === ']') stack.pop()
+    else if (c === ',' && top?.keys) top.wantKey = true
+  }
+  return ev
+}
+
 /** Why `ev` is not a usage event, or null. */
 export function usageEventProblem(ev: unknown): string | null {
   if (!isObj(ev)) return 'not an object'

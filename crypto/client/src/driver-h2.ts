@@ -9,7 +9,7 @@
 // control by `release`, and the per-request disclosure, attestation and
 // receipt.
 
-import { usageEventProblem } from './usage-rule.ts'
+import { parseUsageEvent, usageEventProblem } from './usage-rule.ts'
 import { createHash } from 'node:crypto'
 
 import { concat, hex } from './advice.ts'
@@ -359,7 +359,8 @@ export class H2Conn {
   private async proveRecords(m: any): Promise<void> {
     const first = m.first_seq
     const count = m.count
-    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(count) || count < 1) throw new Error('π_WIN: malformed batch')
+    // The node's count is bounded before anything is sized by it (the SDK and the browser client use the same bound).
+    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(count) || first < 0 || count < 1 || count > 4096) throw new Error('π_WIN: malformed batch')
     const covered = Array.from({ length: count }, (_, i) => first + i)
     let shape = { windows: m.params?.PiWin?.windows?.length ?? 0, ctBytes: 0 }
     if (!this.advActive) {
@@ -621,7 +622,7 @@ export class H2Conn {
     } else {
       throw new Error(`request ${n}: status ${status} is neither a success nor a disclosable error`)
     }
-    ctx.checkReceipt?.(receipt, { n, http: '2', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce, reserved, refusal: refusalReceipt ? cur.refusal!.kind : undefined })
+    ctx.checkReceipt?.(receipt, { n, http: '2', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce, reserved, refusal: refusalReceipt ? cur.refusal!.kind : undefined, released: cur.released })
     const tEnd = Date.now()
     noteDepositRelease(s, ctx, receipt, n)
 
@@ -714,7 +715,7 @@ export class H2Conn {
     const at = before.lastIndexOf('\n\ndata: ', before.length - 3)
     const evStart = at >= 0 ? at + 2 : 0
     if (!before.startsWith('data: ', evStart) || !before.endsWith('\n\n')) throw new Error('no usage event before data: [DONE]')
-    const ownUsage = JSON.parse(Buffer.from(before.slice(evStart + 6, before.length - 2), 'latin1').toString('utf8'))
+    const ownUsage: any = parseUsageEvent(Buffer.from(before.slice(evStart + 6, before.length - 2), 'latin1').toString('utf8'))
     const notUsage = usageEventProblem(ownUsage)
     if (notUsage) {
       throw new Error(`the last event before data: [DONE] is not a usage event (${notUsage})`)

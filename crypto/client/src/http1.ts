@@ -1,7 +1,7 @@
 // HTTP/1.1 response parsing for framing "1.1": the final head after interim
 // ones, the de-chunked body, and the usage disclosure R (PROTOCOL-V3.md §12.8).
 
-import { usageEventProblem } from './usage-rule.ts'
+import { parseUsageEvent, usageEventProblem } from './usage-rule.ts'
 import { concat } from './advice.ts'
 
 /** Where the final response head starts, after any interim 1xx heads. */
@@ -79,7 +79,7 @@ function endsWithUsageEvent(joined: Uint8Array): boolean {
   const evText = (idx >= 0 ? before.slice(idx + 6) : before).trim()
   if (!evText) return false
   try {
-    const v = JSON.parse(evText)
+    const v = parseUsageEvent(evText)
     return usageEventProblem(v) === null
   } catch {
     return false

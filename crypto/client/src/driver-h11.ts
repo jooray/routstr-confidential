@@ -199,7 +199,7 @@ export class H11 {
     } else {
       throw new Error(`status ${status} is neither a success nor a disclosable error`)
     }
-    ctx.checkReceipt?.(receipt, { n: 1, http: '1.1', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce, reserved: this.reserved })
+    ctx.checkReceipt?.(receipt, { n: 1, http: '1.1', model: b.model, status, usage: ownUsage?.usage, image: b.image, first: !s.settledOnce, reserved: this.reserved, released: !early })
     noteDepositRelease(s, ctx, receipt, 1)
     const tEnd = Date.now()
     // The connection's orderly end: `done` after a settled 2xx, `error_settled` after an error head.

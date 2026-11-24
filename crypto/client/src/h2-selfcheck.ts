@@ -253,7 +253,16 @@ ok(
   const { extractR } = await import('./http1.ts')
   const { readFileSync } = await import('node:fs')
   const vec = JSON.parse(readFileSync(new URL('../../relay/usage-event-vectors.json', import.meta.url), 'utf8'))
-  for (const t of vec.vectors) ok((usageEventProblem(t.event) === null) === t.ok, `usage vector: ${t.name}`)
+  const { parseUsageEvent } = await import('./usage-rule.ts')
+  const verdict = (t: any) => {
+    if (t.raw === undefined) return usageEventProblem(t.event) === null
+    try {
+      return usageEventProblem(parseUsageEvent(t.raw)) === null
+    } catch {
+      return false
+    }
+  }
+  for (const t of vec.vectors) ok(verdict(t) === t.ok, `usage vector: ${t.name}`)
   const content = '{"choices":[{"index":0,"delta":{"content":"Hello"}}],"usage":{"prompt_tokens":0,"completion_tokens":1}}'
   const last = '{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":3}}'
   const sse = `data: ${content}\n\ndata: ${last}\n\ndata: [DONE]\n\n`

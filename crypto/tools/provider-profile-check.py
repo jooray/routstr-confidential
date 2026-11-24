@@ -1923,6 +1923,16 @@ def _self_test_argv() -> bool:
     return ok
 
 
+def _usage_vector_ok(t: dict) -> bool:
+    """A shared usage vector's verdict: an event, or the event's text (``raw``)."""
+    if "raw" not in t:
+        return h2.usage_event_problem(t["event"]) is None
+    try:
+        return h2.usage_event_problem(h2.parse_usage_event(t["raw"])) is None
+    except ValueError:
+        return False
+
+
 def self_test() -> int:
     global RETRIES, BACKOFF, KEY
     if not _self_test_argv():
@@ -1933,7 +1943,7 @@ def self_test() -> int:
     # the shared usage event vectors against cu_h2.usage_event_problem
     vec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relay", "usage-event-vectors.json")
     with open(vec_path) as fh:
-        vec_bad = [t["name"] for t in json.load(fh)["vectors"] if (h2.usage_event_problem(t["event"]) is None) != t["ok"]]
+        vec_bad = [t["name"] for t in json.load(fh)["vectors"] if _usage_vector_ok(t) != t["ok"]]
     if vec_bad:
         print(f"self-test FAILED: usage event vectors disagree: {vec_bad}")
         return 1

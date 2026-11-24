@@ -559,6 +559,20 @@ def _numeric_object(v, depth: int) -> bool:
         for k, x in v.items())
 
 
+def parse_usage_event(text):
+    """The usage event's JSON text parsed; ``ValueError`` when it is not JSON
+    or repeats a key in any object (the text, not the parsed object, is what
+    the node receives)."""
+
+    def pairs(items):
+        keys = [k for k, _ in items]
+        if len(keys) != len(set(keys)):
+            raise ValueError("the usage event repeats a key")
+        return dict(items)
+
+    return json.loads(text, object_pairs_hook=pairs)
+
+
 def usage_event_problem(ev) -> str | None:
     """PROTOCOL-V3.md §5.4: why ``ev`` is not a usage event, or None.
 
@@ -650,9 +664,9 @@ def tail_problem(r: StreamResp) -> str | None:
     if b"\n" in usage or b"\x00" in usage:
         return "the last event before [DONE] is not one line"
     try:
-        ev = json.loads(usage)
+        ev = parse_usage_event(usage)
     except ValueError:
-        return "the last event before [DONE] is not JSON"
+        return "the last event before [DONE] is not JSON, or repeats a key"
     if not isinstance(ev, dict) or not isinstance(ev.get("usage"), dict):
         return "the last event before [DONE] is not the usage event"
     bad = usage_event_problem(ev)

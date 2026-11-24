@@ -26,6 +26,8 @@ export interface ReceiptQuery {
   reserved?: number
   /** A provider refusal we disclosed (`disclose_reset`): `rst_stream` or `goaway`. */
   refusal?: string
+  /** The node reported `body_released` for the request (absent: assumed). */
+  released?: boolean
 }
 
 /** `request_ok.reserved_msats`: absent, or a non-negative safe integer (anything else is refused). */
@@ -76,8 +78,8 @@ export function reservationCeiling(offer: any, model: string, maxTokens: number,
  * A receipt never names larger fees than the offer; the session fee is
  * charged with the connection's first settlement only; the charge is at most
  * what the usage at the signed rates (or the error status) allows, and
- * exactly the flat price for accepted images. A 5xx other than 503 may cost
- * the reservation, and the bound for it is the number the node announced in
+ * exactly the flat price for accepted images. A 5xx other than 503 after
+ * `body_released` may cost the reservation (before it, the abandon fee), and the bound for it is the number the node announced in
  * `request_ok` before the request was released, never the receipt's own: a
  * node that announced none gets at most the session fee if still due.
  * Whatever the settlement, a node that announced a reservation never charges
@@ -111,10 +113,12 @@ export function makeReceiptChecker(label: string, terms: () => ReceiptTerms): (r
       bound = feeDue
     } else if (q.status >= 400 && !(q.image && receipt.usage?.flat === true)) {
       // 429/503 and 401/402/403 (the provider's capacity, the node's own key
-      // or account): the session fee if still due; any other 4xx: the abandon
-      // fee; other 5xx: at most the reservation the node announced.
+      // or account): the session fee if still due; any other 4xx, and any
+      // other error before the request was released (the provider never had
+      // all of it): the abandon fee; other 5xx: at most the reservation the
+      // node announced.
       if ([401, 402, 403, 429, 503].includes(q.status)) bound = feeDue
-      else if (q.status < 500) bound = Math.max(feeDue, abandonFee)
+      else if (q.status < 500 || q.released === false) bound = Math.max(feeDue, abandonFee)
       else if (q.reserved === undefined) bound = feeDue
       else bound = q.reserved
       if (q.image) {

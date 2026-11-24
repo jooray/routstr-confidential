@@ -1,5 +1,5 @@
 // Offline check of the vendored TLS fork's record rules (FORK PATCH TLS-15,
-// TLS-16) and of what it accepts as a server flight (TLS-17, TLS-18, TLS-19).
+// TLS-16, TLS-21) and of what it accepts as a server flight (TLS-17, TLS-18, TLS-19).
 //
 //   node --experimental-strip-types test/tls-fork-records-check.ts
 //
@@ -196,8 +196,8 @@ class FakeServer {
     this.transcript.push(msg)
     return msg
   }
-  /** One encrypted record of inner content type `type`. */
-  async seal(content: Uint8Array, type = 0x16): Promise<Uint8Array> {
+  /** One encrypted record of inner content type `type` (outer type `outer`). */
+  async seal(content: Uint8Array, type = 0x16, outer = 0x17): Promise<Uint8Array> {
     const { encKey, iv } = await deriveTrafficKeysForSide(this.secret, SUITE)
     const { ciphertext } = (await encryptWrappedRecord(concatenateUint8Arrays([content, new Uint8Array([type])]), {
       key: encKey,
@@ -205,9 +205,9 @@ class FakeServer {
       recordNumber: this.seq++,
       cipherSuite: SUITE,
       version: 'TLS1_3',
-      recordHeaderOpts: { type: 'WRAPPED_RECORD', version: 'TLS1_2' },
+      recordHeaderOpts: { type: outer === 0x16 ? 'HELLO' : 'WRAPPED_RECORD', version: 'TLS1_2' },
     } as any)) as { ciphertext: Uint8Array }
-    return plain(0x17, ciphertext)
+    return plain(outer, ciphertext)
   }
 }
 
@@ -352,6 +352,20 @@ const FORGED = new TextEncoder().encode(
   await c.client.handleReceivedBytes(await post.seal(hsMsg(24, [0])))
   const next = (c.client.getKeys() as { serverSecret: Uint8Array }).serverSecret
   check('an encrypted KeyUpdate still rotates the read key', !c.client.hasEnded() && !Buffer.from(next).equals(Buffer.from(sAp0)))
+}
+{
+  // TLS-21: after the server's ChangeCipherSpec, a protected record with an
+  // outer type other than application_data is refused (RFC 8446 §5.2).
+  const c = await afterServerHello()
+  await c.client.handleReceivedBytes(plain(0x14, [0x01]))
+  await flight(c)
+  const post = new FakeServer((c.client.getKeys() as { serverSecret: Uint8Array }).serverSecret)
+  await rejects(
+    'a protected KeyUpdate of outer type handshake is refused',
+    c.client.handleReceivedBytes(await post.seal(hsMsg(24, [0]), 0x16, 0x16)),
+    /protected record of outer type/,
+  )
+  check('  the client ended', c.client.hasEnded())
 }
 
 // --- one accepted flight per signature (TLS-17) ----------------------------

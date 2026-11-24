@@ -27,6 +27,10 @@ try {
   assert.throws(() => check(r({ cost_msats: 5001, reserved_msats: 5000 }), q({ reserved: 5000 })), /more than the 5000/)
   assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 9000 }), q({ reserved: 5000 })), /announced 5000/)
   assert.throws(() => check(r({ cost_msats: 100 }), q({ reserved: 5000 })), /announced 5000/)
+  // A 5xx before body_released (the provider never had the whole request): the abandon fee.
+  check(r({ cost_msats: 300, reserved_msats: 5000 }), q({ status: 502, reserved: 5000, released: false }))
+  assert.throws(() => check(r({ cost_msats: 5000, reserved_msats: 5000 }), q({ status: 502, reserved: 5000, released: false })), /more than the 300/)
+  check(r({ cost_msats: 5000, reserved_msats: 5000 }), q({ status: 502, reserved: 5000, released: true }))
   // Never more than the announced reservation, whatever the settlement:
   // a fee, a 4xx, a refusal, usage at the signed rates, images.
   assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 40 }), q({ reserved: 40 })), /more than the 40/)

@@ -335,8 +335,11 @@ function checkOffer(offer: any): void {
 
 /** The provider host of the TLS session: the offer's `upstream_host`, which `checkOffer` held to the trusted list. */
 function upstreamHost(): string {
-  const h = typeof OFFER?.upstream_host === 'string' ? OFFER.upstream_host.toLowerCase() : undefined
-  if (h === undefined || !TRUSTED_HOSTS.includes(h)) throw new Error(`upstream host ${shown(h)} is not trusted`)
+  // Trusted case-insensitively; written as the offer signs it (the sidecar
+  // checks the ClientHello's server name against the offer's exact bytes, as
+  // the SDK and the browser client write it).
+  const h = typeof OFFER?.upstream_host === 'string' ? OFFER.upstream_host : undefined
+  if (h === undefined || !TRUSTED_HOSTS.includes(h.toLowerCase())) throw new Error(`upstream host ${shown(h)} is not trusted`)
   return h
 }
 

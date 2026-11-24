@@ -18,7 +18,7 @@ export type Ceiling = 'zero' | 'session_fee' | 'abandon_fee' | 'reservation' | n
 export const REQUEST_OUTCOME_RULES: Record<string, { before: Ceiling; after: Ceiling; disclosed?: boolean }> = {
   request_received: { before: null, after: 'reservation' },
   settlement_failed: { before: 'zero', after: 'reservation' },
-  settled_without_receipt: { before: 'reservation', after: 'reservation', disclosed: true },
+  settled_without_receipt: { before: 'abandon_fee', after: 'reservation', disclosed: true },
   unattested: { before: 'zero', after: 'zero' },
   provider_refused: { before: 'session_fee', after: null },
   provider_unreachable: { before: 'zero', after: null },
