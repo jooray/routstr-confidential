@@ -1778,6 +1778,51 @@ async fn client_below_the_first_gate_gets_no_tables() {
     assert!(r.is_err());
 }
 
+/// A client that sends its salt and then only part of an OT message (or
+/// bytes that are no OT message) on any OT channel costs N no garbling.
+#[tokio::test(flavor = "multi_thread")]
+async fn incomplete_ot_message_starts_no_garbling() {
+    let mut salt = VERSION_TAG.to_vec();
+    salt.extend_from_slice(&[CH_C2N as u8, 0, 0, 0, 20, 0, 0, 0, 16]);
+    salt.extend_from_slice(&[7u8; 16]);
+    for ch in [CH_COTA, CH_COTB, CH_SC] {
+        for body in [vec![0u8], vec![0u8; 3], vec![0xffu8; 200]] {
+            let mut sent = salt.clone();
+            sent.extend_from_slice(&[ch as u8]);
+            sent.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            sent.extend_from_slice(&body);
+            let (frames, garbled, r) = n_against(sent, Duration::from_secs(2)).await;
+            assert!(!garbled, "channel {ch}, {} bytes: N garbled", body.len());
+            let tab: usize = frames.iter().filter(|f| f.0 as usize == CH_TAB).map(|f| f.1.len()).sum();
+            assert_eq!(tab, 0);
+            assert!(r.is_err());
+        }
+    }
+}
+
+/// An empty multiplexer frame ends the session: no honest peer sends one.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_mux_frame_ends_the_session() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    let (a, b) = tokio::io::duplex(1 << 20);
+    let (mut rd, mut wr) = tokio::io::split(b);
+    let mut sent = VERSION_TAG.to_vec();
+    sent.extend_from_slice(&[CH_COTB as u8, 0, 0, 0, 0]);
+    wr.write_all(&sent).await.unwrap();
+    // Drain what N sends; the client end stays open.
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1 << 16];
+        while matches!(rd.read(&mut buf).await, Ok(k) if k > 0) {}
+    });
+    let mut n = Party::new(Role::N, a.compat()).await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(5), n.preprocess())
+        .await
+        .expect("N ends the session at the empty frame, without waiting for the client");
+    assert!(r.is_err());
+    drop(wr);
+}
+
 // ---------------------------------------------------------------------------
 // The honest wire, recorded: what crosses the transport in each direction,
 // parsed back into multiplexer frames.

@@ -186,7 +186,8 @@ impl<'a> RowHash<'a> {
 
 #[inline]
 fn sel(bit: bool, b: Block) -> Block {
-    Block::SELECT_MASK[bit as usize] & b
+    // A mask from the bit by arithmetic, not a table read at a secret index.
+    Block::mask(bit) & b
 }
 
 #[inline]

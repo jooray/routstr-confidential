@@ -422,8 +422,8 @@ struct CState {
     /// C's salt of the input-label commitments.
     in_salt: [u8; 16],
     /// Opened masks, by input wire / output index (false where not opened).
-    lam_in: Vec<bool>,
-    lam_out: Vec<bool>,
+    lam_in: Zeroizing<Vec<bool>>,
+    lam_out: Zeroizing<Vec<bool>>,
     /// Label-check pairs, by `Lay::e_idx`.
     pairs: Vec<[[u8; 16]; 2]>,
     /// COTs under Δ_A for C's inputs (`msg = key ⊕ choice·Δ_A`).
@@ -477,6 +477,16 @@ pub const VERSION_TAG: &[u8] = b"routstr-2pc/split-public-3\n";
 /// (`BENCH.md`, "Table scheduling"): other thresholds were equal within noise
 /// or slower.
 const TABLES_GATE: [u64; 2] = [64 * 1024, 500_000];
+
+/// Garblings that may run at once in one process (N side): one per core, at
+/// least two and at most eight.
+fn garble_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(2, |n| n.get());
+        tokio::sync::Semaphore::new(n.clamp(2, 8))
+    })
+}
 
 const TAG_KS: &[u8] = b"routstr-twopc-v2 key-share commit";
 const TAG_OPEN: &[u8] = b"routstr-twopc-ag open";
@@ -673,7 +683,8 @@ fn unpack(bytes: &[u8], n: usize) -> Vec<bool> {
 }
 
 fn sel(bit: bool, b: Block) -> Block {
-    Block::SELECT_MASK[bit as usize] & b
+    // A mask from the bit by arithmetic, not a table read at a secret index.
+    Block::mask(bit) & b
 }
 
 /// A challenge derived from C's seed; both parties compute it the same way.
@@ -1223,8 +1234,9 @@ impl Party {
         //
         // Nothing of this starts before C sent what an honest C sends first:
         // its salt (the first message on C→N, read here, used for the
-        // input-label commitments below) and the first bytes of its OT
-        // traffic, which it sends at once without waiting for N. Garbling
+        // input-label commitments below) and a complete first OT message
+        // (its base-OT setup on CH_COTA), which it sends at once without
+        // waiting for N. Garbling
         // starts only then, and the tables follow only C's progress (no time
         // limit), so a client that sends nothing after the version tag gets
         // no garbling and no table byte. An honest C's bytes and their order
@@ -1240,10 +1252,14 @@ impl Party {
             }
         };
         let mut gates = vec![gate(TABLES_GATE[0]), gate(TABLES_GATE[1])].into_iter();
+        // C's OT traffic has started once N's OT layer has accepted a whole
+        // message of it: N is the base-OT receiver of the KOS instance on
+        // CH_COTA, so its first byte there answers C's complete base-OT setup
+        // (a raw byte count would start garbling on one byte of anything).
         let ot_started = {
             let counters = counters.clone();
             async move {
-                while counters.ch_recv(CH_COTA) + counters.ch_recv(CH_COTB) + counters.ch_recv(CH_SC) == 0 {
+                while counters.ch_sent(CH_COTA) == 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
             }
@@ -1251,8 +1267,12 @@ impl Party {
         let send_fut = async {
             let in_salt: [u8; 16] = c2n.recv_exact(16).await?.try_into().expect("16 bytes");
             ot_started.await;
+            // At most a few garblings at once in the process, whatever the
+            // number of sessions (each is a CPU-bound burst).
+            let permit = garble_slots().acquire().await.map_err(perr("garbling slot"))?;
             #[allow(unused_mut)]
             let (k, mut tables) = tokio::task::spawn_blocking(garble_job).await.map_err(perr("garbling task"))?;
+            drop(permit);
             #[cfg(test)]
             if let Cheat::CorruptGate(s) | Cheat::CorruptControlBits(s) = cheat {
                 let r = lay.shapes[s].ands.clone();
@@ -1719,11 +1739,11 @@ impl Party {
             h.update((key[w] ^ sel(b, delta_b)).as_bytes());
             b
         };
-        let mut lam_in = vec![false; lay.n_in];
+        let mut lam_in = Zeroizing::new(vec![false; lay.n_in]);
         for &w in &lay.open_in {
             lam_in[w] = take(w);
         }
-        let mut lam_out = vec![false; lay.n_out];
+        let mut lam_out = Zeroizing::new(vec![false; lay.n_out]);
         for (gi, g) in sp.outs.iter().enumerate() {
             if lay.opened(gi) {
                 for o in g.off..g.off + g.len {
@@ -2195,9 +2215,9 @@ impl Party {
                 x_bits[2 * r] = true;
             }
         }
-        let d: Vec<bool> = {
+        let d: Zeroizing<Vec<bool>> = {
             let st = self.cst()?;
-            x_bits.iter().zip(st.cot_choices.iter()).map(|(x, r)| x ^ r).collect()
+            Zeroizing::new(x_bits.iter().zip(st.cot_choices.iter()).map(|(x, r)| x ^ r).collect())
         };
         self.c2n.send(&from_bits(&d)).await?;
         let el = SecretBlocks(bytes_to_blocks(&self.c_recv(16 * 256).await?));

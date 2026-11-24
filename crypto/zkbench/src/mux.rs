@@ -122,7 +122,10 @@ impl Mux {
                 }
                 let ch = hdr[0] as usize;
                 let len = u32::from_be_bytes(hdr[1..].try_into().unwrap()) as usize;
-                if ch >= remotes_w.len() || len > MAX_MUX_FRAME {
+                // An empty frame carries nothing (no honest writer sends one:
+                // a frame is a chunk the pump read, at least one byte) and
+                // would cost the reader work outside every byte budget.
+                if ch >= remotes_w.len() || len == 0 || len > MAX_MUX_FRAME {
                     break; // protocol violation: tear everything down
                 }
                 if ch_recv[ch] + len as u64 > inbound_caps[ch] {
@@ -175,3 +178,22 @@ impl Drop for Mux {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    /// A frame with a payload reaches its channel; an empty frame ends the mux
+    /// (every channel then reads EOF) and what follows it is not delivered.
+    #[tokio::test]
+    async fn empty_frame_ends_the_mux() {
+        let (a, mut b) = tokio::io::duplex(1 << 16);
+        let (_mux, mut chans) = Mux::start(a.compat(), 2, &[1 << 20, 1 << 20]);
+        b.write_all(&[1, 0, 0, 0, 2, 9, 9, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 7]).await.unwrap();
+        let mut got = Vec::new();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), chans[1].read_to_end(&mut got)).await;
+        assert_eq!(r.expect("channel 1 ends").unwrap(), 2);
+        assert_eq!(got, [9, 9]);
+    }
+}

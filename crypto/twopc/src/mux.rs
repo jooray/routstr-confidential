@@ -41,6 +41,8 @@ pub struct Counters {
     pub recv: AtomicU64,
     /// Payload bytes received per channel.
     pub(crate) ch_recv: Vec<AtomicU64>,
+    /// Payload bytes sent per channel.
+    pub(crate) ch_sent: Vec<AtomicU64>,
 }
 
 impl Counters {
@@ -52,6 +54,9 @@ impl Counters {
     }
     pub(crate) fn ch_recv(&self, ch: usize) -> u64 {
         self.ch_recv.get(ch).map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+    pub(crate) fn ch_sent(&self, ch: usize) -> u64 {
+        self.ch_sent.get(ch).map_or(0, |c| c.load(Ordering::Relaxed))
     }
 }
 
@@ -78,6 +83,7 @@ impl Mux {
         let inbound_caps = inbound_caps.to_vec();
         let counters = Arc::new(Counters {
             ch_recv: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            ch_sent: (0..n).map(|_| AtomicU64::new(0)).collect(),
             ..Counters::default()
         });
         let (mut rd, mut wr) = io.split();
@@ -135,6 +141,9 @@ impl Mux {
                     break;
                 }
                 c_w.sent.fetch_add(5 + data.len() as u64, Ordering::Relaxed);
+                if let Some(c) = c_w.ch_sent.get(ch as usize) {
+                    c.fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
                 // Coalesce: only flush when nothing else is queued.
                 if rx.is_empty() && rx_bulk.is_empty() && wr.flush().await.is_err() {
                     break;
@@ -154,7 +163,10 @@ impl Mux {
                 }
                 let ch = hdr[0] as usize;
                 let len = u32::from_be_bytes(hdr[1..].try_into().unwrap()) as usize;
-                if ch >= remotes_w.len() || len > MAX_MUX_FRAME {
+                // An empty frame carries nothing (no honest writer sends one:
+                // a frame is a chunk the pump read, at least one byte) and
+                // would cost the reader work outside every byte budget.
+                if ch >= remotes_w.len() || len == 0 || len > MAX_MUX_FRAME {
                     break; // protocol violation: tear everything down
                 }
                 if c_r.ch_recv[ch].load(Ordering::Relaxed) + len as u64 > inbound_caps[ch] {
