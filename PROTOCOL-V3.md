@@ -544,7 +544,10 @@ every case above with exact money (`h2-k-*`, `h11-k-extra-record`, `h11-k-pipeli
   `id`, `object`, `model`, `provider`, `service_tier`, `system_fingerprint` (each `null` or a string of at
   most 128 characters from `[A-Za-z0-9 ._:/@+-]`, the empty string included); `created` (a non-negative
   integer); and `cost` (`null`, a number or a numeric object, as `usage`: Venice sends `{"usd","diem"}`). `usage` holds only numbers, booleans, `null` and nested objects of these (every number in `usage` and `cost` has a magnitude below 2^53, so that the node and every client read it alike): keys `[A-Za-z0-9_]{1,64}`,
-  at most 3 levels of object counting `usage` itself, no strings, no arrays. A provider field outside the
+  at most 3 levels of object counting `usage` itself, no strings, no arrays. No object of the event may
+  repeat a key: a parser keeps one of the values, but the text is what N receives, so a shadowed member
+  (say a first `choices` with content and a last `choices: []`) would reach N unchecked. C refuses such an
+  event before it discloses it and S refuses it too (the `raw` vectors). A provider field outside the
   list (`citations`, search results, moderation or debug data) could carry prompt- or
   output-derived data to N, so an event with one is not disclosed and the request is charged as a missing
   disclosure. Measured shapes (2026-11-12): Venice, Numes, xKiro, NVIDIA send `choices: []`;
@@ -804,6 +807,18 @@ The rate is measured over the idle time (`--h2-idle`, default `h2.idle_secs`), s
 that window: a provider whose PING rate rises later is not seen. Venice (2026-11-23): one SETTINGS, at the
 start, and no PING in 300 s of idle; H10 passes.
 
+**Server records the disclosures need as TLS 1.3 sends them** (both framings; not checked by the profile
+tool, which sees no records, but every disclosure of the gates exercises them). A provider MUST NOT pad a
+server record (RFC 8446 §5.4) that a disclosure may cover: the records of a usage event's tail, of an error
+head and of a refusal. π_C3S and π_WIN take the record's last plaintext byte as its content type and count
+no padding, so a padded covered record makes that answer undisclosable. A provider MUST NOT send more than
+16 KeyUpdates on one connection (the proofs' `key_updates` bound), and, in framing `"2"`, no KeyUpdate
+between the last record of a response and the next request (a framing-`"2"` usage disclosure ends at the
+last server record, §5.4; framing `"1.1"` names trailing KeyUpdates, `trailing`). Every protected record
+has the outer type 23 (RFC 8446 §5.2); C refuses another (TLS-21, `FORK-NOTES.md`), because S counts
+records of outer type 23 only. Padding outside the covered records, and KeyUpdates elsewhere, are harmless.
+The consequence of a violation is H9's: an undisclosable answer, charged in full after `body_released`.
+
 H9 is not checked by the profile tool (it sees no record boundaries); the clients check it on every error
 head and the gates exercise it. A provider that splits a frame across records right before an error head
 makes that error undisclosable, and after `body_released` an undisclosed request is charged in full: the
@@ -834,6 +849,8 @@ ClientHello. π_NK as v2.
 
 The body under `c_ap_1`; the canonical suffix is its own final record. N forwards body records as they
 arrive and holds the final record until π_WIN (one window: the whole record = suffix ‖ `0x17`) verifies.
+A body comes in at most `3 + body_len / 4096` records, the bound of framing `"2"` (§12.6): every client
+writes full records (16 380 bytes of content) and one for the suffix; N refuses a body in more.
 π_C2S no longer exists.
 
 ### 6.3 End
@@ -887,7 +904,7 @@ correlations + 6.4 k per block).
 - A connection that ends with no settled request: the deposit is **charged**, except when the end was the
   node's, the sidecar's or the provider's failure and not something C can cause: the provider unreachable,
   `h2` not selected, framing `"2"` withdrawn, a sidecar or node failure, the provider closing an open idle
-  connection (not after control frames of C on it, `after_client_frames`). Then it is released. A provider that closes **during the handshake** is charged: a client
+  connection (not after control frames of C on it that a provider did not ask for, `after_client_frames`). Then it is released. A provider that closes **during the handshake** is charged: a client
   can cause that (a bad Finished). A connection a newer setup closed under slot pressure while it was
   unused (§8.4) is charged. §12.10 has every row.
 - The outcome is reported in `closed.deposit = {"msat", "outcome": "released"|"charged", "reason"}` and,
@@ -974,7 +991,8 @@ nothing. The minimum age (60 s) is five times an honest cold setup and first req
 180 s), so moving bytes cannot keep an unused connection out of reach for long; a request in flight
 protects its connection until its settlement (it holds a full reservation, and abandoning it costs the
 deposit, §12.10 row 9), except the framing-`"1.1"` request 1 above. The node does no handshake work for a
-client that does not do its own: N starts garbling only after C's salt and the start of C's OT traffic, and
+client that does not do its own: N starts garbling only after C's salt and a complete first OT message (its
+base-OT setup, which N's OT layer has answered), runs a bounded number of garblings at once per process, and
 sends no table byte before C uploaded 64 KiB of its MAC-COT traffic (§12.2).
 
 **What it costs.** With D the connection deposit (default max(abandon fee, session fee, 1000 msat)):
@@ -1377,7 +1395,8 @@ status 3 and code `twopc_version_mismatch` on another tag; the sidecar ends the 
 whose `code` is `twopc_version_mismatch`.
 
 **2PC channel messages** (`split-public-3`). After the tag the channel is a multiplexer: each chunk has a
-5-byte header (1 byte channel, 4 bytes big-endian length). The protocol channels `n2c`, `c2n` and the
+5-byte header (1 byte channel, 4 bytes big-endian length) and at least one byte of payload: an empty chunk
+ends the channel (no implementation writes one; the proof channel's multiplexer, §9.2, has the same rule). The protocol channels `n2c`, `c2n` and the
 tables channel carry messages framed with a 4-byte big-endian length each; the OT channels (KOS, Ferret,
 the OLEs of ECtF) carry mpz2's own messages beside them. Chunk boundaries depend on timing, so transport
 byte counts vary by a few bytes; the sizes below are payload. Integers little-endian, bit vectors packed
@@ -1386,7 +1405,7 @@ LSB first.
 | # | Direction, channel | Message | Bytes | Condition |
 |---|---|---|---|---|
 | P0 | both | version tag `routstr-2pc/split-public-3\n` | 27 | first bytes |
-| P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n`, sent before anything else (its OT messages follow at once, without waiting for N); N starts garbling only once it has this salt and at least one byte of C's OT traffic, and uses the salt in P6 |
+| P1 | C→N, `c2n` | `in_salt` | 16 | C's first message on `c2n`, sent before anything else (its OT messages follow at once, without waiting for N); N starts garbling only once it has this salt and a complete first OT message of C (C's base-OT setup on the KOS channel: N's first byte there is its answer to it), and uses the salt in P6; at most a few garblings run at once in one N process (one per core, 2 to 8) |
 | P2 | N→C, tables | `hparams` | 32 | the first message on the tables channel, right before tables part 1 and behind the same wait (P3) |
 | P3 | N→C, tables | tables part 1 (stages A1 to A3), part 2 (B1, B2) | 24 B + 5 bits per AND gate | part 1 once N received 64 KiB of C's MAC-COT bytes, part 2 once it received 500 000; each also once the MAC COTs are complete; there is no time limit, so a client that uploads nothing gets no table byte (scheduling only: C sends P7 after everything of P2 to P6 arrived, whatever the order) |
 | P4 | N→C, `n2c` | d bits (masks of the base wires, AND products) | ⌈`mac_fixed`/8⌉ | after the MAC COTs |
@@ -1428,7 +1447,8 @@ LSB first.
 The conformance file `crypto/conformance/twopc-hash-vectors.json` is produced by the implementation it
 tests; it pins the garbling hash, one gate, the input commitments, the key-share proof, `chi`, the
 label-check pair half, the label hash of a stage report and the openings hash. It has no vector for the
-counter rule of `chi` (no known seed gives a zero block) and none for a whole message. A second
+counter rule of `chi` (no known seed gives a zero block) and none for a whole message (P4's d bits, P5's
+`gl`, H4's correction labels, a whole stage report), and no independent generator. A second
 implementation is checked against the running one, not against the file alone.
 
 Against `split-public-1`: P1, P2, P6 and H2 are new, P5 moved from the handshake (where it carried the labels
@@ -1740,7 +1760,7 @@ After a settled 2xx a framing-`"2"` connection is READY again. Otherwise the con
 | `error_settled` | an error head (both framings) or a refusal (`disclose_reset`, framing `"2"`) was settled |
 | `idle` | no request in flight for the idle limit (the node's `idle_timeout_s`; the sidecar's `h2.idle_secs` behind it) |
 | `max_requests`, `max_lifetime`, `max_bytes` | framing `"2"`: at the settlement that reached `h2.max_requests`, `h2.max_lifetime_s`, or 1 GiB received |
-| `upstream_closed` | the provider closed an open connection with no request in flight; `"after_client_frames": true` when C had control frames written on a connection that carried no request (the close may be C's doing: not row 5 of 12.10) |
+| `upstream_closed` | the provider closed an open connection with no request in flight; `"after_client_frames": true` when C had control frames written on a connection that carried no request (the close may be C's doing: not row 5 of 12.10); the connection's first SETTINGS ACK and a PING ACK that follows a server record (it may answer the provider's PING) do not count, since a provider asks for the one and ignores the other unasked |
 | `evicted` | node only: a newer setup took the slot of this connection (§8.4): an idle, used one (no deposit held), or, with `"unused": true`, one with no settled request past the minimum age (its deposit charged, `evicted`; §12.10 row 13) |
 | `ended` | node only: neither side had a last word (the sidecar's socket ended or was closed by the node without a `closed` or `error`); sent with or without a deposit outcome |
 
@@ -1867,7 +1887,7 @@ settled request, first matching row:
 | 6 | the node refused a request of this connection with a 5xx **and accepted none after it**, or a settlement's billing write failed | released | `node_failure` |
 | 7 | a request was written in full (`body_released`) and never settled | released (the reservation is charged) | `request_received` |
 | 8 | not used since 2026-11-24 (§5.4.2): a node before it released the deposit when the provider closed before a request's body was complete with response bytes and no `client_caused`; a provider's answer before the body was complete now settles only when disclosed (a settlement, none of these rows) | released (the request kept the session fee) | `provider_refused` |
-| 9 | a request was accepted and the connection ended before its `body_released` for any other reason, an early provider close with no disclosed answer included (whatever its response bytes) | **charged**; the reservation is released in full | `request_abandoned` |
+| 9 | a request was accepted and the connection ended before its `body_released` for any other reason, an early provider close with no disclosed answer included (whatever its response bytes) | **charged**; the reservation is released in full (only once the deposit's charge is in the database: a deposit that could not be charged leaves the request its own outcome, the abandon fee) | `request_abandoned` |
 | 10 | no request in flight for `idle_timeout_s` | **charged** | `idle` |
 | 11 | `head_written` not reached within 600 s | **charged** | `setup_timeout` |
 | 12 | anything else: the client left, a failed handshake or π_NK, a protocol error, the provider closing during the handshake or after the client's control frames (`after_client_frames`), only refused requests | **charged** | `unused` |
@@ -1930,7 +1950,7 @@ outcome:
 | `v` | `1`, the format |
 | `sid`, `http`, `n` | the connection, its framing, the request |
 | `outcome` | `"charged"` when `cost_msats` > 0, else `"released"` |
-| `reason` | `request_received` (written in full, no settlement: the reservation), `settlement_failed` (the billing write failed: the reservation after `body_released`, released in full before it), `settled_without_receipt` (charged what its settlement says, but the deposit could not be released, so N sent no receipt; only after C disclosed the answer, before or after `body_released`: an error head may be settled before it, a 5xx at the reservation), `provider_refused` (a node before 2026-11-24 only: the provider sent bytes and closed first: the session fee if still due; clients still accept it from such a node), `provider_unreachable`, `sidecar_failure` (released in full), `request_abandoned` (the abandon fee, or released in full when the deposit is charged for it), `evicted` (released in full on a connection closed for a newer setup, row 13: a framing-`"1.1"` request 1 without a ClientHello, else a race), `unattested` (a usage without an attestation: released), `not_started` (the sidecar never accepted it: released) |
+| `reason` | `request_received` (written in full, no settlement: the reservation), `settlement_failed` (the billing write failed: the reservation after `body_released`, released in full before it), `settled_without_receipt` (charged what its settlement says, but the deposit could not be released, so N sent no receipt; only after C disclosed the answer, before or after `body_released`: before it only an error head or a refusal settles, at most the abandon fee; after it a 5xx may cost the reservation), `provider_refused` (a node before 2026-11-24 only: the provider sent bytes and closed first: the session fee if still due; clients still accept it from such a node), `provider_unreachable`, `sidecar_failure` (released in full), `request_abandoned` (the abandon fee, or released in full when the deposit is charged for it), `evicted` (released in full on a connection closed for a newer setup, row 13: a framing-`"1.1"` request 1 without a ClientHello, else a race), `unattested` (a usage without an attestation: released), `not_started` (the sidecar never accepted it: released) |
 | `cost_msats` | what the credential paid for the request; never above `reserved_msats` |
 | `reserved_msats` | what was reserved for it (`request_ok.reserved_msats`) |
 | `balance_msats` | the credential's balance afterwards (`null` if the key is gone) |
@@ -1957,7 +1977,7 @@ and the cases all three clients run):
 |---|---|---|
 | `request_received` | never | the reservation |
 | `settlement_failed` | 0 | the reservation |
-| `settled_without_receipt` (only after C's own disclosure or `accept`) | the reservation | the reservation |
+| `settled_without_receipt` (only after C's own disclosure or `accept`) | max(abandon fee, session fee if still due) | the reservation |
 | `unattested` | 0 | 0 |
 | `provider_refused` | the session fee if still due | never |
 | `provider_unreachable`, `sidecar_failure`, `evicted`, `not_started` | 0 | never |
@@ -2014,7 +2034,7 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | `split-public-2`, changed in place on 2026-11-22/23: N sends a proof of knowledge of its key-share scalar with `P_N` (+64 bytes N→C, no round trip); builds from before and after did not interoperate under the same tag | §4, §4.1, §12.2 |
 | `split-public-2` (2026-11-22) replaces `split-public-1`: garbling hash `H_g` with N's `hparams`, the check-row hash keyed from the seed, N's input a mask ρ with labels before the seed and δ in the handshake, input-label commitments under C's `in_salt`, the 2PC message list, conformance vectors; the eight outcomes are those after preprocessing; assumption (4) | §4, §4.1, §10, §11, §12.1, §12.2 |
 | privacy: linkability and its off switches, body padding (off by default), residual risks 7-10 | §1, §9.1, §9.3, §10 |
-| slot pressure: setups claim slots one at a time, each closes at most one connection and a refused one none; after the idle used ones, an unused connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s) that is not setting up, of the address holding the most (another address for a full node); its deposit charged (`evicted`) only at `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more unused connections at its address, else released (`evicted_released`), the counts signed (`deposit.evicted`); clients check them and stop pre-warming for that node for 10 minutes | §8.1, §8.4, §9.2, §10, §12.9, §12.10 |
+| slot pressure: setups claim slots one at a time, each closes at most one connection and a refused one none; after the idle used ones, an unused connection past `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (60 s) that is not setting up, of the address holding the most (another address for a full node); its deposit charged (`evicted`) only at `CONFIDENTIAL_EVICT_CHARGE_FROM` (5) or more unused connections at its address, else released (`evicted_released`), the counts signed (`deposit.evicted`); clients check them and stop pre-warming for that node for 10 minutes (the threshold is superseded: since the eviction row of 2026-11-23 below the deposit is always charged and `CONFIDENTIAL_EVICT_CHARGE_FROM` is gone) | §8.1, §8.4, §9.2, §10, §12.9, §12.10 |
 | a request finalized without a receipt is stated, signed, on the last frame (`request_outcome`: `sid`, `http`, `n`, `outcome`, `reason`, `cost_msats`, `reserved_msats`, `balance_msats`, `time`); clients check it | §10, §12.9, §12.10 |
 | provider check H10: the provider's PING and SETTINGS within the control-record allowance | §5.6, §12.9 |
 | a cancelled request cannot lend its credential reference (the attack and why each form fails) | §5.3.1 |
@@ -2036,7 +2056,7 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | further epoch-0 records of a malicious N: what they can do in each framing | §10 |
 | a control record of C written while a request is in flight marks that request, before its first record too: the provider's early close is `client_caused` and a GOAWAY does not refuse it. The connection's first SETTINGS ACK never marks; a PING ACK after a server record since the previous PING ACK does not mark, up to 2 per request | §5.4.1, §12.9 |
 | every number in a usage event's `usage` and `cost` has a magnitude below 2^53 | §5.4 |
-| an unused connection is not evicted in the 15 s after `head_written`; `CONFIDENTIAL_EVICT_CHARGE_FROM` is at least 2 and C reports an eviction charge at a threshold of 1; what the eviction rules do not give | §8.4, §10 risk 13, §12.10 |
+| an unused connection is not evicted in the 15 s after `head_written`; `CONFIDENTIAL_EVICT_CHARGE_FROM` is at least 2 and C reports an eviction charge at a threshold of 1 (superseded by the eviction row below: no threshold); what the eviction rules do not give | §8.4, §10 risk 13, §12.10 |
 | a control socket that ends without the node's last frame while the node holds money of the connection is reported by the SDK and the browser library | §12.10 |
 | the 2PC channel: P2 and P8 as the code sends them, the abort bytes of stage B2, no abort byte in K; the conformance file gains `chi`, the label-check pair, the stage report hash and the openings hash | §12.2 |
 | eviction (2026-11-23): an evicted unused connection's deposit is always charged (`evicted_released` and `CONFIDENTIAL_EVICT_CHARGE_FROM` are gone, `deposit.evicted` is `{unused_at_address}`); the asking address's own oldest goes when it holds as many evictable unused connections as any; a framing-`"1.1"` request 1 without a ClientHello does not hold the slot; no eviction while the sidecar is unreachable; the offer's `evict_unused_after_s`; what holding, self-eviction and griefing cost | §8.4, §9.2, §10 risk 13, §12.1, §12.9, §12.10 |
@@ -2044,3 +2064,4 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | an early provider close (2026-11-24) settles a request only with a disclosed answer: `upstream_closed_early` settles nothing by its response bytes (row 8 is no longer used); after it S takes `disclose_head` as well as `disclose_reset` for 60 s (framing `"1.1"`: attested at once, `disclose_head` only), not after a `client_caused` close; a control record written outside a request marks the next one accepted or first written within `W`; a 5xx error head settled before `body_released` costs the abandon fee | §5.4.1, §5.4.2, §8.4, §10 risk 16, §12.8–§12.10 |
 | C's TLS stack: an RSA signature must have the length of the modulus (TLS-20) | `FORK-NOTES.md`, `docs/TWOPC-NODE-GARBLING.md` §4 |
 | the shipped Venice offer: `h2.idle_secs` 300 (was 390) | §2.1, `docs/SETUP.md` |
+| no wire change (2026-11-24): N garbles only after a complete first OT message, a bounded number at once; an empty multiplexer chunk ends the 2PC or proof channel; a `disclose_head`, `disclose_reset` or `accept` that overtakes the client records' π_WIN result waits for it; the connection's first SETTINGS ACK and a PING ACK after a server record do not make a provider close `after_client_frames` (row 5); a usage event that repeats a key is refused (both clients' parse and S); framing `"1.1"` carries a body in at most `3 + body_len / 4096` records; the images `max_count` of a sidecar offer is 1 to 4; a head template that could render beyond one record is refused at startup; C refuses a protected record whose outer type is not 23 (TLS-21); the clients hold an error receipt before `body_released` and `settled_without_receipt` before it to the abandon fee; a deposit the database could not charge does not pay for the request it ends; the provider obligations of §5.6 on server padding and KeyUpdates | §4, §5.4, §5.6, §8.4, §12.2, §12.10, `FORK-NOTES.md` |

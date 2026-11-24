@@ -149,6 +149,10 @@ anyone but N. A receipt is N's signed statement, not a proof to outsiders.
 
 Adversaries: either C or N may deviate arbitrarily from the protocol (they are malicious towards each
 other); U follows TLS and its own API, and is trusted with the prompt and the API key as it is today.
+For money the two directions differ: against a malicious C, P4 holds (C pays for the usage U reported);
+against a malicious N it is detection only. C pays through a balance or token that N holds, so N can
+debit it outside the protocol; the signed receipts and outcomes let C show a charge beyond the rules, they
+do not prevent it.
 Assumptions: the standard hardness of ECDH over P-256, SHA-256, HMAC and AES-GCM, and two
 assumptions on the SHA-256 compression function that the split key schedule uses directly (section
 4.4); AES-128 as a pseudorandom permutation and, under a key revealed after garbling, as an ideal

@@ -321,8 +321,8 @@ settled request is charged its deposit (unused, idle, 600 s without a head, or e
 unused costs one deposit. Under slot pressure a newer setup closes an unused one past
 `CONFIDENTIAL_EVICT_UNUSED_AFTER_S` (below) and charges its deposit, also when the setup is the same
 client's. The node does no handshake work for a client that does not run the 2PC itself: it garbles only
-after the client's salt and first OT messages, and streams the tables only as the client's own upload
-progresses. Set the deposit to what a blocked slot costs you; with a deposit of 0 the slots are free to
+after the client's salt and a complete first OT message (its base-OT setup, a few at once per process),
+and streams the tables only as the client's own upload progresses. Set the deposit to what a blocked slot costs you; with a deposit of 0 the slots are free to
 hold.
 
 **Denial-of-service limit.** The node refuses a new confidential connection (HTTP 429, WebSocket close

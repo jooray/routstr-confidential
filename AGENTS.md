@@ -347,7 +347,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   offline checks, the client root store against `gen-client-roots.py`, every copy of a vector of
   `crypto/conformance/` byte-identical, a secret scan. `CU_CI_SKIP_CARGO=1` skips the Rust tests.
 - Unit tests:
-  - `crypto`: `cargo test --release -p cu-sidecar` (138), `-p zkbench`, `-p twopc` (55 unit tests, 4 of the `cu-2pc` binary)
+  - `crypto`: `cargo test --release -p cu-sidecar` (140, 1 ignored), `-p zkbench`, `-p twopc` (60 unit tests, 4 of the `cu-2pc` binary)
   - `routstr-core`: `.venv/bin/python -m pytest tests/unit -q`
   - `routstr-sdk`: `npx vitest run`, `npx tsc --noEmit`, `bun test tests/bun` (vitest
     reports those two files as failed: it cannot load `bun:test`)
@@ -436,7 +436,7 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
 - **`crypto/` builds into `zkbench/target`** (see `crypto/.cargo/config.toml`).
 - **The client's TLS stack is part of the 2PC soundness argument.** The node holds `s_hs`, so whatever
   the fork accepts after the provider's signature (between CertificateVerify and Finished, or as another
-  encoding of the signature) is the node's choice of `th_SF`. Keep the TLS-17 to TLS-20 rules (TLS-20: an RSA signature has the length of the modulus) in all three copies
+  encoding of the signature) is the node's choice of `th_SF`. Keep the TLS-17 to TLS-21 rules (TLS-20: an RSA signature has the length of the modulus; TLS-21: a protected record has the outer type 23) in all three copies
   of the fork (`FORK-NOTES.md`; `docs/TWOPC-NODE-GARBLING.md` §4) and their negative tests
   (`crypto/client/test/tls-fork-records-check.ts`, the `confidential-tls` tests of the SDK and the web
   library).
@@ -528,7 +528,20 @@ Both speak protocol v3 (`main`; v2 is archived on their `v2` branches). The PWA 
   early with nothing provable pays the abandon fee or the deposit (risk 16).
   Clients: optional body padding (`confidential.padBucket`,
   `--pad-bucket`, off by default); routstrd `x-routstr-reuse-scope` narrows the
-  reuse scope.
+  reuse scope. **Also 2026-11-24, no wire change:** the node garbles only
+  once its OT layer answered the client's first complete OT message (N's
+  first byte on the KOS channel), at most a few garblings per process
+  (`garble_slots`); both multiplexers refuse an empty frame; a disclosure
+  (`disclose_head`, `disclose_reset`, `accept`) that overtakes the result
+  of a records π_WIN is deferred, not fatal (`Session::deferred`); the
+  first SETTINGS ACK and an owed PING ACK do not set `after_client_frames`;
+  a usage event that repeats a key is refused (`parse_event`,
+  `parseUsageEvent`, `parse_usage_event`; the `raw` usage vectors);
+  framing "1.1" takes at most `3 + body_len/4096` body records; the
+  clients refuse a protected record of outer type other than 23 (TLS-21)
+  and bound a pre-release 5xx receipt and `settled_without_receipt` before
+  release by the abandon fee; a deposit the database refused to charge no
+  longer pays for the request it ends.
 - **mpz2 is pinned to the fork `github.com/jooray/mpz2`**, branch `routstr-ct-selects` (the rev is in
   `crypto/twopc/Cargo.toml`, `crypto/zkbench/Cargo.toml` and the library's `crates/client-wasm/Cargo.toml`):
   upstream `eaca5f9` plus branch-free selects on secret bits, with the same values and bytes
