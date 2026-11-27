@@ -172,7 +172,7 @@ The withdrawal is for every client, so only what **no client can cause**
 counts: the provider closing without a byte after the canonical ClientHello;
 a verified handshake that did not select `h2`; the provider closing within
 10 s of the connection head with no client record written and the head
-written within 15 s of the dial. The table in `H2Guard`'s doc comment lists
+written within 5 s of the provider's first byte. The table in `H2Guard`'s doc comment lists
 every lever a client has and why it does not count. A client falls back to
 "1.1" on the same node by itself (§2.3).
 
@@ -269,7 +269,7 @@ cd $P/routstr-core && DATABASE_URL=sqlite+aiosqlite:////tmp/node.db NSEC=<test n
   HTTP_URL=http://127.0.0.1:8010 RELAYS='["ws://127.0.0.1:9"]' ENABLE_ANALYTICS_SHARING=false \
   .venv/bin/uvicorn routstr.core.main:app --host 127.0.0.1 --port 8010 --ws-ping-timeout 300 &
 #   v3 settings: CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT (default max(abandon fee, session fee, 1000)),
-#   CONFIDENTIAL_IDLE_TIMEOUT_S (default 120, at most the sidecar's h2.idle_secs)
+#   CONFIDENTIAL_IDLE_TIMEOUT_S (default 120, at most the sidecar's h2.idle_secs - 10)
 # UPSTREAM_BASE_URL seeds a `custom` provider, whose offer has 0 models (its public ids differ
 # from the provider's). No env selects `venice`: stop the node after its first start, run this,
 # and start it again; the offer's price_list then has the models.
@@ -328,9 +328,10 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
   vision model bills an image as prompt tokens; A14 = a cap alias such as
   `max_output_tokens` in the private part does not lift the pinned cap);
   `--images` I1–I10 (three paid images, up to four more for I10: the other
-  count key, an explicit size, the other format key in the private part); **`--h2` H1–H8, H10** (§5.6: what framing "2" needs; H10 = the
+  count key, an explicit size, the other format key in the private part); **`--h2` H1–H8, H10, H11** (§5.6: what framing "2" needs; H10 = the
   provider's PING and SETTINGS stay within the sidecar's control-record allowance, 16 and one per 10 s,
-  counted on the idle connection; idles one
+  counted on the idle connection; H11 = the provider waits at least 5 s after its handshake for the HTTP/2
+  preface, the sidecar's `H2_HEAD_PROMPT`: the tool writes the head 6 s late; idles one
   connection for `--h2-idle`, default the offer's `h2.idle_secs`, sends one
   body of `--h2-body-bytes`, default 8 MiB, one paid image; ends with
   `offer "2": yes | no, because …`). `--self-test` proves the negative

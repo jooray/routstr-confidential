@@ -66,11 +66,16 @@ The operator states what their upstream supports. Nothing is probed or assumed.
   client can cause. It is one of: the provider closed without sending a byte in answer to the ClientHello
   (which is canonical, §12.5, so its bytes are the offer's up to three opaque values; N relays no other
   client record before the provider's first byte, and after it at most one ChangeCipherSpec, exactly
-  `14 03 03 00 01 01`, and one application-data record, the Finished); a verified
-  handshake did not select `h2`; the provider closed within 10 s of the connection head, with no response
-  to a request yet, no client record written to it since the head, and the head written within 15 s of
-  the dial (a client that delays `release_head`, or whose own record made the provider close, is not
-  counted). (N cannot see a GOAWAY: it is encrypted. It sees the close that follows.) A response to the
+  `14 03 03 00 01 01`, and one application-data record with the header `17 03 03 00 35`, the Finished
+  without padding); a verified handshake did not select `h2`; the provider closed within 10 s of the
+  connection head, with no response to a request yet, no client record written to it since the head, and
+  the head written within 5 s of the provider's first byte (a client that delays its Finished, π_NK or
+  `release_head`, or whose own record made the provider close, is not counted). The 5 s run from the
+  provider's first byte, not the dial: everything a client can do to delay the head comes after that byte,
+  and no provider timer that waits for the HTTP/2 preface starts before it. So a client can time a counted
+  close only against a provider that ends a connection whose preface comes less than 5 s after its own
+  flight; an operator offers `"2"` only for a provider that waits longer (such a provider would also fail
+  honest clients on slow links). (N cannot see a GOAWAY: it is encrypted. It sees the close that follows.) A response to the
   connection's first request resets the count. A provider that fails only once a request's records
   arrive is not detected here (the body is the client's): the profile check and the client's fallback
   (§2.3) cover it. While withdrawn, a `setup` for `"2"` is refused with `code: "h2_withdrawn"` and
@@ -645,6 +650,31 @@ like any other: after `body_released`, the whole reservation. C therefore proves
   was written `h2.idle_secs` or more after N's last write of the connection head or of a request record
   (control records do not count: C can have them written at will, and a provider need not count them as
   activity): C may have held the request unwritten until the provider's idle close was in flight.
+- **A GOAWAY that raced the request** (since 2026-11-27). A GOAWAY whose record reached N **before** N
+  sent `request_ok` refuses the request too, when all of these hold: it carries `NO_ERROR` and a
+  last-stream-id below the request's stream (as any refusing GOAWAY); the request is not marked (no
+  control record of C marks it, by the rules below, including one written between requests less than
+  `W` before `request_ok`); it reached N less than `h2.idle_secs` after N's last write of the head or of
+  a request record (control records do not count), so it is no idle close; and it reached N at most `W`
+  before N sent `request_ok` (N's own clock, the record holding the GOAWAY's last byte is the one
+  judged). Nothing of the request was written before it, so it is judged as a GOAWAY before the first
+  write, also when C released records after it. Why: C sends `request` when it has seen no GOAWAY, and
+  the provider's shutdown GOAWAY can cross it on the way, within one round trip of `request_ok`; `W`
+  bounds how old such a GOAWAY may be, and the idle cutoff keeps the provider's idle close out (it
+  comes no sooner than `h2.idle_secs` after N's last write, H5), so C cannot keep a GOAWAY to end a later
+  request cheaply. S keeps the arrival times of the latest server records for this (at most 256, none
+  older than 30 s; a GOAWAY further back is judged as received before the request and refuses nothing).
+  A `RST_STREAM` received before `request_ok` refuses nothing: no stream of the request existed. C chooses
+  `i` as for any GOAWAY before the request's first write: a record N still holds, no later than the
+  record of the GOAWAY (the clients keep that record when the GOAWAY arrives while the request is being
+  opened). A client that saw the GOAWAY before it chose the connection does not send the request on it
+  (the connection is no longer usable). Until 2026-11-27 every refusing frame received before
+  `request_ok` was refused, so an honest client whose request raced a provider's shutdown paid the
+  abandon fee, or the deposit on the connection's first request. Tests (S):
+  `a_goaway_that_raced_request_ok_refuses_the_request`,
+  `a_refusal_received_before_request_ok_counts_only_as_a_raced_goaway`,
+  `a_two_goaway_shutdown_around_request_ok_refuses_the_request` (RFC 9113 §6.8: GOAWAY(2^31-1) first,
+  the last processed stream after it), `the_raced_goaway_run_ends_at_the_window_and_the_idle_cutoff`.
 - **The refusing frame.** `RST_STREAM` must be on the request's stream (the probe stream 1, another
   request's stream, or stream 0 do not count) with payload length 4 and code 7; any other code (`CANCEL`,
   `NO_ERROR`, `INTERNAL_ERROR`, …) is no statement that nothing was processed. GOAWAY must carry
@@ -790,6 +820,7 @@ Checked by `provider-profile-check.py --h2`; an operator offers `"2"` only when 
 | H8 | the streamed usage event and `[DONE]` end the stream as §5.4 parses them |
 | H9 | an error response's HEADERS frame lies in a record that starts at a frame boundary (the frames before it in the record being of the kinds §5.4 allows); the same for the records from a request's interval to a refusal of its stream (§5.4.1) |
 | H10 | the provider's SETTINGS and PING frames, each of which needs a control record of C (SETTINGS ACK, PING ACK), stay within S's control-record allowance (§12.6) over the connection's life |
+| H11 | the provider waits at least 5 s after its handshake for the HTTP/2 preface: S counts a close after the connection head towards the withdrawal of `"2"` only when the head was written within `H2_HEAD_PROMPT` (5 s) of the provider's first byte (§2.1), so a provider with a shorter timer fails honest clients on a slow link and lets a slow client's connections count. The tool writes the head 6 s after the handshake and needs the connection to stay open and answer a request by index |
 
 **H10 in detail.** S lets a connection carry 16 control records, and one more per 10 s since `head_written`,
 with at most 16 unproven at once (§12.6, `CTL_BURST`, `CTL_REFILL`, `MAX_QUEUED_CTL` in
@@ -832,7 +863,8 @@ start of the first header block after C acknowledged the SETTINGS (RFC 7541 §4.
 request block cannot carry: nghttp2 (Node's http2 server) answers it with GOAWAY `COMPRESSION_ERROR` for
 1024 and for 4095 alike, and serves the same request at 4096 and above. Because the value is C's claim, this end does not count towards the
 withdrawal of §2.1 and the deposit is charged like any unused connection. H5 is checked for the idle time
-the node offers: `idle_timeout_s` MUST NOT exceed `h2.idle_secs`, and the operator sets `h2.idle_secs` no
+the node offers: `idle_timeout_s` MUST NOT exceed `h2.idle_secs` (the node keeps it 10 s below, at least 10, so a
+request it accepts at the end of its idle time reaches the sidecar before the sidecar's own limit), and the operator sets `h2.idle_secs` no
 higher than the idle time the profile check ran with.
 
 ## 6. Framing `"1.1"` (HTTP/1.1)
@@ -1240,7 +1272,8 @@ after the provider closed: N waits 60 s for the disclosure). C runs the request 
 connection. An `RST_STREAM` with any other code, a GOAWAY with an error code, and a reset after a
 response head stay as they were: the provider may have processed the request, or C may have caused the
 end. A GOAWAY that arrived before any record of the request was written (also when records were written
-after it) counts only within the GOAWAY window after `request_ok` (§5.4.1), so a client cannot wait for the provider's idle close to end a request cheaply.
+after it) counts only within the GOAWAY window after `request_ok`, or as one that raced the request (at
+most `W` before `request_ok` and before the idle cutoff, §5.4.1), so a client cannot wait for the provider's idle close to end a request cheaply.
 Residual: risk 12.
 
 ## 11. Versions and upgrade
@@ -1299,7 +1332,8 @@ block stays). An offer file that names `v` other than 3 is refused at startup.
 **N** `GET /v1/confidential/offer[?v=3]` (the query is ignored by the node; clients send it): the signed
 offer. Fields: `v: 3`; `http`, `h2` (the sidecar's; `kinds` lists `images` only when the offer has an
 `images` block; `h2` only when `http` lists `"2"`); `twopc`; `connection_deposit_msat` (integer ≥ 0);
-`idle_timeout_s` (integer ≥ 10, at most `h2.idle_secs` when `"2"` is offered; node setting
+`idle_timeout_s` (integer ≥ 10, at most `h2.idle_secs` when `"2"` is offered, by the current node at most
+`h2.idle_secs` − 10; node setting
 `CONFIDENTIAL_IDLE_TIMEOUT_S`, default 120; the deposit's default is max(abandon fee, session fee,
 1000 msat), 0 settable, a value above 0 at least the node's minimum request); `evict_unused_after_s`
 (integer ≥ 0, node setting `CONFIDENTIAL_EVICT_UNUSED_AFTER_S`, default 60: how old an unused connection
@@ -1676,8 +1710,10 @@ connection began (handshake flight included).
   (§5.4.1: `min(30 s, h2.idle_secs / 4)` after `request_ok`, and under `h2.idle_secs` after N's last write
   of the head or of a request record; control records do not count) (then `S_k` := the server records received so far, the interval stays empty), and a GOAWAY
   after the first write is refused when that write came `h2.idle_secs` or more after N's last write of the head
-  or of a request record (§5.4.1); the record that ends the refusing frame arrived after `request_ok` (a
-  refusal received before N accepted the request refuses nothing of it); `i` is held, received and in the
+  or of a request record (§5.4.1); the record that ends the refusing frame arrived after `request_ok`,
+  except a GOAWAY that raced the request (§5.4.1: at most `W` before `request_ok`, under `h2.idle_secs`
+  after N's last write of the head or of a request record, the request not marked; a `RST_STREAM`
+  received before `request_ok` refuses nothing); `i` is held, received and in the
   named key epoch. Then `attestation` (as for any request; with
   no record written, `server_records` and `client_records` are 0), then
   `{"type":"zk_params","proof":"pi_win","purpose":"refusal","n","record","params"}` (`anchor = h2`; per
@@ -1835,7 +1871,7 @@ request the sidecar or N refused (`request_refused`) has none; neither has a req
 | sessions | 32 per process (S and N); per address: `CONFIDENTIAL_MAX_UNUSED_PER_IP` (12) unused, counted until the first `body_released`, and `CONFIDENTIAL_MAX_ACTIVE_PER_IP` (16) in all; a full node or address closes at most one connection first: its longest-idle used one, else an evictable unused one (§8.4) |
 | pending connections (N) | a socket whose setup is not reserved yet is pending and takes no session slot: 1024 per process, 4 per address; a full pool or address share evicts the oldest connection still waiting for its setup frame, else 429 (address) or 503 (pool) |
 | client address (N) | the peer, or, when the peer is listed in `CONFIDENTIAL_TRUSTED_PROXIES` (`self` adds the host's own addresses), the header `CONFIDENTIAL_CLIENT_IP_HEADER` (default `x-forwarded-for`, its rightmost entry over all lines; another header: its last line). IPv6 addresses count by their /64 |
-| wallet lock (N) | a setup or request waits at most 10 s for the wallet lock before a first-use Cashu token is redeemed; past it 503 with `detail.error = {"type":"wallet_busy","retry_after_s":1}` (a setup: `error`; a request: `request_refused`, §12.10 row 6) |
+| wallet lock (N) | a setup or request waits at most 10 s for the wallet lock before a first-use Cashu token is redeemed; past it 503 with `detail.error = {"type":"wallet_busy","retry_after_s":1}` (a setup: `error`; a request: `request_refused`, which does not mark the connection for §12.10 row 6) |
 | completion margin (N) | `CONFIDENTIAL_RESERVE_MARGIN_TOKENS` (default 16) tokens beyond `max_tokens` in every chat reservation (§12.10) |
 | refused requests | 8 in a row per connection; the ninth ends it (`error` 429) |
 | control records (S, framing `"2"`) | 16 unproven at once; over the connection 16 and one more per 10 s since `head_written` (§12.6); a provider must stay within it (§5.6, H10) |
@@ -1881,7 +1917,7 @@ settled request, first matching row:
 |---|---|---|---|
 | 1 | the setup was refused before the sidecar was dialed | never reserved | (the `error`) |
 | 2 | no session slot, the sidecar unreachable, or it refused the setup | released | `not_started` |
-| 3 | the sidecar reported `fault: "upstream"` (the provider unreachable, `h2` not selected, framing `"2"` withdrawn) | released | `provider_unreachable` |
+| 3 | the sidecar reported `fault: "upstream"` (the provider unreachable, `h2` not selected, framing `"2"` withdrawn, the provider closed without a byte in answer to the ClientHello in either framing) | released | `provider_unreachable` |
 | 4 | the sidecar reported `fault: "node"`, or its socket ended without `error` or `closed` | released | `sidecar_failure` |
 | 5 | the provider closed the open, idle connection before any request (`closed`, `upstream_closed`, without `after_client_frames`) | released | `provider_closed` |
 | 6 | the node refused a request of this connection with a 5xx **and accepted none after it**, or a settlement's billing write failed | released | `node_failure` |
@@ -1898,12 +1934,18 @@ threshold (`evicted_released`, with `evicted.charge_from`); current clients acce
 node, and the current node never sends it.
 
 A refused request (4xx) by itself costs nothing; the connection stays, and the deposit follows how the
-connection ends. A 5xx refusal (the node could not reserve, `wallet_busy`) marks the connection for row 6;
+connection ends. A 5xx refusal because the node could not reserve marks the connection for row 6; a 5xx about the credential
+the request named (`wallet_busy`, a mint that is unreachable or timed out, a busy swap, a redemption error)
+does not, since the client chose that credential and can provoke it;
 a later request of the connection that the node accepts (`request_ok`) clears the mark, so a client cannot
 make a connection free of deposit risk by provoking one refusal: a request accepted after it and then
 abandoned is row 9. Rows 3 and 4 come before row 6: a fault the sidecar reports (`"upstream"`, `"node"`) or
 its lost socket decides both the open request (released in full) and the deposit's reason, whatever node
-refusal came earlier on the connection.
+refusal came earlier on the connection. C cannot tell every 5xx about the credential a request named (a Cashu
+token the node cannot redeem now, the wallet lock its redemption waited for) from a failure of the node's own
+reservation path, so it reports a charged deposit in row 6's state only for a 5xx refusal of a request that
+named an API key (not a Cashu token) and whose detail is not `wallet_busy`, with no `request_ok` after it
+(detection only).
 
 **A provider refusal is a settlement.** A request whose stream the provider refused unprocessed
 (`RST_STREAM(REFUSED_STREAM)`, or GOAWAY with `NO_ERROR` below it), disclosed by C (`disclose_reset`,
@@ -1912,7 +1954,9 @@ with its receipt (`deposit_released_msat`), so such a connection is in none of t
 particular a GOAWAY that ends the connection **before `body_released`** is a provider-caused end and no
 longer costs the deposit (row 9) once C discloses it, also after the provider closed the TCP connection
 (N waits 60 s). When it reached N before any record of the request was written, that GOAWAY must have
-reached N within the GOAWAY window (§5.4.1); a later one (an idle close the client may have waited for) stays in row 9. A GOAWAY C cannot disclose (an error code, which C's own frames may have caused; frames
+reached N within the GOAWAY window (§5.4.1), or, before `request_ok`, at most `W` before it and under
+`h2.idle_secs` after N's last write of the head or of a request record (a GOAWAY that raced the request,
+§5.4.1; since 2026-11-27); a later one (an idle close the client may have waited for) or an older one stays in row 9. A GOAWAY C cannot disclose (an error code, which C's own frames may have caused; frames
 it cannot walk) stays in row 9.
 
 ```
@@ -1927,7 +1971,7 @@ it cannot walk) stays in row 9.
 | `msat` | the deposit that was reserved (`ready.deposit_msat`) |
 | `outcome` | `"released"` or `"charged"` |
 | `reason` | the row's `reason` above |
-| `cost_msats` | what the credential paid for it: `msat` when charged, `0` when released |
+| `cost_msats` | what the credential paid for it: `msat` when charged, `0` when released (C reports any other value) |
 | `balance_msats` | the credential's balance afterwards (`null` if the key is gone) |
 | `time` | Unix seconds |
 | `evicted` | row 13 only: `{"unused_at_address"}`, the evictable unused connections its address held (§8.4). C reports a charge without the object, one that comes earlier than the signed offer's `evict_unused_after_s` after C's `setup` (or any, when that value is 0), and one after N had accepted a request of the connection, except a framing-`"1.1"` request 1 before C's ClientHello |
@@ -1950,7 +1994,7 @@ outcome:
 | `v` | `1`, the format |
 | `sid`, `http`, `n` | the connection, its framing, the request |
 | `outcome` | `"charged"` when `cost_msats` > 0, else `"released"` |
-| `reason` | `request_received` (written in full, no settlement: the reservation), `settlement_failed` (the billing write failed: the reservation after `body_released`, released in full before it), `settled_without_receipt` (charged what its settlement says, but the deposit could not be released, so N sent no receipt; only after C disclosed the answer, before or after `body_released`: before it only an error head or a refusal settles, at most the abandon fee; after it a 5xx may cost the reservation), `provider_refused` (a node before 2026-11-24 only: the provider sent bytes and closed first: the session fee if still due; clients still accept it from such a node), `provider_unreachable`, `sidecar_failure` (released in full), `request_abandoned` (the abandon fee, or released in full when the deposit is charged for it), `evicted` (released in full on a connection closed for a newer setup, row 13: a framing-`"1.1"` request 1 without a ClientHello, else a race), `unattested` (a usage without an attestation: released), `not_started` (the sidecar never accepted it: released) |
+| `reason` | `request_received` (written in full, no settlement: the reservation), `settlement_failed` (the billing write failed: the reservation after `body_released`, released in full before it), `settled_without_receipt` (charged what its settlement says, but the deposit could not be released, so N sent no receipt; only after C disclosed the answer, before or after `body_released`, and never more than that disclosure costs by the per-request table above: before `body_released` only an error head or a refusal settles, at most the abandon fee; after it a 5xx error head may cost the reservation), `provider_refused` (a node before 2026-11-24 only: the provider sent bytes and closed first: the session fee if still due; clients still accept it from such a node), `provider_unreachable`, `sidecar_failure` (released in full), `request_abandoned` (the abandon fee, or released in full when the deposit is charged for it), `evicted` (released in full on a connection closed for a newer setup, row 13: a framing-`"1.1"` request 1 without a ClientHello, else a race), `unattested` (a usage without an attestation: released), `not_started` (the sidecar never accepted it: released) |
 | `cost_msats` | what the credential paid for the request; never above `reserved_msats` |
 | `reserved_msats` | what was reserved for it (`request_ok.reserved_msats`) |
 | `balance_msats` | the credential's balance afterwards (`null` if the key is gone) |
@@ -1977,11 +2021,22 @@ and the cases all three clients run):
 |---|---|---|
 | `request_received` | never | the reservation |
 | `settlement_failed` | 0 | the reservation |
-| `settled_without_receipt` (only after C's own disclosure or `accept`) | max(abandon fee, session fee if still due) | the reservation |
+| `settled_without_receipt` (only after C's own disclosure or `accept`) | what C's disclosure implies, at most max(abandon fee, session fee if still due) | what C's disclosure implies |
 | `unattested` | 0 | 0 |
 | `provider_refused` | the session fee if still due | never |
 | `provider_unreachable`, `sidecar_failure`, `evicted`, `not_started` | 0 | never |
 | `request_abandoned` | max(abandon fee, session fee if still due) | never |
+
+"What C's disclosure implies" is the per-request table above, applied to what C itself disclosed: a
+refusal (`disclose_reset`) the session fee if still due; an error head 429/503/401/402/403 the session fee
+if still due, any other 4xx the abandon fee, a 5xx the reservation announced in `request_ok` (none
+announced: the session fee if still due), but the abandon fee before `body_released`, and for an image
+request never more than `msat_per_image × count` + max(session fee if still due, abandon fee); a chat 2xx
+(`disclose`) its usage at the frozen rates plus the session fee if still due; an image 2xx (`accept`)
+`msat_per_image × count` plus the session fee if still due. N charges the settlement's own cost, which an
+honest node computes by the same table, so the bound is what N's receipt would have been held to. A client
+that does not track what it disclosed holds the outcome to the abandon fee before `body_released` and to the
+reservation after it.
 
 **Order at a connection's end.** The node first decides the deposit, then finalizes a request still in
 flight, then sends the last frame; a client that is already gone changes none of it. A client that leaves
@@ -2062,6 +2117,10 @@ is never row 4: that row needs the sidecar's socket to end while the client's is
 | eviction (2026-11-23): an evicted unused connection's deposit is always charged (`evicted_released` and `CONFIDENTIAL_EVICT_CHARGE_FROM` are gone, `deposit.evicted` is `{unused_at_address}`); the asking address's own oldest goes when it holds as many evictable unused connections as any; a framing-`"1.1"` request 1 without a ClientHello does not hold the slot; no eviction while the sidecar is unreachable; the offer's `evict_unused_after_s`; what holding, self-eviction and griefing cost | §8.4, §9.2, §10 risk 13, §12.1, §12.9, §12.10 |
 | the request outcome: the ceiling per reason (shared vectors), the cross-checks against the frame and the deposit outcome, a failed settlement before `body_released` releases in full; all three clients report a missing last frame | §12.10 |
 | an early provider close (2026-11-24) settles a request only with a disclosed answer: `upstream_closed_early` settles nothing by its response bytes (row 8 is no longer used); after it S takes `disclose_head` as well as `disclose_reset` for 60 s (framing `"1.1"`: attested at once, `disclose_head` only), not after a `client_caused` close; a control record written outside a request marks the next one accepted or first written within `W`; a 5xx error head settled before `body_released` costs the abandon fee | §5.4.1, §5.4.2, §8.4, §10 risk 16, §12.8–§12.10 |
+| no wire change for honest clients (2026-11-27): a close on the connection head counts for the withdrawal of `"2"` only when the head was written within 5 s of the provider's first byte (was: 15 s of the dial); the client's Finished record must have the header `17 03 03 00 35`; a framing-`"1.1"` provider that closes without a byte in answer to the ClientHello ends the connection with `fault: "upstream"` (row 3), as in framing `"2"`; a RST_STREAM is proven for the stream of the request in flight when it arrived; no record of a request is written after its error head was disclosed (no `body_released` follows it); S's 2PC for a connection stops when the connection's session ends | §2.1, §5.1, §12.10 |
+| no wire change (2026-11-27), client checks: a `settled_without_receipt` outcome costs at most what C's own disclosure implies (by the per-request table); a deposit outcome's `cost_msats` is `msat` when charged and 0 when released; a charge after a 5xx refusal of a request that named an API key (not a Cashu token, not `wallet_busy`) with none accepted after it is reported (row 6); `body_released` counts only for a request C released; C refuses a record of an unknown outer type or one longer than 2^14 + 256 bytes, and a SHA-1 certificate signature (TLS-22); the profile tool checks that the provider waits 5 s for the HTTP/2 preface (H11) | §5.6, §12.10, `FORK-NOTES.md` |
+| no wire change (2026-11-27), node: a 5xx refusal about the request's own credential does not mark row 6; an ended connection no longer renews its offer's 10 minutes (a setup refreshes the current offer); `idle_timeout_s` at most `h2.idle_secs` − 10; a client frame the node cannot parse is the client's (400); the deposit is judged only after a settlement still writing ends | §3.3, §8, §12.9, §12.10 |
 | C's TLS stack: an RSA signature must have the length of the modulus (TLS-20) | `FORK-NOTES.md`, `docs/TWOPC-NODE-GARBLING.md` §4 |
 | the shipped Venice offer: `h2.idle_secs` 300 (was 390) | §2.1, `docs/SETUP.md` |
 | no wire change (2026-11-24): N garbles only after a complete first OT message, a bounded number at once; an empty multiplexer chunk ends the 2PC or proof channel; a `disclose_head`, `disclose_reset` or `accept` that overtakes the client records' π_WIN result waits for it; the connection's first SETTINGS ACK and a PING ACK after a server record do not make a provider close `after_client_frames` (row 5); a usage event that repeats a key is refused (both clients' parse and S); framing `"1.1"` carries a body in at most `3 + body_len / 4096` records; the images `max_count` of a sidecar offer is 1 to 4; a head template that could render beyond one record is refused at startup; C refuses a protected record whose outer type is not 23 (TLS-21); the clients hold an error receipt before `body_released` and `settled_without_receipt` before it to the abandon fee; a deposit the database could not charge does not pay for the request it ends; the provider obligations of §5.6 on server padding and KeyUpdates | §4, §5.4, §5.6, §8.4, §12.2, §12.10, `FORK-NOTES.md` |
+| no wire change (2026-11-27): a GOAWAY(`NO_ERROR`, last-stream-id below the stream) that reached N at most `W` before `request_ok` and less than `h2.idle_secs` after N's last write of the head or of a request record refuses an unmarked request (the provider's shutdown racing it; settled like a 429, the deposit released); a `RST_STREAM` before `request_ok` still refuses nothing; S keeps the latest server records' arrival times; the clients keep the GOAWAY's record when it arrives while the request is being opened | §5.4.1, §10.1, §12.8, §12.10 |

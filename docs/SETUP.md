@@ -377,7 +377,7 @@ request exists. The settings:
 | Setting | Default | Effect |
 |---|---|---|
 | `CONFIDENTIAL_CONNECTION_DEPOSIT_MSAT` | max(abandon fee, session fee, 1000 msat) | reserved at the setup, released by the connection's first settled request, **charged** when a connection ends without one through the client's doing (opened and unused, abandoned, idled out, a failed handshake or proof). Released when the end was the node's, the sidecar's or the provider's. `0` = no deposit |
-| `CONFIDENTIAL_IDLE_TIMEOUT_S` | 120 | the node closes a connection with no request in flight after this long; at least 10, at most the sidecar's `h2.idle_secs` |
+| `CONFIDENTIAL_IDLE_TIMEOUT_S` | 120 | the node closes a connection with no request in flight after this long; at least 10, at most the sidecar's `h2.idle_secs` − 10 (the node clamps it) |
 | `CONFIDENTIAL_RATE_SURCHARGE_PCT` | 0 | percentage added to the per-token rates of confidential requests (the signed offer lists the surcharged rates) |
 | `CONFIDENTIAL_SESSION_FEE_MSAT` | 0 | flat fee for the two-party handshake, due **once per connection**, with its first settled request: added to a 2xx; the whole charge when the provider is limiting or at capacity (429/503) or refuses the node's own key or account (401/402/403), or answers and closes before the request body is complete |
 | `CONFIDENTIAL_ABANDON_FEE_MSAT` | the session fee | kept when an accepted request is dropped before it reached the provider, on a connection whose deposit was already released; also the charge for a 4xx other than the above |
