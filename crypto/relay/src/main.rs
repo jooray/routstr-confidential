@@ -732,10 +732,10 @@ async fn healthz_http(State(app): State<Arc<AppState>>) -> impl IntoResponse {
 /// |---|---|
 /// | the ClientHello's bytes | canonical (`tls_v2::canonical_client_hello`): only the random and the session id are the client's, the joint share is a valid point it cannot choose; one record, version `03 03` |
 /// | when the ClientHello is written | the sidecar dials when the checked hello and the joint share are there and writes it at once |
-/// | records after the ClientHello, before the provider answered (a CCS, a "Finished", anything) | held until the provider's first byte has arrived (`handshake_record_step`), so a provider that closes without a byte has seen the hello alone; after it, at most one CCS of exactly `14 03 03 00 01 01` and one application-data record |
+/// | records after the ClientHello, before the provider answered (a CCS, a "Finished", anything) | held until the provider's first byte has arrived (`handshake_record_step`), so a provider that closes without a byte has seen the hello alone; after it, at most one CCS of exactly `14 03 03 00 01 01` and one application-data record with the header `17 03 03 00 35` (one Finished, no padding) |
 /// | its Finished, π_NK, `release_head` (wrong, late or never; a handshake record holding anything besides the one Finished, which `verify_handshake` refuses without `fault`) | the provider has sent its flight by then, so bytes were received and the head is not written: "closed during the handshake", not counted |
 /// | leaving | the sidecar closes the connection itself; no provider close is seen |
-/// | a late `release_head`, so that a provider timer fires just after the head | the close after the head counts only when the head was written within `H2_HEAD_PROMPT` of the dial |
+/// | a late `release_head` (or a slow Finished or π_NK), so that a provider timer that runs from its handshake fires just as the head arrives | the close after the head counts only when the head was written within `H2_HEAD_PROMPT` of the provider's first byte: every provider timer that can end a connection waiting for its preface starts no earlier, so the client's whole say over the head's time is that bound, whatever the provider's timer is |
 /// | records after the head (control frames with free payloads, e.g. a WINDOW_UPDATE of 0; a request body) | the close after the head counts only while **no client record** was written to the provider |
 /// | `settings_seen` (its claim of the provider's table size) | ends the connection without counting (§5.6) |
 ///
@@ -747,9 +747,16 @@ async fn healthz_http(State(app): State<Arc<AppState>>) -> impl IntoResponse {
 ///    the provider's, authenticated by its Finished, in answer to a hello
 ///    whose ALPN is exactly `h2`.
 /// 3. The provider closed within `H2_OPEN_WINDOW` of the connection head,
-///    which was written within `H2_HEAD_PROMPT` of the dial, with no response
+///    which was written within `H2_HEAD_PROMPT` of the provider's first byte
+///    (its ServerHello), with no response
 ///    to a request and no client record written: the hello, the client's
 ///    Finished (verified by N) and N's own head and KeyUpdate.
+///
+/// What remains of the client's timing: a provider that ends a connection
+/// whose HTTP/2 preface comes less than `H2_HEAD_PROMPT` after its own
+/// flight can be met by a client that takes nearly that long. Such a
+/// provider also fails honest clients on a slow link, and `"2"` needs a
+/// provider that waits at least `H2_HEAD_PROMPT` for the preface (§5.6).
 ///
 /// A provider that closes an alert or a HelloRetryRequest into the hello
 /// (bytes received) fails framing "1.1" the same way and is not counted.
@@ -770,11 +777,16 @@ const H2_WITHDRAW_FOR: std::time::Duration = std::time::Duration::from_secs(600)
 /// A provider that closes an HTTP/2 connection this soon after the head,
 /// with no response to a request yet, failed the open.
 const H2_OPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
-/// ...when the head was written this soon after the dial. An honest client
-/// needs the handshake's round trips and π_NK (about a second, a few on a
-/// slow link); one that stalls its `release_head` to meet a timer of the
-/// provider is past this and its connection does not count.
-const H2_HEAD_PROMPT: std::time::Duration = std::time::Duration::from_secs(15);
+/// ...when the head was written this soon after the provider's first byte
+/// (its ServerHello). Measured from there, not from the dial: whatever the
+/// client does to delay the head (its 2PC steps, its Finished, π_NK,
+/// `release_head`) happens after that byte, and a provider timer that waits
+/// for the preface cannot start before it. An honest client needs the 2PC's
+/// handshake and application steps, its Finished and π_NK (about a second);
+/// one that is slower, or that stalls to meet a timer of the provider, is
+/// past this and its connection does not count (a missed count, never a
+/// wrong one).
+const H2_HEAD_PROMPT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl H2Guard {
     fn new(retry: std::time::Duration, fail_file: Option<std::path::PathBuf>) -> Self {
@@ -925,10 +937,11 @@ const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// the second from its receipt of `body_released`.
 const SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Framing "1.1": a provider that answers a request from its head alone and
-/// closes (§12.10 row 8) does so while the client is still sending. A close
-/// that comes this long or longer after N's last write of the head or of a
-/// body record is not counted as the provider's answer: the client may have
-/// held the rest of the body back until the provider gave up on it.
+/// closes does so while the client is still sending. A close that comes this
+/// long or longer after N's last write of the head or of a body record is
+/// marked `client_caused` in `upstream_closed_early`: the client may have
+/// held the rest of the body back until the provider gave up on it, so a
+/// disclosed error head no longer settles the request (§5.4.2).
 const EARLY_ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 /// Largest TLS 1.3 record on the wire: header + 2^14 plaintext + 256 expansion.
 const MAX_TLS_RECORD: usize = 5 + (1 << 14) + 256;
@@ -2129,6 +2142,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                 let Some(ev) = ev else { break };
                 match ev {
                     Ev::ServerBytes(bytes) => {
+                        st.answered_at.get_or_insert_with(std::time::Instant::now);
                         let verified = st.handshake.is_some();
                         if let Err(e) = log.server_bytes(&bytes, verified) {
                             if !verified { st.fault = Some("upstream"); }
@@ -2180,7 +2194,7 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         // A failed open (§2.1, `H2Guard`): not a byte in
                         // answer to the canonical ClientHello, or the provider
                         // closing on the connection head alone.
-                        let why = if hello_unanswered(&st, &log) {
+                        let why = if unanswered_close(&mut st, &log) {
                             Some("the provider closed without answering the ClientHello")
                         } else if st.h2.as_ref().is_some_and(|h| h.open_failed()) {
                             Some("the provider closed on the connection head")
@@ -2206,12 +2220,17 @@ async fn session_inner(socket: WebSocket, app: Arc<AppState>) -> Result<()> {
                         // record that can no longer be written, and the node
                         // would charge the full reservation for nothing.
                         if !st.released {
-                            // Tell the node first how much the upstream sent
-                            // after the credential record: a provider that
-                            // refused it from the head alone and closed is a
-                            // provider refusal, not a client abandon, and the
-                            // node can settle it as such. Bytes before the
-                            // head (session tickets) do not count.
+                            // A provider that closed without a byte in answer
+                            // to the canonical ClientHello (nothing else of the
+                            // client's reached it, `handshake_record_step`):
+                            // no client can cause that, as for framing "2"
+                            // (`H2Guard` row 1), so the error frame says so and
+                            // the node releases what the connection holds.
+                            unanswered_close(&mut st, &log);
+                            // Tell the node how much the upstream sent after
+                            // the credential record (logged only: bytes alone
+                            // settle nothing, §5.4.2). Bytes before the head
+                            // (session tickets) do not count.
                             let response_bytes = st
                                 .recv_at_head
                                 .map_or(0, |at| log.recv_len.saturating_sub(at));
@@ -2469,6 +2488,8 @@ struct Session {
     /// When the TCP connection to the provider was up (the ClientHello is
     /// written right after).
     dialed_at: Option<std::time::Instant>,
+    /// When the provider's first byte arrived (`H2_HEAD_PROMPT`).
+    answered_at: Option<std::time::Instant>,
     hs_cmd_sent: bool,
     /// The transcript hash through the server Finished fed to the 2PC
     /// application phase (the keys of the credential record derive from it).
@@ -3302,6 +3323,13 @@ async fn v2_pump_client(
 /// The middlebox-compatibility ChangeCipherSpec record (RFC 8446 §D.4).
 const CLIENT_CCS: [u8; 6] = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
 
+/// The header of the client's Finished record: record version `03 03`, and
+/// the length of one Finished under TLS_AES_128_GCM_SHA256 with no padding
+/// (4 + 32 bytes of message, 1 of inner type, 16 of tag). The record version
+/// is only additional data to GCM, so N's own check of the Finished would
+/// pass another one; the provider may refuse it and close after N's head.
+const CLIENT_FINISHED_HEADER: [u8; 5] = [0x17, 0x03, 0x03, 0x00, 0x35];
+
 #[derive(Debug, PartialEq)]
 enum HsStep {
     /// The checked ClientHello: relay it.
@@ -3320,7 +3348,8 @@ enum HsStep {
 /// compatibility CCS waits with no harm), and so the provider closing
 /// without a byte can only be its answer to the canonical hello (`H2Guard`).
 /// After the hello: at most one CCS, exactly `14 03 03 00 01 01`, and one
-/// application-data record (the Finished).
+/// application-data record with the Finished's exact header
+/// (`CLIENT_FINISHED_HEADER`).
 fn handshake_record_step(ch_sent: bool, recv_len: usize, ccs_sent: bool, ctype: u8, raw: &[u8]) -> Result<HsStep> {
     if !ch_sent {
         return Ok(HsStep::Hello);
@@ -3332,6 +3361,9 @@ fn handshake_record_step(ch_sent: bool, recv_len: usize, ccs_sent: bool, ctype: 
         tls::CT_CHANGE_CIPHER_SPEC if ccs_sent => bail!("a second ChangeCipherSpec during the handshake"),
         tls::CT_CHANGE_CIPHER_SPEC if raw != CLIENT_CCS => bail!("a ChangeCipherSpec record other than 14 03 03 00 01 01"),
         tls::CT_CHANGE_CIPHER_SPEC => Ok(HsStep::Ccs),
+        CT_APPLICATION_DATA if raw.get(..5) != Some(&CLIENT_FINISHED_HEADER[..]) => {
+            bail!("the client Finished record must have the header 17 03 03 00 35 (one Finished, no padding)")
+        }
         CT_APPLICATION_DATA => Ok(HsStep::Finished),
         t => bail!("unexpected client record type {t} during the handshake"),
     }
@@ -3343,6 +3375,18 @@ fn handshake_record_step(ch_sent: bool, recv_len: usize, ccs_sent: bool, ctype: 
 /// provider's first byte).
 fn hello_unanswered(st: &Session, log: &RelayLog) -> bool {
     st.ch_sent && log.recv_len == 0 && st.post_hello_records == 0
+}
+
+/// The provider closed: when it had not answered the ClientHello with one
+/// byte (`hello_unanswered`), no client can have caused the close, in either
+/// framing, and the session's error frame carries `fault: "upstream"` (the
+/// node then keeps nothing of the connection's deposit or request).
+fn unanswered_close(st: &mut Session, log: &RelayLog) -> bool {
+    let unanswered = hello_unanswered(st, log);
+    if unanswered {
+        st.fault = Some("upstream");
+    }
+    unanswered
 }
 
 /// Advance the joint handshake as U's messages and the 2PC outputs arrive.
@@ -3558,9 +3602,17 @@ async fn zk_inner(socket: WebSocket, proof: &str, sid: &str, app: &Arc<AppState>
     if proof == "twopc" {
         let rx = shared.twopc_rx.lock().unwrap().take().ok_or_else(|| anyhow!("2PC not available for this session"))?;
         let (io, bridge) = ws_duplex(socket);
-        let result = tokio::time::timeout(SESSION_TIMEOUT, run_twopc_n(io, rx, shared.evt.clone()))
-            .await
-            .unwrap_or_else(|_| Err(anyhow!("2PC timed out")));
+        // The 2PC ends with its session: once the session's task is gone (it
+        // drops the event receiver) no garbling or evaluation goes on for
+        // it, so a client that drops its control socket and keeps feeding
+        // this one holds no work without a session slot.
+        let evt = shared.evt.clone();
+        let result = tokio::select! {
+            r = tokio::time::timeout(SESSION_TIMEOUT, run_twopc_n(io, rx, shared.evt.clone())) => {
+                r.unwrap_or_else(|_| Err(anyhow!("2PC timed out")))
+            }
+            _ = evt.closed() => Err(anyhow!("2PC stopped: its session ended")),
+        };
         bridge.finish().await;
         info!(elapsed_ms = started.elapsed().as_millis() as u64, ok = result.is_ok(), "2pc end");
         if let Err(e) = &result {
@@ -4415,7 +4467,8 @@ mod relay_log_tests {
     #[test]
     fn nothing_after_the_hello_is_relayed_before_the_provider_answers() {
         use super::{handshake_record_step, hello_unanswered, HsStep, Session, CLIENT_CCS};
-        let fin = [0x17, 3, 3, 0, 1, 0];
+        let mut fin = vec![0x17, 3, 3, 0, 0x35];
+        fin.extend_from_slice(&[0u8; 0x35]);
         // Before the hello was written: the hello.
         assert_eq!(handshake_record_step(false, 0, false, 0x16, &[0x16]).unwrap(), HsStep::Hello);
         // After it, with no provider byte: every record is held.
@@ -4429,6 +4482,28 @@ mod relay_log_tests {
         assert!(handshake_record_step(true, 1, false, 0x14, &[0x14, 3, 3, 0, 2, 1, 1]).is_err());
         assert_eq!(handshake_record_step(true, 1, true, 0x17, &fin).unwrap(), HsStep::Finished);
         assert!(handshake_record_step(true, 1, false, 0x15, &[0x15, 3, 3, 0, 0]).is_err());
+        // The Finished record exactly: another record version, or padding
+        // (a longer record), is refused before it reaches the provider.
+        let mut v = fin.clone();
+        v[2] = 1;
+        assert!(handshake_record_step(true, 1, false, 0x17, &v).is_err());
+        let mut padded = vec![0x17, 3, 3, 0, 0x36];
+        padded.extend_from_slice(&[0u8; 0x36]);
+        assert!(handshake_record_step(true, 1, false, 0x17, &padded).is_err());
+        assert!(handshake_record_step(true, 1, false, 0x17, &[0x17, 3, 3, 0, 1, 0]).is_err());
+
+        // A close with no byte after the hello is the provider's in both
+        // framings (framing "1.1" reserved request 1 before the hello).
+        for framing11 in [true, false] {
+            let mut st = Session { ch_sent: true, framing11, req1: framing11, ..Session::default() };
+            assert!(super::unanswered_close(&mut st, &RelayLog::default()));
+            assert_eq!(st.fault, Some("upstream"));
+            let mut answered = RelayLog::default();
+            answered.server_bytes(&[0x16], false).unwrap();
+            let mut st = Session { ch_sent: true, framing11, req1: framing11, ..Session::default() };
+            assert!(!super::unanswered_close(&mut st, &answered));
+            assert_eq!(st.fault, None);
+        }
 
         // The zero-response attribution counts only the hello alone.
         let log = RelayLog::default();

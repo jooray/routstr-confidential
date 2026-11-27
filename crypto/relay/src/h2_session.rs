@@ -77,6 +77,10 @@ struct Rec {
     proven: bool,
     /// 1-based position among its request's records; 0 for a control record.
     req_idx: usize,
+    /// The stream a control record names (RST_STREAM: the request in flight
+    /// when it arrived; 0 otherwise). Fixed at arrival, not when its π_WIN
+    /// batch is built: by then another request may be in flight.
+    stream: u32,
 }
 
 enum WinInflight {
@@ -132,8 +136,17 @@ struct Req {
     ok_at: std::time::Instant,
     /// Server application-data records received when N accepted it (as
     /// `RelayLog::server_app_records`): a refusal in an earlier record
-    /// predates the request and refuses nothing.
+    /// predates the request and refuses nothing, except a GOAWAY in a record
+    /// from `early_from` on.
     ok_records: usize,
+    /// The first server record (as `RelayLog::server_app_records`) of the
+    /// run, ending at `ok_records`, that arrived at most the GOAWAY window
+    /// (`goaway_window`) before `request_ok`, each less than `h2.idle_secs`
+    /// after N's last write of the head or of a request record
+    /// (`H2::early_from`): a GOAWAY(NO_ERROR) below the request's stream in
+    /// one of them is the provider's shutdown racing the request, not an
+    /// idle close, and refuses it. `ok_records` when there is none.
+    early_from: usize,
     /// The index (as `RelayLog::server_app_records`) of the first server
     /// record that arrived after the GOAWAY window closed (`goaway_window`):
     /// a GOAWAY in it or later that arrived before the request's first
@@ -192,7 +205,7 @@ pub(crate) struct H2 {
     pub(crate) closing: Option<&'static str>,
     conn_end: Option<tokio::time::Instant>,
     /// When the connection head was written, and whether that was within
-    /// `H2_HEAD_PROMPT` of the dial.
+    /// `H2_HEAD_PROMPT` of the provider's first byte.
     head_at: Option<std::time::Instant>,
     head_prompt: bool,
     /// A client record was written to the provider on this connection.
@@ -222,6 +235,11 @@ pub(crate) struct H2 {
     last_req_write: Option<std::time::Instant>,
     /// Control records accepted on this connection (`ctl_allowance`).
     ctl_records: u64,
+    /// The latest server application-data records' arrivals, at most
+    /// `RECENT_RECORDS` and none older than the longest GOAWAY window:
+    /// (index, when, whether it arrived less than `h2.idle_secs` after N's
+    /// last write of the head or of a request record). `Req::early_from`.
+    recent: VecDeque<(usize, std::time::Instant, bool)>,
     /// The connection's first SETTINGS ACK was written. A provider sends its
     /// SETTINGS at the start of every connection and expects exactly this
     /// answer, whenever it comes: it is the one control record that cannot
@@ -271,6 +289,7 @@ impl H2 {
             last_write: None,
             last_req_write: None,
             ctl_records: 0,
+            recent: VecDeque::new(),
             settings_acked: false,
             ping_ack_mark: 0,
             ctl_outside_at: None,
@@ -283,7 +302,7 @@ impl H2 {
     }
 
     /// The provider closed the connection on its head alone: soon after it
-    /// was written (itself promptly after the dial), with no response to a
+    /// was written (itself promptly after the provider's first byte), with no response to a
     /// request yet and nothing of the client's written since (`H2Guard`).
     pub(crate) fn open_failed(&self) -> bool {
         self.closed_on_head(std::time::Instant::now())
@@ -335,6 +354,14 @@ impl H2 {
         let window = goaway_window(self.cfg.idle_secs);
         let last_req_write = self.last_req_write;
         let idle = std::time::Duration::from_secs(self.cfg.idle_secs);
+        // Its arrival, for a GOAWAY that a request accepted soon after may
+        // disclose (`Req::early_from`).
+        while self.recent.front().is_some_and(|&(_, at, _)| now.saturating_duration_since(at) > MAX_GOAWAY_WINDOW)
+            || self.recent.len() >= RECENT_RECORDS
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((index, now, last_req_write.is_some_and(|w| now < w + idle)));
         if let Some(q) = self.req.as_mut().filter(|q| q.late_from.is_none()) {
             // Past the window after `request_ok`, or as long after N's last
             // write of the head or of a request record as the provider may
@@ -370,6 +397,23 @@ impl H2 {
         Ok(())
     }
 
+    /// For a request accepted `now`: the first server record of the run,
+    /// ending with the latest one, that arrived at most the GOAWAY window
+    /// before `now` and less than `h2.idle_secs` after N's last write of the
+    /// head or of a request record (`Req::early_from`); `app_records` when
+    /// the latest one did not.
+    fn early_from(&self, now: std::time::Instant) -> usize {
+        let window = goaway_window(self.cfg.idle_secs);
+        let mut from = self.app_records;
+        for &(index, at, before_idle) in self.recent.iter().rev() {
+            if !before_idle || now.saturating_duration_since(at) > window {
+                break;
+            }
+            from = index;
+        }
+        from
+    }
+
     fn idle_deadline(&self) -> tokio::time::Instant {
         let idle = tokio::time::Instant::now() + std::time::Duration::from_secs(self.cfg.idle_secs);
         self.conn_end.map_or(idle, |end| end.min(idle))
@@ -389,8 +433,9 @@ pub(crate) fn stalled(last: Option<std::time::Instant>, now: std::time::Instant,
     last.is_some_and(|w| now.saturating_duration_since(w) >= window)
 }
 
-/// Whether the provider's close before a request was written in full is its
-/// own answer (§12.10 row 8) or may be the client's doing: a control record
+/// Whether the provider's close before a request was written in full may be
+/// the client's doing (`client_caused`; then a disclosed error head no longer
+/// settles it, §5.4.2): a control record
 /// of the client (other than the connection's first SETTINGS ACK) went out
 /// while the request was in flight, or the client held proven
 /// records back for the GOAWAY window or longer before the close.
@@ -477,8 +522,16 @@ pub(crate) fn head_written(st: &mut Session) {
     h.head_at = Some(std::time::Instant::now());
     h.last_write = h.head_at;
     h.last_req_write = h.head_at;
-    h.head_prompt = st.dialed_at.is_some_and(|t| t.elapsed() < H2_HEAD_PROMPT);
+    h.head_prompt = head_prompt(st.answered_at, std::time::Instant::now());
     st.deadline = Some(h.idle_deadline());
+}
+
+/// Whether a head written at `now` was prompt (`H2_HEAD_PROMPT`): measured
+/// from the provider's first byte, after which every delay is the client's
+/// (its 2PC steps, its Finished, π_NK, `release_head`). The dial does not
+/// count: the client cannot make the provider answer sooner.
+fn head_prompt(answered_at: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    answered_at.is_some_and(|t| now.saturating_duration_since(t) < H2_HEAD_PROMPT)
 }
 
 /// `request`: the terms of the next request (kind, model, cap or count, body length).
@@ -558,7 +611,9 @@ pub(crate) fn on_request(
     }
     let stream = h2::request_stream(n);
     let block = h2::request_block(&app.offer.upstream_host, &path);
-    let ctl_before = recent_ctl_outside(h.ctl_outside_at, std::time::Instant::now(), goaway_window(h.cfg.idle_secs));
+    let ok_at = std::time::Instant::now();
+    let ctl_before = recent_ctl_outside(h.ctl_outside_at, ok_at, goaway_window(h.cfg.idle_secs));
+    let early_from = h.early_from(ok_at);
     h.requests = n;
     h.req = Some(Req {
         n,
@@ -585,8 +640,9 @@ pub(crate) fn on_request(
         settle_on: None,
         attestation: None,
         refused: false,
-        ok_at: std::time::Instant::now(),
+        ok_at,
         ok_records: h.app_records,
+        early_from,
         late_from: None,
         late_write: false,
         stall_from: None,
@@ -721,9 +777,13 @@ pub(crate) fn client_bytes(st: &mut Session, data: &[u8]) -> Result<()> {
             q.records += 1;
             (kind, q.records)
         };
+        let stream = match kind {
+            RecKind::Ctl(Ctl::RstStream) => h.req.as_ref().map_or(0, |q| q.stream),
+            _ => 0,
+        };
         let bytes = r.bytes();
         h.held += bytes.len();
-        h.queue.push_back(Rec { seq: h.next_seq, bytes, kind, proven: false, req_idx });
+        h.queue.push_back(Rec { seq: h.next_seq, bytes, kind, proven: false, req_idx, stream });
         h.next_seq += 1;
     }
     h.pending.drain(..used);
@@ -771,8 +831,12 @@ async fn flush(
                 break;
             }
             let q = h.req.as_mut().ok_or_else(|| anyhow!("a request record without its request"))?;
-            // A refused request (its refusal disclosed) gets nothing more written.
-            if front.req_idx > q.upto || q.refused {
+            // A refused request (its refusal disclosed), or one whose error
+            // head was disclosed before it was written in full, gets nothing
+            // more written: the provider answered it, and a later
+            // `body_released` would turn the settlement of that answer into
+            // one of a request the provider had in full.
+            if front.req_idx > q.upto || q.refused || q.usage.is_some() {
                 break;
             }
             if q.s_k.is_none() {
@@ -904,7 +968,6 @@ fn next_batch(shared: &Arc<SessionShared>, to_client: &mpsc::UnboundedSender<Mes
 /// windows and the number of records they cover (at least one).
 fn batch_windows(h: &H2, first: usize) -> Result<(Vec<zkbench::statements::WinWindow>, usize)> {
     use zkbench::statements::{MAX_WIN_BYTES, MAX_WIN_WINDOWS};
-    let stream = h.req.as_ref().map_or(0, |q| q.stream);
     let mut windows = Vec::new();
     let mut ct_bytes = 0usize;
     let mut count = 0usize;
@@ -912,7 +975,7 @@ fn batch_windows(h: &H2, first: usize) -> Result<(Vec<zkbench::statements::WinWi
         let payload = &rec.bytes[5..];
         let inner = payload.len() - 16;
         let (head, tail): (Vec<u8>, &[u8]) = match rec.kind {
-            RecKind::Ctl(c) => (c.header(stream).to_vec(), &[]),
+            RecKind::Ctl(c) => (c.header(rec.stream).to_vec(), &[]),
             RecKind::Headers => {
                 let q = h.req.as_ref().ok_or_else(|| anyhow!("a HEADERS record without its request"))?;
                 (h2::frame(h2::HEADERS, h2::END_HEADERS, q.stream, &q.block), &[])
@@ -1165,6 +1228,15 @@ pub(crate) fn goaway_window(idle_secs: u64) -> std::time::Duration {
     std::time::Duration::from_millis((idle_secs * 1000 / 4).min(30_000))
 }
 
+/// The longest GOAWAY window (`goaway_window`): how long N keeps a server
+/// record's arrival for `Req::early_from`.
+const MAX_GOAWAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Most server record arrivals N keeps for `Req::early_from`. A GOAWAY that
+/// raced a request is among the latest records before `request_ok`; one
+/// further back is judged as received before the request (refused).
+const RECENT_RECORDS: usize = 256;
+
 /// `disclose_reset`: the provider refused the request's stream without
 /// processing it (`PROTOCOL-V3.md` §5.4, §12.8): RST_STREAM(REFUSED_STREAM)
 /// on the stream, or GOAWAY(NO_ERROR) with a last-stream-id below it. `R`
@@ -1179,8 +1251,13 @@ pub(crate) fn goaway_window(idle_secs: u64) -> std::time::Duration {
 /// more after its last write of the head or of a request record
 /// (`Req::late_write`): the provider's idle close may already have been on
 /// its way. Control records do not count as activity: a client can have them
-/// written at will, and a provider need not count them. Settled like a
-/// 429 (§12.10); the connection closes after it.
+/// written at will, and a provider need not count them. A refusing frame
+/// received before `request_ok` refuses the request only as a GOAWAY that
+/// arrived at most the GOAWAY window before it and less than `h2.idle_secs`
+/// after N's last write of the head or of a request record
+/// (`Req::early_from`; the provider's shutdown racing the request), and
+/// never a marked request (`Req::ctl_written`). Settled like a 429
+/// (§12.10); the connection closes after it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_disclose_reset(
     app: &Arc<AppState>,
@@ -1218,14 +1295,28 @@ pub(crate) fn on_disclose_reset(
     }
     let pinned = q.s_k.map(|s_k| (s_k, q.pinned.as_slice()));
     let p = record_windows(anchor, key_updates, log, floor, record, &r, pinned)?;
-    // The refusing frame must have arrived after N accepted the request: a
-    // GOAWAY (or a reset) received before `request_ok` was about something
-    // else and refuses nothing of this request. The frame ends in the last
-    // record R covers.
+    // The refusing frame must have arrived after N accepted the request,
+    // with one exception: a GOAWAY that arrived at most the GOAWAY window
+    // before `request_ok` and less than `h2.idle_secs` after N's last write
+    // of the head or of a request record (`Req::early_from`). That is the
+    // provider's shutdown racing the request (an honest race is one round
+    // trip), never its idle close; nothing of the request was written before
+    // it. A reset received before `request_ok` refuses nothing: no stream of
+    // the request existed. The frame ends in the last record R covers.
     let covered = p.windows.iter().map(|w| w.seq).collect::<std::collections::BTreeSet<_>>().len();
     let refusing_record = record + covered.max(1) - 1;
     if refusing_record < q.ok_records {
-        bail!("the refusing frame arrived before request {n} was accepted (server record {refusing_record}, the request was accepted at {})", q.ok_records);
+        let goaway = matches!(refusal, h2::Refusal::GoAway { .. });
+        if !goaway {
+            bail!("a reset that arrived before request {n} was accepted refuses nothing of it (server record {refusing_record}, the request was accepted at {})", q.ok_records);
+        }
+        if refusing_record < q.early_from {
+            bail!(
+                "a GOAWAY that arrived before request {n} was accepted refuses it only within {window:?} before request_ok and before the provider's idle time (server record {refusing_record}; accepted at {}, the window from {})",
+                q.ok_records,
+                q.early_from
+            );
+        }
     }
     if let h2::Refusal::GoAway { .. } = refusal {
         // A GOAWAY that arrived before any record of the request was written
@@ -1573,6 +1664,7 @@ mod tests {
             refused: false,
             ok_at: std::time::Instant::now(),
             ok_records: h.app_records,
+            early_from: h.app_records,
             late_from: None,
             late_write: false,
             stall_from: None,
@@ -1721,6 +1813,29 @@ mod tests {
         let (w, count) = batch_windows(h, 0).unwrap();
         assert_eq!(count, 1);
         assert_eq!(w[0].expected, h2::frame_header(8, h2::PING, h2::ACK, 0));
+    }
+
+    /// A RST_STREAM names the request that was in flight when it arrived, even
+    /// when its π_WIN batch is built only after the next request started: it
+    /// can never be proven, and written, as a reset of a stream the provider
+    /// has not seen yet.
+    #[test]
+    fn a_reset_keeps_the_stream_it_arrived_under() {
+        let block = h2::request_block("h", "/api/v1/chat/completions");
+        let mut st = session_with_request(300, "sfx");
+        client_bytes(&mut st, &record(9 + block.len() + 1)).unwrap();
+        client_bytes(&mut st, &record(10 + 300)).unwrap();
+        on_ctl(&mut st, "rst_stream").unwrap();
+        client_bytes(&mut st, &record(14)).unwrap();
+        // The request settles and the next one is in flight on stream 5
+        // before the reset's batch is built.
+        let h = st.h2.as_mut().unwrap();
+        h.queue.retain(|r| r.req_idx == 0);
+        let q = h.req.as_mut().unwrap();
+        (q.n, q.stream, q.records, q.complete) = (2, 5, 0, true);
+        let (w, count) = batch_windows(st.h2.as_ref().unwrap(), 0).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(w[0].expected, h2::frame_header(4, h2::RST_STREAM, 0, 3));
     }
 
     /// A provider close after the client wrote control frames on a connection
@@ -2050,6 +2165,36 @@ mod tests {
         assert!(st.h2.as_ref().unwrap().queue.is_empty());
     }
 
+    /// An error head disclosed before the request was written in full stops
+    /// its writing: a `release` that comes after it writes nothing, and no
+    /// `body_released` follows the provider's answer.
+    #[tokio::test]
+    async fn nothing_of_a_request_is_written_after_its_error_head_was_disclosed() {
+        let app = app_state(false);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, mut up) = upstream().await;
+        let log = RelayLog::default();
+        let mut st = open_session(9000);
+        let block = h2::request_block("h", "/api/v1/chat/completions").len();
+        for inner in [9 + block + 1, 10 + 4000, 10 + 4000, 10 + 1000] {
+            client_bytes(&mut st, &record(inner)).unwrap();
+        }
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        on_release(&mut st, 1, 2).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        assert_eq!(read_some(&mut up).await.len(), record(9 + block + 1).len() + record(10 + 4000).len());
+        // The error head is disclosed (its proof in flight), then the rest released.
+        let q = st.h2.as_mut().unwrap().req.as_mut().unwrap();
+        q.usage = Some(serde_json::json!({"error_status": 503, "choices": []}));
+        on_release(&mut st, 1, 4).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        assert!(read_some(&mut up).await.is_empty());
+        assert!(!st.h2.as_ref().unwrap().req.as_ref().unwrap().released);
+        assert!(texts(&mut rx).iter().all(|m| m["type"] != "body_released"));
+    }
+
     /// Feed a request of `data` DATA records (each `size` payload bytes, the
     /// last holding the rest) and return the HEADERS record's inner length.
     fn feed_many(st: &mut Session, body_len: usize, data: usize, size: usize) {
@@ -2304,6 +2449,43 @@ mod tests {
         let h = st.h2.as_mut().unwrap();
         (h.head_at, h.head_prompt, h.responded, h.client_written) = (Some(now), true, false, false);
         assert!(!h.closed_on_head(now + H2_OPEN_WINDOW));
+    }
+
+    /// §2.1: the client's say over when the head is written starts at the
+    /// provider's first byte, so the bound on it is measured from there.
+    #[test]
+    fn a_head_is_prompt_only_soon_after_the_providers_first_byte() {
+        let t = std::time::Instant::now();
+        let s = std::time::Duration::from_millis;
+        assert!(head_prompt(Some(t), t + s(800)));
+        assert!(head_prompt(Some(t), t + H2_HEAD_PROMPT - s(1)));
+        // A client that held its Finished, π_NK or release_head this long
+        // can have met a provider timer: not counted.
+        assert!(!head_prompt(Some(t), t + H2_HEAD_PROMPT));
+        assert!(!head_prompt(Some(t), t + H2_HEAD_PROMPT + s(9000)));
+        // No byte from the provider: no handshake, no head to count.
+        assert!(!head_prompt(None, t));
+        // The bound leaves no room for a client to wait out a preface timer
+        // of ten seconds or more, counted from the provider's own flight.
+        assert!(H2_HEAD_PROMPT < std::time::Duration::from_secs(10));
+    }
+
+    /// `head_written` takes the time from the provider's first byte, not
+    /// from the dial: a slow dial is not the client's, a late release is.
+    #[test]
+    fn head_written_measures_from_the_providers_first_byte() {
+        let app = app_state(false);
+        let mut st = idle_session(&app);
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        st.dialed_at = Some(long_ago);
+        st.answered_at = Some(std::time::Instant::now());
+        head_written(&mut st);
+        assert!(st.h2.as_ref().unwrap().head_prompt);
+        let mut st = idle_session(&app);
+        st.dialed_at = Some(std::time::Instant::now());
+        st.answered_at = Some(long_ago);
+        head_written(&mut st);
+        assert!(!st.h2.as_ref().unwrap().head_prompt);
     }
 
     fn idle_session(app: &AppState) -> Session {
@@ -2917,35 +3099,195 @@ mod tests {
         on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap();
     }
 
-    /// A refusal received before the request was accepted refuses nothing of
-    /// it: a GOAWAY (or a reset) in a server record that arrived before
-    /// `request_ok` cannot be disclosed for the request, so a client cannot
-    /// keep the provider's idle GOAWAY and release its deposit with it.
+    /// An open connection with no request yet: the head written just now
+    /// (N's last write), two server records received (0, 1).
+    fn before_request(app: &AppState) -> (Session, RelayLog) {
+        let mut log = RelayLog::default();
+        let mut st = idle_session(app);
+        st.h2.as_mut().unwrap().last_req_write = Some(std::time::Instant::now());
+        for c in [&[1u8; 40][..], &[2; 900]] {
+            feed(&mut st, &mut log, c);
+        }
+        (st, log)
+    }
+
+    /// Request 1 (stream 3), accepted now.
+    fn accept_first(app: &Arc<AppState>, tx: &mpsc::UnboundedSender<Message>, st: &mut Session) {
+        on_request(app, tx, st, 1, None, "m".into(), 20, 400, None, None).unwrap();
+    }
+
+    /// The records of the request `accept_first` accepted (HEADERS, one DATA).
+    fn send_accepted(st: &mut Session) {
+        let q = st.h2.as_ref().unwrap().req.as_ref().unwrap();
+        let recs = [record(9 + q.block.len() + 1), record(10 + q.body_len)];
+        for r in &recs {
+            client_bytes(st, r).unwrap();
+        }
+    }
+
+    /// The provider's shutdown GOAWAY races the request: it reaches N just
+    /// before `request_ok` (one round trip), less than `h2.idle_secs` after
+    /// N's last write. It refuses the request, settled like a 429, also when
+    /// the client released a record after it (S_k set later).
     #[tokio::test]
-    async fn a_refusal_received_before_request_ok_refuses_nothing() {
+    async fn a_goaway_that_raced_request_ok_refuses_the_request() {
         let app = app_state(true);
         let (sh, _ev) = shared(&app);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        for (ok_records, refused) in [(3usize, true), (2, false)] {
-            let mut log = RelayLog::default();
-            let mut st = open_session(300);
-            for c in [&[1u8; 40][..], &[2; 900]] {
-                feed(&mut st, &mut log, c);
+        let (mut w, mut up) = upstream().await;
+        for write_after in [false, true] {
+            let (mut st, log) = {
+                let (mut st, mut log) = before_request(&app);
+                feed(&mut st, &mut log, &goaway_frame(1, 0)); // record 2
+                (st, log)
+            };
+            accept_first(&app, &tx, &mut st);
+            let q = st.h2.as_ref().unwrap().req.as_ref().unwrap();
+            assert_eq!((q.ok_records, q.early_from), (3, 0));
+            if write_after {
+                send_accepted(&mut st);
+                on_release(&mut st, 1, 1).unwrap();
+                pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+                prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+                assert_eq!(st.h2.as_ref().unwrap().req.as_ref().unwrap().s_k, Some(3));
+                read_some(&mut up).await;
             }
-            let g = goaway_frame(1, 0);
-            feed(&mut st, &mut log, &g); // record 2
-            // The request was accepted after record 2 arrived (3), or before it (2).
-            st.h2.as_mut().unwrap().req.as_mut().unwrap().ok_records = ok_records;
             texts(&mut rx);
-            let res = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0);
-            if refused {
-                let err = res.unwrap_err();
-                assert!(err.to_string().contains("before request 1 was accepted"), "{err}");
-                assert!(texts(&mut rx).is_empty(), "nothing attested");
-            } else {
-                res.unwrap();
-            }
+            on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(goaway_frame(1, 0)), 0, 0).unwrap();
+            let m = texts(&mut rx);
+            assert_eq!((m[0]["type"].as_str(), m[1]["purpose"].as_str()), (Some("attestation"), Some("refusal")), "write_after {write_after}");
+            prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+            let m = texts(&mut rx);
+            let u = m.iter().find(|x| x["type"] == "usage").unwrap();
+            assert_eq!(u["usage"], serde_json::json!({"refused": "goaway", "error_code": 0, "last_stream_id": 1, "choices": []}));
+            assert_eq!(st.h2.as_ref().unwrap().closing, Some("error_settled"));
         }
+        assert!(read_some(&mut up).await.is_empty(), "a refused request reached the provider");
+    }
+
+    /// What a GOAWAY received before `request_ok` cannot refuse: one older
+    /// than the window before it, one at or past the idle cutoff (N's last
+    /// write of the head or of a request record), a marked request, a GOAWAY
+    /// with an error code. A reset received before `request_ok` never counts
+    /// (no stream of the request existed).
+    #[tokio::test]
+    async fn a_refusal_received_before_request_ok_counts_only_as_a_raced_goaway() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (mut w, _up) = upstream().await;
+        let past = |d: std::time::Duration| std::time::Instant::now().checked_sub(d).unwrap();
+        let idle = app.offer.h2.as_ref().unwrap().idle_secs;
+        let window = goaway_window(idle);
+        let s = std::time::Duration::from_secs;
+        type Setup = Box<dyn Fn(&mut H2)>;
+        type Case = (&'static str, Vec<u8>, Setup, Setup, &'static str);
+        let cases: Vec<Case> = vec![
+            // Arrived more than W before request_ok.
+            ("older than W", goaway_frame(1, 0), Box::new(|_| {}), Box::new(move |h| {
+                for e in h.recent.iter_mut() {
+                    e.1 = past(window + std::time::Duration::from_millis(500));
+                }
+            }), "refuses it only within"),
+            // Arrived `h2.idle_secs` after N's last write: an idle close.
+            ("at the idle cutoff", goaway_frame(1, 0), Box::new(move |h| h.last_req_write = Some(past(s(idle)))), Box::new(|_| {}), "refuses it only within"),
+            ("past the idle cutoff", goaway_frame(1, 0), Box::new(move |h| h.last_req_write = Some(past(s(idle + 5)))), Box::new(|_| {}), "refuses it only within"),
+            // A control record outside a request just before: the request is marked.
+            ("marked", goaway_frame(1, 0), Box::new(|_| {}), Box::new(|h| h.ctl_outside_at = Some(std::time::Instant::now())), "control record"),
+            // A connection error: the client's frames may have caused it.
+            ("error code", goaway_frame(1, 2), Box::new(|_| {}), Box::new(|_| {}), "refusal R"),
+            // Names the request's stream as processed.
+            ("not below the stream", goaway_frame(3, 0), Box::new(|_| {}), Box::new(|_| {}), "refusal R"),
+        ];
+        for (what, g, before, after, msg) in cases {
+            let (mut st, mut log) = before_request(&app);
+            before(st.h2.as_mut().unwrap());
+            feed(&mut st, &mut log, &g); // record 2
+            after(st.h2.as_mut().unwrap());
+            accept_first(&app, &tx, &mut st);
+            texts(&mut rx);
+            let err = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&g), 0, 0).unwrap_err();
+            assert!(err.to_string().contains(msg), "{what}: {err}");
+            assert!(texts(&mut rx).is_empty(), "{what}: nothing attested");
+        }
+        // RST_STREAM(REFUSED_STREAM) on the request's stream before
+        // request_ok, disclosed once a record of the request was written.
+        let (mut st, mut log) = before_request(&app);
+        let rst = rst_frame(3, 7);
+        feed(&mut st, &mut log, &rst); // record 2
+        accept_first(&app, &tx, &mut st);
+        send_accepted(&mut st);
+        on_release(&mut st, 1, 1).unwrap();
+        pump(&sh, &tx, &mut st, &log, &mut w).await.unwrap();
+        prove(&app, &sh, &tx, &mut st, &log, &mut w, "pi_win").await.unwrap();
+        texts(&mut rx);
+        let err = on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&rst), 0, 0).unwrap_err();
+        assert!(err.to_string().contains("a reset that arrived before request 1 was accepted"), "{err}");
+        assert!(texts(&mut rx).is_empty(), "reset: nothing attested");
+    }
+
+    /// The graceful shutdown of RFC 9113 §6.8: GOAWAY(2^31-1) first, then
+    /// GOAWAY with the last processed stream. With the first before
+    /// `request_ok` and the second after it, R may start at either; with
+    /// both before it (within the window), it refuses the request too.
+    #[tokio::test]
+    async fn a_two_goaway_shutdown_around_request_ok_refuses_the_request() {
+        let app = app_state(true);
+        let (sh, _ev) = shared(&app);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (first, second) = (goaway_frame(0x7fff_ffff, 0), goaway_frame(1, 0));
+        for (both_before, record) in [(false, 2usize), (false, 3), (true, 2), (true, 3)] {
+            let (mut st, mut log) = before_request(&app);
+            feed(&mut st, &mut log, &first); // record 2
+            if both_before {
+                feed(&mut st, &mut log, &second); // record 3
+            }
+            accept_first(&app, &tx, &mut st);
+            if !both_before {
+                feed(&mut st, &mut log, &second); // record 3
+            }
+            texts(&mut rx);
+            let r = if record == 2 { [first.clone(), second.clone()].concat() } else { second.clone() };
+            on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, record, &hex::encode(&r), 0, 0)
+                .unwrap_or_else(|e| panic!("both_before {both_before}, record {record}: {e}"));
+            assert_eq!(texts(&mut rx)[1]["purpose"], "refusal");
+        }
+        // The first GOAWAY alone refuses nothing: it names every stream as
+        // possibly processed.
+        let (mut st, mut log) = before_request(&app);
+        feed(&mut st, &mut log, &first);
+        accept_first(&app, &tx, &mut st);
+        assert!(on_disclose_reset(&app, &sh, &tx, &mut st, &log, 1, 2, &hex::encode(&first), 0, 0).is_err());
+    }
+
+    /// `H2::early_from`: the run of the latest server records that arrived
+    /// at most the window before `request_ok`, each before the idle cutoff;
+    /// the arrivals kept are bounded in number and age.
+    #[test]
+    fn the_raced_goaway_run_ends_at_the_window_and_the_idle_cutoff() {
+        let app = app_state(true);
+        let mut st = idle_session(&app);
+        let h = st.h2.as_mut().unwrap();
+        let window = goaway_window(h.cfg.idle_secs);
+        let now = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        h.app_records = 8;
+        assert_eq!(h.early_from(now), 8, "no arrivals kept");
+        h.recent = VecDeque::from(vec![(5, now - window - ms(1), true), (6, now - window, true), (7, now - ms(10), true)]);
+        assert_eq!(h.early_from(now), 6);
+        h.recent = VecDeque::from(vec![(5, now - ms(20), true), (6, now - ms(15), false), (7, now - ms(10), true)]);
+        assert_eq!(h.early_from(now), 7, "a record past the idle cutoff ends the run");
+        h.recent.back_mut().unwrap().2 = false;
+        assert_eq!(h.early_from(now), 8);
+        assert!(window <= MAX_GOAWAY_WINDOW && goaway_window(u64::MAX / 1000) == MAX_GOAWAY_WINDOW);
+        let mut log = RelayLog::default();
+        let mut st = idle_session(&app);
+        for _ in 0..RECENT_RECORDS + 10 {
+            feed(&mut st, &mut log, &[1u8; 10]);
+        }
+        let h = st.h2.as_ref().unwrap();
+        assert_eq!(h.recent.len(), RECENT_RECORDS);
+        assert_eq!(h.recent.back().unwrap().0, RECENT_RECORDS + 9);
     }
 
     /// The cutoff after which a GOAWAY may be an idle close counts from N's
