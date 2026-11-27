@@ -5,6 +5,7 @@
 import { hex, sha256 } from './advice.ts'
 import type { H2OfferBlock } from './h2.ts'
 import { announcedReserve, reservationCeiling, type ReceiptQuery } from './receipt-check.ts'
+import type { Disclosure } from './request-outcome.ts'
 
 export type Framing = '2' | '1.1'
 
@@ -195,6 +196,15 @@ export function certChainProblem(captured: Uint8Array | undefined, attested: unk
 }
 
 /** The deposit a settled request's receipt releases (node mode): the connection's first settlement, the offer's amount. */
+/**
+ * What the client is about to disclose (or accept) for the open request
+ * `n`: a settlement the node finalizes without a receipt is then held to
+ * what it implies (`request_outcome`, §12.10).
+ */
+export function noteDisclosure(s: any, n: number, d: Disclosure): void {
+  if (s.openReq && s.openReq.n === n) s.openReq.disclosure = d
+}
+
 export function noteDepositRelease(s: any, ctx: Ctx, receipt: any, n: number): void {
   const released = receipt.deposit_released_msat
   if (released === undefined) {

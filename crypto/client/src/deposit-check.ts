@@ -40,6 +40,12 @@ export interface DepositContext {
   evictAfterS?: number
   /** Seconds from the client's `setup` to the last frame (default: not judged). */
   ageS?: number
+  /**
+   * The node refused a request of this connection with a 5xx of its own
+   * (`refusalMarksNodeFailure`) and accepted none after it: §12.10 row 6
+   * (default: not judged).
+   */
+  refused5xx?: boolean
 }
 
 /** The outcome as parsed from `deposit_json` (or `deposit`). */
@@ -48,8 +54,29 @@ export interface DepositOutcome {
   msat?: unknown
   outcome?: unknown
   reason?: unknown
+  /** What the credential paid for it: `msat` when charged, 0 when released. */
+  cost_msats?: unknown
   /** An eviction under slot pressure: the evictable unused connections its address held. */
   evicted?: unknown
+}
+
+/**
+ * Whether a `request_refused` marks the connection for §12.10 row 6 (the
+ * deposit released when the connection ends before another request is
+ * accepted): a 5xx of the node's own reservation path. A 5xx about the
+ * credential the request named is not one (a Cashu token the node cannot
+ * redeem now, the wallet lock its redemption waited for, `wallet_busy`): the
+ * client chose that credential, so the node may charge the deposit then. The
+ * client tells them apart by what it sent: only a refusal of a request that
+ * named an API key (not a Cashu token) and no `wallet_busy` marks it.
+ */
+export function refusalMarksNodeFailure(refused: any, requestAuth: unknown): boolean {
+  const status = refused?.status
+  if (!(Number.isSafeInteger(status) && status >= 500 && status <= 599)) return false
+  if (typeof requestAuth !== 'string' || requestAuth.trim() === '' || /^cashu/i.test(requestAuth.trim())) return false
+  const detail = refused?.detail
+  const type = detail && typeof detail === 'object' ? (detail as any).error?.type ?? (detail as any).type : undefined
+  return type !== 'wallet_busy'
 }
 
 /** `evicted.unused_at_address` of a deposit outcome, if well formed (an older node also sent `charge_from`, ignored). */
@@ -73,6 +100,13 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
   }
   if (d.outcome !== 'released' && d.outcome !== 'charged') problems.push(`an outcome ${JSON.stringify(d.outcome ?? null).slice(0, 40)}`)
   if (d.msat !== c.depositMsat) problems.push(`a deposit of ${JSON.stringify(d.msat ?? null).slice(0, 32)} msat, the signed offer's is ${c.depositMsat} msat`)
+  // What the credential paid: the deposit when charged, nothing when released.
+  if (d.outcome === 'charged' && (d.cost_msats !== d.msat || !Number.isSafeInteger(d.cost_msats))) {
+    problems.push(`charged at a cost of ${JSON.stringify(d.cost_msats ?? null).slice(0, 32)} msat, the deposit is ${JSON.stringify(d.msat ?? null).slice(0, 32)} msat`)
+  }
+  if (d.outcome === 'released' && d.cost_msats !== 0) {
+    problems.push(`released at a cost of ${JSON.stringify(d.cost_msats ?? null).slice(0, 32)} msat (a released deposit costs nothing)`)
+  }
   if (d.outcome === 'charged') {
     if (c.releasedByReceipt) problems.push('charged, though a receipt of this connection released it')
     if (frame?.type === 'error' && (frame.fault === 'node' || frame.fault === 'upstream')) {
@@ -102,6 +136,11 @@ export function depositProblems(frame: any, d: DepositOutcome, c: DepositContext
       if (c.openAccepted === true && !(c.framing === '1.1' && c.helloSent === false)) {
         problems.push('charged as evicted, though the node had accepted a request of it (never evicted)')
       }
+    }
+    // Row 6: the node refused a request with a 5xx of its own and accepted
+    // none after it.
+    if (c.refused5xx === true) {
+      problems.push('charged though the node refused a request with a 5xx and accepted none after it (released by §12.10 row 6)')
     }
     // Row 5: the provider closed the open connection while no request of the
     // client was open, and not after control frames of the client alone.

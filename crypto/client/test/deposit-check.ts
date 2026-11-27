@@ -2,12 +2,15 @@
 // node to (`src/deposit-check.ts`, PROTOCOL-V3.md §12.9, §12.10).
 //   node --experimental-strip-types test/deposit-check.ts
 import assert from 'node:assert/strict'
-import { DEPOSIT_RELEASED_REASONS, depositProblems, missingDepositProblem, missingLastFrameProblem } from '../src/deposit-check.ts'
+import { DEPOSIT_RELEASED_REASONS, depositProblems, missingDepositProblem, missingLastFrameProblem, refusalMarksNodeFailure } from '../src/deposit-check.ts'
 
 const SID = 'ab'.repeat(32)
 const ctx = { sid: SID, depositMsat: 7000, releasedByReceipt: false }
 const closed = { type: 'closed' }
-const d = (o: Record<string, unknown>) => ({ sid: SID, msat: 7000, outcome: 'charged', reason: 'unused', ...o })
+const d = (o: Record<string, unknown>) => {
+  const x: Record<string, unknown> = { sid: SID, msat: 7000, outcome: 'charged', reason: 'unused', ...o }
+  return { cost_msats: x.outcome === 'charged' ? x.msat : 0, ...x }
+}
 
 // Honest outcomes.
 assert.deepEqual(depositProblems(closed, d({}), ctx), [])
@@ -57,11 +60,33 @@ assert.deepEqual(depositProblems(closed, d({ outcome: 'released', reason: 'provi
 // Row 5: the provider closed the open connection with no request of the
 // client open. Charged then only after control frames of the client alone.
 const upClosed = { type: 'closed', reason: 'upstream_closed' }
+const evicted0 = () => ({ type: 'closed', reason: 'evicted', unused: true })
 assert.match(depositProblems(upClosed, d({}), { ...ctx, requestOpen: false }).join(), /row 5/)
 assert.deepEqual(depositProblems({ ...upClosed, after_client_frames: true }, d({}), { ...ctx, requestOpen: false }), [])
 assert.deepEqual(depositProblems(upClosed, d({ reason: 'request_abandoned' }), { ...ctx, requestOpen: true }), [])
 assert.deepEqual(depositProblems({ type: 'closed', reason: 'idle' }, d({ reason: 'idle' }), { ...ctx, requestOpen: false }), [])
 assert.deepEqual(depositProblems(upClosed, d({ outcome: 'released', reason: 'provider_closed' }), { ...ctx, requestOpen: false }), [])
+
+// Row 6: a 5xx refusal of the node's own, no request accepted after it.
+assert.match(depositProblems(closed, d({}), { ...ctx, refused5xx: true }).join(), /row 6/)
+assert.match(depositProblems(closed, d({ reason: 'request_abandoned' }), { ...ctx, refused5xx: true }).join(), /row 6/)
+assert.match(depositProblems(evicted0(), d({ reason: 'evicted', evicted: { unused_at_address: 2 } }), { ...ctx, refused5xx: true }).join(), /row 6/)
+assert.deepEqual(depositProblems(closed, d({ outcome: 'released', reason: 'node_failure' }), { ...ctx, refused5xx: true }), [])
+assert.deepEqual(depositProblems(closed, d({}), { ...ctx, refused5xx: false }), [])
+// Which refusals mark it: a 5xx of a request that named an API key, not a
+// Cashu token, and not `wallet_busy`.
+assert.equal(refusalMarksNodeFailure({ status: 500, reason: 'reservation failed' }, 'sk-abc'), true)
+assert.equal(refusalMarksNodeFailure({ status: 503, detail: { error: { type: 'wallet_busy' } } }, 'sk-abc'), false)
+assert.equal(refusalMarksNodeFailure({ status: 500 }, 'cashuBo2F0gaJhaUgA'), false)
+assert.equal(refusalMarksNodeFailure({ status: 500 }, undefined), false)
+assert.equal(refusalMarksNodeFailure({ status: 402 }, 'sk-abc'), false)
+assert.equal(refusalMarksNodeFailure({ status: '500' }, 'sk-abc'), false)
+
+// What the credential paid: the deposit when charged, nothing when released.
+assert.match(depositProblems(closed, d({ cost_msats: 6999 }), ctx).join(), /cost of 6999 msat, the deposit is 7000/)
+assert.match(depositProblems(closed, d({ cost_msats: undefined }), ctx).join(), /cost of null msat/)
+assert.match(depositProblems(closed, d({ outcome: 'released', reason: 'node_failure', cost_msats: 7000 }), ctx).join(), /released at a cost of 7000/)
+assert.match(depositProblems(closed, d({ outcome: 'released', reason: 'node_failure', cost_msats: undefined }), ctx).join(), /released at a cost of null/)
 
 // A last frame with no outcome for a deposit nothing released.
 assert.match(missingDepositProblem(ctx, true, false) ?? '', /no deposit outcome .* 7000 msat/)

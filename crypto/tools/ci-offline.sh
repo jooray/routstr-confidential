@@ -10,8 +10,12 @@
 #   3. the reference client's offline checks (src/{h2-selfcheck,h2-conn-test,
 #      fork-selfcheck}.ts and every test/*-check.ts);
 #   4. gen-client-roots.py regenerates the TLS fork's root store byte for byte;
-#   5. every copy of a shared vector of crypto/conformance in this checkout is
-#      byte-identical to the original;
+#   5. every copy of a shared vector (crypto/conformance, the usage event
+#      vectors of crypto/relay, the HTTP/2 vectors of crypto/client/src) is
+#      byte-identical to the original; the SDK and browser-library copies are
+#      compared only when those checkouts sit beside this one (never in CI,
+#      which checks out this repository alone), and so are the vectors that
+#      live only there (chat suffix, image request): SDK copy against web copy;
 #   6. a secret scan of the files git would see (tracked and untracked, not
 #      ignored): key shapes, and the value of every *_API_KEY variable set in
 #      the environment. A hit prints the file and line, never the match.
@@ -91,7 +95,9 @@ cd "$ROOT"
 ALLFILES=$TMP/files
 git ls-files -co --exclude-standard > "$ALLFILES"
 vec_ok=1
-for v in crypto/conformance/*; do
+SDK_FIX=routstr-sdk/tests/unit/fixtures
+WEB_FIX=../routstr-confidential-web/test/fixtures
+for v in crypto/conformance/* crypto/relay/usage-event-vectors.json crypto/client/src/h2-vectors.json; do
   [ -f "$v" ] || continue
   name=${v##*/}
   copies=0
@@ -106,12 +112,21 @@ for v in crypto/conformance/*; do
     fi
   done < <(grep -E "(^|/)${name//./\\.}\$" "$ALLFILES")
   # The SDK and browser-library checkouts, when present beside this one (git-ignored here).
-  for c in "routstr-sdk/tests/unit/fixtures/$name" "../routstr-confidential-web/test/fixtures/$name"; do
+  for c in "$SDK_FIX/$name" "$WEB_FIX/$name"; do
     [ -f "$c" ] || continue
     copies=$((copies + 1))
     if cmp -s "$v" "$c"; then echo "same  $c"; else echo "DIFF  $c (differs from $v)"; vec_ok=0; fi
   done
   echo "$v: $copies cop$([ $copies = 1 ] && echo y || echo ies)"
+done
+# Vectors with no original in this repository: the SDK and web copies agree.
+for name in chat-suffix-vectors.json image-request-vectors.json; do
+  a=$SDK_FIX/$name b=$WEB_FIX/$name
+  if [ -f "$a" ] && [ -f "$b" ]; then
+    if cmp -s "$a" "$b"; then echo "same  $b = $a"; else echo "DIFF  $b (differs from $a)"; vec_ok=0; fi
+  else
+    echo "$name: SDK or web checkout absent, not compared"
+  fi
 done
 if [ "$vec_ok" = 1 ]; then pass "shared vectors"; else fail "shared vectors"; fi
 

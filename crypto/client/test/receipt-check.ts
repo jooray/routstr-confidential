@@ -85,6 +85,10 @@ try {
   assert.throws(() => check(r({ cost_msats: 1, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000, first: false })), /more than the 0/)
   assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 5000, usage: refused }), q({ status: 0, refusal: 'goaway', reserved: 5000 })), /not the goaway/)
   assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 4000, usage: refused }), q({ status: 0, refusal: 'rst_stream', reserved: 5000 })), /announced 5000/)
+  // An image request's refusal receipt names its terms, as an error receipt does.
+  check(ir({ cost_msats: 100, reserved_msats: 9000, usage: refused }), q({ status: 0, refusal: 'rst_stream', image, reserved: 9000 }))
+  assert.throws(() => check(ir({ count: 1, cost_msats: 100, reserved_msats: 9000, usage: refused }), q({ status: 0, refusal: 'rst_stream', image, reserved: 9000 })), /image request's terms/)
+  assert.throws(() => check(r({ cost_msats: 100, reserved_msats: 9000, usage: refused }), q({ status: 0, refusal: 'rst_stream', image, reserved: 9000 })), /image request's terms/)
   // An accepted image is the flat price exactly, and within the announced reservation.
   check(ir({ cost_msats: 2100, usage: { flat: true }, msat_per_image: 1000 }), q({ status: 200, image }))
   check(ir({ cost_msats: 2100, usage: { flat: true }, msat_per_image: 1000, reserved_msats: 2100 }), q({ status: 200, image, reserved: 2100 }))

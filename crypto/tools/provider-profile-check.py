@@ -5,7 +5,7 @@ Run against the real provider with a real key (costs a fraction of a cent):
 
     VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py            # A1-A14
     VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --images   # I1-I10 (paid)
-    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8, H10
+    VENICE_API_KEY=... python3 -I crypto/tools/provider-profile-check.py --h2       # H1-H8, H10, H11
     python3 -I crypto/tools/provider-profile-check.py --self-test   # offline, mocked
 
 Any other argument (a mistyped mode, ``--h2`` with ``--images``, an option
@@ -56,7 +56,8 @@ Assumptions (paper section 3.1):
   A3  a later object value replaces an earlier one (no merge)
   A4  unknown top-level fields are rejected (400, unrecognized key)
   A5  malformed JSON is rejected (400), so the suffix cannot land inside a
-      nested object or a string
+      nested object or a string, nor after a complete object as trailing bytes
+      the provider would ignore
   A6  max_completion_tokens caps the billed output, reasoning included, up to a
       small overshoot that the reservation margin (OUTPUT_MARGIN tokens) must cover
   A7  the terminal usage event names the model and precedes [DONE], and with
@@ -126,6 +127,12 @@ Framing "2" (``--h2``, PROTOCOL-V3.md section 5.6):
       the client: SETTINGS ACK, PING ACK) stay within the sidecar's
       control-record allowance, counted on the connection that idles for H5
       and extrapolated to the offer's ``h2.max_lifetime_s`` (``h10_problem``)
+  H11 the provider waits for the HTTP/2 preface: a connection whose head goes
+      out ``H11_WAIT_S`` (6 s) after the TLS handshake, more than the 5 s the
+      sidecar may take (``H2_HEAD_PROMPT`` in crypto/relay/src/main.rs: its
+      withdrawal of "2" counts a close after the head only for a head written
+      that soon after the provider's first byte), stays open and answers a
+      request by index
 """
 
 from __future__ import annotations
@@ -710,10 +717,15 @@ def a5_malformed_rejected() -> None:
     r1 = request("{" + MSG + ',"response_format":{"type":"json_object"' + suffix, "A5.1")
     # Private part leaves a string open.
     r2 = request("{" + MSG + ',"user":"abc' + suffix, "A5.2")
+    # Private part is a complete request of its own; the suffix follows it as
+    # trailing bytes. A parser that reads the first value and ignores the rest
+    # would run the private request and never see the pinned suffix.
+    r3 = request(BASE + suffix, "A5.3")
     check(
-        "A5 suffix cannot land inside a nested object or string",
-        ok_c and rejected(r1, EXPECT_BAD_JSON) and rejected(r2, EXPECT_BAD_JSON),
-        f"{ev_c}; open object -> {r1.status} {snip(r1.text, 40)}; open string -> {r2.status} {snip(r2.text, 40)}",
+        "A5 suffix cannot land inside a nested object or string, or after a complete object",
+        ok_c and rejected(r1, EXPECT_BAD_JSON) and rejected(r2, EXPECT_BAD_JSON) and rejected(r3, EXPECT_BAD_JSON),
+        f"{ev_c}; open object -> {r1.status} {snip(r1.text, 40)}; open string -> {r2.status} {snip(r2.text, 40)}; "
+        f"complete object then suffix -> {r3.status} {snip(r3.text, 40)}",
     )
 
 
@@ -1045,8 +1057,8 @@ def run_all(pause: float = 0.3, quiet: bool = False, checks: list | None = None)
 #   I2 unknown keys rejected                     I7 waits for the full body
 #   I3 unknown model refused, no fallback        I8 TLS 1.3 / suite / P-256 / ALPN
 #   I4 no head reflection (success and error)    I9 KeyUpdate after the head
-#   I5 an open string cannot swallow the suffix  I10 aliases in the private part
-#                                                    (the other count key, an explicit
+#   I5 an open string or trailing bytes cannot   I10 aliases in the private part
+#      hide the suffix                               (the other count key, an explicit
 #                                                    size, the other format key) lose
 #                                                    to the pins or are refused
 # ---------------------------------------------------------------------------
@@ -1154,8 +1166,13 @@ def i3_image_unknown_model() -> None:
 
 def i5_image_malformed() -> None:
     r = image_request(f'{{"prompt":"x,"model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "I5")
-    check("I5 image route: an open string cannot swallow the suffix (free)", 400 <= r.status < 500 and r.status != 429,
-          f"{r.status} {snip(r.text, 60)}")
+    # A complete request, then the suffix as trailing bytes. A fit provider
+    # refuses it (free); one that reads only the first value generates an image.
+    whole = f'{{"prompt":"x","model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}'
+    r2 = image_request(whole + f',"model":"{IMAGE_MODEL}","variants":1,{IMAGE_PINS}}}', "I5.2")
+    check("I5 image route: an open string or trailing bytes cannot hide the suffix (free)",
+          all(400 <= x.status < 500 and x.status != 429 for x in (r, r2)),
+          f"open string -> {r.status} {snip(r.text, 40)}; complete object then suffix -> {r2.status} {snip(r2.text, 40)}")
 
 
 IMAGE_COUNT_KEY = _IMAGES.get("count_key") or ("variants" if "/image/generate" in IMAGE_PATH else "n")
@@ -1303,8 +1320,15 @@ H2_NAMES = {
     "H7": "H7 no response reflects the credential",
     "H8": "H8 the usage event and [DONE] end the stream as the disclosure parses it",
     "H10": "H10 the provider's SETTINGS and PING stay within the control-record allowance",
+    "H11": "H11 the provider waits for the HTTP/2 preface longer than the sidecar may take",
 }
 H2_MAX_LIFETIME = int(_H2.get("max_lifetime_s", 3600))
+# The longest the sidecar may take from the provider's first byte to the
+# connection head and still count a close after it towards the withdrawal of
+# "2" (crypto/relay/src/main.rs: H2_HEAD_PROMPT; PROTOCOL-V3.md section 2.1).
+# A copy: change both together. H11 writes its head a second later.
+H2_HEAD_PROMPT_S = 5.0
+H11_WAIT_S = H2_HEAD_PROMPT_S + 1.0
 
 # The sidecar's control-record allowance (crypto/relay/src/h2_session.rs:
 # CTL_BURST, CTL_REFILL, MAX_QUEUED_CTL, ctl_allowance; PROTOCOL-V3.md
@@ -1510,7 +1534,7 @@ def run_h2() -> int:
 
     guarded(["H1"], p_h1)
     if res.get("H1", ("", ""))[0] == "FAIL":
-        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10"):
+        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10", "H11"):
             put(it, "FAIL", "not checked: no HTTP/2 connection (H1)")
         return _h2_verdict(res)
 
@@ -1531,12 +1555,12 @@ def run_h2() -> int:
     probe = state.get("probe")
     ctl = state.get("control")
     if probe is not None and probe.status in H2_UNAUTH:
-        for it in ("H2", "H3", "H5", "H6", "H8", "H10"):
+        for it in ("H2", "H3", "H5", "H6", "H8", "H10", "H11"):
             put(it, "FAIL", f"the key is refused: probe GET {H2_PROBE} with the literal credential -> {probe.status}")
     elif ctl is not None and 400 <= ctl.status < 500 and ctl.status not in H2_UNAUTH:
         # Not the provider's HTTP/2: the plain request itself is refused (the
         # model, the body). Nothing can be concluded from such a run.
-        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10"):
+        for it in ("H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10", "H11"):
             put(it, "INCONCLUSIVE", f"the check's own chat request is refused: {ctl.status} {snip(ctl.text, 70)} (name a chat model of this provider with --model)")
         for c in conns:
             c.tr.close()
@@ -1614,6 +1638,42 @@ def run_h2() -> int:
             + ("" if ok or r.status != 413 else f" (the provider refuses a body this large: run the sidecar with a smaller --max-body and check that size with --h2-body-bytes)"))
 
     guarded(["H6"], p_big)
+
+    # ---- H11: a connection head written later than the sidecar may take.
+    # The provider's timer for the preface runs from its handshake at the
+    # latest; nothing is written until H11_WAIT_S after it.
+    def p_late_head() -> None:
+        tr = TRANSPORT["h2"]()
+        t0 = tr.now()
+        early, gone = b"", False
+        while tr.now() - t0 < H11_WAIT_S:
+            try:
+                early += tr.recv(min(1.0, max(0.0, H11_WAIT_S - (tr.now() - t0))))
+            except h2.TransportClosed:
+                gone = True
+                break
+        waited = tr.now() - t0
+        if gone:
+            tr.close()
+            put("H11", "FAIL", f"the provider closed the connection {waited:.1f} s after the handshake, before the HTTP/2 preface "
+                f"(the sidecar may write it up to {H2_HEAD_PROMPT_S:.0f} s after the provider's first byte)")
+            return
+        c = h2.H2Client(tr, HOST, KEY)
+        c.buf = early  # the provider's own preface (SETTINGS), if it sent it already
+        conns.append(c)
+        c.open(H2_PROBE, True)
+        c.key_update()
+        c.pump(lambda: bool(c.peer_settings) and c.settings_acked, 10.0)
+        if c.closed or c.goaway:
+            put("H11", "FAIL", f"the provider closed the connection after a head written {waited:.1f} s after the handshake{_goaway(c)}")
+            return
+        r = h2_request(c, PATH, h2_body(), f"chat by index, head {waited:.0f} s after the handshake")
+        ok = h2_stream_ok(r, CHEAP)
+        put("H11", "PASS" if ok else "FAIL",
+            f"head written {waited:.1f} s after the handshake (the sidecar's bound {H2_HEAD_PROMPT_S:.0f} s), then a request -> {r.status}"
+            + ("" if ok else f" {snip(r.text, 60)}"))
+
+    guarded(["H11"], p_late_head)
 
     # ---- The image paths of H7 (item 8 / I4): error (free), success (paid).
     def p_images() -> None:
@@ -1739,9 +1799,9 @@ def _h2_verdict(res: dict) -> int:
             print(f'  keep "http": ["1.1"] in the offer file for {HOST}.')
         elif inc:
             print(f'offer "2": not yet, because the check is incomplete ({why(inc)})')
-            print('  run it again; add "2" only after a run in which H1-H8 and H10 all pass.')
+            print('  run it again; add "2" only after a run in which H1-H8, H10 and H11 all pass.')
         else:
-            print(f'offer "2": yes. {HOST} does what framing "2" needs (H1-H8, H10).')
+            print(f'offer "2": yes. {HOST} does what framing "2" needs (H1-H8, H10, H11).')
             print(f'  "http": ["2", "1.1"] with "h2": {{"probe_path": {json.dumps(H2_PROBE)}, "idle_secs": at most {H2_IDLE:.0f}}}; '
                   f"the sidecar's --max-body at most {H2_BODY_BYTES}.")
     return 1 if fails else (2 if inc else 0)
@@ -1772,12 +1832,16 @@ class MockProvider:
                  no_close: bool = False, no_ku: bool = False, crlf: bool = False,
                  pretty: bool = False, image_free: bool = False, image_fee: bool = False,
                  h2_alpn: bool = True, open_auth: bool = False, reflect_body: bool = False, h2: dict | None = None,
-                 alias_cap: bool = False, image_alias: bool = False, image_lenient: bool = False) -> None:
+                 alias_cap: bool = False, image_alias: bool = False, image_lenient: bool = False,
+                 first_value: bool = False) -> None:
         self.h2_alpn, self.open_auth, self.reflect_body, self.h2_faults = h2_alpn, open_auth, reflect_body, h2 or {}
         # alias_cap: max_output_tokens accepted and obeyed over the pinned caps;
         # image_alias: the other count key, width/height and output_format
         # accepted and obeyed over the pins; image_lenient: accepted, ignored.
         self.alias_cap, self.image_alias, self.image_lenient = alias_cap, image_alias, image_lenient
+        # first_value: the body parser reads the first JSON value and ignores
+        # whatever follows it.
+        self.first_value = first_value
         self.status, self.lenient, self.cipher = status, lenient, cipher
         self.hs_refuse, self.timeout, self.early = hs_refuse, timeout, early
         self.no_close, self.no_ku = no_close, no_ku
@@ -1790,7 +1854,10 @@ class MockProvider:
         if self.status is not None:
             return Resp(self.status, '{"error":"mock"}')
         try:
-            d = json.loads(body)  # duplicate keys: last wins, objects replaced
+            if self.first_value:
+                d = json.JSONDecoder().raw_decode(body)[0]
+            else:
+                d = json.loads(body)  # duplicate keys: last wins, objects replaced
         except json.JSONDecodeError:
             return Resp(400, '{"error":"Invalid JSON request"}')
         extra = set(d) - self.ALLOWED - ({"max_output_tokens"} if self.alias_cap else set())
@@ -1985,6 +2052,8 @@ def self_test() -> int:
          lambda v, rc: rc == 1 and v.get("A13") == "FAIL"),
         ("a cap alias (max_output_tokens) obeyed over the pinned cap fails A14", MockProvider(alias_cap=True),
          lambda v, rc: rc == 1 and v.get("A14") == "FAIL" and v.get("A4") == "PASS"),
+        ("a parser that ignores bytes after the first JSON value fails A5", MockProvider(first_value=True),
+         lambda v, rc: rc == 1 and v.get("A5") == "FAIL" and v.get("A2") == "PASS" and v.get("A4") == "PASS"),
     ]
     # The image route (--images): I10 alone, offline; the other image checks
     # read the provider's own echo and run live only.
@@ -2007,9 +2076,9 @@ def self_test() -> int:
     global QUIET, H2_IMAGES, H2_IDLE, H2_BODY_BYTES, H2_PROBE
     QUIET, H2_IMAGES, H2_BODY_BYTES, H2_PROBE = True, True, 300_000, H2_PROBE or "/v1/models"
     H2_IDLE = float(H2_OFFER_IDLE)
-    hs = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10"]
+    hs = ["H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8", "H10", "H11"]
     h2_scenarios = [
-        ("h2: healthy provider passes H1-H8, H10", MockProvider(),
+        ("h2: healthy provider passes H1-H8, H10, H11", MockProvider(),
          lambda v, rc: rc == 0 and all(v.get(k) == "PASS" for k in hs)),
         ("h2: ALPN h2 not selected fails H1, nothing passes", MockProvider(h2_alpn=False),
          lambda v, rc: rc == 1 and v.get("H1") == "FAIL" and not any(x == "PASS" for x in v.values())),
@@ -2043,6 +2112,10 @@ def self_test() -> int:
          lambda v, rc: rc == 1 and v.get("H10") == "FAIL" and v.get("H5") == "PASS"),
         ("h2: 17 PINGs at once fail H10 (more than may wait unproven)", MockProvider(h2={"ping_burst": (200.0, 17)}),
          lambda v, rc: rc == 1 and v.get("H10") == "FAIL"),
+        ("h2: a provider that waits 10 s for the HTTP/2 preface passes H11", MockProvider(h2={"preface_wait": 10.0}),
+         lambda v, rc: rc == 0 and v.get("H11") == "PASS"),
+        ("h2: a provider that closes 3 s after its handshake without the preface fails H11", MockProvider(h2={"preface_wait": 3.0}),
+         lambda v, rc: rc == 1 and v.get("H11") == "FAIL" and v.get("H2") == "PASS" and v.get("H5") == "PASS"),
         ("h2: CRLF event stream fails H8", MockProvider(crlf=True),
          lambda v, rc: rc == 1 and v.get("H8") == "FAIL"),
         ("h2: multi-line usage event fails H8", MockProvider(pretty=True),

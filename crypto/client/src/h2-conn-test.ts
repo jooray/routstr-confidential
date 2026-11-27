@@ -248,6 +248,31 @@ for (const kind of ['goaway', 'rst_stream'] as const) {
   ok(!wire.includes('disclose_reset') && String(out).includes('reset stream 3'), `a reset after a response head is not disclosed (got: ${out})`)
 }
 
+// 6c. A GOAWAY(NO_ERROR) below the stream that reached us before the request
+//     was sent: nothing is sent (not processed, may run on a new connection).
+//     One that arrived after the `request`, before `request_ok`, is disclosed
+//     (6b); R starts no later than the record of the refusing frame.
+{
+  const rig = requestRig(0)
+  const { conn, wire } = rig
+  conn.onFrame(fr(FRAME.GOAWAY, 0, 0, Uint8Array.from([0, 0, 0, 1, 0, 0, 0, 0])))
+  const out = await within(conn.request(1).catch((e: Error) => e), 5000, 'goaway before the request')
+  ok(String(out).includes('not sent') && !wire.includes('request') && !wire.includes('disclose_reset'), `a request is not sent past a GOAWAY that leaves it out (got: ${out}; wire ${wire.join(', ')})`)
+}
+{
+  const { conn } = requestRig()
+  const g = Uint8Array.from([0, 0, 8, FRAME.GOAWAY, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
+  conn.reader.push(new Uint8Array(13), 4) // a WINDOW_UPDATE-sized record
+  conn.reader.push(g, 5)
+  conn.reader.push(new Uint8Array(13), 6)
+  const c = cur(1)
+  c.refusal = { kind: 'goaway', start: 13, end: 30, last: 1 }
+  c.recvAtSend = 6
+  ok(conn.refusalStart(c) === 5, `R starts at the GOAWAY's record when it precedes the request's start (${conn.refusalStart(c)})`)
+  c.recvAtSend = 4
+  ok(conn.refusalStart(c) === 4, `R starts at the request's start otherwise (${conn.refusalStart(c)})`)
+}
+
 // 7. SETTINGS_INITIAL_WINDOW_SIZE applies to the open stream (RFC 9113 §6.9.2).
 {
   const { conn, releases } = requestRig(0)

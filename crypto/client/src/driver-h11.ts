@@ -13,10 +13,11 @@
 import { randomBytes } from 'node:crypto'
 
 import { concat, hex } from './advice.ts'
-import { certChainProblem, noteDepositRelease, openRequest, takeReceipt, type Ctx, type ReqBody } from './ctx.ts'
+import { certChainProblem, noteDepositRelease, noteDisclosure, openRequest, takeReceipt, type Ctx, type ReqBody } from './ctx.ts'
 import { checkPiWinFinalRecord } from './h2.ts'
-import { extractR, finalHeadOffset, responseBody } from './http1.ts'
+import { extractR, finalHeadOffset, responseBody, usageEventOfR } from './http1.ts'
 import { checkPiC3SParams, serverTailEpoch } from './params.ts'
+import { maxUsageCharge } from './offer.ts'
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
@@ -122,6 +123,8 @@ export class H11 {
       let shape = { windows: zp.params?.PiWin?.windows?.length ?? 0, ctBytes: 0 }
       if (!adv) shape = checkPiWinFinalRecord(zp, { anchor: s.ap.h1, seq: finalSeq, wire: finalRecord, suffix: b.suffix })
       const t = Date.now()
+      // From here the request may reach the provider.
+      s.releaseSentN = 1
       await s.proof('pi_win', 'prove', zp.params, { Secret: Array.from(s.ap.clientAp1) })
       this.pushProof({ proof: 'pi_win', purpose: 'records', n: 1, records: 1, ...shape, ms: Date.now() - t }, 'pi_win')
       ctx.log({ ev: 'pi_win_ok', first_seq: finalSeq })
@@ -166,6 +169,7 @@ export class H11 {
     let imageOut: any
     if (b.image && ((status >= 200 && status < 300) || (ctx.acceptAny && status > 0))) {
       // Only a 2xx is accepted (`acceptAny` is the dishonest client): nothing is disclosed or proven.
+      noteDisclosure(s, 1, { kind: 'images', imagesMsat: b.image.msatPerImage * b.image.count })
       s.sendText({ type: 'accept', n: 1 })
       receipt = await takeReceipt(s, ctx, 1, attJson, wait)
       if (receipt.usage?.flat !== true) throw new Error('the settlement of an accepted image request is not flat')
@@ -174,11 +178,13 @@ export class H11 {
     } else if (status >= 200 && status < 300 && !b.image) {
       const r = extractR(resp)
       if (!r) throw new Error('could not extract a valid usage disclosure R')
+      const mine = usageEventOfR(r)
+      const rates = ctx.offer?.price_list?.[b.model]
+      if (rates && mine?.usage) noteDisclosure(s, 1, { kind: 'usage', usageMsat: maxUsageCharge(rates, mine.usage) })
       await this.disclose('disclose', r, 0)
       receipt = await takeReceipt(s, ctx, 1, attJson, wait)
-      const parts = Buffer.from(r).toString('utf8').split('data: ')
-      const usageSeg = parts.length >= 2 ? parts[parts.length - 2]! : '{}'
-      ownUsage = JSON.parse(usageSeg.split('\r\n')[0]!.split('\n\n')[0]!.trim())
+      ownUsage = usageEventOfR(r)
+      if (!ownUsage) throw new Error('could not parse our own usage event')
       const u = receipt.usage?.usage
       if (u?.prompt_tokens !== ownUsage.usage?.prompt_tokens || u?.completion_tokens !== ownUsage.usage?.completion_tokens) {
         throw new Error('receipt usage does not match our own plaintext')
@@ -192,6 +198,7 @@ export class H11 {
       const headEnd = Buffer.from(resp).indexOf('\r\n\r\n')
       if (headEnd < 0) throw new Error('upstream error response has no head')
       const r = resp.slice(0, headEnd + 4)
+      noteDisclosure(s, 1, { kind: 'error_head', status, imagesMsat: b.image ? b.image.msatPerImage * b.image.count : undefined })
       await this.disclose('disclose_head', r, resp.length - r.length)
       receipt = await takeReceipt(s, ctx, 1, attJson, wait)
       if (receipt.usage?.error_status !== status) throw new Error('error receipt does not match the disclosed status')

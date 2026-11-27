@@ -106,7 +106,7 @@ import { padBody, pinnedModel, renderChatSuffix, renderImagesSuffix } from './of
 import { checkPiNKParams, type ServerPostRecord } from './params.ts'
 import { makeReceiptChecker } from './receipt-check.ts'
 import { pubkeyHex, verifySig } from './sig.ts'
-import { depositProblems, missingDepositProblem, missingLastFrameProblem } from './deposit-check.ts'
+import { depositProblems, missingDepositProblem, missingLastFrameProblem, refusalMarksNodeFailure } from './deposit-check.ts'
 import { requestOutcomeProblems, type OpenRequest } from './request-outcome.ts'
 import { errText, shown, termSafe } from './term.ts'
 import { TwoPc, type ApOut } from './twopc.ts'
@@ -550,6 +550,12 @@ class Session {
   requestOpen = false
   /** That request, as far as the node answered it (for its signed outcome, §12.10). */
   openReq: OpenRequest | undefined
+  /** The credential the open request named (`request.auth`). */
+  openAuth: unknown
+  /** The request we last released (framing "2": sent a `release` for; "1.1": proved its final record). */
+  releaseSentN: number | undefined
+  /** The node refused a request with a 5xx of its own and accepted none after it (§12.10 row 6). */
+  refused5xx = false
   /** The node's signed outcome of a request finalized without a receipt (§12.9). */
   requestOutcome: { n: unknown; outcome: string; reason: string; cost_msats: unknown; signed: boolean } | undefined
   /** The node sent a last frame (`closed` or `error`). */
@@ -659,10 +665,15 @@ class Session {
         process.stderr.write(`[client ${this.label}] <- ${shown(m.type)}\n`)
         trace('<-', shown(m.type))
         if (typeof m.type === 'string' && this.tFirst[m.type] === undefined) this.tFirst[m.type] = Date.now()
-        if (m.type === 'body_released') {
+        // Only for a request we released (framing "2": a `release`; "1.1":
+        // the π_WIN of its final record): an early one would mark an
+        // unreleased request as one that may have reached the provider.
+        if (m.type === 'body_released' && this.releaseSentN !== undefined && m.n === this.releaseSentN) {
           this.bodyReleased = true
           if (this.openReq && m.n === this.openReq.n) this.openReq.bodyReleased = true
         }
+        if (m.type === 'request_refused' && refusalMarksNodeFailure(m, this.openAuth)) this.refused5xx = true
+        if (m.type === 'request_ok') this.refused5xx = false
         if (m.type === 'request_ok' && this.openReq && m.n === this.openReq.n) {
           this.openReq.accepted = true
           if (Number.isSafeInteger(m.reserved_msats) && m.reserved_msats >= 0) this.openReq.reservedMsats = m.reserved_msats
@@ -742,6 +753,7 @@ class Session {
       signed,
       requestOpen: this.requestOpen,
       openAccepted: this.openReq?.accepted === true,
+      refused5xx: this.refused5xx,
       framing: this.framing,
       helloSent: this.helloSent,
       evictAfterS: EVICT_AFTER_S,
@@ -816,11 +828,13 @@ class Session {
     trace('->', shown((obj as any)?.type))
     if ((obj as any)?.type === 'request') {
       this.requestOpen = true
+      this.openAuth = (obj as any).auth
       // A `request` while one is open is a protocol error the node refuses
       // (one request at a time): the open one is still the one at stake.
       this.openReq ??= { n: Number((obj as any).n), accepted: false, bodyReleased: false, disclosed: false }
     }
     if (['disclose', 'disclose_head', 'disclose_reset', 'accept'].includes((obj as any)?.type) && this.openReq) this.openReq.disclosed = true
+    if ((obj as any)?.type === 'release' && Number.isSafeInteger((obj as any).n)) this.releaseSentN = (obj as any).n
     if ((obj as any)?.type === 'setup') this.tSetupSent = Date.now()
     this.ws.send(text)
   }

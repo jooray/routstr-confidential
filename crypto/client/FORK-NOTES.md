@@ -89,7 +89,7 @@ changes; without a call the client behaves as before. **This patch is only in
 the reference client's copy**: the SDK fork and the web library do not have it
 yet.
 
-## Security patches (TLS-01 … TLS-21)
+## Security patches (TLS-01 … TLS-22)
 
 Marked in-source with `// FORK PATCH (TLS-xx)`. The `.js` files are
 identical in the SDK fork (`routstr-sdk/client/confidential/tls-fork`) and the
@@ -204,8 +204,21 @@ reference client (`crypto/client/vendor/tls`); only `.d.ts` import extensions di
 - **TLS-20** (an RSA signature has the length of the modulus; the ALPN
   report; no ChangeCipherSpec after the handshake): the full text is in the
   SDK copy of this file.
+- **TLS-22, the record layer; no SHA-1 certificate signatures**
+  (`utils/packets.js` `makeMessageProcessor`; `make-tls-client.js`
+  `processPacketInner`; `utils/x509.js` `getSigAlgorithm`). A record of outer
+  type 0 was taken for "no record in progress", so when its body arrived in
+  a later read the body was parsed as the next record header, and the
+  client's records no longer matched the ones the connection counts on the
+  wire. A record of an outer type other than 20 to 23 was logged and skipped;
+  it now ends the client (unexpected_message, RFC 8446 §5), and so does a
+  record longer than 2^14 + 256 bytes (record_overflow, §5.2). A certificate
+  signed with SHA-1 is refused (webpki, the sidecar's verifier, refuses it
+  too); trust anchors are not checked by their own signature, so a root
+  self-signed with SHA-1 still anchors a path. None of the three is in the
+  transcript, and an honest provider sends none of them.
 
-Offline check of TLS-15 to TLS-21: `npm run tls-records-check`
+Offline check of TLS-15 to TLS-22: `npm run tls-records-check`
 (`test/tls-fork-records-check.ts`).
 
 ## Runtime dependencies

@@ -1,5 +1,5 @@
 // Offline check of the vendored TLS fork's record rules (FORK PATCH TLS-15,
-// TLS-16, TLS-21) and of what it accepts as a server flight (TLS-17, TLS-18, TLS-19).
+// TLS-16, TLS-21, TLS-22) and of what it accepts as a server flight (TLS-17, TLS-18, TLS-19).
 //
 //   node --experimental-strip-types test/tls-fork-records-check.ts
 //
@@ -33,7 +33,11 @@
 //     CertificateVerify; a P-384 signature with a short r or s verifies;
 //   - TLS-20: an RSA-PSS signature has the length of the modulus (one whose
 //     leading zero byte was dropped is refused), no ALPN protocol is reported
-//     when the server selected none, a ChangeCipherSpec after the handshake.
+//     when the server selected none, a ChangeCipherSpec after the handshake;
+//   - TLS-22: a record of outer type 0 is a record (also when its body comes
+//     in a later read) and is refused, so is an outer type TLS does not
+//     define and a record longer than 2^14 + 256 bytes; a certificate signed
+//     with SHA-1 is refused.
 //
 // Self-contained: imports only the vendored fork and its dependencies.
 
@@ -45,7 +49,7 @@ import { webcryptoCrypto } from '../vendor/tls/lib/crypto/webcrypto.js'
 import { deriveTrafficKeysForSide } from '../vendor/tls/lib/utils/decryption-utils.js'
 import { packFinishMessagePacket } from '../vendor/tls/lib/utils/finish-messages.js'
 import { concatenateUint8Arrays } from '../vendor/tls/lib/utils/generics.js'
-import { getSignatureDataTls13 } from '../vendor/tls/lib/utils/parse-certificate.js'
+import { getSignatureDataTls13, verifyCertificateChain } from '../vendor/tls/lib/utils/parse-certificate.js'
 import { encryptWrappedRecord } from '../vendor/tls/lib/utils/wrapped-record.js'
 import { loadX509FromDer } from '../vendor/tls/lib/utils/x509.js'
 
@@ -77,7 +81,7 @@ type Issued = { cert: x509.X509Certificate; keys: CryptoKeyPair }
 let serial = 1
 async function issue(
   subject: string,
-  opts: { issuer?: Issued; ca?: boolean; san?: string[]; keyAlg?: object },
+  opts: { issuer?: Issued; ca?: boolean; san?: string[]; keyAlg?: object; signAlg?: object },
 ): Promise<Issued> {
   const keys = (await crypto.subtle.generateKey((opts.keyAlg ?? ALG) as any, true, ['sign', 'verify'])) as CryptoKeyPair
   const extensions: x509.Extension[] = []
@@ -103,7 +107,7 @@ async function issue(
     notAfter: new Date(now + 86400_000),
     publicKey: keys.publicKey,
     signingKey: opts.issuer ? opts.issuer.keys.privateKey : keys.privateKey,
-    signingAlgorithm: ALG,
+    signingAlgorithm: (opts.signAlg ?? ALG) as any,
     extensions,
   })
   return { cert, keys }
@@ -660,6 +664,49 @@ for (const [what, first] of [
     /ChangeCipherSpec after the TLS 1.3 handshake/,
   )
   check('  the client ended', c.client.hasEnded())
+}
+
+{
+  // TLS-22: a record of outer type 0, its header alone, then a body that
+  // itself looks like a record header.
+  const c = await afterServerHello()
+  const body = plain(0x17, [0, 0, 0, 0, 0])
+  await c.client.handleReceivedBytes(new Uint8Array([0x00, 0x03, 0x03, ...u16(body.length)]))
+  await rejects('a record of outer type 0 is read as a record, also when its body arrives later, and refused', c.client.handleReceivedBytes(body), /unknown outer type 0/)
+  check('  the client ended once', c.client.hasEnded() && c.ended.length === 1)
+}
+{
+  const c = await afterServerHello()
+  await rejects('a record of an outer type TLS does not define is refused (unexpected_message)', c.client.handleReceivedBytes(plain(0x18, [1, 0, 0])), /unknown outer type 24/)
+  check('  the client ended', c.client.hasEnded())
+}
+{
+  const c = await afterServerHello()
+  await rejects('a record longer than 2^14 + 256 bytes is refused (record_overflow)', c.client.handleReceivedBytes(plain(0x17, new Uint8Array(16384 + 257))), /above the limit of 16640/)
+  check('  the client ended', c.client.hasEnded())
+}
+{
+  // TLS-22: no SHA-1 certificate signatures. A WebCrypto RSA key is bound to
+  // one hash: one root per hash.
+  const load = (i: Issued) => loadX509FromDer(new Uint8Array(i.cert.rawData))
+  const chain = async (hash: string) => {
+    const rsa = { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash }
+    const rsaRoot = await issue('CN=Test RSA Root', { ca: true, keyAlg: rsa, signAlg: rsa })
+    const rsaLeaf = await issue(`CN=${HOST}`, { issuer: rsaRoot, ca: false, san: [HOST], signAlg: { name: 'RSASSA-PKCS1-v1_5', hash } })
+    return { rsaRoot, rsaLeaf }
+  }
+  const verify = (x: { rsaRoot: Issued; rsaLeaf: Issued }) => verifyCertificateChain([load(x.rsaLeaf)], HOST, quiet, undefined, [load(x.rsaRoot)])
+  const good = await chain('SHA-256')
+  let err = ''
+  try {
+    await verify(good)
+  } catch (e) {
+    err = e instanceof Error ? e.message : String(e)
+  }
+  check('a chain signed with SHA-256 verifies', err === '', err)
+  const sha1 = await chain('SHA-1')
+  check('  the same chain signed with SHA-1 names SHA-1', (sha1.rsaLeaf.cert.signatureAlgorithm as any).hash?.name === 'SHA-1')
+  await rejects('a certificate signed with SHA-1 is refused', verify(sha1), /Unsupported hash algorithm: SHA-1/)
 }
 
 if (failures) {

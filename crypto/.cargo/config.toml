@@ -1,4 +1,4 @@
-# Reuse the pre-compiled mpz2 dependency artifacts that shipped in
-# zkbench/target so the pinned (rev 8f89783) VOLE deps are not rebuilt.
+# The whole workspace builds into zkbench/target, so the mpz2 dependency
+# (pinned by rev in twopc/Cargo.toml and zkbench/Cargo.toml) is compiled once.
 [build]
 target-dir = "zkbench/target"

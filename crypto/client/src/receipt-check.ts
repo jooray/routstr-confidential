@@ -110,6 +110,9 @@ export function makeReceiptChecker(label: string, terms: () => ReceiptTerms): (r
       if (receipt.usage?.refused !== q.refusal) {
         throw new Error(`refusal receipt ${q.n} names ${shown(receipt.usage?.refused)}, not the ${q.refusal} we disclosed`)
       }
+      if (q.image && !(receipt.kind === 'images' && receipt.model === q.model && receipt.variant === q.image.variant && receipt.count === q.image.count)) {
+        throw new Error(`refusal receipt ${q.n} does not carry the image request's terms`)
+      }
       bound = feeDue
     } else if (q.status >= 400 && !(q.image && receipt.usage?.flat === true)) {
       // 429/503 and 401/402/403 (the provider's capacity, the node's own key

@@ -271,6 +271,17 @@ ok(
   ok(r !== null && new TextDecoder().decode(r).startsWith(`\ndata: ${last}`), 'usage on every chunk: R starts at the last event')
   const merged = `data: ${last}\n\ndata: ${content}\n\ndata: [DONE]\n\n`
   ok(extractR(new TextEncoder().encode(`HTTP/1.1 200 OK\r\n\r\n${merged.length.toString(16)}\r\n${merged}\r\n0\r\n\r\n`)) === null, 'usage merged into content: no R')
+  // The client's own usage event, read from R as the "1.1" driver reads it:
+  // the same event in one chunk or split across chunks, and a repeated key refused.
+  const { usageEventOfR } = await import('./http1.ts')
+  ok(usageEventOfR(r!)?.usage?.prompt_tokens === 14, 'own usage from R (one chunk)')
+  const tail = `data: ${last}\n\ndata: [DONE]\n\n`
+  const cut = 30
+  const split = `${cut.toString(16)}\r\n${tail.slice(0, cut)}\r\n${(tail.length - cut).toString(16)}\r\n${tail.slice(cut)}\r\n0\r\n\r\n`
+  const rs = extractR(new TextEncoder().encode(`HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n${split}`))
+  ok(rs !== null && usageEventOfR(rs)?.usage?.completion_tokens === 3, 'own usage from R (event split across chunks)')
+  const dup = `data: {"usage":{"prompt_tokens":14,"completion_tokens":3,"completion_tokens":1}}\n\ndata: [DONE]\n\n`
+  ok(usageEventOfR(new TextEncoder().encode(`${dup.length.toString(16)}\r\n${dup}\r\n0\r\n\r\n`)) === null, 'own usage with a repeated key: refused')
 }
 
 console.log(`h2-selfcheck: ${checks} checks passed`)

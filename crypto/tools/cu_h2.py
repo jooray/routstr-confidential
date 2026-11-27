@@ -706,7 +706,8 @@ class MockH2:
     def __init__(self, key: str, app: Callable, *, close_on_ku: bool = False, table_size: int | None = None,
                  dynamic_responses: bool = False, forget_after_idle: bool = False, stall: bool = False,
                  reflect_header: bool = False, dead: bool = False, window: int = 65535,
-                 ping_every: float | None = None, ping_burst: tuple[float, int] | None = None) -> None:
+                 ping_every: float | None = None, ping_burst: tuple[float, int] | None = None,
+                 preface_wait: float | None = None) -> None:
         self.key, self.app = key, app
         self.close_on_ku, self.table_size, self.dynamic_responses = close_on_ku, table_size, dynamic_responses
         self.forget_after_idle, self.stall, self.reflect_header, self.dead = forget_after_idle, stall, reflect_header, dead
@@ -715,6 +716,9 @@ class MockH2:
         # ``ping_burst = (at, n)``: n at once ``at`` s in (H10).
         self.ping_every, self.ping_burst = ping_every, ping_burst
         self.next_ping = ping_every
+        # The provider closes a connection whose HTTP/2 preface has not come
+        # ``preface_wait`` s after its handshake (H11).
+        self.preface_wait = preface_wait
         self.clock = 0.0
         self.last_send = 0.0
         self.inbuf = b""
@@ -745,6 +749,8 @@ class MockH2:
             self.closed = True
 
     def recv(self, timeout: float) -> bytes:
+        if not self.preface and self.preface_wait is not None and self.clock >= self.preface_wait:
+            self.closed = True
         if self.preface and not self.closed and not self.dead:
             while self.next_ping is not None and self.clock >= self.next_ping:
                 self.out += frame(PING, 0, 0, b"\0" * 8)

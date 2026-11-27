@@ -70,20 +70,39 @@ function parseChunks(b: Uint8Array): { start: number; data: Uint8Array }[] | nul
   }
 }
 
-function endsWithUsageEvent(joined: Uint8Array): boolean {
+/** The usage event that ends an SSE body (before `data: [DONE]`), or null when there is none the rule accepts. */
+function usageEventOf(joined: Uint8Array): any | null {
   const text = Buffer.from(joined).toString('utf8')
   const tail = 'data: [DONE]\n\n'
-  if (!text.endsWith(tail)) return false
+  if (!text.endsWith(tail)) return null
   const before = text.slice(0, text.length - tail.length)
   const idx = before.lastIndexOf('data: ')
   const evText = (idx >= 0 ? before.slice(idx + 6) : before).trim()
-  if (!evText) return false
+  if (!evText) return null
   try {
     const v = parseUsageEvent(evText)
-    return usageEventProblem(v) === null
+    return usageEventProblem(v) === null ? v : null
   } catch {
-    return false
+    return null
   }
+}
+
+function endsWithUsageEvent(joined: Uint8Array): boolean {
+  return usageEventOf(joined) !== null
+}
+
+/**
+ * The usage event of an R that `extractR` returned, parsed by the usage rule
+ * (repeated keys and numbers past 2^53 refused) from the dechunked data, so
+ * an event split across chunks reads the same as one in a single chunk.
+ * Null when R holds none.
+ */
+export function usageEventOfR(r: Uint8Array): any | null {
+  const joined = r[0] === 10 ? dechunkLineStart(r) : (() => {
+    const chunks = parseChunks(r)
+    return chunks ? concat(...chunks.map((c) => c.data)) : null
+  })()
+  return joined ? usageEventOf(joined) : null
 }
 
 /** SSE data of an R that starts at "\ndata: " inside a chunk (data runs to the first CRLF). */
