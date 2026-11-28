@@ -16,7 +16,10 @@
 #      compared only when those checkouts sit beside this one (never in CI,
 #      which checks out this repository alone), and so are the vectors that
 #      live only there (chat suffix, image request): SDK copy against web copy;
-#   6. a secret scan of the files git would see (tracked and untracked, not
+#   6. the π_WIN shape limits (MAX_WIN_WINDOWS, MAX_WIN_BYTES) of
+#      zkbench/src/statements.rs equal the reference client's h2.ts, and the
+#      SDK's and browser library's copies when those checkouts are present;
+#   7. a secret scan of the files git would see (tracked and untracked, not
 #      ignored): key shapes, and the value of every *_API_KEY variable set in
 #      the environment. A hit prints the file and line, never the match.
 #
@@ -130,7 +133,39 @@ for name in chat-suffix-vectors.json image-request-vectors.json; do
 done
 if [ "$vec_ok" = 1 ]; then pass "shared vectors"; else fail "shared vectors"; fi
 
-# 6. secret scan
+# 6. the π_WIN shape limits: the statement's constants and every client copy agree
+step "π_WIN shape limits agree (statements.rs and the clients' h2.ts)"
+win_files=("$CRYPTO/zkbench/src/statements.rs" "$CLIENT/src/h2.ts")
+# The SDK and browser-library copies, when those checkouts sit beside this one.
+for c in "$ROOT/routstr-sdk/client/confidential/h2.ts" "$ROOT/../routstr-confidential-web/src/h2.ts"; do
+  if [ -f "$c" ]; then win_files+=("$c"); else echo "absent, not compared: ${c#$ROOT/}"; fi
+done
+if python3 -I - "${win_files[@]}" <<'PY'
+import re, sys
+want = None
+ok = True
+for path in sys.argv[1:]:
+    text = open(path, encoding="utf-8").read()
+    got = {}
+    for name in ("MAX_WIN_WINDOWS", "MAX_WIN_BYTES"):
+        m = re.findall(r"\b" + name + r"\s*(?::\s*\w+)?\s*=\s*([0-9_]+)(?:\s*<<\s*([0-9_]+))?\s*;?\s*$", text, re.M)
+        if len(m) != 1:
+            print(f"MISSING {name} in {path} ({len(m)} definitions)")
+            ok = False
+            continue
+        a, b = m[0]
+        got[name] = int(a.replace("_", "")) << int(b.replace("_", "") or 0)
+    print(f"{got}  {path}")
+    if want is None:
+        want = got
+    elif got != want:
+        print(f"DIFF  {path} (differs from {sys.argv[1]})")
+        ok = False
+sys.exit(0 if ok else 1)
+PY
+then pass "π_WIN shape limits"; else fail "π_WIN shape limits"; fi
+
+# 7. secret scan
 step "secret scan"
 PATTERN='nsec1[02-9ac-hj-np-z]{58}|cashu[AB][A-Za-z0-9_=-]{60,}|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|sk-[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}|xox[abprs]-[A-Za-z0-9-]{10,}'
 sec_ok=1
