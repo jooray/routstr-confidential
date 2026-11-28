@@ -570,7 +570,13 @@ def parse_usage_event(text):
             raise ValueError("the usage event repeats a key")
         return dict(items)
 
-    return json.loads(text, object_pairs_hook=pairs)
+    def integer(s):
+        # serde_json reads "-0" as a float, so the sidecar's unsigned-integer
+        # fields refuse it; read it the same way here.
+        n = int(s)
+        return -0.0 if n == 0 and s.startswith("-") else n
+
+    return json.loads(text, object_pairs_hook=pairs, parse_int=integer)
 
 
 def usage_event_problem(ev) -> str | None:
