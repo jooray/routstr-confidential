@@ -372,7 +372,7 @@ block (`routstrd/docs/confidential-upstream.md`). Run it with Bun and send
 | measurements | loopback and shaped links (2/50, 2/10 Mbit/s, 40 ms one way) with `bench.sh` + `shape-proxy.py`: `crypto/PROGRESS-CONFIDENTIAL.md` |
 | `routstr-core` (node), `routstr-sdk`, `routstrd` | published on the forks (`confidential-2pc` in routstr-core and routstr-sdk, `confidential-upstream` in routstrd; PRs #855, #112, #155); their state and commands: `routstr-core/docs/confidential-upstream.md`, `routstrd/docs/confidential-upstream.md` |
 | browser library, PWA | v3 with `split-public-3`: library `main`, pinned by the PWA at `672bd9e` (wasm built by CI); PWA 0.2.18 deployed |
-| deployment | routstr.cypherpunk.today runs v3 since 2026-11-12 11:43 UTC; since 2026-11-28 00:08 CET node 0.5.1+gb901ac9 (on upstream 0dece8e4) and sidecar from `main` 2da120a (mpz2 from the fork with branch-free selects; a GOAWAY that raced `request_ok` refuses the request) (`split-public-3`; `h2.idle_secs` 300, offer `idle_timeout_s` 290), offer `http: ["2","1.1"]`, deposit 2000 msat |
+| deployment | routstr.cypherpunk.today runs v3 since 2026-11-12 11:43 UTC; since 2026-11-28 14:05 CET node 0.5.1+g28cfbe5 (on upstream 12e2b4b6) and sidecar from `main` 2da120a (mpz2 from the fork with branch-free selects; a GOAWAY that raced `request_ok` refuses the request) (`split-public-3`; `h2.idle_secs` 300, offer `idle_timeout_s` 290), offer `http: ["2","1.1"]`, deposit 2000 msat |
 
 Notes that outlive the port: the client needs `cu-2pc` next to `cu-prover`
 (or `CU_2PC`). The sidecar dials the provider only when the ClientHello

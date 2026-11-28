@@ -18,7 +18,8 @@
 //!   end with the disclosed `R` (plus `skip` undisclosed bytes).
 //! * **π_NK** (node proves): the credential record (epoch 0, seq 0, under
 //!   `K_0`/`IV_0`) is the published template with alphabet-constrained key
-//!   bytes; the ciphertext is bound by `c_commit = SHA256(header ‖ C_1)`.
+//!   bytes; `c_commit = SHA256(header ‖ C_1)` names the ciphertext π_NK
+//!   proves. That N wrote that record is N's attested statement, not enforced.
 //!
 //! The anchor digests are decoded (they equal public values); every
 //! plaintext comparison is a one-bit in-circuit equality (`eq_bytes`).
